@@ -896,7 +896,14 @@ def _resolve_source_blob(
         if pending_content is not None:
             fresh_blob, data = blob, pending_content
         else:
-            fresh_blob, data = _locked_read_ready_blob(session_engine, session_id, blob_id)
+            fresh_blob, data = _locked_read_ready_blob(
+                session_engine,
+                session_id,
+                blob_id,
+                data_dir=context.data_dir,
+                session_operation_context=context.session_operation_context,
+                session_operation_authority=context.session_operation_authority,
+            )
         if fresh_blob is None:
             return _failure_result(state, f"Blob '{blob_id}' not found.")
         if fresh_blob["status"] != "ready":

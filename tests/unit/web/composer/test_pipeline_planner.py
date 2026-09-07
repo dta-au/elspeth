@@ -40,6 +40,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
+from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
 from elspeth.web.composer import pipeline_planner
@@ -111,6 +112,7 @@ from elspeth.web.composer.tools.generation import explain_validation_code, expla
 from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_schema
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -130,6 +132,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, composition_proposals_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 _TEST_SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -739,7 +742,20 @@ async def _plan(
             unresolved_classes=(),
         )
         policy_context = patch.object(planner_module.PlannerDiscoveryPolicy, "initial", return_value=full_policy)
-    with policy_context:
+    origin = originating_message or _origin()
+    custody = custody_config or _custody(tmp_path)
+    operation_scope = (
+        fenced_operation_context(custody.session_engine, origin.session_id)
+        if custody.session_engine is not None and custody.session_operation_context is None
+        else nullcontext(custody.session_operation_context)
+    )
+    with policy_context, operation_scope as operation_context:
+        if custody.session_engine is not None and custody.session_operation_context is None:
+            custody = replace(
+                custody,
+                session_operation_context=operation_context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(custody.session_engine),
+            )
         return await plan_pipeline(
             intent=intent,
             current_state=current_state or _empty_state(),
@@ -759,13 +775,13 @@ async def _plan(
             conversation_context=conversation_context,
             policy_catalog=policy_catalog,
             plugin_snapshot=plugin_snapshot,
-            originating_message=originating_message or _origin(),
+            originating_message=origin,
             base=AbsentBase(),
             model_config=_model(completion, **dict(model_overrides or {})),
             rendered_skill=rendered_skill or f"{load_pipeline_capability_core()}\n\nYou are the bounded ELSPETH pipeline planner.",
             repair_budget=repair_budget,
             budget_policy=budget or _budget(),
-            custody_config=custody_config or _custody(tmp_path),
+            custody_config=custody,
             lifecycle=lifecycle or _lifecycle(),
             recorder=recorder or BufferingRecorder(),
             candidate_finalizer=candidate_finalizer or (lambda candidate: candidate),
@@ -3536,7 +3552,7 @@ async def test_parallel_discovery_cancellation_closes_every_audit_before_return(
         )
     )
     try:
-        await asyncio.wait_for(asyncio.to_thread(both_workers_entered.wait, 2), timeout=3)
+        await asyncio.wait_for(run_sync_in_worker(both_workers_entered.wait, 2), timeout=3)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -6163,29 +6179,50 @@ async def test_absolute_deadline_audits_slow_provider_timeout_and_settles(
     tmp_path: Path,
     tool_context: ToolContext,
 ) -> None:
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    clock_origin = real_time()
+    provider_started_at: float | None = None
+    provider_cancelled = False
+
+    def deadline_clock() -> float:
+        # Run the real preflight without charging CI scheduling delays to this
+        # provider-timeout test. Once the provider enters, consume the original
+        # one-second budget using real elapsed time and asyncio's real timer.
+        # The sync-phase deadline tests separately cover preflight timeouts.
+        if provider_started_at is None:
+            return clock_origin
+        return clock_origin + real_time() - provider_started_at
+
     class SlowCompletion(_ScriptedCompletion):
         async def __call__(self, **kwargs: Any) -> _Response:
+            nonlocal provider_started_at, provider_cancelled
             self.requests.append(deepcopy(kwargs))
-            await asyncio.sleep(60)
+            provider_started_at = real_time()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                provider_cancelled = True
+                raise
             raise AssertionError("unreachable")
 
     completion = SlowCompletion()
     recorder = BufferingRecorder()
     events: list[str] = []
-    with pytest.raises(PipelinePlannerError, match="wall-clock"):
+    with patch.object(loop, "time", deadline_clock), pytest.raises(PipelinePlannerError, match="wall-clock") as error:
         await _plan(
             tmp_path=tmp_path,
             tool_context=tool_context,
             completion=completion,
             recorder=recorder,
-            # The absolute deadline now includes the worker-offloaded initial
-            # policy validation. Leave enough time to reach the deliberately
-            # hanging provider so this test remains specifically about its
-            # audited timeout path under xdist load.
             model_overrides={"timeout_seconds": 1.0},
             lifecycle=_lifecycle(events),
         )
-    assert recorder.llm_calls[0].status.value == "timeout"
+    assert len(completion.requests) == 1
+    assert provider_cancelled
+    assert error.value.code == "TIMEOUT"
+    (call,) = recorder.llm_calls
+    assert call.status is ComposerLLMCallStatus.TIMEOUT
     assert events[-1] == "settled:failed"
 
 

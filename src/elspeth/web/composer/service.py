@@ -3202,6 +3202,7 @@ class ComposerServiceImpl:
         llm_messages: list[dict[str, Any]],
         session_id: str | None,
         repair_turns_used: int,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> _ProofRepairOutcome:
         """Pre-finalize proof gate.
 
@@ -3233,6 +3234,9 @@ class ComposerServiceImpl:
             state,
             session_engine=self._session_engine,
             session_id=session_id,
+            data_dir=self._data_dir,
+            session_operation_context=session_operation_context,
+            session_operation_authority=self._sessions_service.session_operation_authority if self._sessions_service is not None else None,
         )
         # The diagnostic dict shape is the documented contract of
         # ``compute_proof_diagnostics`` (see ``tools.py``): every entry
@@ -4009,6 +4013,8 @@ class ComposerServiceImpl:
             custody_config=PlannerCustodyConfig(
                 data_dir=self._data_dir,
                 session_engine=self._session_engine,
+                session_operation_context=session_operation_context,
+                session_operation_authority=self._require_sessions_service().session_operation_authority,
                 max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
                 secret_service=self._secret_service,
                 secret_wiring_policy=self._secret_wiring_policy,
@@ -4210,6 +4216,8 @@ class ComposerServiceImpl:
         custody_config = PlannerCustodyConfig(
             data_dir=self._data_dir,
             session_engine=self._session_engine,
+            session_operation_context=session_operation_context,
+            session_operation_authority=self._require_sessions_service().session_operation_authority,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
             secret_wiring_policy=self._secret_wiring_policy,
@@ -4825,6 +4833,8 @@ class ComposerServiceImpl:
         custody_config = PlannerCustodyConfig(
             data_dir=self._data_dir,
             session_engine=self._session_engine,
+            session_operation_context=session_operation_context,
+            session_operation_authority=self._require_sessions_service().session_operation_authority,
             max_storage_per_session=self._settings.max_blob_storage_per_session_bytes,
             secret_service=self._secret_service,
             secret_wiring_policy=self._secret_wiring_policy,
@@ -5166,6 +5176,7 @@ class ComposerServiceImpl:
             cancellation_requested=cancellation_requested,
             plugin_snapshot=plugin_snapshot,
             policy_catalog=policy_catalog,
+            session_operation_authority=(turn_sessions_service.session_operation_authority if turn_sessions_service is not None else None),
         )
         acc = BatchAccumulator(
             state=state,
@@ -5724,6 +5735,7 @@ class ComposerServiceImpl:
                 llm_messages=llm_messages,
                 session_id=session_id,
                 repair_turns_used=repair_turns_used,
+                session_operation_context=session_operation_context,
             )
             if proof_repair.action == "repair_injected":
                 return _TerminateOutcome(action="continue", repair_turns_delta=1)

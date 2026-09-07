@@ -8,6 +8,7 @@ import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.blobs.service import _composition_references_blob
+from elspeth.web.coordination.repository import _composition_references_blob as _coordination_composition_references_blob
 
 
 def test_composition_references_blob_finds_transform_inline_content_ref() -> None:
@@ -164,7 +165,12 @@ def _sections_carrying_options(pipeline: dict[str, Any]) -> list[str]:
     return sorted(carrying)
 
 
-def test_delete_guard_sees_a_reference_in_every_options_bearing_emitted_section() -> None:
+@pytest.mark.parametrize(
+    "walker",
+    [_composition_references_blob, _coordination_composition_references_blob],
+    ids=["blob-service", "postgres-coordination"],
+)
+def test_delete_guard_sees_a_reference_in_every_options_bearing_emitted_section(walker: Any) -> None:
     blob_id = "0a274caf-6d51-44a4-b8ef-3d2f5f77a1f0"
     marker = {"blob_ref": blob_id, "mode": "inline_content", "sha256": "a" * 64}
     pipeline = _emitted_pipeline_with_every_node_kind(marker)
@@ -174,7 +180,7 @@ def test_delete_guard_sees_a_reference_in_every_options_bearing_emitted_section(
     blind: list[str] = []
     for section in sections:
         isolated = {section: pipeline[section]}
-        if not _composition_references_blob(isolated, blob_id, "/unused"):
+        if not walker(isolated, blob_id, "/unused"):
             blind.append(section)
 
     assert not blind, (

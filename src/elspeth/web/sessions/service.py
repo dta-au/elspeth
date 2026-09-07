@@ -49,10 +49,8 @@ from elspeth.web.composer.authority_hashing import composer_authority_hash, proj
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.pipeline_commit import PipelineDispatchAuditBinding
 from elspeth.web.composer.pipeline_custody import (
-    InlineCustodyPublication,
     finalize_pipeline_custody_on_connection,
-    publish_pipeline_custody,
-    reconcile_pipeline_custody_after_transaction_failure,
+    staged_pipeline_custody,
 )
 from elspeth.web.composer.pipeline_planner import PipelinePlanResult
 from elspeth.web.composer.pipeline_proposal import (
@@ -11319,23 +11317,20 @@ class SessionServiceImpl:
         now = self._now()
 
         def _sync() -> GuidedFullPipelineProposalStageSettlement:
-            publication: InlineCustodyPublication | None = None
-
-            @contextlib.contextmanager
-            def _reconcile_publication_on_error() -> Iterator[None]:
-                try:
-                    yield
-                except BaseException as primary_exc:
-                    if publication is not None:
-                        reconcile_pipeline_custody_after_transaction_failure(
-                            self._engine,
-                            publication,
-                            primary_exc=primary_exc,
-                        )
-                    raise
-
             with (
-                _reconcile_publication_on_error(),
+                staged_pipeline_custody(
+                    custody_preparation,
+                    engine=self._engine,
+                    data_dir=custody_data_dir,
+                    write_fence=BlobGuidedOperationWriteFence(
+                        session_id=command.fence.session_id,
+                        operation_id=command.fence.operation_id,
+                        lease_token=command.fence.lease_token,
+                        attempt=command.fence.attempt,
+                    ),
+                    session_operation_context=session_operation_context,
+                    session_operation_authority=self._session_operation_authority,
+                ) as staged_custody,
                 self._session_process_locked_begin(sid) as conn,
                 self._session_write_lock(conn, sid),
             ):
@@ -11456,11 +11451,12 @@ class SessionServiceImpl:
                     # lineage FK and keeps message, blob, and proposal in a
                     # single atomic cohort (elspeth-1e3ad83d89).
                     assert command.custody_max_storage_per_session is not None  # command __post_init__ contract
-                    assert custody_data_dir is not None  # validated with the preparation above
-                    publication = finalize_pipeline_custody_on_connection(
+                    if staged_custody is None:
+                        raise AuditIntegrityError("guided-full inline custody was not staged before its atomic cohort")
+                    finalize_pipeline_custody_on_connection(
                         custody_preparation,
                         conn=conn,
-                        data_dir=custody_data_dir,
+                        staged=staged_custody,
                         max_storage_per_session=command.custody_max_storage_per_session,
                         write_fence=BlobGuidedOperationWriteFence(
                             session_id=command.fence.session_id,
@@ -11540,8 +11536,6 @@ class SessionServiceImpl:
                     response_json=projected_json,
                     response_hash=response_hash,
                 )
-            if publication is not None:
-                publish_pipeline_custody(self._engine, publication)
             return settlement
 
         settlement = cast(

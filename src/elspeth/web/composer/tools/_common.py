@@ -40,6 +40,7 @@ from elspeth.contracts.hashing import canonical_json, stable_hash
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.contracts.plugin_protocols import PluginConfigProtocol
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.sink import FILE_SINK_PLUGINS, FILE_SINK_REPAIR_EXTENSIONS
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.config import TriggerConfig
@@ -116,6 +117,7 @@ from elspeth.web.secrets.ref_policy import (
     allowed_secret_ref_fields_text,
 )
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 from elspeth.web.validation import (
     INTERPRETATION_PLACEHOLDER_RE,
 )
@@ -3538,6 +3540,8 @@ class ToolContext:
     require_data_dir_for_paths: bool = False
     session_engine: Engine | None = None
     session_id: str | None = None
+    session_operation_context: SessionOperationContext | None = None
+    session_operation_authority: SessionOperationAuthority | None = None
     secret_service: WebSecretResolver | None = None
     secret_wiring_policy: SecretWiringPolicy | None = None
     user_id: str | None = None

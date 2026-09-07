@@ -49,6 +49,7 @@ from elspeth.contracts.composer_progress import ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.tool_calls import is_valid_provider_replay_tool_call_id
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.canonical import canonical_json, stable_hash
@@ -139,6 +140,7 @@ from elspeth.web.composer.tools.schema_contract import canonical_set_pipeline_sc
 from elspeth.web.composer.tools.sessions import build_set_pipeline_candidate, canonicalize_authored_node_review_requirements
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 _PLANNER_DISCOVERY_TOOL_NAME_SET: Final[frozenset[str]] = frozenset(PLANNER_DISCOVERY_TOOL_NAMES)
 _TERMINAL_TOOL_NAME: Final[str] = PLANNER_TERMINAL_TOOL_NAME
@@ -978,6 +980,8 @@ class PlannerCustodyConfig:
     # structural findings the strict ledger skipped (elspeth-229e9e8195).
     structural_preflight: RuntimePreflight | None = None
     write_fence: BlobGuidedOperationWriteFence | None = None
+    session_operation_context: SessionOperationContext | None = None
+    session_operation_authority: SessionOperationAuthority | None = None
     # Guided-full defers inline-custody finalization into the atomic staging
     # settlement: the blob row's composite lineage FK requires the originating
     # chat message row, which that surface only inserts at settlement
@@ -3437,6 +3441,8 @@ async def _build_valid_pipeline_plan(
                     data_dir=custody_config.data_dir,
                     max_storage_per_session=custody_config.max_storage_per_session,
                     write_fence=custody_config.write_fence,
+                    session_operation_context=custody_config.session_operation_context,
+                    session_operation_authority=custody_config.session_operation_authority,
                 )
             )
         safe_pipeline = cast(dict[str, Any], deep_thaw(preparation.arguments))
@@ -3719,6 +3725,8 @@ async def _plan_pipeline_inner(
         require_data_dir_for_paths=True,
         session_engine=custody_config.session_engine,
         session_id=originating_message.session_id,
+        session_operation_context=custody_config.session_operation_context,
+        session_operation_authority=custody_config.session_operation_authority,
         secret_service=custody_config.secret_service,
         secret_wiring_policy=custody_config.secret_wiring_policy,
         user_id=originating_message.user_id,

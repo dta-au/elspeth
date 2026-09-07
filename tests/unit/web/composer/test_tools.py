@@ -5,7 +5,8 @@ from __future__ import annotations
 import csv
 import io
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
@@ -21,6 +22,7 @@ from sqlalchemy.pool import StaticPool
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import (
@@ -54,6 +56,7 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools._common import rejected_component_prefix
 from elspeth.web.config import WebSettings
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -86,6 +89,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.state_envelope import envelope_state_column
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _attached_notes(exc: BaseException) -> tuple[str, ...]:
@@ -702,6 +706,19 @@ def _verbatim_blob_context(engine: Any, session_id: str, content: str) -> dict[s
     }
 
 
+@contextmanager
+def _blob_operation(
+    engine: Any,
+    session_id: str,
+    *,
+    kind: SessionOperationKind = SessionOperationKind.COMPOSE,
+) -> Iterator[tuple[SQLiteLocalSessionOperationAuthority, SessionOperationContext]]:
+    """Hold genuine operation authority around one explicit test dispatch."""
+    authority = SQLiteLocalSessionOperationAuthority(engine)
+    with fenced_operation_context(engine, session_id, operation_kind=kind) as context:
+        yield authority, context
+
+
 def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str) -> str:
     """Persist one valid session-fork operation in the requested lifecycle state."""
     from datetime import UTC, datetime, timedelta
@@ -753,17 +770,21 @@ def _insert_session_fork_operation(engine: Any, session_id: str, *, status: str)
 
 def test_execute_create_blob_honors_configured_session_quota(tmp_path: Path) -> None:
     engine, session_id = _session_engine_with_session()
-    result = execute_tool(
-        "create_blob",
-        {"filename": "too-large.txt", "mime_type": "text/plain", "content": "exceeds"},
-        _empty_state(),
-        _mock_catalog(),
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=session_id,
-        max_blob_storage_per_session_bytes=3,
-        **_verbatim_blob_context(engine, session_id, "exceeds"),
-    )
+    blob_provenance = _verbatim_blob_context(engine, session_id, "exceeds")
+    with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+        result = execute_tool(
+            "create_blob",
+            {"filename": "too-large.txt", "mime_type": "text/plain", "content": "exceeds"},
+            _empty_state(),
+            _mock_catalog(),
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_authority=blob_authority,
+            session_operation_context=blob_operation_context,
+            max_blob_storage_per_session_bytes=3,
+            **blob_provenance,
+        )
 
     assert result.success is False
     assert "3 byte limit" in result.data["error"]
@@ -5462,34 +5483,38 @@ class TestBlobTools:
         state = _empty_state()
         catalog = _mock_catalog()
         data_dir = str(tmp_path)
-        original_write = blob_service._atomic_write_blob
+        original_replace = blob_service.os.replace
 
-        def _write_then_fail(path: Path, content: bytes) -> None:
-            original_write(path, content)
+        def _replace_then_fail(source, target, *, src_dir_fd=None, dst_dir_fd=None) -> None:
+            original_replace(source, target, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
             raise RuntimeError("simulated interruption after file publication")
 
-        with (
-            patch(
-                "elspeth.web.blobs.service._atomic_write_blob",
-                side_effect=_write_then_fail,
-            ),
-            pytest.raises(RuntimeError, match="simulated interruption after file publication"),
-        ):
-            execute_tool(
-                "create_blob",
-                {"filename": "test.csv", "mime_type": "text/csv", "content": "a,b\n1,2"},
-                state,
-                catalog,
-                data_dir=data_dir,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "a,b\n1,2"),
-            )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "a,b\n1,2")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with (
+                patch(
+                    "elspeth.web.blobs.service.os.replace",
+                    side_effect=_replace_then_fail,
+                ),
+                pytest.raises(RuntimeError, match="simulated interruption after file publication"),
+            ):
+                execute_tool(
+                    "create_blob",
+                    {"filename": "test.csv", "mime_type": "text/csv", "content": "a,b\n1,2"},
+                    state,
+                    catalog,
+                    data_dir=data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
 
-        # Storage file must have been cleaned up
-        blob_dir = tmp_path / "blobs" / self.session_id
-        remaining = list(blob_dir.glob("*")) if blob_dir.exists() else []
-        assert remaining == [], f"Orphaned files after interrupted publication: {remaining}"
+            # Storage file must have been cleaned up
+            blob_dir = tmp_path / "blobs" / self.session_id
+            remaining = list(blob_dir.glob("*")) if blob_dir.exists() else []
+            assert remaining == [], f"Orphaned files after interrupted publication: {remaining}"
 
     def test_update_blob_restores_old_content_on_db_failure(self, tmp_path: Path) -> None:
         """DB failure during update_blob must restore the original file content."""
@@ -5497,6 +5522,7 @@ class TestBlobTools:
         from unittest.mock import patch
         from uuid import uuid4
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.models import blobs_table
 
         state = _empty_state()
@@ -5519,7 +5545,7 @@ class TestBlobTools:
                     filename="test.csv",
                     mime_type="text/csv",
                     size_bytes=len(original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=content_hash(original_content),
                     storage_path=str(storage_path),
                     created_at=now,
                     created_by="user",
@@ -5531,27 +5557,31 @@ class TestBlobTools:
         # Patch session_engine.begin() to raise AFTER the file is overwritten.
         # The update function reads old content, writes new content, THEN enters
         # the DB transaction.  We need the DB part to fail.
-        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "new,content\n3,4")
-        with (
-            patch.object(
-                self.engine,
-                "begin",
-                side_effect=RuntimeError("simulated DB failure"),
-            ),
-            pytest.raises(RuntimeError, match="simulated DB failure"),
-        ):
-            execute_tool(
-                "update_blob",
-                {"blob_id": blob_id, "content": "new,content\n3,4"},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **provenance_context,
-            )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new,content\n3,4")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with (
+                patch.object(
+                    self.engine,
+                    "begin",
+                    side_effect=RuntimeError("simulated DB failure"),
+                ),
+                pytest.raises(RuntimeError, match="simulated DB failure"),
+            ):
+                execute_tool(
+                    "update_blob",
+                    {"blob_id": blob_id, "content": "new,content\n3,4"},
+                    state,
+                    catalog,
+                    data_dir=str(tmp_path),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
 
-        # File must contain the ORIGINAL content after rollback
-        assert storage_path.read_bytes() == original_content
+            # File must contain the ORIGINAL content after rollback
+            assert storage_path.read_bytes() == original_content
 
     def test_blob_rollback_does_not_catch_keyboard_interrupt(self, tmp_path: Path) -> None:
         """Blob exception handlers must catch Exception, not BaseException.
@@ -5594,6 +5624,7 @@ class TestDeleteBlobActiveRunGuard:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -5606,6 +5637,7 @@ class TestDeleteBlobActiveRunGuard:
         initialize_session_schema(self.engine)
 
         self.session_id = str(uuid4())
+        self.data_dir = str(tmp_path)
         self.blob_id = str(uuid4())
         self.run_id = str(uuid4())
         now = datetime.now(UTC)
@@ -5633,8 +5665,8 @@ class TestDeleteBlobActiveRunGuard:
                     session_id=self.session_id,
                     filename="data.csv",
                     mime_type="text/csv",
-                    size_bytes=100,
-                    content_hash=_STUB_SHA256,
+                    size_bytes=len(b"a,b\n1,2"),
+                    content_hash=content_hash(b"a,b\n1,2"),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -5773,49 +5805,61 @@ class TestDeleteBlobActiveRunGuard:
     def test_delete_succeeds_when_no_runs_linked(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        assert not self.storage_path.exists()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is True
+            assert not self.storage_path.exists()
 
     def test_delete_rejected_while_session_fork_is_in_progress(self) -> None:
         operation_id = _insert_session_fork_operation(self.engine, self.session_id, status="in_progress")
 
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
-        assert result.success is False
-        assert operation_id in result.data["error"]
-        assert "session fork" in result.data["error"].lower()
-        assert self.storage_path.read_bytes() == b"a,b\n1,2"
+            assert result.success is False
+            assert operation_id in result.data["error"]
+            assert "session fork" in result.data["error"].lower()
+            assert self.storage_path.read_bytes() == b"a,b\n1,2"
 
     @pytest.mark.parametrize("fork_status", ["completed", "failed"])
     def test_delete_allowed_after_session_fork_is_terminal(self, fork_status: str) -> None:
         _insert_session_fork_operation(self.engine, self.session_id, status=fork_status)
 
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
-        assert result.success is True
-        assert not self.storage_path.exists()
+            assert result.success is True
+            assert not self.storage_path.exists()
 
     def test_delete_rejected_when_pending_run_exists_without_link(self) -> None:
         """Pre-link window: run exists but blob_run_links row hasn't been created yet.
@@ -5828,34 +5872,42 @@ class TestDeleteBlobActiveRunGuard:
         self._insert_run_without_link("pending")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is False
-        assert "active run" in result.data["error"].lower()
-        assert self.storage_path.exists(), "File must not be deleted when guard blocks"
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is False
+            assert "active run" in result.data["error"].lower()
+            assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_rejected_when_running_run_exists_without_link(self) -> None:
         """Same as pending — a running run without a link row must also block."""
         self._insert_run_without_link("running")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is False
-        assert "active run" in result.data["error"].lower()
-        assert self.storage_path.exists(), "File must not be deleted when guard blocks"
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is False
+            assert "active run" in result.data["error"].lower()
+            assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_succeeds_when_active_run_uses_different_source(self) -> None:
         """Active run using source.path (no blob_ref) must not block unrelated blob deletion.
@@ -5871,16 +5923,20 @@ class TestDeleteBlobActiveRunGuard:
         )
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        assert not self.storage_path.exists()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is True
+            assert not self.storage_path.exists()
 
     def test_delete_rejected_when_active_run_path_matches_storage(self) -> None:
         """Active run using source.path matching this blob's storage_path must block.
@@ -5894,79 +5950,99 @@ class TestDeleteBlobActiveRunGuard:
         )
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is False
-        assert "active run" in result.data["error"].lower()
-        assert self.storage_path.exists(), "File must not be deleted when guard blocks"
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is False
+            assert "active run" in result.data["error"].lower()
+            assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_succeeds_when_completed_run_exists_without_link(self) -> None:
         """Completed runs (no link row) must not block deletion."""
         self._insert_run_without_link("completed")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        assert not self.storage_path.exists()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is True
+            assert not self.storage_path.exists()
 
     def test_delete_rejected_when_pending_run_linked(self) -> None:
         self._insert_run_and_link("pending")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is False
-        assert "active run" in result.data["error"].lower()
-        assert self.storage_path.exists(), "File must not be deleted when guard blocks"
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is False
+            assert "active run" in result.data["error"].lower()
+            assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_rejected_when_running_run_linked(self) -> None:
         self._insert_run_and_link("running")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is False
-        assert self.storage_path.exists(), "File must not be deleted when guard blocks"
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is False
+            assert self.storage_path.exists(), "File must not be deleted when guard blocks"
 
     def test_delete_succeeds_when_completed_run_linked(self) -> None:
         self._insert_run_and_link("completed")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        assert not self.storage_path.exists()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
+            assert result.success is True
+            assert not self.storage_path.exists()
 
     def test_delete_restores_file_when_db_delete_fails_after_filesystem_mutation(self) -> None:
         """DB failure after the filesystem step must not leave a stale row/missing-file split."""
@@ -5992,24 +6068,28 @@ class TestDeleteBlobActiveRunGuard:
             if statement.lstrip().upper().startswith("DELETE FROM BLOBS"):
                 raise RuntimeError("simulated delete failure")
 
-        event.listen(self.engine, "before_cursor_execute", _fail_blob_row_delete)
-        try:
-            with pytest.raises(RuntimeError, match="simulated delete failure"):
-                execute_tool(
-                    "delete_blob",
-                    {"blob_id": self.blob_id},
-                    _empty_state(),
-                    _mock_catalog(),
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                )
-        finally:
-            event.remove(self.engine, "before_cursor_execute", _fail_blob_row_delete)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            event.listen(self.engine, "before_cursor_execute", _fail_blob_row_delete)
+            try:
+                with pytest.raises(RuntimeError, match="simulated delete failure"):
+                    execute_tool(
+                        "delete_blob",
+                        {"blob_id": self.blob_id},
+                        _empty_state(),
+                        _mock_catalog(),
+                        data_dir=self.data_dir,
+                        session_engine=self.engine,
+                        session_id=self.session_id,
+                        session_operation_authority=blob_authority,
+                        session_operation_context=blob_operation_context,
+                    )
+            finally:
+                event.remove(self.engine, "before_cursor_execute", _fail_blob_row_delete)
 
-        assert self.storage_path.exists(), "Rollback must restore the backing file"
-        with self.engine.connect() as conn:
-            row = conn.execute(select(blobs_table.c.id).where(blobs_table.c.id == self.blob_id)).first()
-        assert row is not None, "The blob row should still exist after the failed delete"
+            assert self.storage_path.exists(), "Rollback must restore the backing file"
+            with self.engine.connect() as conn:
+                row = conn.execute(select(blobs_table.c.id).where(blobs_table.c.id == self.blob_id)).first()
+            assert row is not None, "The blob row should still exist after the failed delete"
 
 
 # ---------------------------------------------------------------------------
@@ -6032,6 +6112,7 @@ class TestUpdateBlobQuota:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -6073,7 +6154,7 @@ class TestUpdateBlobQuota:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=content_hash(self.original_content),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -6106,53 +6187,61 @@ class TestUpdateBlobQuota:
         assert quota_error is None
         assert locked_sessions == [self.session_id]
 
-    def test_update_locks_session_before_current_size_delta_read(self, monkeypatch) -> None:
-        """The quota lock must cover the current-size read used for update deltas."""
-        from elspeth.web.composer.tools import blobs as composer_blob_tools
+    def test_update_locks_session_before_quota_sum(self) -> None:
+        """Replacement quota reads follow a session-row lock on the same connection."""
+        from sqlalchemy.dialects import postgresql
 
-        events: list[str] = []
-        original_lock = composer_blob_tools._lock_session_for_blob_quota
+        statements: list[tuple[object, str]] = []
+        quota_sums = 0
 
-        def recording_lock(conn, session_id: str) -> None:
-            events.append("lock")
-            original_lock(conn, session_id)
+        def record_quota_read(conn, statement, multiparams, params, execution_options) -> None:
+            nonlocal quota_sums
+            compiled = str(statement.compile(dialect=postgresql.dialect()))
+            if "sum(blobs.size_bytes)" in compiled:
+                quota_sums += 1
+                assert any(prior_conn is conn and "FROM sessions" in sql and "FOR UPDATE" in sql for prior_conn, sql in statements)
+            statements.append((conn, compiled))
 
-        def record_size_read(_conn, _cursor, statement: str, _parameters, _context, _executemany) -> None:
-            normalized = " ".join(statement.lower().split())
-            if normalized.startswith("select blobs.size_bytes") and "from blobs" in normalized:
-                events.append("size_read")
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "larger content")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            event.listen(self.engine, "before_execute", record_quota_read)
+            try:
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "larger content"},
+                    _empty_state(),
+                    _mock_catalog(),
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            finally:
+                event.remove(self.engine, "before_execute", record_quota_read)
 
-        monkeypatch.setattr(composer_blob_tools, "_lock_session_for_blob_quota", recording_lock)
-        event.listen(self.engine, "before_cursor_execute", record_size_read)
-        try:
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "larger content"},
-                _empty_state(),
-                _mock_catalog(),
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "larger content"),
-            )
-        finally:
-            event.remove(self.engine, "before_cursor_execute", record_size_read)
-
-        assert result.success is True
-        assert events[:2] == ["lock", "size_read"]
+            assert result.success is True
+            assert quota_sums > 0, "the ordering assertion must observe a real quota SUM"
 
     def test_update_within_quota_succeeds(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "slightly larger content"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "slightly larger content"),
-        )
-        assert result.success is True
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "slightly larger content")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "slightly larger content"},
+                state,
+                catalog,
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
+            assert result.success is True
 
     def test_update_exceeding_quota_rejected(self) -> None:
         from unittest.mock import patch
@@ -6160,35 +6249,45 @@ class TestUpdateBlobQuota:
         state = _empty_state()
         catalog = _mock_catalog()
         # Set quota to a tiny value so any growth exceeds it
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-            )
-        assert result.success is False
-        assert "quota" in result.data["error"].lower()
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 100)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 100},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            assert result.success is False
+            assert "quota" in result.data["error"].lower()
 
     def test_update_exceeding_quota_preserves_old_content(self) -> None:
         from unittest.mock import patch
 
         state = _empty_state()
         catalog = _mock_catalog()
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
-            execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-            )
-        assert self.storage_path.read_bytes() == self.original_content
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 100)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
+                execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 100},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            assert self.storage_path.read_bytes() == self.original_content
 
     def test_shrink_always_succeeds(self) -> None:
         from unittest.mock import patch
@@ -6196,29 +6295,39 @@ class TestUpdateBlobQuota:
         # First grow the blob so we have something to shrink
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "a" * 200},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "a" * 200),
-        )
-        assert result.success is True
-
-        # Now set quota very low — shrinking should still succeed
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "a" * 200)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
             result = execute_tool(
                 "update_blob",
-                {"blob_id": self.blob_id, "content": "tiny"},
+                {"blob_id": self.blob_id, "content": "a" * 200},
                 state,
                 catalog,
+                data_dir=self.data_dir,
                 session_engine=self.engine,
                 session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "tiny"),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
             )
-        assert result.success is True
+            assert result.success is True
+
+        # Now set quota very low — shrinking should still succeed
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "tiny")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "tiny"},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            assert result.success is True
 
     def test_delta_boundary_case(self) -> None:
         """Update that fits when measured by delta but not by absolute new size.
@@ -6232,6 +6341,7 @@ class TestUpdateBlobQuota:
         from unittest.mock import patch
         from uuid import uuid4
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.models import blobs_table
 
         # Add a second blob to bring session total to 490
@@ -6248,7 +6358,7 @@ class TestUpdateBlobQuota:
                     filename="filler.bin",
                     mime_type="application/octet-stream",
                     size_bytes=485,
-                    content_hash=_STUB_SHA256_ALT,
+                    content_hash=content_hash(b"x" * 485),
                     storage_path=str(filler_path),
                     created_at=now,
                     created_by="user",
@@ -6261,17 +6371,22 @@ class TestUpdateBlobQuota:
         state = _empty_state()
         catalog = _mock_catalog()
         # New content: 15 bytes. Delta = 15 - 5 = 10. Total after = 490 + 10 = 500.
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 500):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 15},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 15),
-            )
-        assert result.success is True, f"Delta-based quota check should pass at boundary: {result.data}"
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 15)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 500):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 15},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            assert result.success is True, f"Delta-based quota check should pass at boundary: {result.data}"
 
     def test_shrink_on_at_quota_session_succeeds(self) -> None:
         """Shrinking a blob on a session exactly at quota must succeed."""
@@ -6280,88 +6395,78 @@ class TestUpdateBlobQuota:
         state = _empty_state()
         catalog = _mock_catalog()
         # Quota exactly matches current total (5 bytes)
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", len(self.original_content)):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x"},  # 1 byte < 5 bytes
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x"),
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", len(self.original_content)):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x"},  # 1 byte < 5 bytes
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
+            assert result.success is True
+
+    def test_replacement_refuses_stale_size_snapshot(self) -> None:
+        """A competing committed replacement invalidates the entire expected snapshot."""
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+        from elspeth.web.blobs.service import content_hash
+
+        original_replace = BlobReplacementCoordinator.replace_blob
+        competing_content = b"y" * 50
+        competing_writes = 0
+
+        def replace_after_competitor(driver, **kwargs):
+            nonlocal competing_writes
+            expected = kwargs["expected"]
+            competitor = replace(expected, size_bytes=len(competing_content), content_hash=content_hash(competing_content))
+            original_replace(
+                driver,
+                expected=expected,
+                replacement=competitor,
+                content=competing_content,
+                context=kwargs["context"],
+                max_storage_per_session=70,
+                accepting_proposal_id=None,
             )
-        assert result.success is True
+            competing_writes += 1
+            return original_replace(driver, **kwargs)
 
-    def test_quota_delta_uses_current_db_size_not_stale_snapshot(self) -> None:
-        """size_delta must be computed from the in-transaction DB row, not the
-        pre-transaction snapshot returned by _sync_get_blob().
-
-        Scenario: blob starts at 5 bytes.  A concurrent writer grows it to 50
-        bytes between the _sync_get_blob() call and the transaction.  Our
-        update writes 60 bytes.  The correct delta is 60 - 50 = 10, not
-        60 - 5 = 55.  With quota set to 70, the stale delta (55) would exceed
-        quota while the correct delta (10) fits.
-        """
-        from unittest.mock import patch
-
-        from sqlalchemy import update as sa_update
-
-        # Simulate concurrent writer: bump DB size_bytes to 50 *after*
-        # _sync_get_blob() has already read 5.  We hook _sync_get_blob to
-        # perform the concurrent write immediately after returning.
-        from elspeth.web.composer.tools.blobs import _sync_get_blob as original_get
-        from elspeth.web.sessions.models import blobs_table
-
-        def _get_then_concurrent_write(*args, **kwargs):
-            result = original_get(*args, **kwargs)
-            # Simulate concurrent writer updating size_bytes in the DB
-            with self.engine.begin() as conn:
-                conn.execute(sa_update(blobs_table).where(blobs_table.c.id == self.blob_id).values(size_bytes=50))
-            return result
-
-        state = _empty_state()
-        catalog = _mock_catalog()
-
-        # Quota = 70.  Correct delta: 60 - 50 = 10 → total 70 ≤ 70 → OK.
-        # Stale delta: 60 - 5 = 55 → total 70 (from SUM) + 55 = would exceed.
-        # (But _check_blob_quota reads SUM which already includes the 50,
-        #  so stale delta of 55 → 50 + 55 = 105 > 70 → wrongly rejected.)
-        with (
-            patch("elspeth.web.composer.tools.blobs._sync_get_blob", side_effect=_get_then_concurrent_write),
-            patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 70),
-        ):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 60},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 60),
-            )
-        assert result.success is True, f"Quota check used stale snapshot instead of current DB size: {result.data}"
+        provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 60)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            with (
+                patch.object(BlobReplacementCoordinator, "replace_blob", replace_after_competitor),
+                pytest.raises(AuditIntegrityError, match="metadata changed before durable replacement"),
+            ):
+                execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 60},
+                    _empty_state(),
+                    _mock_catalog(),
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                    max_blob_storage_per_session_bytes=70,
+                    **provenance,
+                )
+            assert competing_writes == 1
+            assert self.storage_path.read_bytes() == competing_content
+            with self.engine.connect() as conn:
+                row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
+            assert row.size_bytes == len(competing_content)
+            assert row.content_hash == content_hash(competing_content)
 
 
 class TestUpdateBlobRollbackPreservesPrimaryException:
-    """Pre-``os.replace`` failures must propagate cleanly with storage intact.
-
-    Post atomic-rename refactor (bug_004), ``_execute_update_blob``
-    writes new content to a sibling tempfile and defers the file swap
-    to ``os.replace`` inside the DB transaction — AFTER the active-run
-    guard, quota check, and UPDATE.  Any failure BEFORE ``os.replace``
-    therefore cannot produce file/DB divergence because the backing
-    file was never touched, and the rollback-write branch must be
-    skipped (writing ``old_content`` back would be a needless write on
-    an unmodified file).
-
-    Before the refactor the file was overwritten BEFORE the DB
-    transaction, so every DB failure required a rollback-write and an
-    add_note-on-rollback-OSError discipline.  That discipline is
-    retained in the code for the narrowed post-replace commit-failure
-    window (still reachable via ``except Exception`` when ``replaced``
-    is True), but the pre-replace scenarios — which dominate in
-    practice — now exit cleanly.
-    """
+    """Composer replacement preserves primary faults and durable cleanup obligations."""
 
     @pytest.fixture(autouse=True)
     def _setup(self, tmp_path: Path):
@@ -6370,6 +6475,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -6410,7 +6516,7 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=content_hash(self.original_content),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -6419,312 +6525,156 @@ class TestUpdateBlobRollbackPreservesPrimaryException:
                 )
             )
 
-    def test_primary_db_exception_before_replace_propagates_without_rollback(self) -> None:
-        """An in-transaction failure before ``os.replace`` must not trigger a rollback write.
-
-        Forces ``_check_blob_quota`` to raise RuntimeError mid-transaction.
-        Because the atomic-rename flow defers the file swap to
-        ``os.replace`` AFTER the quota check, storage_path is never
-        modified — the RuntimeError propagates cleanly with:
-
-        * no call to the rollback write branch (``replaced`` was never
-          set to True);
-        * no add_note diagnostic (no divergence occurred);
-        * storage_path still containing the original bytes;
-        * no stale tempfile in the storage directory.
-        """
-        from unittest.mock import patch
-
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        primary_message = "primary-db-fault"
-
-        def _raise_primary(*_args: Any, **_kwargs: Any) -> str | None:
-            raise RuntimeError(primary_message)
-
-        # A failing rollback-write patch WOULD be armed in the
-        # pre-fix design; under the new design no rollback-write
-        # runs so the patch is a negative guard — if any write to
-        # storage_path happens after the first read, the test fails
-        # via the tripwire counter.
-        target_path_str = str(self.storage_path)
-        write_bytes_calls_to_storage = [0]
-        real_write_bytes = Path.write_bytes
-
-        def _tripwire_write_bytes(path_self: Path, data: bytes) -> int:
-            if str(path_self) == target_path_str:
-                write_bytes_calls_to_storage[0] += 1
-            return real_write_bytes(path_self, data)
-
-        state = _empty_state()
-        catalog = _mock_catalog()
-
-        with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", side_effect=_raise_primary),
-            patch.object(Path, "write_bytes", _tripwire_write_bytes),
-            pytest.raises(RuntimeError, match=primary_message) as exc_info,
-        ):
-            _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                _trained_tool_context(
-                    catalog,
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
-            )
-
-        # Headline is the primary RuntimeError.
-        assert type(exc_info.value) is RuntimeError, f"Unexpected exception type: got {type(exc_info.value).__name__}"
-        # No rollback write was performed — the tempfile carries the new
-        # bytes but storage_path was never written.
-        assert write_bytes_calls_to_storage[0] == 0, (
-            f"Pre-replace failure should not trigger a storage_path rollback write; "
-            f"got {write_bytes_calls_to_storage[0]} writes to {target_path_str}"
-        )
-        # No add_note diagnostic — no divergence to record.
-        notes = _attached_notes(exc_info.value)
-        assert not any("Rollback failed" in n for n in notes), f"Spurious rollback note on pre-replace failure: {notes!r}"
-        # File contents intact.
-        assert self.storage_path.read_bytes() == self.original_content
-        # Tempfile cleaned up.
-        leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
-        assert leftovers == [], f"Tempfile leaked: {leftovers}"
-
-    def test_clean_db_failure_before_replace_leaves_no_residue(self) -> None:
-        """Pre-replace DB failure: file intact, no note, no tempfile residue.
-
-        Companion to the test above — same invariant but with the
-        cleanest possible setup (no write_bytes tripwire) so a future
-        reader can see the happy-path exit shape in isolation.
-        """
-        from unittest.mock import patch
-
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        primary_message = "primary-db-fault-clean-exit"
-
-        def _raise_primary(*_args: Any, **_kwargs: Any) -> str | None:
-            raise RuntimeError(primary_message)
-
-        state = _empty_state()
-        catalog = _mock_catalog()
-
-        with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", side_effect=_raise_primary),
-            pytest.raises(RuntimeError, match=primary_message) as exc_info,
-        ):
-            _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                _trained_tool_context(
-                    catalog,
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
-            )
-
-        assert self.storage_path.read_bytes() == self.original_content
-        notes = _attached_notes(exc_info.value)
-        assert not any("Rollback failed" in n for n in notes), f"Spurious rollback note attached on clean DB failure: {notes!r}"
-        leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
-        assert leftovers == [], f"Tempfile leaked: {leftovers}"
-
-    def test_tempfile_cleanup_failure_preserves_primary_db_exception(self) -> None:
-        """A secondary tempfile-unlink failure must not replace the DB failure."""
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        primary_message = "primary-db-fault-before-temp-cleanup"
-        cleanup_message = "temp-unlink-fault"
-        real_unlink = Path.unlink
-
-        def _raise_primary(*_args: Any, **_kwargs: Any) -> str | None:
-            raise RuntimeError(primary_message)
-
-        def _fail_tempfile_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
-            if path_self.suffix == ".tmp":
-                raise OSError(cleanup_message)
-            real_unlink(path_self, missing_ok=missing_ok)
-
-        with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", side_effect=_raise_primary),
-            patch.object(Path, "unlink", _fail_tempfile_unlink),
-            pytest.raises(RuntimeError, match=primary_message) as exc_info,
-        ):
-            _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                _empty_state(),
-                _trained_tool_context(
-                    _mock_catalog(),
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
-            )
-
-        assert type(exc_info.value) is RuntimeError
-        notes = exc_info.value.__notes__
-        assert any("Temporary blob cleanup failed" in note and cleanup_message in note for note in notes), notes
-
-    def test_tempfile_cleanup_failure_surfaces_after_quota_rejection(self) -> None:
-        """A mapped quota rejection must not hide leaked uncommitted bytes."""
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        quota_message = "quota-primary-rejection"
-        real_unlink = Path.unlink
-
-        def _fail_tempfile_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
-            if path_self.suffix == ".tmp":
-                raise OSError("temp-unlink-fault")
-            real_unlink(path_self, missing_ok=missing_ok)
-
-        with (
-            patch("elspeth.web.composer.tools.blobs._check_blob_quota", return_value=quota_message),
-            patch.object(Path, "unlink", _fail_tempfile_unlink),
-            pytest.raises(OSError, match="temp-unlink-fault"),
-        ):
-            _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                _empty_state(),
-                _trained_tool_context(
-                    _mock_catalog(),
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
-            )
-
-    def test_tempfile_cleanup_failure_surfaces_after_retention_rejection(self) -> None:
-        """A mapped retention rejection must not hide leaked uncommitted bytes."""
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        real_unlink = Path.unlink
-
-        def _fail_tempfile_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
-            if path_self.suffix == ".tmp":
-                raise OSError("temp-unlink-fault")
-            real_unlink(path_self, missing_ok=missing_ok)
-
-        with (
-            patch(
-                "elspeth.web.composer.tools.blobs._in_progress_session_fork_operation_id",
-                return_value="fork-operation",
-            ),
-            patch.object(Path, "unlink", _fail_tempfile_unlink),
-            pytest.raises(OSError, match="temp-unlink-fault"),
-        ):
-            _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                _empty_state(),
-                _trained_tool_context(
-                    _mock_catalog(),
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-                ),
-            )
-
-    def test_tempfile_cleanup_failure_preserves_successful_update(self) -> None:
-        """Cleanup must not replace a committed file-and-DB update."""
-        from elspeth.web.composer.tools import _execute_update_blob
-
-        real_unlink = Path.unlink
-
-        def _fail_tempfile_unlink(path_self: Path, *, missing_ok: bool = False) -> None:
-            if path_self.suffix == ".tmp":
-                raise OSError("temp-unlink-fault")
-            real_unlink(path_self, missing_ok=missing_ok)
-
-        with patch.object(Path, "unlink", _fail_tempfile_unlink):
-            result = _execute_update_blob(
-                {"blob_id": self.blob_id, "content": "new"},
-                _empty_state(),
-                _trained_tool_context(
-                    _mock_catalog(),
-                    session_engine=self.engine,
-                    session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "new"),
-                ),
-            )
-
-        assert result.success is True
-        assert self.storage_path.read_bytes() == b"new"
-
-
-class TestSessionBlobLockRegistry:
-    """``_session_blob_lock`` must return a stable lock per session_id.
-
-    The lock identity is the contract the ``_execute_update_blob``
-    critical section depends on: two threads asking for the same
-    session_id's lock must receive the SAME ``threading.Lock`` instance
-    so acquiring it in one thread blocks the other.  A broken registry
-    that returned fresh locks on every call would offer no
-    serialisation at all — correctness would silently regress to the
-    pre-I4 race.
-    """
-
-    def test_same_session_returns_identical_lock(self) -> None:
-        """Two lookups for the same session_id must return the same lock."""
-        from elspeth.web.composer.tools import _session_blob_lock
-
-        session_id = "test-session-identity"
-        first = _session_blob_lock(session_id)
-        second = _session_blob_lock(session_id)
-        assert first is second, (
-            "Session lock registry returned a DIFFERENT lock for the same session_id; two concurrent updaters would not serialise."
+    def _update(self, authority, context, provenance, *, quota: int = 1000) -> ToolResult:
+        return execute_tool(
+            "update_blob",
+            {"blob_id": self.blob_id, "content": "new"},
+            _empty_state(),
+            _mock_catalog(),
+            data_dir=self.data_dir,
+            session_engine=self.engine,
+            session_id=self.session_id,
+            session_operation_authority=authority,
+            session_operation_context=context,
+            max_blob_storage_per_session_bytes=quota,
+            **provenance,
         )
 
-    def test_different_sessions_return_distinct_locks(self) -> None:
-        """Different session_ids must map to different locks (no global bottleneck)."""
-        from elspeth.web.composer.tools import _session_blob_lock
+    def _assert_settled(self, expected: bytes) -> None:
+        from elspeth.web.blobs.service import content_hash
+        from elspeth.web.sessions.models import blob_replacement_cleanups_table
 
-        lock_a = _session_blob_lock("session-A")
-        lock_b = _session_blob_lock("session-B")
-        assert lock_a is not lock_b, (
-            "Session lock registry returned the SAME lock for different session_ids; unrelated sessions would contend."
-        )
+        assert self.storage_path.read_bytes() == expected
+        with self.engine.connect() as conn:
+            record = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
+            obligations = conn.execute(select(blob_replacement_cleanups_table)).all()
+        assert record.size_bytes == len(expected)
+        assert record.content_hash == content_hash(expected)
+        assert obligations == []
+        assert list(self.storage_path.parent.iterdir()) == [self.storage_path]
 
-    def test_concurrent_lookups_converge_on_single_lock(self) -> None:
-        """Under concurrent first-access, all threads must receive the same lock.
+    def test_preparation_failure_preserves_primary_error_without_writing_bytes(self) -> None:
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 
-        Regression guard for the double-checked-locking implementation
-        in ``_session_blob_lock``.  Without the registry mutex, two
-        threads asking for a not-yet-present session_id at the same
-        time could each install a different lock and half the callers
-        would serialise against one instance while the other half
-        serialise against the other — the race the I4 fix closes would
-        persist across threads partitioned by lock identity.
-        """
-        import threading as stdlib_threading
-        from uuid import uuid4
+        provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            with (
+                patch(
+                    "elspeth.web.coordination.repository._RepositoryBlobMutations.prepare_blob_replacement",
+                    side_effect=RuntimeError("primary-db-fault"),
+                ),
+                patch.object(BlobReplacementCoordinator, "_remove", side_effect=OSError("cleanup-fault")) as cleanup,
+                pytest.raises(RuntimeError, match="primary-db-fault") as error,
+            ):
+                self._update(authority, context, provenance)
+            assert type(error.value) is RuntimeError
+            assert _attached_notes(error.value) == ()
+            cleanup.assert_not_called()
+            self._assert_settled(self.original_content)
 
-        from elspeth.web.composer.tools import _session_blob_lock
+    @pytest.mark.parametrize("rejection", ["quota", "retention"])
+    def test_admission_rejection_creates_no_bytes_requiring_cleanup(self, rejection: str) -> None:
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
 
-        session_id = f"concurrent-{uuid4()}"
-        start = stdlib_threading.Event()
-        locks: list[Any] = []
-        lock_guard = stdlib_threading.Lock()
+        if rejection == "retention":
+            _insert_session_fork_operation(self.engine, self.session_id, status="in_progress")
+        provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            with patch.object(BlobReplacementCoordinator, "_remove", side_effect=OSError("cleanup-fault")) as cleanup:
+                result = self._update(authority, context, provenance, quota=1 if rejection == "quota" else 1000)
+            assert result.success is False
+            assert ("quota" if rejection == "quota" else "fork") in result.data["error"]
+            cleanup.assert_not_called()
+            self._assert_settled(self.original_content)
 
-        def worker() -> None:
-            start.wait()
-            lock = _session_blob_lock(session_id)
-            with lock_guard:
-                locks.append(lock)
+    def test_recovery_failure_preserves_primary_commit_error_and_durable_obligation(self) -> None:
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+        from elspeth.web.sessions.models import blob_replacement_cleanups_table
 
-        threads = [stdlib_threading.Thread(target=worker) for _ in range(16)]
-        for t in threads:
-            t.start()
-        start.set()
-        for t in threads:
-            t.join()
+        provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            with (
+                patch(
+                    "elspeth.web.coordination.repository._RepositoryBlobMutations.commit_blob_replacement",
+                    side_effect=RuntimeError("primary-commit-fault"),
+                ),
+                patch.object(BlobReplacementCoordinator, "_remove", side_effect=OSError("cleanup-fault")),
+                pytest.raises(RuntimeError, match="primary-commit-fault") as error,
+            ):
+                self._update(authority, context, provenance)
+            assert type(error.value) is RuntimeError
+            assert any("Durable replacement recovery remains pending: OSError" in note for note in error.value.__notes__)
+            assert self.storage_path.read_bytes() == self.original_content
+            with self.engine.connect() as conn:
+                assert conn.execute(select(blob_replacement_cleanups_table)).one().phase == "swap_pending"
+            BlobReplacementCoordinator(engine=self.engine, data_dir=Path(self.data_dir), session_operation_authority=authority).reconcile(
+                context=context
+            )
+            self._assert_settled(self.original_content)
 
-        assert len(locks) == 16
-        assert all(lock is locks[0] for lock in locks), (
-            "Concurrent _session_blob_lock callers received distinct lock instances; "
-            "the registry mutex is missing or double-checked locking is broken."
-        )
+    def test_cleanup_failure_preserves_committed_update_for_recovery(self) -> None:
+        from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+        from elspeth.web.blobs.service import content_hash
+        from elspeth.web.sessions.models import blob_replacement_cleanups_table
+
+        provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            with (
+                patch.object(BlobReplacementCoordinator, "_remove", side_effect=OSError("cleanup-fault")),
+                pytest.raises(OSError, match="cleanup-fault"),
+            ):
+                self._update(authority, context, provenance)
+            assert self.storage_path.read_bytes() == b"new"
+            with self.engine.connect() as conn:
+                assert conn.execute(select(blob_replacement_cleanups_table)).one().phase == "purge_pending"
+                assert conn.execute(
+                    select(blobs_table.c.content_hash).where(blobs_table.c.id == self.blob_id)
+                ).scalar_one() == content_hash(b"new")
+            BlobReplacementCoordinator(engine=self.engine, data_dir=Path(self.data_dir), session_operation_authority=authority).reconcile(
+                context=context
+            )
+            self._assert_settled(b"new")
+
+
+class TestBlobCustodySessionIsolation:
+    """Shared custody serializes one session while unrelated sessions progress."""
+
+    @pytest.mark.parametrize("same_session", [True, False], ids=["same-session-blocks", "other-session-progresses"])
+    def test_acquisition_obeys_session_scope(self, same_session: bool) -> None:
+        from threading import Event, Thread
+
+        from elspeth.web.blobs.service import _blob_custody_session_lock
+
+        engine, session_id = _session_engine_with_session()
+        contender_session = session_id if same_session else str(uuid4())
+        started = Event()
+        entered = Event()
+        errors: list[Exception] = []
+
+        def acquire_custody() -> None:
+            started.set()
+            try:
+                with _blob_custody_session_lock(engine, contender_session):
+                    entered.set()
+            except Exception as exc:
+                errors.append(exc)
+
+        worker = Thread(target=acquire_custody, daemon=True)
+        try:
+            with _blob_custody_session_lock(engine, session_id):
+                worker.start()
+                assert started.wait(2), "contender never started"
+                if same_session:
+                    assert not entered.wait(0.2), "same-session contender bypassed shared custody"
+                else:
+                    assert entered.wait(2), "unrelated session was blocked by shared custody"
+            worker.join(2)
+            assert not worker.is_alive(), "contender did not finish after custody release"
+            assert errors == []
+            assert entered.is_set()
+        finally:
+            worker.join(2)
+            engine.dispose()
 
 
 class TestUpdateBlobSessionLockSerialisation:
@@ -6745,6 +6695,7 @@ class TestUpdateBlobSessionLockSerialisation:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -6756,7 +6707,7 @@ class TestUpdateBlobSessionLockSerialisation:
         )
         initialize_session_schema(self.engine)
 
-        self.session_id = f"lock-serialise-{uuid4()}"
+        self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         self.data_dir = str(tmp_path)
         now = datetime.now(UTC)
@@ -6785,7 +6736,7 @@ class TestUpdateBlobSessionLockSerialisation:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=content_hash(self.original_content),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -6813,9 +6764,9 @@ class TestUpdateBlobSessionLockSerialisation:
         """
         import threading as stdlib_threading
 
-        from elspeth.web.composer.tools import _session_blob_lock
+        from elspeth.web.blobs.service import _blob_custody_session_lock
 
-        lock = _session_blob_lock(self.session_id)
+        lock = _blob_custody_session_lock(self.engine, self.session_id)
         started = stdlib_threading.Event()
         completed = stdlib_threading.Event()
         result_holder: list[Any] = []
@@ -6828,52 +6779,57 @@ class TestUpdateBlobSessionLockSerialisation:
                     {"blob_id": self.blob_id, "content": "new-content-from-worker"},
                     _empty_state(),
                     _mock_catalog(),
+                    data_dir=self.data_dir,
                     session_engine=self.engine,
                     session_id=self.session_id,
-                    **_verbatim_blob_context(self.engine, self.session_id, "new-content-from-worker"),
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
                 )
                 result_holder.append(result)
             finally:
                 completed.set()
 
-        lock.acquire()
-        try:
-            t = stdlib_threading.Thread(target=worker, daemon=True)
-            t.start()
-            # Probe first: the worker must actually enter its body
-            # before we interpret ``completed.wait`` returning False as
-            # "lock-blocked."  A thread that never scheduled would
-            # satisfy the completed-wait check for the wrong reason.
-            assert started.wait(timeout=2.0), "worker thread never entered its body"
-            # While we hold the lock, the worker MUST NOT complete — if
-            # it does, the tool bypassed the session lock. Keep a full
-            # second of slack here: under xdist load the worker thread may
-            # take longer than a few hundred milliseconds to reach the
-            # lock acquisition point even though the locking contract is
-            # correct.
-            blocked = not completed.wait(timeout=1.0)
-            assert blocked, (
-                "update_blob completed while the session lock was held externally; "
-                "the tool did not acquire _session_blob_lock before _sync_get_blob, "
-                "reopening the I4 file/DB rollback race."
-            )
-        finally:
-            lock.release()
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new-content-from-worker")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            lock.__enter__()
+            try:
+                t = stdlib_threading.Thread(target=worker, daemon=True)
+                t.start()
+                # Probe first: the worker must actually enter its body
+                # before we interpret ``completed.wait`` returning False as
+                # "lock-blocked."  A thread that never scheduled would
+                # satisfy the completed-wait check for the wrong reason.
+                assert started.wait(timeout=2.0), "worker thread never entered its body"
+                # While we hold the lock, the worker MUST NOT complete — if
+                # it does, the tool bypassed the session lock. Keep a full
+                # second of slack here: under xdist load the worker thread may
+                # take longer than a few hundred milliseconds to reach the
+                # lock acquisition point even though the locking contract is
+                # correct.
+                blocked = not completed.wait(timeout=1.0)
+                assert blocked, (
+                    "update_blob completed while the session lock was held externally; "
+                    "the tool did not acquire shared blob custody before reading metadata, "
+                    "reopening the I4 file/DB rollback race."
+                )
+            finally:
+                lock.__exit__(None, None, None)
 
-        assert completed.wait(timeout=2.0), "update_blob did not complete within 2s after session lock was released"
-        t.join(timeout=2.0)
-        assert not t.is_alive(), "worker thread failed to exit after update completed"
-        assert result_holder, "worker did not produce a result"
-        assert result_holder[0].success is True, f"Update failed after lock release: {result_holder[0].data}"
-        assert self.storage_path.read_bytes() == b"new-content-from-worker"
+            assert completed.wait(timeout=2.0), "update_blob did not complete within 2s after session lock was released"
+            t.join(timeout=2.0)
+            assert not t.is_alive(), "worker thread failed to exit after update completed"
+            assert result_holder, "worker did not produce a result"
+            assert result_holder[0].success is True, f"Update failed after lock release: {result_holder[0].data}"
+            assert self.storage_path.read_bytes() == b"new-content-from-worker"
 
     def test_delete_blob_blocks_when_session_lock_is_held(self) -> None:
         """Delete must share update's lock for its read->tombstone->commit sequence."""
         import threading as stdlib_threading
 
-        from elspeth.web.composer.tools import _session_blob_lock
+        from elspeth.web.blobs.service import _blob_custody_session_lock
 
-        lock = _session_blob_lock(self.session_id)
+        lock = _blob_custody_session_lock(self.engine, self.session_id)
         started = stdlib_threading.Event()
         completed = stdlib_threading.Event()
         result_holder: list[Any] = []
@@ -6887,30 +6843,34 @@ class TestUpdateBlobSessionLockSerialisation:
                         {"blob_id": self.blob_id},
                         _empty_state(),
                         _mock_catalog(),
+                        data_dir=self.data_dir,
                         session_engine=self.engine,
                         session_id=self.session_id,
+                        session_operation_authority=blob_authority,
+                        session_operation_context=blob_operation_context,
                     )
                 )
             finally:
                 completed.set()
 
-        lock.acquire()
-        try:
-            thread = stdlib_threading.Thread(target=worker, daemon=True)
-            thread.start()
-            assert started.wait(timeout=2.0), "worker thread never entered its body"
-            assert not completed.wait(timeout=1.0), (
-                "delete_blob completed while update_blob's shared session lock was held; "
-                "delete and update can race their filesystem/DB mutations"
-            )
-        finally:
-            lock.release()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            lock.__enter__()
+            try:
+                thread = stdlib_threading.Thread(target=worker, daemon=True)
+                thread.start()
+                assert started.wait(timeout=2.0), "worker thread never entered its body"
+                assert not completed.wait(timeout=1.0), (
+                    "delete_blob completed while update_blob's shared session lock was held; "
+                    "delete and update can race their filesystem/DB mutations"
+                )
+            finally:
+                lock.__exit__(None, None, None)
 
-        assert completed.wait(timeout=2.0), "delete_blob did not complete after the shared lock was released"
-        thread.join(timeout=2.0)
-        assert not thread.is_alive(), "delete_blob worker failed to exit"
-        assert result_holder and result_holder[0].success is True
-        assert not self.storage_path.exists()
+            assert completed.wait(timeout=2.0), "delete_blob did not complete after the shared lock was released"
+            thread.join(timeout=2.0)
+            assert not thread.is_alive(), "delete_blob worker failed to exit"
+            assert result_holder and result_holder[0].success is True
+            assert not self.storage_path.exists()
 
 
 class TestUpdateBlobQuotaRollbackDivergence:
@@ -6940,6 +6900,7 @@ class TestUpdateBlobQuotaRollbackDivergence:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -6980,7 +6941,7 @@ class TestUpdateBlobQuotaRollbackDivergence:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=content_hash(self.original_content),
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -7019,30 +6980,35 @@ class TestUpdateBlobQuotaRollbackDivergence:
         catalog = _mock_catalog()
 
         # Quota 10 bytes; new content 100 bytes → delta 85 exceeds quota.
-        with (
-            patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10),
-            patch.object(Path, "write_bytes", _tripwire_write_bytes),
-        ):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-            )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 100)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with (
+                patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10),
+                patch.object(Path, "write_bytes", _tripwire_write_bytes),
+            ):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 100},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
 
-        # Clean failure result — no exception, no divergence.
-        assert result.success is False, f"Expected quota failure result, got {result!r}"
-        assert "quota" in result.data["error"].lower(), f"Quota failure message missing from error: {result.data['error']!r}"
-        # Tripwire must not have fired — no write to storage_path.
-        assert tripwire_hits == [], f"Pre-replace write to storage_path detected (atomic-rename regression): {tripwire_hits}"
-        # Storage unchanged.
-        assert self.storage_path.read_bytes() == self.original_content
-        # Tempfile cleaned up in finally.
-        leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
-        assert leftovers == [], f"Tempfile leaked after quota breach: {leftovers}"
+            # Clean failure result — no exception, no divergence.
+            assert result.success is False, f"Expected quota failure result, got {result!r}"
+            assert "quota" in result.data["error"].lower(), f"Quota failure message missing from error: {result.data['error']!r}"
+            # Tripwire must not have fired — no write to storage_path.
+            assert tripwire_hits == [], f"Pre-replace write to storage_path detected (atomic-rename regression): {tripwire_hits}"
+            # Storage unchanged.
+            assert self.storage_path.read_bytes() == self.original_content
+            # Tempfile cleaned up in finally.
+            leftovers = [p for p in self.storage_path.parent.iterdir() if p != self.storage_path]
+            assert leftovers == [], f"Tempfile leaked after quota breach: {leftovers}"
 
     def test_quota_rollback_success_returns_failure_result_not_exception(self) -> None:
         """When rollback succeeds on quota path, callers still get a ToolResult.
@@ -7058,23 +7024,28 @@ class TestUpdateBlobQuotaRollbackDivergence:
         state = _empty_state()
         catalog = _mock_catalog()
 
-        with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
-            result = execute_tool(
-                "update_blob",
-                {"blob_id": self.blob_id, "content": "x" * 100},
-                state,
-                catalog,
-                session_engine=self.engine,
-                session_id=self.session_id,
-                **_verbatim_blob_context(self.engine, self.session_id, "x" * 100),
-            )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "x" * 100)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            with patch("elspeth.web.composer.tools.blobs._BLOB_QUOTA_BYTES", 10):
+                result = execute_tool(
+                    "update_blob",
+                    {"blob_id": self.blob_id, "content": "x" * 100},
+                    state,
+                    catalog,
+                    data_dir=self.data_dir,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    **blob_provenance,
+                )
 
-        assert result.success is False, "Quota-exceeded must return failure, not success"
-        assert "quota" in result.data["error"].lower()
-        # File must be restored to original content.
-        assert self.storage_path.read_bytes() == self.original_content, (
-            "File was not rolled back after quota-exceeded with successful rollback"
-        )
+            assert result.success is False, "Quota-exceeded must return failure, not success"
+            assert "quota" in result.data["error"].lower()
+            # File must be restored to original content.
+            assert self.storage_path.read_bytes() == self.original_content, (
+                "File was not rolled back after quota-exceeded with successful rollback"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -10437,15 +10408,18 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-        )
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert result.success is True
         assert _default_source(result.updated_state) is not None
@@ -10501,16 +10475,20 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, "name,email\n"),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, "name,email\n")
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert _default_source(result.updated_state) is None
@@ -10556,8 +10534,6 @@ class TestSetPipeline:
                 raise AssertionError("header-only custody check must not read candidate CSVs in full")
             return original_read_text(path, *args, **kwargs)
 
-        monkeypatch.setattr(Path, "read_text", _forbid_read_text)
-
         args = _valid_pipeline_args()
         args["source"] = {
             "plugin": "csv",
@@ -10574,16 +10550,21 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, "name,email\n"),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, "name,email\n")
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            monkeypatch.setattr(Path, "read_text", _forbid_read_text)
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert "header-only inline CSV" in result.data["error"]
@@ -10637,7 +10618,11 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        with pytest.raises(AuditIntegrityError, match="could not be decoded"):
+        blob_provenance = _verbatim_blob_context(engine, session_id, "name,email\n")
+        with (
+            _blob_operation(engine, session_id) as (blob_authority, blob_operation_context),
+            pytest.raises(AuditIntegrityError, match="could not be decoded"),
+        ):
             execute_tool(
                 "set_pipeline",
                 args,
@@ -10646,7 +10631,9 @@ class TestSetPipeline:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
-                **_verbatim_blob_context(engine, session_id, "name,email\n"),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
             )
 
     def test_set_pipeline_oversized_inline_csv_field_returns_bounded_failure(self, tmp_path: Path) -> None:
@@ -10670,16 +10657,20 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, oversized_content),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, oversized_content)
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
@@ -10728,16 +10719,20 @@ class TestSetPipeline:
             }
         )
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, malformed_content),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, malformed_content)
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert result.data["error"] == "Source 'source': Refusing inline CSV because it exceeds bounded CSV inspection limits."
@@ -10788,22 +10783,26 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["path"] = str(tmp_path / "outputs" / "out.csv")
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
-        previous_limit = csv.field_size_limit()
-        csv.field_size_limit(32)
-        try:
-            with pytest.raises(AuditIntegrityError, match="bounded CSV inspection"):
-                execute_tool(
-                    "set_pipeline",
-                    args,
-                    state,
-                    catalog,
-                    data_dir=str(tmp_path),
-                    session_engine=engine,
-                    session_id=session_id,
-                    **_verbatim_blob_context(engine, session_id, inline_content),
-                )
-        finally:
-            csv.field_size_limit(previous_limit)
+        blob_provenance = _verbatim_blob_context(engine, session_id, inline_content)
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            previous_limit = csv.field_size_limit()
+            csv.field_size_limit(32)
+            try:
+                with pytest.raises(AuditIntegrityError, match="bounded CSV inspection"):
+                    execute_tool(
+                        "set_pipeline",
+                        args,
+                        state,
+                        catalog,
+                        data_dir=str(tmp_path),
+                        session_engine=engine,
+                        session_id=session_id,
+                        session_operation_authority=blob_authority,
+                        session_operation_context=blob_operation_context,
+                        **blob_provenance,
+                    )
+            finally:
+                csv.field_size_limit(previous_limit)
 
     def test_first_nonempty_csv_row_from_path_returns_header_when_complete_in_window(self, tmp_path: Path) -> None:
         """A header row that terminates inside the window still parses normally."""
@@ -10931,16 +10930,20 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, inline_content),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, inline_content)
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is True, result.data
         assert _default_source(result.updated_state) is not None
@@ -10996,7 +10999,11 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        with pytest.raises(AuditIntegrityError, match="bounded CSV inspection"):
+        blob_provenance = _verbatim_blob_context(engine, session_id, inline_content)
+        with (
+            _blob_operation(engine, session_id) as (blob_authority, blob_operation_context),
+            pytest.raises(AuditIntegrityError, match="bounded CSV inspection"),
+        ):
             execute_tool(
                 "set_pipeline",
                 args,
@@ -11005,7 +11012,9 @@ class TestSetPipeline:
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
-                **_verbatim_blob_context(engine, session_id, inline_content),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
             )
 
     @pytest.mark.parametrize(
@@ -11061,7 +11070,6 @@ class TestSetPipeline:
             reads += 1
             return ("name", "email") if reads == match_on_read else None
 
-        monkeypatch.setattr(sources_module, "_first_nonempty_csv_row_from_path", _record_read)
         inline_content = "name,email\n"
         args = _valid_pipeline_args()
         args["source"] = {
@@ -11079,16 +11087,21 @@ class TestSetPipeline:
         args["outputs"][0]["options"]["mode"] = "write"
         args["outputs"][0]["options"]["collision_policy"] = "auto_increment"
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, inline_content),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, inline_content)
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            monkeypatch.setattr(sources_module, "_first_nonempty_csv_row_from_path", _record_read)
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert expected_error in result.data["error"]
@@ -11549,16 +11562,20 @@ class TestSetPipeline:
             "metadata": {"name": "Append literal text"},
         }
 
-        result = execute_tool(
-            "set_pipeline",
-            args,
-            state,
-            catalog,
-            data_dir=str(tmp_path),
-            session_engine=engine,
-            session_id=session_id,
-            **_verbatim_blob_context(engine, session_id, "hello"),
-        )
+        blob_provenance = _verbatim_blob_context(engine, session_id, "hello")
+        with _blob_operation(engine, session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "set_pipeline",
+                args,
+                state,
+                catalog,
+                data_dir=str(tmp_path),
+                session_engine=engine,
+                session_id=session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is True
         assert _default_source(result.updated_state) is not None
@@ -14732,10 +14749,13 @@ class TestCreateBlobTypeGuard:
         # Post Task 13 the LLM-facing message names the argument-bundle and
         # the Pydantic model; the raw offending value is not echoed (the
         # full Pydantic detail survives on __cause__ for auditors).
-        with pytest.raises(
-            ToolArgumentError,
-            match=r"'create_blob arguments' must be object conforming to CreateBlobArgumentsModel, got ValidationError",
-        ) as exc_info:
+        with (
+            pytest.raises(
+                ToolArgumentError,
+                match=r"'create_blob arguments' must be object conforming to CreateBlobArgumentsModel, got ValidationError",
+            ) as exc_info,
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "create_blob",
                 {
@@ -14748,6 +14768,8 @@ class TestCreateBlobTypeGuard:
                 data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
         # __cause__ chain MUST preserve the structured Pydantic detail
         # (rev-2 BLOCKER_A leak discipline: full detail audit-side,
@@ -14821,26 +14843,33 @@ class TestUpdateBlobTypeGuard:
         # Seed a real blob so the handler reaches the content guard before
         # the "blob not found" check.  Use the create path end-to-end so
         # the row is persisted by the same code path production uses.
-        create_result = execute_tool(
-            "create_blob",
-            {"filename": "a.txt", "mime_type": "text/plain", "content": "initial"},
-            state,
-            catalog,
-            data_dir=str(self.data_dir),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "initial"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "initial")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            create_result = execute_tool(
+                "create_blob",
+                {"filename": "a.txt", "mime_type": "text/plain", "content": "initial"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         blob_id = create_result.data["blob_id"]
         state = create_result.updated_state
 
         # Post Task 13 the LLM-facing message names the argument-bundle and
         # the Pydantic model; the raw offending value is not echoed (the
         # full Pydantic detail survives on __cause__ for auditors).
-        with pytest.raises(
-            ToolArgumentError,
-            match=r"'update_blob arguments' must be object conforming to UpdateBlobArgumentsModel, got ValidationError",
-        ) as exc_info:
+        with (
+            pytest.raises(
+                ToolArgumentError,
+                match=r"'update_blob arguments' must be object conforming to UpdateBlobArgumentsModel, got ValidationError",
+            ) as exc_info,
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "update_blob",
                 {"blob_id": blob_id, "content": 42},
@@ -14849,6 +14878,8 @@ class TestUpdateBlobTypeGuard:
                 data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
         # __cause__ chain MUST preserve the structured Pydantic detail.
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
@@ -14859,20 +14890,27 @@ class TestUpdateBlobTypeGuard:
         catalog = _mock_catalog()
         state = _empty_state()
 
-        create_result = execute_tool(
-            "create_blob",
-            {"filename": "a.txt", "mime_type": "text/plain", "content": "initial"},
-            state,
-            catalog,
-            data_dir=str(self.data_dir),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "initial"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "initial")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            create_result = execute_tool(
+                "create_blob",
+                {"filename": "a.txt", "mime_type": "text/plain", "content": "initial"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         blob_id = create_result.data["blob_id"]
         user_message_id = _insert_user_message(self.engine, self.session_id, "Please update the blob.")
 
-        with pytest.raises(ToolArgumentError, match="valid UTF-8"):
+        with (
+            pytest.raises(ToolArgumentError, match="valid UTF-8"),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "update_blob",
                 {"blob_id": blob_id, "content": "bad\ud800"},
@@ -14881,6 +14919,8 @@ class TestUpdateBlobTypeGuard:
                 data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
                 user_message_id=user_message_id,
                 composer_model_identifier="test-model",
                 composer_model_version="test-model-2026-06-28",
@@ -14954,16 +14994,20 @@ class TestSetSourceFromBlobTypeGuard:
         catalog = _mock_catalog()
         state = _empty_state()
 
-        create_result = execute_tool(
-            "create_blob",
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            state,
-            catalog,
-            data_dir=str(self.data_dir),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "hello"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "hello")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            create_result = execute_tool(
+                "create_blob",
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         blob_id = create_result.data["blob_id"]
         state = create_result.updated_state
 
@@ -15041,6 +15085,7 @@ class TestGetBlobContentGuards:
         )
         initialize_session_schema(self.engine)
 
+        self.data_dir = tmp_path
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         now = datetime.now(UTC)
@@ -15092,14 +15137,18 @@ class TestGetBlobContentGuards:
         """Happy path — status=ready, hash matches, bytes are UTF-8."""
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "get_blob_content",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is True
         assert result.data["content"] == self.content_bytes.decode("utf-8")
 
@@ -15108,14 +15157,18 @@ class TestGetBlobContentGuards:
         self._set_status("pending")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "get_blob_content",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is False
         assert "pending" in result.data["error"].lower() or "not readable" in result.data["error"].lower()
 
@@ -15126,14 +15179,18 @@ class TestGetBlobContentGuards:
         self._set_status("error")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "get_blob_content",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is False
         assert "error" in result.data["error"].lower() or "not readable" in result.data["error"].lower()
 
@@ -15154,14 +15211,20 @@ class TestGetBlobContentGuards:
 
         state = _empty_state()
         catalog = _mock_catalog()
-        with pytest.raises(BlobIntegrityError) as exc_info:
+        with (
+            pytest.raises(BlobIntegrityError) as exc_info,
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "get_blob_content",
                 {"blob_id": self.blob_id},
                 state,
                 catalog,
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
         assert exc_info.value.blob_id == self.blob_id
 
@@ -15189,14 +15252,20 @@ class TestGetBlobContentGuards:
 
         state = _empty_state()
         catalog = _mock_catalog()
-        with pytest.raises(AuditIntegrityError, match="NULL content_hash"):
+        with (
+            pytest.raises(AuditIntegrityError, match="NULL content_hash"),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "get_blob_content",
                 {"blob_id": self.blob_id},
                 state,
                 catalog,
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
 
     def test_non_utf8_bytes_return_failure_not_crash(self) -> None:
@@ -15232,14 +15301,18 @@ class TestGetBlobContentGuards:
 
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "get_blob_content",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "get_blob_content",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is False
         assert "utf-8" in result.data["error"].lower()
 
@@ -15311,14 +15384,23 @@ class TestGetBlobContentOrigin:
             )
         return blob_id
 
-    def _read_back(self, blob_id: str) -> Any:
+    def _read_back(
+        self,
+        blob_id: str,
+        *,
+        session_operation_authority: SQLiteLocalSessionOperationAuthority,
+        session_operation_context: SessionOperationContext,
+    ) -> Any:
         result = execute_tool(
             "get_blob_content",
             {"blob_id": blob_id},
             _empty_state(),
             _mock_catalog(),
+            data_dir=str(self.data_dir),
             session_engine=self.engine,
             session_id=self.session_id,
+            session_operation_authority=session_operation_authority,
+            session_operation_context=session_operation_context,
         )
         assert result.success is True
         return result.data
@@ -15334,25 +15416,33 @@ class TestGetBlobContentOrigin:
         user_message_content = "Make up a couple of sample complaints for me."
         user_message_id = _insert_user_message(self.engine, self.session_id, user_message_content)
 
-        created = execute_tool(
-            "create_blob",
-            {"filename": "complaints.csv", "mime_type": "text/csv", "content": invented},
-            _empty_state(),
-            _mock_catalog(),
-            data_dir=self.data_dir,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            user_message_id=user_message_id,
-            user_message_content=user_message_content,
-            composer_model_identifier="openai/gpt-5-mini",
-            composer_model_version="gpt-5-mini-2026-05-01",
-            composer_provider="openai",
-            composer_skill_hash="a" * 64,
-            tool_arguments_hash="b" * 64,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            created = execute_tool(
+                "create_blob",
+                {"filename": "complaints.csv", "mime_type": "text/csv", "content": invented},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+                composer_model_identifier="openai/gpt-5-mini",
+                composer_model_version="gpt-5-mini-2026-05-01",
+                composer_provider="openai",
+                composer_skill_hash="a" * 64,
+                tool_arguments_hash="b" * 64,
+            )
         assert created.success is True
 
-        data = self._read_back(created.data["blob_id"])
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            data = self._read_back(
+                created.data["blob_id"],
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert data["content"] == invented
         assert data["created_by"] == "assistant"
@@ -15378,19 +15468,28 @@ class TestGetBlobContentOrigin:
         """
         dictated = "sku,on_hand\nAX-100,12\n"
 
-        created = execute_tool(
-            "create_blob",
-            {"filename": "stock.csv", "mime_type": "text/csv", "content": dictated},
-            _empty_state(),
-            _mock_catalog(),
-            data_dir=self.data_dir,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, dictated),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, dictated)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            created = execute_tool(
+                "create_blob",
+                {"filename": "stock.csv", "mime_type": "text/csv", "content": dictated},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=self.data_dir,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert created.success is True
 
-        data = self._read_back(created.data["blob_id"])
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            data = self._read_back(
+                created.data["blob_id"],
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert data["created_by"] == "assistant"
         assert data["creation_modality"] == CreationModality.VERBATIM.value
@@ -15399,7 +15498,12 @@ class TestGetBlobContentOrigin:
         """An operator upload: the discovery case the defect was mimicking."""
         blob_id = self._insert_blob_row(created_by="user", content=b"col_a,col_b\n1,2\n")
 
-        data = self._read_back(blob_id)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            data = self._read_back(
+                blob_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert data["created_by"] == "user"
         assert data["creation_modality"] == CreationModality.VERBATIM.value
@@ -15414,7 +15518,12 @@ class TestGetBlobContentOrigin:
         """
         blob_id = self._insert_blob_row(created_by="pipeline", content=b"row_id,score\n1,0.9\n")
 
-        data = self._read_back(blob_id)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            data = self._read_back(
+                blob_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert data["created_by"] == "pipeline"
         assert data["creation_modality"] == CreationModality.VERBATIM.value
@@ -15434,7 +15543,12 @@ class TestGetBlobContentOrigin:
         assert listed.success is True
         entry = next(blob for blob in listed.data if blob["id"] == blob_id)
 
-        read_back = self._read_back(blob_id)
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            read_back = self._read_back(
+                blob_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert entry["created_by"] == read_back["created_by"]
         assert entry["creation_modality"] == read_back["creation_modality"]
 
@@ -15471,6 +15585,7 @@ class TestUpdateBlobActiveRunGuard:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -15482,6 +15597,7 @@ class TestUpdateBlobActiveRunGuard:
         )
         initialize_session_schema(self.engine)
 
+        self.data_dir = tmp_path
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         self.run_id = str(uuid4())
@@ -15492,6 +15608,7 @@ class TestUpdateBlobActiveRunGuard:
         self.storage_path = storage_dir / f"{self.blob_id}_data.csv"
         self.original_content = b"a,b\n1,2"
         self.storage_path.write_bytes(self.original_content)
+        self.original_hash = content_hash(self.original_content)
 
         with self.engine.begin() as conn:
             conn.execute(
@@ -15511,7 +15628,7 @@ class TestUpdateBlobActiveRunGuard:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=self.original_hash,
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -15640,30 +15757,39 @@ class TestUpdateBlobActiveRunGuard:
     def test_update_succeeds_when_no_runs_exist(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new,content\n9,9"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new,content\n9,9"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is True
         assert self.storage_path.read_bytes() == b"new,content\n9,9"
 
     def test_update_rejected_while_session_fork_is_in_progress(self) -> None:
-        operation_id = _insert_session_fork_operation(self.engine, self.session_id, status="in_progress")
-
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new,content\n9,9"},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            operation_id = _insert_session_fork_operation(self.engine, self.session_id, status="in_progress")
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new,content\n9,9"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert operation_id in result.data["error"]
@@ -15674,15 +15800,20 @@ class TestUpdateBlobActiveRunGuard:
     def test_update_allowed_after_session_fork_is_terminal(self, fork_status: str) -> None:
         _insert_session_fork_operation(self.engine, self.session_id, status=fork_status)
 
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new,content\n9,9"},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new,content\n9,9"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is True
         assert self.storage_path.read_bytes() == b"new,content\n9,9"
@@ -15693,20 +15824,26 @@ class TestUpdateBlobActiveRunGuard:
         state = _empty_state()
         catalog = _mock_catalog()
 
-        with pytest.raises(AuditIntegrityError, match="missing: user_message_id"):
+        with (
+            pytest.raises(AuditIntegrityError, match="missing: user_message_id"),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "update_blob",
                 {"blob_id": self.blob_id, "content": "new,content\n9,9"},
                 state,
                 catalog,
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
 
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
-        assert row.content_hash == _STUB_SHA256
+        assert row.content_hash == self.original_hash
 
     def test_update_rejected_when_blob_is_current_source_blob_ref(self) -> None:
         """A blob-backed source locks the blob content hash stamped in source_authoring."""
@@ -15729,22 +15866,27 @@ class TestUpdateBlobActiveRunGuard:
         )
         catalog = _mock_catalog()
 
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new,content\n9,9"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new,content\n9,9")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new,content\n9,9"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
 
         assert result.success is False
         assert "referenced by the current composition" in result.data["error"]
         assert self.storage_path.read_bytes() == self.original_content
         with self.engine.begin() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == self.blob_id)).one()
-        assert row.content_hash == _STUB_SHA256
+        assert row.content_hash == self.original_hash
 
     def test_unbound_update_recomputes_composer_provenance(self) -> None:
         """Unbound blob updates that author new bytes refresh blob provenance."""
@@ -15756,21 +15898,25 @@ class TestUpdateBlobActiveRunGuard:
         user_message_id = _insert_user_message(self.engine, self.session_id, user_message_content)
         new_content = "name,score\nada,42\n"
 
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": new_content},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            user_message_id=user_message_id,
-            user_message_content=user_message_content,
-            composer_model_identifier="openai/gpt-5-mini",
-            composer_model_version="gpt-5-mini-2026-05-01",
-            composer_provider="openai",
-            composer_skill_hash="a" * 64,
-            tool_arguments_hash="b" * 64,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": new_content},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                user_message_id=user_message_id,
+                user_message_content=user_message_content,
+                composer_model_identifier="openai/gpt-5-mini",
+                composer_model_version="gpt-5-mini-2026-05-01",
+                composer_provider="openai",
+                composer_skill_hash="a" * 64,
+                tool_arguments_hash="b" * 64,
+            )
 
         assert result.success is True
         assert self.storage_path.read_bytes() == new_content.encode("utf-8")
@@ -15789,15 +15935,20 @@ class TestUpdateBlobActiveRunGuard:
         self._insert_run_and_link("pending")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is False
         assert "active run" in result.data["error"].lower()
         assert self.storage_path.read_bytes() == self.original_content, "File must not change when the active-run guard blocks the update"
@@ -15806,15 +15957,20 @@ class TestUpdateBlobActiveRunGuard:
         self._insert_run_and_link("running")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is False
         assert "active run" in result.data["error"].lower()
         assert self.storage_path.read_bytes() == self.original_content
@@ -15824,15 +15980,20 @@ class TestUpdateBlobActiveRunGuard:
         self._insert_run_and_link("completed")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "post,run\n1,1"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "post,run\n1,1"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "post,run\n1,1")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "post,run\n1,1"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is True
         assert self.storage_path.read_bytes() == b"post,run\n1,1"
 
@@ -15841,15 +16002,20 @@ class TestUpdateBlobActiveRunGuard:
         self._insert_run_without_link("pending")
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is False
         assert "active run" in result.data["error"].lower()
         assert self.storage_path.read_bytes() == self.original_content
@@ -15862,15 +16028,20 @@ class TestUpdateBlobActiveRunGuard:
         )
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "new"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "new"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "new")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "new"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is False
         assert "active run" in result.data["error"].lower()
         assert self.storage_path.read_bytes() == self.original_content
@@ -15883,15 +16054,20 @@ class TestUpdateBlobActiveRunGuard:
         )
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "should,proceed\n1,1"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "should,proceed\n1,1"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "should,proceed\n1,1")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "should,proceed\n1,1"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is True
         assert self.storage_path.read_bytes() == b"should,proceed\n1,1"
 
@@ -15928,6 +16104,7 @@ class TestUpdateBlobAtomicWrite:
 
         from sqlalchemy.pool import StaticPool
 
+        from elspeth.web.blobs.service import content_hash
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -15939,6 +16116,7 @@ class TestUpdateBlobAtomicWrite:
         )
         initialize_session_schema(self.engine)
 
+        self.data_dir = tmp_path
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         self.storage_dir = tmp_path / "blobs" / self.session_id
@@ -15946,6 +16124,7 @@ class TestUpdateBlobAtomicWrite:
         self.storage_path = self.storage_dir / f"{self.blob_id}_data.csv"
         self.original_content = b"ORIGINAL-BYTES"
         self.storage_path.write_bytes(self.original_content)
+        self.original_hash = content_hash(self.original_content)
 
         now = datetime.now(UTC)
         with self.engine.begin() as conn:
@@ -15966,7 +16145,7 @@ class TestUpdateBlobAtomicWrite:
                     filename="data.csv",
                     mime_type="text/csv",
                     size_bytes=len(self.original_content),
-                    content_hash=_STUB_SHA256,
+                    content_hash=self.original_hash,
                     storage_path=str(self.storage_path),
                     created_at=now,
                     created_by="user",
@@ -16031,15 +16210,20 @@ class TestUpdateBlobAtomicWrite:
 
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "update_blob",
-            {"blob_id": self.blob_id, "content": "would,corrupt,mid-run\n"},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "would,corrupt,mid-run\n"),
-        )
+        blob_provenance = _verbatim_blob_context(self.engine, self.session_id, "would,corrupt,mid-run\n")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "update_blob",
+                {"blob_id": self.blob_id, "content": "would,corrupt,mid-run\n"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                **blob_provenance,
+            )
         assert result.success is False
         assert self.storage_path.read_bytes() == self.original_content
 
@@ -16067,6 +16251,7 @@ class TestUpdateBlobAtomicWrite:
         # BEFORE any UPDATE / os.replace, so no file mutation can
         # have occurred.
         with (
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
             patch.object(
                 self.engine,
                 "begin",
@@ -16079,8 +16264,11 @@ class TestUpdateBlobAtomicWrite:
                 {"blob_id": self.blob_id, "content": "new"},
                 state,
                 catalog,
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
                 **provenance_context,
             )
 
@@ -16119,6 +16307,7 @@ class TestInspectSourceTool:
         )
         initialize_session_schema(self.engine)
 
+        self.data_dir = tmp_path
         self.session_id = str(uuid4())
         self.blob_id = str(uuid4())
         now = datetime.now(UTC)
@@ -16166,14 +16355,18 @@ class TestInspectSourceTool:
     def test_returns_csv_facts_for_ready_blob(self) -> None:
         state = _empty_state()
         catalog = _mock_catalog()
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": self.blob_id},
-            state,
-            catalog,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is True
         data = result.data
         assert data["source_kind"] == "csv"
@@ -16220,14 +16413,18 @@ class TestInspectSourceTool:
                 )
             )
 
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": url_blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": url_blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is True
         assert result.data["source_kind"] == "text"
         # url_candidates are redacted to scheme + host (+ port): userinfo and path
@@ -16238,14 +16435,18 @@ class TestInspectSourceTool:
 
     def test_pending_blob_refused(self) -> None:
         self._set_status("pending")
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is False
         # Failure messages live in result.data["error"] (set by _failure_result).
         assert "pending" in result.data["error"].lower()
@@ -16253,14 +16454,18 @@ class TestInspectSourceTool:
     def test_missing_blob_returns_failure(self) -> None:
         from uuid import uuid4
 
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": str(uuid4())},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": str(uuid4())},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
         assert result.success is False
         assert "not found" in result.data["error"].lower()
 
@@ -16278,17 +16483,23 @@ class TestInspectSourceTool:
 
         from elspeth.web.composer.protocol import ToolArgumentError
 
-        with pytest.raises(
-            ToolArgumentError,
-            match=r"'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel, got ValidationError",
-        ) as exc_info:
+        with (
+            pytest.raises(
+                ToolArgumentError,
+                match=r"'inspect_source arguments' must be object conforming to InspectSourceArgumentsModel, got ValidationError",
+            ) as exc_info,
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "inspect_source",
                 {},
                 _empty_state(),
                 _mock_catalog(),
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
@@ -16314,14 +16525,18 @@ class TestInspectSourceTool:
 
         monkeypatch.setattr(Path, "read_bytes", _forbid_storage_read_bytes)
 
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert result.success is True
         assert result.data["byte_range_inspected"][1] <= 8 * 1024
@@ -16332,26 +16547,36 @@ class TestInspectSourceTool:
 
         # Tamper with the on-disk bytes so SHA-256 mismatches the stored hash.
         self.storage_path.write_bytes(b"tampered,content\n9,9\n")
-        with pytest.raises(BlobIntegrityError):
+        with (
+            pytest.raises(BlobIntegrityError),
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
+        ):
             execute_tool(
                 "inspect_source",
                 {"blob_id": self.blob_id},
                 _empty_state(),
                 _mock_catalog(),
+                data_dir=str(self.data_dir),
                 session_engine=self.engine,
                 session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
             )
 
     def test_non_uuid_blob_id_rejected_before_lookup(self) -> None:
         """LLM placeholder identifiers must fail at the blob-id boundary."""
-        result = execute_tool(
-            "inspect_source",
-            {"blob_id": "__missing__"},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            result = execute_tool(
+                "inspect_source",
+                {"blob_id": "__missing__"},
+                _empty_state(),
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+            )
 
         assert result.success is False
         assert "not a valid UUID" in result.data["error"]
@@ -16391,6 +16616,7 @@ class TestPreviewProofStep:
         )
         initialize_session_schema(self.engine)
 
+        self.data_dir = tmp_path
         self.session_id = str(uuid4())
         self.csv_blob_id = str(uuid4())
         self.url_blob_id = str(uuid4())
@@ -16453,6 +16679,8 @@ class TestPreviewProofStep:
     def _state_with_csv_source(
         self,
         *,
+        session_operation_authority: SQLiteLocalSessionOperationAuthority,
+        session_operation_context: SessionOperationContext,
         schema_mode: str = "fixed",
         fields: tuple[object, ...] = (),
         on_validation_failure: str = "discard",
@@ -16480,6 +16708,9 @@ class TestPreviewProofStep:
             },
             state,
             catalog,
+            data_dir=str(self.data_dir),
+            session_operation_authority=session_operation_authority,
+            session_operation_context=session_operation_context,
             session_engine=self.engine,
             session_id=self.session_id,
         )
@@ -16505,7 +16736,13 @@ class TestPreviewProofStep:
         assert result.success, result.data
         return result.updated_state
 
-    def _state_with_text_url_source(self, *, fetch_plugin: str | None):
+    def _state_with_text_url_source(
+        self,
+        *,
+        session_operation_authority: SQLiteLocalSessionOperationAuthority,
+        session_operation_context: SessionOperationContext,
+        fetch_plugin: str | None,
+    ):
         """Build a state with a text URL blob source and optional HTTP fetcher."""
         state = _empty_state()
         catalog = _mock_catalog()
@@ -16523,6 +16760,9 @@ class TestPreviewProofStep:
             },
             state,
             catalog,
+            data_dir=str(self.data_dir),
+            session_operation_authority=session_operation_authority,
+            session_operation_context=session_operation_context,
             session_engine=self.engine,
             session_id=self.session_id,
         )
@@ -16596,204 +16836,244 @@ class TestPreviewProofStep:
     def test_proof_empty_when_no_blob_source(self) -> None:
         """Path-based source has no blob to inspect — diagnostics empty."""
         # Build a state via set_pipeline using a path-based source (no blob_ref)
-        args = _valid_pipeline_args()
-        args["source"]["on_validation_failure"] = "discard"
-        result = execute_tool("set_pipeline", args, _empty_state(), _mock_catalog())
-        assert result.success, result.data
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            args = _valid_pipeline_args()
+            args["source"]["on_validation_failure"] = "discard"
+            result = execute_tool("set_pipeline", args, _empty_state(), _mock_catalog())
+            assert result.success, result.data
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            result.updated_state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        assert result.data["proof_diagnostics"] == ()
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                result.updated_state,
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+            assert result.success is True
+            assert result.data["proof_diagnostics"] == ()
 
     def test_proof_empty_when_no_session_context(self) -> None:
         """Blob source with no session_engine — proof step degrades to empty."""
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
-        assert result.success is True
-        assert result.data["proof_diagnostics"] == ()
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
+            )
+            result = execute_tool("preview_pipeline", {}, state, _mock_catalog())
+            assert result.success is True
+            assert result.data["proof_diagnostics"] == ()
 
     def test_proof_inspects_named_sources_beyond_compatibility_source(self) -> None:
         """A non-first named source must not bypass proof diagnostics."""
-        state = self._state_with_csv_source(schema_mode="observed").with_named_source(
-            "url_source",
-            SourceSpec(
-                plugin="text",
-                on_success="content",
-                options={
-                    "blob_ref": self.url_blob_id,
-                    "column": "url",
-                    "schema": {"mode": "fixed", "fields": ["url: str"]},
-                },
-                on_validation_failure="discard",
-            ),
-        )
-
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        diagnostics = result.data["proof_diagnostics"]
-        matching = [d for d in diagnostics if d["code"] == "text_source_url_without_web_scrape"]
-        assert matching
-        assert matching[0]["evidence_locator"]["source_name"] == "url_source"
-
-    def test_unrelated_branch_fetcher_does_not_suppress_text_url_blocker(self) -> None:
-        """Fetcher membership is necessary but must be downstream of this source."""
-        state = self._state_with_csv_source(schema_mode="observed").with_named_source(
-            "url_source",
-            SourceSpec(
-                plugin="text",
-                on_success="url_content",
-                options={
-                    "blob_ref": self.url_blob_id,
-                    "column": "url",
-                    "schema": {"mode": "fixed", "fields": ["url: str"]},
-                },
-                on_validation_failure="discard",
-            ),
-        )
-        state = state.with_node(
-            NodeSpec(
-                id="unrelated_fetch",
-                node_type="transform",
-                plugin="web_scrape",
-                input="rows",
-                on_success="unrelated_content",
-                on_error="discard",
-                options={},
-                condition=None,
-                routes=None,
-                fork_to=None,
-                branches=None,
-                policy=None,
-                merge=None,
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
+            ).with_named_source(
+                "url_source",
+                SourceSpec(
+                    plugin="text",
+                    on_success="content",
+                    options={
+                        "blob_ref": self.url_blob_id,
+                        "column": "url",
+                        "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    },
+                    on_validation_failure="discard",
+                ),
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        matching = [
-            diagnostic for diagnostic in result.data["proof_diagnostics"] if diagnostic["code"] == "text_source_url_without_web_scrape"
-        ]
-        assert matching
-        assert matching[0]["evidence_locator"]["source_name"] == "url_source"
-
-    def test_same_blob_sources_share_one_metadata_and_verified_content_read(self) -> None:
-        """Composer preview evaluates each alias without re-reading its blob."""
-        from elspeth.web.composer.tools import generation as generation_module
-
-        base = self._state_with_csv_source(schema_mode="observed")
-        source = base.sources["source"]
-        gate = NodeSpec(
-            id="orders_gate",
-            node_type="gate",
-            plugin=None,
-            input="order_rows",
-            on_success=None,
-            on_error=None,
-            options={},
-            condition="row['price'] > 100",
-            routes={"true": "high_value", "false": "standard"},
-            fork_to=None,
-            branches=None,
-            policy=None,
-            merge=None,
-        )
-        state = replace(
-            base,
-            sources={
-                "orders": replace(source, on_success="order_rows"),
-                "refunds": replace(source, on_success="refund_rows"),
-            },
-            nodes=(
-                gate,
-                replace(gate, id="refunds_gate", input="refund_rows"),
-            ),
-            outputs=(
-                OutputSpec(
-                    name="high_value",
-                    plugin="json",
-                    options={
-                        "path": "outputs/high.json",
-                        "schema": {"mode": "observed"},
-                        "mode": "write",
-                        "collision_policy": "auto_increment",
-                    },
-                    on_write_failure="discard",
-                ),
-                OutputSpec(
-                    name="standard",
-                    plugin="json",
-                    options={
-                        "path": "outputs/standard.json",
-                        "schema": {"mode": "observed"},
-                        "mode": "write",
-                        "collision_policy": "auto_increment",
-                    },
-                    on_write_failure="discard",
-                ),
-            ),
-        )
-        original_locked_read = generation_module._locked_read_ready_blob
-        original_read_bytes = Path.read_bytes
-        metadata_reads: list[str] = []
-        content_reads: list[Path] = []
-
-        def counted_locked_read(engine: Any, session_id: str, blob_id: str) -> Any:
-            metadata_reads.append(blob_id)
-            return original_locked_read(engine, session_id, blob_id)
-
-        def counted_read_bytes(path: Path) -> bytes:
-            content_reads.append(path)
-            return original_read_bytes(path)
-
-        with (
-            patch.object(generation_module, "_locked_read_ready_blob", side_effect=counted_locked_read),
-            patch.object(Path, "read_bytes", counted_read_bytes),
-        ):
             result = execute_tool(
                 "preview_pipeline",
                 {},
                 state,
                 _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
                 session_engine=self.engine,
                 session_id=self.session_id,
             )
 
-        assert result.validation.is_valid is True
-        matching = [
-            diagnostic
-            for diagnostic in result.data["proof_diagnostics"]
-            if diagnostic["code"] == "gate_expression_type_mismatch_against_source_schema"
-        ]
-        assert [
-            (
-                diagnostic["evidence_locator"]["source_name"],
-                diagnostic["evidence_locator"]["node_id"],
+            diagnostics = result.data["proof_diagnostics"]
+            matching = [d for d in diagnostics if d["code"] == "text_source_url_without_web_scrape"]
+            assert matching
+            assert matching[0]["evidence_locator"]["source_name"] == "url_source"
+
+    def test_unrelated_branch_fetcher_does_not_suppress_text_url_blocker(self) -> None:
+        """Fetcher membership is necessary but must be downstream of this source."""
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
+            ).with_named_source(
+                "url_source",
+                SourceSpec(
+                    plugin="text",
+                    on_success="url_content",
+                    options={
+                        "blob_ref": self.url_blob_id,
+                        "column": "url",
+                        "schema": {"mode": "fixed", "fields": ["url: str"]},
+                    },
+                    on_validation_failure="discard",
+                ),
             )
-            for diagnostic in matching
-        ] == [("orders", "orders_gate"), ("refunds", "refunds_gate")]
-        assert metadata_reads == [self.csv_blob_id]
-        assert content_reads == [self.csv_storage_path]
+            state = state.with_node(
+                NodeSpec(
+                    id="unrelated_fetch",
+                    node_type="transform",
+                    plugin="web_scrape",
+                    input="rows",
+                    on_success="unrelated_content",
+                    on_error="discard",
+                    options={},
+                    condition=None,
+                    routes=None,
+                    fork_to=None,
+                    branches=None,
+                    policy=None,
+                    merge=None,
+                )
+            )
+
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+
+            matching = [
+                diagnostic for diagnostic in result.data["proof_diagnostics"] if diagnostic["code"] == "text_source_url_without_web_scrape"
+            ]
+            assert matching
+            assert matching[0]["evidence_locator"]["source_name"] == "url_source"
+
+    def test_same_blob_sources_share_one_metadata_and_verified_content_read(self) -> None:
+        """Composer preview evaluates each alias without re-reading its blob."""
+        from elspeth.web.composer.tools import generation as generation_module
+
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            base = self._state_with_csv_source(
+                session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
+            )
+            source = base.sources["source"]
+            gate = NodeSpec(
+                id="orders_gate",
+                node_type="gate",
+                plugin=None,
+                input="order_rows",
+                on_success=None,
+                on_error=None,
+                options={},
+                condition="row['price'] > 100",
+                routes={"true": "high_value", "false": "standard"},
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+            state = replace(
+                base,
+                sources={
+                    "orders": replace(source, on_success="order_rows"),
+                    "refunds": replace(source, on_success="refund_rows"),
+                },
+                nodes=(
+                    gate,
+                    replace(gate, id="refunds_gate", input="refund_rows"),
+                ),
+                outputs=(
+                    OutputSpec(
+                        name="high_value",
+                        plugin="json",
+                        options={
+                            "path": "outputs/high.json",
+                            "schema": {"mode": "observed"},
+                            "mode": "write",
+                            "collision_policy": "auto_increment",
+                        },
+                        on_write_failure="discard",
+                    ),
+                    OutputSpec(
+                        name="standard",
+                        plugin="json",
+                        options={
+                            "path": "outputs/standard.json",
+                            "schema": {"mode": "observed"},
+                            "mode": "write",
+                            "collision_policy": "auto_increment",
+                        },
+                        on_write_failure="discard",
+                    ),
+                ),
+            )
+            original_locked_read = generation_module._locked_read_ready_blob
+            original_read_bytes = Path.read_bytes
+            metadata_reads: list[str] = []
+            content_reads: list[Path] = []
+
+            def counted_locked_read(
+                engine: Any,
+                session_id: str,
+                blob_id: str,
+                *,
+                data_dir: str,
+                session_operation_authority: SQLiteLocalSessionOperationAuthority,
+                session_operation_context: SessionOperationContext,
+            ) -> Any:
+                metadata_reads.append(blob_id)
+                return original_locked_read(
+                    engine,
+                    session_id,
+                    blob_id,
+                    data_dir=data_dir,
+                    session_operation_authority=session_operation_authority,
+                    session_operation_context=session_operation_context,
+                )
+
+            def counted_read_bytes(path: Path) -> bytes:
+                content_reads.append(path)
+                return original_read_bytes(path)
+
+            with (
+                patch.object(generation_module, "_locked_read_ready_blob", side_effect=counted_locked_read),
+                patch.object(Path, "read_bytes", counted_read_bytes),
+            ):
+                result = execute_tool(
+                    "preview_pipeline",
+                    {},
+                    state,
+                    _mock_catalog(),
+                    data_dir=str(self.data_dir),
+                    session_operation_authority=blob_authority,
+                    session_operation_context=blob_operation_context,
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                )
+
+            assert result.validation.is_valid is True
+            matching = [
+                diagnostic
+                for diagnostic in result.data["proof_diagnostics"]
+                if diagnostic["code"] == "gate_expression_type_mismatch_against_source_schema"
+            ]
+            assert [
+                (
+                    diagnostic["evidence_locator"]["source_name"],
+                    diagnostic["evidence_locator"]["node_id"],
+                )
+                for diagnostic in matching
+            ] == [("orders", "orders_gate"), ("refunds", "refunds_gate")]
+            assert metadata_reads == [self.csv_blob_id]
+            assert content_reads == [self.csv_storage_path]
 
     @pytest.mark.parametrize("status", ["pending", "error"])
     def test_non_ready_blob_metadata_abstains_before_any_path_or_integrity_access(
@@ -16805,11 +17085,15 @@ class TestPreviewProofStep:
 
         from elspeth.web.composer.tools import generation as generation_module
 
-        state = self._state_with_csv_source(schema_mode="observed")
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority, session_operation_context=blob_operation_context, schema_mode="observed"
+            )
         with self.engine.begin() as conn:
             conn.execute(update(blobs_table).where(blobs_table.c.id == self.csv_blob_id).values(status=status, content_hash=None))
 
         with (
+            _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context),
             patch.object(
                 Path,
                 "exists",
@@ -16828,6 +17112,9 @@ class TestPreviewProofStep:
         ):
             diagnostics = generation_module.compute_proof_diagnostics(
                 state,
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
                 session_engine=self.engine,
                 session_id=self.session_id,
             )
@@ -16840,160 +17127,214 @@ class TestPreviewProofStep:
     # -- csv_fixed_schema_omits_observed_columns ----------------------------
 
     def test_fixed_csv_omits_columns_with_discard_blocks(self) -> None:
-        state = self._state_with_csv_source(
-            schema_mode="fixed",
-            fields=("order_id: str",),
-            on_validation_failure="discard",
-        )
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        diagnostics = result.data["proof_diagnostics"]
-        codes = [d["code"] for d in diagnostics]
-        assert "csv_fixed_schema_omits_observed_columns" in codes
-        blocking = [d for d in diagnostics if d["severity"] == "blocking"]
-        assert blocking, "expected a blocking diagnostic for omitted observed columns"
-        # is_valid is forced False by the blocking proof diagnostic.
-        assert result.data["preview_is_valid"] is False
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                schema_mode="fixed",
+                fields=("order_id: str",),
+                on_validation_failure="discard",
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+            diagnostics = result.data["proof_diagnostics"]
+            codes = [d["code"] for d in diagnostics]
+            assert "csv_fixed_schema_omits_observed_columns" in codes
+            blocking = [d for d in diagnostics if d["severity"] == "blocking"]
+            assert blocking, "expected a blocking diagnostic for omitted observed columns"
+            # is_valid is forced False by the blocking proof diagnostic.
+            assert result.data["preview_is_valid"] is False
 
     def test_fixed_csv_with_all_columns_does_not_block(self) -> None:
-        state = self._state_with_csv_source(
-            schema_mode="fixed",
-            fields=("order_id: str", "customer: str", "price: float"),
-            on_validation_failure="discard",
-        )
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "csv_fixed_schema_omits_observed_columns" not in codes
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                schema_mode="fixed",
+                fields=("order_id: str", "customer: str", "price: float"),
+                on_validation_failure="discard",
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "csv_fixed_schema_omits_observed_columns" not in codes
 
     def test_fixed_csv_with_structured_fields_does_not_crash_or_block(self) -> None:
-        state = self._state_with_csv_source(
-            schema_mode="fixed",
-            fields=(
-                {"name": "order_id", "field_type": "str"},
-                {"name": "customer", "field_type": "str"},
-                {"name": "price", "field_type": "float"},
-            ),
-            on_validation_failure="discard",
-        )
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        assert result.success is True
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
+        with _blob_operation(self.engine, self.session_id) as (blob_authority, blob_operation_context):
+            state = self._state_with_csv_source(
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                schema_mode="fixed",
+                fields=(
+                    {"name": "order_id", "field_type": "str"},
+                    {"name": "customer", "field_type": "str"},
+                    {"name": "price", "field_type": "float"},
+                ),
+                on_validation_failure="discard",
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                data_dir=str(self.data_dir),
+                session_operation_authority=blob_authority,
+                session_operation_context=blob_operation_context,
+                session_engine=self.engine,
+                session_id=self.session_id,
+            )
+            assert result.success is True
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
         assert "csv_fixed_schema_omits_observed_columns" not in codes
 
     def test_flexible_csv_does_not_block(self) -> None:
         """Flexible mode accepts extra columns by design."""
-        state = self._state_with_csv_source(schema_mode="flexible", fields=("order_id: str",))
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "csv_fixed_schema_omits_observed_columns" not in codes
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="flexible", fields=("order_id: str",)
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "csv_fixed_schema_omits_observed_columns" not in codes
 
     def test_fixed_csv_with_routed_failures_does_not_block(self) -> None:
         """on_validation_failure routes to a sink → not silent discard, not blocking."""
-        state = self._state_with_csv_source(
-            schema_mode="fixed",
-            fields=("order_id: str",),
-            on_validation_failure="quarantine_sink",
-        )
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "csv_fixed_schema_omits_observed_columns" not in codes
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority,
+                session_operation_context=context,
+                schema_mode="fixed",
+                fields=("order_id: str",),
+                on_validation_failure="quarantine_sink",
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "csv_fixed_schema_omits_observed_columns" not in codes
 
     # -- text_source_url_without_web_scrape ---------------------------------
 
     def test_text_url_without_web_scrape_blocks(self) -> None:
-        state = self._state_with_text_url_source(fetch_plugin=None)
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        diagnostics = result.data["proof_diagnostics"]
-        codes = [d["code"] for d in diagnostics]
-        assert "text_source_url_without_web_scrape" in codes
-        blocking = [d for d in diagnostics if d["severity"] == "blocking"]
-        assert blocking
-        assert result.data["preview_is_valid"] is False
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_text_url_source(
+                session_operation_authority=authority, session_operation_context=context, fetch_plugin=None
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            diagnostics = result.data["proof_diagnostics"]
+            codes = [d["code"] for d in diagnostics]
+            assert "text_source_url_without_web_scrape" in codes
+            blocking = [d for d in diagnostics if d["severity"] == "blocking"]
+            assert blocking
+            assert result.data["preview_is_valid"] is False
 
     def test_text_url_with_web_scrape_does_not_block(self) -> None:
-        state = self._state_with_text_url_source(fetch_plugin="web_scrape")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "text_source_url_without_web_scrape" not in codes
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_text_url_source(
+                session_operation_authority=authority, session_operation_context=context, fetch_plugin="web_scrape"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "text_source_url_without_web_scrape" not in codes
 
     def test_text_url_with_blob_fetch_does_not_block(self) -> None:
-        state = self._state_with_text_url_source(fetch_plugin="blob_fetch")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "text_source_url_without_web_scrape" not in codes
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_text_url_source(
+                session_operation_authority=authority, session_operation_context=context, fetch_plugin="blob_fetch"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "text_source_url_without_web_scrape" not in codes
 
     # -- inspection warnings surfaced as info -------------------------------
 
     def test_inspection_warnings_surfaced_as_info(self) -> None:
         """The text source's web_scrape warning is mirrored in proof_diagnostics as info."""
-        state = self._state_with_text_url_source(fetch_plugin="web_scrape")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        diagnostics = result.data["proof_diagnostics"]
-        info = [d for d in diagnostics if d["severity"] == "info"]
-        # web_scrape warning from inspection should be mirrored — as info, not blocking
-        assert any(d["code"] == "source_inspection_warning" for d in info)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_text_url_source(
+                session_operation_authority=authority, session_operation_context=context, fetch_plugin="web_scrape"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            diagnostics = result.data["proof_diagnostics"]
+            info = [d for d in diagnostics if d["severity"] == "info"]
+            # web_scrape warning from inspection should be mirrored — as info, not blocking
+            assert any(d["code"] == "source_inspection_warning" for d in info)
 
     # -- csv_duplicate_headers (promoted to blocking) -----------------------
     # Duplicate CSV headers cause silent column collapse in csv.DictReader
@@ -17032,62 +17373,74 @@ class TestPreviewProofStep:
     def test_csv_duplicate_headers_blocks(self) -> None:
         """Duplicate CSV headers must surface as a blocking proof diagnostic."""
         sentinel = self._replace_csv_blob_with_duplicate_headers()
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        diagnostics = result.data["proof_diagnostics"]
-        codes = [d["code"] for d in diagnostics]
-        assert "csv_duplicate_headers" in codes, diagnostics
-        # Severity is blocking, not info.
-        dup = next(d for d in diagnostics if d["code"] == "csv_duplicate_headers")
-        assert dup["severity"] == "blocking", dup
-        # Must carry an actionable suggested_repair string (not None) so the
-        # forced-repair loop has a concrete remedy to relay to the LLM.
-        assert isinstance(dup["suggested_repair"], str) and dup["suggested_repair"], dup
-        model_visible_payload = json.dumps(deep_thaw(diagnostics), sort_keys=True)
-        assert sentinel not in model_visible_payload
-        assert "1 duplicate header value class(es)" in dup["message"]
-        assert "2 duplicate column position(s)" in dup["message"]
-        assert dup["evidence_locator"]["observed_header_count"] == 4
-        assert dup["evidence_locator"]["duplicate_header_class_count"] == 1
-        assert dup["evidence_locator"]["duplicate_header_column_count"] == 2
-        assert tuple(dup["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
-        assert dup["evidence_locator"]["header_values_redacted"] is True
-        repair = dup["suggested_repair"]
-        assert "field_mapping" not in repair
-        assert "on_validation_failure" not in repair
-        assert "quarantine" not in repair
-        assert "correct" in repair
-        assert "re-upload" in repair
-        assert "headerless" in repair
-        assert "explicit unique `columns`" in repair
-        # is_valid is forced False by the blocking proof diagnostic.
-        assert result.data["preview_is_valid"] is False
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            diagnostics = result.data["proof_diagnostics"]
+            codes = [d["code"] for d in diagnostics]
+            assert "csv_duplicate_headers" in codes, diagnostics
+            # Severity is blocking, not info.
+            dup = next(d for d in diagnostics if d["code"] == "csv_duplicate_headers")
+            assert dup["severity"] == "blocking", dup
+            # Must carry an actionable suggested_repair string (not None) so the
+            # forced-repair loop has a concrete remedy to relay to the LLM.
+            assert isinstance(dup["suggested_repair"], str) and dup["suggested_repair"], dup
+            model_visible_payload = json.dumps(deep_thaw(diagnostics), sort_keys=True)
+            assert sentinel not in model_visible_payload
+            assert "1 duplicate header value class(es)" in dup["message"]
+            assert "2 duplicate column position(s)" in dup["message"]
+            assert dup["evidence_locator"]["observed_header_count"] == 4
+            assert dup["evidence_locator"]["duplicate_header_class_count"] == 1
+            assert dup["evidence_locator"]["duplicate_header_column_count"] == 2
+            assert tuple(dup["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
+            assert dup["evidence_locator"]["header_values_redacted"] is True
+            repair = dup["suggested_repair"]
+            assert "field_mapping" not in repair
+            assert "on_validation_failure" not in repair
+            assert "quarantine" not in repair
+            assert "correct" in repair
+            assert "re-upload" in repair
+            assert "headerless" in repair
+            assert "explicit unique `columns`" in repair
+            # is_valid is forced False by the blocking proof diagnostic.
+            assert result.data["preview_is_valid"] is False
 
     def test_explicit_unique_columns_clear_duplicate_warning_for_headerless_input(self) -> None:
         self._replace_csv_blob_with_duplicate_headers(headerless=True)
-        state = self._state_with_csv_source(
-            schema_mode="observed",
-            columns=("order_id", "given_name", "family_name", "price"),
-        )
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority,
+                session_operation_context=context,
+                schema_mode="observed",
+                columns=("order_id", "given_name", "family_name", "price"),
+            )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "csv_duplicate_headers" not in codes
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "csv_duplicate_headers" not in codes
 
     def test_preview_redacts_regressed_duplicate_warning_text(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Generation must not trust even a regressed source warning string."""
@@ -17106,79 +17459,97 @@ class TestPreviewProofStep:
             warnings=(f"csv_duplicate_headers: {raw_warning_sentinel}",),
         )
         monkeypatch.setattr(generation_module, "inspect_csv_source_content", lambda **_kwargs: raw_facts)
-        state = self._state_with_csv_source(schema_mode="observed")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        serialized = json.dumps(deep_thaw(diagnostics), sort_keys=True)
-        duplicate = next(d for d in diagnostics if d["code"] == "csv_duplicate_headers")
-        assert raw_warning_sentinel not in serialized
-        assert duplicate["severity"] == "blocking"
-        assert duplicate["evidence_locator"]["duplicate_header_class_count"] == 1
-        assert duplicate["evidence_locator"]["duplicate_header_column_count"] == 2
-        assert tuple(duplicate["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
-        assert duplicate["evidence_locator"]["header_values_redacted"] is True
-        assert "re-upload" in duplicate["suggested_repair"]
+            diagnostics = result.data["proof_diagnostics"]
+            serialized = json.dumps(deep_thaw(diagnostics), sort_keys=True)
+            duplicate = next(d for d in diagnostics if d["code"] == "csv_duplicate_headers")
+            assert raw_warning_sentinel not in serialized
+            assert duplicate["severity"] == "blocking"
+            assert duplicate["evidence_locator"]["duplicate_header_class_count"] == 1
+            assert duplicate["evidence_locator"]["duplicate_header_column_count"] == 2
+            assert tuple(duplicate["evidence_locator"]["duplicate_header_positions"]) == (2, 3)
+            assert duplicate["evidence_locator"]["header_values_redacted"] is True
+            assert "re-upload" in duplicate["suggested_repair"]
 
     def test_csv_without_duplicate_headers_does_not_block(self) -> None:
         """Clean headers must not produce a csv_duplicate_headers diagnostic."""
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "csv_duplicate_headers" not in codes
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "csv_duplicate_headers" not in codes
 
     def test_observed_csv_numeric_gate_type_mismatch_blocks(self) -> None:
         """Observed CSV leaves values stringy; numeric gate predicates must
         fail preview before runtime hits ExpressionEvaluationError.
         """
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "price_gate",
-                "node_type": "gate",
-                "plugin": None,
-                "input": "rows",
-                "condition": "row['price'] >= 100",
-                "routes": {"true": "out", "false": "out"},
-                "options": {},
-            },
-            state,
-            _mock_catalog(),
-        )
-        assert result.success, result.data
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "upsert_node",
+                {
+                    "id": "price_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "condition": "row['price'] >= 100",
+                    "routes": {"true": "out", "false": "out"},
+                    "options": {},
+                },
+                state,
+                _mock_catalog(),
+            )
+            assert result.success, result.data
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            result.updated_state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                result.updated_state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert mismatch[0]["severity"] == "blocking"
-        assert mismatch[0]["evidence_locator"]["node_id"] == "price_gate"
-        assert mismatch[0]["evidence_locator"]["field"] == "price"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert mismatch[0]["severity"] == "blocking"
+            assert mismatch[0]["evidence_locator"]["node_id"] == "price_gate"
+            assert mismatch[0]["evidence_locator"]["field"] == "price"
+            assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_string_amplification_gate_blocks_without_evaluating(self, monkeypatch) -> None:
         """A Mult over an observed (string-typed) field must be diagnosed
@@ -17188,100 +17559,114 @@ class TestPreviewProofStep:
         would allocate the amplified string per sampled row inside the web
         process. The amplification diagnostic replaces evaluation entirely.
         """
+        from elspeth.contracts import PipelineRow
         from elspeth.core.expression_parser import ExpressionParser
 
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "amp_gate",
-                "node_type": "gate",
-                "plugin": None,
-                "input": "rows",
-                "condition": "row['price'] * 100000",
-                "routes": {"true": "out", "false": "out"},
-                "options": {},
-            },
-            state,
-            _mock_catalog(),
-        )
-        assert result.success, result.data
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "upsert_node",
+                {
+                    "id": "amp_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "condition": "row['price'] * 100000",
+                    "routes": {"true": "out", "false": "out"},
+                    "options": {},
+                },
+                state,
+                _mock_catalog(),
+            )
+            assert result.success, result.data
 
-        evaluated_expressions: list[str] = []
-        original_evaluate = ExpressionParser.evaluate
+            evaluated_expressions: list[str] = []
+            original_evaluate = ExpressionParser.evaluate
 
-        def counting_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
-            evaluated_expressions.append(repr(self))
-            return original_evaluate(self, context)
+            def counting_evaluate(self: ExpressionParser, context: dict[str, Any] | PipelineRow) -> Any:
+                evaluated_expressions.append(repr(self))
+                return original_evaluate(self, context)
 
-        monkeypatch.setattr(ExpressionParser, "evaluate", counting_evaluate)
+            monkeypatch.setattr(ExpressionParser, "evaluate", counting_evaluate)
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            result.updated_state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                result.updated_state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        amplification = [d for d in diagnostics if d["code"] == "gate_expression_unbounded_string_amplification"]
-        assert amplification, diagnostics
-        assert amplification[0]["severity"] == "blocking"
-        assert amplification[0]["evidence_locator"]["node_id"] == "amp_gate"
-        assert result.data["preview_is_valid"] is False
-        # The mechanism, not just the symptom: the amplifying condition was
-        # never evaluated against sampled rows.
-        assert not any("100000" in expr for expr in evaluated_expressions), evaluated_expressions
-        # And the new branch did not misfile the finding as a type mismatch.
-        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
-        assert not mismatch, mismatch
+            diagnostics = result.data["proof_diagnostics"]
+            amplification = [d for d in diagnostics if d["code"] == "gate_expression_unbounded_string_amplification"]
+            assert amplification, diagnostics
+            assert amplification[0]["severity"] == "blocking"
+            assert amplification[0]["evidence_locator"]["node_id"] == "amp_gate"
+            assert result.data["preview_is_valid"] is False
+            # The mechanism, not just the symptom: the amplifying condition was
+            # never evaluated against sampled rows.
+            assert not any("100000" in expr for expr in evaluated_expressions), evaluated_expressions
+            # And the new branch did not misfile the finding as a type mismatch.
+            mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+            assert not mismatch, mismatch
 
     def test_observed_csv_memory_error_yields_resource_code(self, monkeypatch) -> None:
         """MemoryError during sampled-row evaluation gets its own resource
         diagnostic, not the schema-typing repair (belt-and-braces arm)."""
+        from elspeth.contracts import PipelineRow
         from elspeth.core.expression_parser import ExpressionParser
 
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "upsert_node",
-            {
-                "id": "oom_gate",
-                "node_type": "gate",
-                "plugin": None,
-                "input": "rows",
-                "condition": "row['price'] >= 100",
-                "routes": {"true": "out", "false": "out"},
-                "options": {},
-            },
-            state,
-            _mock_catalog(),
-        )
-        assert result.success, result.data
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "upsert_node",
+                {
+                    "id": "oom_gate",
+                    "node_type": "gate",
+                    "plugin": None,
+                    "input": "rows",
+                    "condition": "row['price'] >= 100",
+                    "routes": {"true": "out", "false": "out"},
+                    "options": {},
+                },
+                state,
+                _mock_catalog(),
+            )
+            assert result.success, result.data
 
-        def exploding_evaluate(self: ExpressionParser, context):  # type: ignore[no-untyped-def]
-            raise MemoryError("simulated allocation failure")
+            def exploding_evaluate(self: ExpressionParser, context: dict[str, Any] | PipelineRow) -> Any:
+                raise MemoryError("simulated allocation failure")
 
-        monkeypatch.setattr(ExpressionParser, "evaluate", exploding_evaluate)
+            monkeypatch.setattr(ExpressionParser, "evaluate", exploding_evaluate)
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            result.updated_state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                result.updated_state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        resource = [d for d in diagnostics if d["code"] == "gate_expression_preview_memory_exhaustion"]
-        assert resource, diagnostics
-        assert resource[0]["severity"] == "blocking"
-        assert resource[0]["evidence_locator"]["node_id"] == "oom_gate"
-        # A resource event must not receive the schema-typing repair.
-        mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
-        assert not mismatch, mismatch
+            diagnostics = result.data["proof_diagnostics"]
+            resource = [d for d in diagnostics if d["code"] == "gate_expression_preview_memory_exhaustion"]
+            assert resource, diagnostics
+            assert resource[0]["severity"] == "blocking"
+            assert resource[0]["evidence_locator"]["node_id"] == "oom_gate"
+            # A resource event must not receive the schema-typing repair.
+            mismatch = [d for d in diagnostics if d["code"] == "gate_expression_type_mismatch_against_source_schema"]
+            assert not mismatch, mismatch
 
     def test_observed_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Observed CSV strings must not reach numeric batch_stats at runtime.
@@ -17307,69 +17692,75 @@ class TestPreviewProofStep:
                 )
             )
 
-        state = (
-            self._state_with_csv_source(schema_mode="observed")
-            .with_node(
-                NodeSpec(
-                    id="classify",
-                    node_type="transform",
-                    plugin="value_transform",
-                    input="rows",
-                    on_success="classified_rows",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "operations": [{"target": "financial_only", "expression": "row['financial_barrier']"}],
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = (
+                self._state_with_csv_source(
+                    session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+                )
+                .with_node(
+                    NodeSpec(
+                        id="classify",
+                        node_type="transform",
+                        plugin="value_transform",
+                        input="rows",
+                        on_success="classified_rows",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "operations": [{"target": "financial_only", "expression": "row['financial_barrier']"}],
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
+                )
+                .with_node(
+                    NodeSpec(
+                        id="summarize",
+                        node_type="aggregation",
+                        plugin="batch_stats",
+                        input="classified_rows",
+                        on_success="out",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "value_field": "financial_barrier",
+                            "group_by": "community",
+                            "compute_mean": True,
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
                 )
             )
-            .with_node(
-                NodeSpec(
-                    id="summarize",
-                    node_type="aggregation",
-                    plugin="batch_stats",
-                    input="classified_rows",
-                    on_success="out",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "value_field": "financial_barrier",
-                        "group_by": "community",
-                        "compute_mean": True,
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
-                )
+
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert mismatch[0]["severity"] == "blocking"
-        assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
-        assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
-        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert mismatch[0]["severity"] == "blocking"
+            assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+            assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
+            assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+            assert result.data["preview_is_valid"] is False
 
     def test_observed_named_csv_batch_stats_string_value_field_blocks_through_transform(self) -> None:
         """Named CSV sources must participate in source-field proof walk-back."""
@@ -17390,80 +17781,86 @@ class TestPreviewProofStep:
                 )
             )
 
-        base_state = self._state_with_csv_source(schema_mode="observed")
-        named_csv_source = SourceSpec(
-            plugin="csv",
-            on_success="survey_rows",
-            options={
-                "blob_ref": self.csv_blob_id,
-                "schema": {"mode": "observed"},
-            },
-            on_validation_failure="discard",
-        )
-        state = (
-            base_state.without_source()
-            .with_named_source("survey_csv", named_csv_source)
-            .with_node(
-                NodeSpec(
-                    id="classify",
-                    node_type="transform",
-                    plugin="value_transform",
-                    input="survey_rows",
-                    on_success="classified_rows",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "operations": [{"target": "financial_only", "expression": "row['financial_barrier']"}],
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            base_state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            named_csv_source = SourceSpec(
+                plugin="csv",
+                on_success="survey_rows",
+                options={
+                    "blob_ref": self.csv_blob_id,
+                    "schema": {"mode": "observed"},
+                },
+                on_validation_failure="discard",
+            )
+            state = (
+                base_state.without_source()
+                .with_named_source("survey_csv", named_csv_source)
+                .with_node(
+                    NodeSpec(
+                        id="classify",
+                        node_type="transform",
+                        plugin="value_transform",
+                        input="survey_rows",
+                        on_success="classified_rows",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "operations": [{"target": "financial_only", "expression": "row['financial_barrier']"}],
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
+                )
+                .with_node(
+                    NodeSpec(
+                        id="summarize",
+                        node_type="aggregation",
+                        plugin="batch_stats",
+                        input="classified_rows",
+                        on_success="out",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "value_field": "financial_barrier",
+                            "group_by": "community",
+                            "compute_mean": True,
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
                 )
             )
-            .with_node(
-                NodeSpec(
-                    id="summarize",
-                    node_type="aggregation",
-                    plugin="batch_stats",
-                    input="classified_rows",
-                    on_success="out",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "value_field": "financial_barrier",
-                        "group_by": "community",
-                        "compute_mean": True,
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
-                )
+
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert mismatch[0]["severity"] == "blocking"
-        assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
-        assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
-        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert mismatch[0]["severity"] == "blocking"
+            assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+            assert mismatch[0]["evidence_locator"]["field"] == "financial_barrier"
+            assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+            assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_numeric_aggregation_does_not_block_after_field_overwrite(self) -> None:
         """The proof step abstains once an upstream transform overwrites the field."""
@@ -17484,69 +17881,77 @@ class TestPreviewProofStep:
                 )
             )
 
-        state = (
-            self._state_with_csv_source(schema_mode="observed")
-            .with_node(
-                NodeSpec(
-                    id="coerce_flag",
-                    node_type="transform",
-                    plugin="value_transform",
-                    input="rows",
-                    on_success="coerced_rows",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "operations": [{"target": "financial_barrier", "expression": "1"}],
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = (
+                self._state_with_csv_source(
+                    session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+                )
+                .with_node(
+                    NodeSpec(
+                        id="coerce_flag",
+                        node_type="transform",
+                        plugin="value_transform",
+                        input="rows",
+                        on_success="coerced_rows",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "operations": [{"target": "financial_barrier", "expression": "1"}],
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
+                )
+                .with_node(
+                    NodeSpec(
+                        id="summarize",
+                        node_type="aggregation",
+                        plugin="batch_stats",
+                        input="coerced_rows",
+                        on_success="out",
+                        on_error="discard",
+                        options={
+                            "schema": {"mode": "observed"},
+                            "value_field": "financial_barrier",
+                            "group_by": "community",
+                            "compute_mean": True,
+                        },
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
                 )
             )
-            .with_node(
-                NodeSpec(
-                    id="summarize",
-                    node_type="aggregation",
-                    plugin="batch_stats",
-                    input="coerced_rows",
-                    on_success="out",
-                    on_error="discard",
-                    options={
-                        "schema": {"mode": "observed"},
-                        "value_field": "financial_barrier",
-                        "group_by": "community",
-                        "compute_mean": True,
-                    },
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches=None,
-                    policy=None,
-                    merge=None,
-                )
+
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in codes
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in codes
 
     # -- the same numeric proof for a COLLECTOR-hosted batch plugin (elspeth-1016a47e8f) --
 
     def _batch_barrier_behind_expand_opener(
         self,
         *,
+        session_operation_authority: SQLiteLocalSessionOperationAuthority,
+        session_operation_context: SessionOperationContext,
         barrier_node_type: str,
         plugin: str = "batch_stats",
         options: dict[str, Any] | None = None,
@@ -17573,7 +17978,11 @@ class TestPreviewProofStep:
             else {}
         )
         return (
-            self._state_with_csv_source(schema_mode="observed")
+            self._state_with_csv_source(
+                session_operation_authority=session_operation_authority,
+                session_operation_context=session_operation_context,
+                schema_mode="observed",
+            )
             .with_node(
                 NodeSpec(
                     id="explode",
@@ -17611,7 +18020,12 @@ class TestPreviewProofStep:
             )
         )
 
-    def _proof_codes(self, state) -> list[str]:
+    def _proof_codes(
+        self,
+        authority: SQLiteLocalSessionOperationAuthority,
+        context: SessionOperationContext,
+        state: CompositionState,
+    ) -> list[str]:
         result = execute_tool(
             "preview_pipeline",
             {},
@@ -17619,6 +18033,9 @@ class TestPreviewProofStep:
             _mock_catalog(),
             session_engine=self.engine,
             session_id=self.session_id,
+            data_dir=str(self.data_dir),
+            session_operation_authority=authority,
+            session_operation_context=context,
         )
         return result.data["proof_diagnostics"]
 
@@ -17633,22 +18050,29 @@ class TestPreviewProofStep:
         the aggregation arm emitted this one — a blocking export diagnostic
         silently lost to a `node_type` gate (filigree elspeth-1016a47e8f).
         """
-        diagnostics = self._proof_codes(self._batch_barrier_behind_expand_opener(barrier_node_type=barrier_node_type))
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            diagnostics = self._proof_codes(
+                authority,
+                context,
+                self._batch_barrier_behind_expand_opener(
+                    session_operation_authority=authority, session_operation_context=context, barrier_node_type=barrier_node_type
+                ),
+            )
 
-        mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
-        assert mismatch, [d["code"] for d in diagnostics]
-        assert mismatch[0]["severity"] == "blocking"
-        assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
-        assert mismatch[0]["evidence_locator"]["field"] == "price"
-        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        # The detector records the REAL node kind so the preflight can label the
-        # blocker without guessing it back out of the (historically named) code.
-        assert mismatch[0]["evidence_locator"]["node_type"] == barrier_node_type
-        # Kind-accurate prose: a collector must not be told to fix a node it does
-        # not have, and only a collector is told about its scope.
-        assert mismatch[0]["message"].startswith(f"{barrier_node_type.capitalize()} 'summarize'")
-        assert f"upstream of the {barrier_node_type}" in mismatch[0]["suggested_repair"]
-        assert ("EXPAND scope" in mismatch[0]["suggested_repair"]) is (barrier_node_type == "collector")
+            mismatch = [d for d in diagnostics if d["code"] == "aggregation_numeric_value_field_type_mismatch_against_source_schema"]
+            assert mismatch, [d["code"] for d in diagnostics]
+            assert mismatch[0]["severity"] == "blocking"
+            assert mismatch[0]["evidence_locator"]["node_id"] == "summarize"
+            assert mismatch[0]["evidence_locator"]["field"] == "price"
+            assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+            # The detector records the REAL node kind so the preflight can label the
+            # blocker without guessing it back out of the (historically named) code.
+            assert mismatch[0]["evidence_locator"]["node_type"] == barrier_node_type
+            # Kind-accurate prose: a collector must not be told to fix a node it does
+            # not have, and only a collector is told about its scope.
+            assert mismatch[0]["message"].startswith(f"{barrier_node_type.capitalize()} 'summarize'")
+            assert f"upstream of the {barrier_node_type}" in mismatch[0]["suggested_repair"]
+            assert ("EXPAND scope" in mismatch[0]["suggested_repair"]) is (barrier_node_type == "collector")
 
     def test_collector_hosting_a_non_numeric_batch_plugin_emits_no_numeric_proof(self) -> None:
         """NEGATIVE control: the test above must not pass merely because a
@@ -17657,15 +18081,20 @@ class TestPreviewProofStep:
         very plugin this diagnostic's repair text recommends instead — so it
         must stay silent on the identical topology.
         """
-        diagnostics = self._proof_codes(
-            self._batch_barrier_behind_expand_opener(
-                barrier_node_type="collector",
-                plugin="batch_top_k",
-                options={"schema": {"mode": "observed"}, "field": "customer"},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            diagnostics = self._proof_codes(
+                authority,
+                context,
+                self._batch_barrier_behind_expand_opener(
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                    barrier_node_type="collector",
+                    plugin="batch_top_k",
+                    options={"schema": {"mode": "observed"}, "field": "customer"},
+                ),
             )
-        )
 
-        assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in [d["code"] for d in diagnostics]
+            assert "aggregation_numeric_value_field_type_mismatch_against_source_schema" not in [d["code"] for d in diagnostics]
 
     # -- declared-input-type mismatch against observed CSV (elspeth-e6e552ce34) --
 
@@ -17696,59 +18125,71 @@ class TestPreviewProofStep:
 
     def test_observed_csv_typed_transform_input_declaration_blocks(self) -> None:
         """A concrete non-str input declaration on a directly-fed transform blocks."""
-        state = self._state_with_csv_source(schema_mode="observed").with_node(
-            self._plain_transform(
-                "tidy",
-                plugin="passthrough",
-                input_connection="rows",
-                on_success="out",
-                options={"schema": {"mode": "flexible", "fields": ["price: float", "customer: str"]}},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            ).with_node(
+                self._plain_transform(
+                    "tidy",
+                    plugin="passthrough",
+                    input_connection="rows",
+                    on_success="out",
+                    options={"schema": {"mode": "flexible", "fields": ["price: float", "customer: str"]}},
+                )
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert len(mismatch) == 1
-        assert mismatch[0]["severity"] == "blocking"
-        assert mismatch[0]["evidence_locator"]["node_id"] == "tidy"
-        assert mismatch[0]["evidence_locator"]["field"] == "price"
-        assert mismatch[0]["evidence_locator"]["declared_type"] == "float"
-        assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert len(mismatch) == 1
+            assert mismatch[0]["severity"] == "blocking"
+            assert mismatch[0]["evidence_locator"]["node_id"] == "tidy"
+            assert mismatch[0]["evidence_locator"]["field"] == "price"
+            assert mismatch[0]["evidence_locator"]["declared_type"] == "float"
+            assert mismatch[0]["evidence_locator"]["observed_type"] == "str"
+            assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_str_input_declaration_does_not_block(self) -> None:
         """str/any declarations match what an observed CSV actually delivers."""
-        state = self._state_with_csv_source(schema_mode="observed").with_node(
-            self._plain_transform(
-                "tidy",
-                plugin="passthrough",
-                input_connection="rows",
-                on_success="out",
-                options={"schema": {"mode": "flexible", "fields": ["price: str", "customer: any"]}},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            ).with_node(
+                self._plain_transform(
+                    "tidy",
+                    plugin="passthrough",
+                    input_connection="rows",
+                    on_success="out",
+                    options={"schema": {"mode": "flexible", "fields": ["price: str", "customer: any"]}},
+                )
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "declared_input_type_mismatch_against_source_schema" not in codes
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "declared_input_type_mismatch_against_source_schema" not in codes
 
     def test_observed_csv_fork_llm_coalesce_typed_declaration_blocks(self) -> None:
         """The elspeth-e6e552ce34 incident shape: fork → llm branches → coalesce →
@@ -17787,160 +18228,178 @@ class TestPreviewProofStep:
                 options=options,
             )
 
-        state = (
-            self._state_with_csv_source(schema_mode="observed")
-            .with_node(
-                NodeSpec(
-                    id="fan_out",
-                    node_type="gate",
-                    plugin=None,
-                    input="rows",
-                    on_success=None,
-                    on_error=None,
-                    options={},
-                    condition="True",
-                    routes={"true": "fork", "false": "fork"},
-                    fork_to=("branch_a", "branch_b"),
-                    branches=None,
-                    policy=None,
-                    merge=None,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = (
+                self._state_with_csv_source(
+                    session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
                 )
-            )
-            .with_node(_branch_llm("llm_a", "branch_a", "answer_a"))
-            .with_node(_branch_llm("llm_b", "branch_b", "answer_b"))
-            .with_node(
-                NodeSpec(
-                    id="merge_branches",
-                    node_type="coalesce",
-                    plugin=None,
-                    input="answered_branch_a",
-                    on_success="merged_rows",
-                    on_error=None,
-                    options={},
-                    condition=None,
-                    routes=None,
-                    fork_to=None,
-                    branches={"branch_a": "answered_branch_a", "branch_b": "answered_branch_b"},
-                    policy="require_all",
-                    merge="union",
+                .with_node(
+                    NodeSpec(
+                        id="fan_out",
+                        node_type="gate",
+                        plugin=None,
+                        input="rows",
+                        on_success=None,
+                        on_error=None,
+                        options={},
+                        condition="True",
+                        routes={"true": "fork", "false": "fork"},
+                        fork_to=("branch_a", "branch_b"),
+                        branches=None,
+                        policy=None,
+                        merge=None,
+                    )
                 )
-            )
-            .with_node(
-                self._plain_transform(
-                    "tidy_columns",
-                    plugin="field_mapper",
-                    input_connection="merged_rows",
-                    on_success="out",
-                    options={
-                        "schema": {
-                            "mode": "flexible",
-                            "fields": ["id: int", "question: str", "answer_a: str", "answer_b: str"],
-                            "guaranteed_fields": ["id", "question", "answer_a", "answer_b"],
+                .with_node(_branch_llm("llm_a", "branch_a", "answer_a"))
+                .with_node(_branch_llm("llm_b", "branch_b", "answer_b"))
+                .with_node(
+                    NodeSpec(
+                        id="merge_branches",
+                        node_type="coalesce",
+                        plugin=None,
+                        input="answered_branch_a",
+                        on_success="merged_rows",
+                        on_error=None,
+                        options={},
+                        condition=None,
+                        routes=None,
+                        fork_to=None,
+                        branches={"branch_a": "answered_branch_a", "branch_b": "answered_branch_b"},
+                        policy="require_all",
+                        merge="union",
+                    )
+                )
+                .with_node(
+                    self._plain_transform(
+                        "tidy_columns",
+                        plugin="field_mapper",
+                        input_connection="merged_rows",
+                        on_success="out",
+                        options={
+                            "schema": {
+                                "mode": "flexible",
+                                "fields": ["id: int", "question: str", "answer_a: str", "answer_b: str"],
+                                "guaranteed_fields": ["id", "question", "answer_a", "answer_b"],
+                            },
+                            "mapping": {
+                                "id": "id",
+                                "question": "question",
+                                "answer_a": "answer_a",
+                                "answer_b": "answer_b",
+                            },
+                            "select_only": True,
                         },
-                        "mapping": {
-                            "id": "id",
-                            "question": "question",
-                            "answer_a": "answer_a",
-                            "answer_b": "answer_b",
-                        },
-                        "select_only": True,
-                    },
+                    )
                 )
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert len(mismatch) == 1, mismatch
-        assert mismatch[0]["evidence_locator"]["node_id"] == "tidy_columns"
-        assert mismatch[0]["evidence_locator"]["field"] == "id"
-        assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
-        assert mismatch[0]["evidence_locator"]["inferred_sample_type"] == "int"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert len(mismatch) == 1, mismatch
+            assert mismatch[0]["evidence_locator"]["node_id"] == "tidy_columns"
+            assert mismatch[0]["evidence_locator"]["field"] == "id"
+            assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
+            assert mismatch[0]["evidence_locator"]["inferred_sample_type"] == "int"
+            assert result.data["preview_is_valid"] is False
 
     def test_observed_csv_typed_sink_schema_blocks(self) -> None:
         """The same contradiction one node further on: a fixed sink schema
         declaring `order_id: int` is armed even when every transform is clean."""
-        state = (
-            self._state_with_csv_source(schema_mode="observed")
-            .with_node(
-                self._plain_transform(
-                    "forward",
-                    plugin="passthrough",
-                    input_connection="rows",
-                    on_success="typed_out",
-                    options={"schema": {"mode": "observed"}},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = (
+                self._state_with_csv_source(
+                    session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+                )
+                .with_node(
+                    self._plain_transform(
+                        "forward",
+                        plugin="passthrough",
+                        input_connection="rows",
+                        on_success="typed_out",
+                        options={"schema": {"mode": "observed"}},
+                    )
+                )
+                .with_output(
+                    OutputSpec(
+                        name="typed_out",
+                        plugin="json",
+                        options={
+                            "path": "outputs/typed.json",
+                            "schema": {"mode": "fixed", "fields": ["order_id: int", "customer: str", "price: str"]},
+                            "mode": "write",
+                            "collision_policy": "auto_increment",
+                        },
+                        on_write_failure="discard",
+                    )
                 )
             )
-            .with_output(
-                OutputSpec(
-                    name="typed_out",
-                    plugin="json",
-                    options={
-                        "path": "outputs/typed.json",
-                        "schema": {"mode": "fixed", "fields": ["order_id: int", "customer: str", "price: str"]},
-                        "mode": "write",
-                        "collision_policy": "auto_increment",
-                    },
-                    on_write_failure="discard",
-                )
+
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-
-        diagnostics = result.data["proof_diagnostics"]
-        mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
-        assert mismatch, diagnostics
-        assert len(mismatch) == 1, mismatch
-        assert mismatch[0]["evidence_locator"]["output_name"] == "typed_out"
-        assert mismatch[0]["evidence_locator"]["field"] == "order_id"
-        assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
-        assert result.data["preview_is_valid"] is False
+            diagnostics = result.data["proof_diagnostics"]
+            mismatch = [d for d in diagnostics if d["code"] == "declared_input_type_mismatch_against_source_schema"]
+            assert mismatch, diagnostics
+            assert len(mismatch) == 1, mismatch
+            assert mismatch[0]["evidence_locator"]["output_name"] == "typed_out"
+            assert mismatch[0]["evidence_locator"]["field"] == "order_id"
+            assert mismatch[0]["evidence_locator"]["declared_type"] == "int"
+            assert result.data["preview_is_valid"] is False
 
     def test_malformed_node_schema_block_abstains_without_crashing(self) -> None:
         """A node whose schema block cannot be parsed is an abstention, not a
         diagnostic: contract-config validation owns reporting it, and the proof
         step must not double-report or escape as a ValueError through
         preview_pipeline (the tool dispatcher only catches ToolArgumentError)."""
-        state = self._state_with_csv_source(schema_mode="observed").with_node(
-            self._plain_transform(
-                "tidy",
-                plugin="passthrough",
-                input_connection="rows",
-                on_success="out",
-                options={"schema": {"mode": "flexible", "fields": ["price: not_a_real_type"]}},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            ).with_node(
+                self._plain_transform(
+                    "tidy",
+                    plugin="passthrough",
+                    input_connection="rows",
+                    on_success="out",
+                    options={"schema": {"mode": "flexible", "fields": ["price: not_a_real_type"]}},
+                )
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "declared_input_type_mismatch_against_source_schema" not in codes
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "declared_input_type_mismatch_against_source_schema" not in codes
 
     def test_unparseable_schema_abstention_is_carried_structurally(self) -> None:
         """The abstention is a distinct fact from "declares nothing typed" —
@@ -17956,30 +18415,36 @@ class TestPreviewProofStep:
 
     def test_declared_source_schema_types_do_not_trip_the_observed_arm(self) -> None:
         """A source that declares its types coerces at ingestion — no diagnostic."""
-        state = self._state_with_csv_source(
-            schema_mode="flexible",
-            fields=("order_id: str", "customer: str", "price: float"),
-        ).with_node(
-            self._plain_transform(
-                "tidy",
-                plugin="passthrough",
-                input_connection="rows",
-                on_success="out",
-                options={"schema": {"mode": "flexible", "fields": ["price: float"]}},
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority,
+                session_operation_context=context,
+                schema_mode="flexible",
+                fields=("order_id: str", "customer: str", "price: float"),
+            ).with_node(
+                self._plain_transform(
+                    "tidy",
+                    plugin="passthrough",
+                    input_connection="rows",
+                    on_success="out",
+                    options={"schema": {"mode": "flexible", "fields": ["price: float"]}},
+                )
             )
-        )
 
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
 
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "declared_input_type_mismatch_against_source_schema" not in codes
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "declared_input_type_mismatch_against_source_schema" not in codes
 
     def test_csv_duplicate_headers_registered_as_blocking_code(self) -> None:
         """Registry membership ripples — the constructor would crash if the
@@ -17995,18 +18460,24 @@ class TestPreviewProofStep:
 
     def test_missing_storage_file_blocks(self) -> None:
         self.csv_storage_path.unlink()
-        state = self._state_with_csv_source(schema_mode="observed")
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        codes = [d["code"] for d in result.data["proof_diagnostics"]]
-        assert "source_inspection_failed" in codes
-        assert result.data["preview_is_valid"] is False
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+            )
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            codes = [d["code"] for d in result.data["proof_diagnostics"]]
+            assert "source_inspection_failed" in codes
+            assert result.data["preview_is_valid"] is False
 
     def test_blocking_proof_overrides_authoring_validation(self, passing_runtime_preflight: _SyncCallRecorder) -> None:
         """Authoring is valid but a blocking proof diagnostic still flips ``preview_is_valid``.
@@ -18016,50 +18487,56 @@ class TestPreviewProofStep:
         the preflight passing, a false ``preview_is_valid`` can only be the
         blocking diagnostic (pin 3 of elspeth-e405ad7cd2 R4).
         """
-        state = self._state_with_csv_source(
-            schema_mode="fixed",
-            fields=("order_id: str",),
-            on_validation_failure="discard",
-        )
-        # Route the source's ``rows`` connection into the sink so the
-        # authoring check is genuinely green; the helper's ``out`` sink leaves
-        # ``rows`` unconsumed, which would make authoring — not the proof
-        # stage — the reason for the verdict below.
-        removed = execute_tool("remove_output", {"sink_name": "out"}, state, _mock_catalog())
-        assert removed.success, removed.data
-        routed = execute_tool(
-            "set_output",
-            {
-                "sink_name": "rows",
-                "plugin": "json",
-                "options": {
-                    "path": "outputs/out.json",
-                    "schema": {"mode": "observed"},
-                    "mode": "write",
-                    "collision_policy": "auto_increment",
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority,
+                session_operation_context=context,
+                schema_mode="fixed",
+                fields=("order_id: str",),
+                on_validation_failure="discard",
+            )
+            # Route the source's ``rows`` connection into the sink so the
+            # authoring check is genuinely green; the helper's ``out`` sink leaves
+            # ``rows`` unconsumed, which would make authoring — not the proof
+            # stage — the reason for the verdict below.
+            removed = execute_tool("remove_output", {"sink_name": "out"}, state, _mock_catalog())
+            assert removed.success, removed.data
+            routed = execute_tool(
+                "set_output",
+                {
+                    "sink_name": "rows",
+                    "plugin": "json",
+                    "options": {
+                        "path": "outputs/out.json",
+                        "schema": {"mode": "observed"},
+                        "mode": "write",
+                        "collision_policy": "auto_increment",
+                    },
+                    "on_write_failure": "discard",
                 },
-                "on_write_failure": "discard",
-            },
-            removed.updated_state,
-            _mock_catalog(),
-        )
-        assert routed.success, routed.data
-        state = routed.updated_state
-        result = execute_tool(
-            "preview_pipeline",
-            {},
-            state,
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            runtime_preflight=passing_runtime_preflight,
-        )
-        assert result.validation.is_valid is True
-        assert result.runtime_preflight is not None
-        assert result.runtime_preflight.is_valid is True
-        assert any(d["severity"] == "blocking" for d in result.data["proof_diagnostics"])
-        assert result.data["preview_is_valid"] is False
-        assert list(result.data["preview_errors"]) == []
+                removed.updated_state,
+                _mock_catalog(),
+            )
+            assert routed.success, routed.data
+            state = routed.updated_state
+            result = execute_tool(
+                "preview_pipeline",
+                {},
+                state,
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+                runtime_preflight=passing_runtime_preflight,
+            )
+            assert result.validation.is_valid is True
+            assert result.runtime_preflight is not None
+            assert result.runtime_preflight.is_valid is True
+            assert any(d["severity"] == "blocking" for d in result.data["proof_diagnostics"])
+            assert result.data["preview_is_valid"] is False
+            assert list(result.data["preview_errors"]) == []
 
     # -- Tier-3 persisted-option boundaries: malformed source.options ---------
     # ``source.options`` is composer/operator-authored config re-read from
@@ -18074,7 +18551,12 @@ class TestPreviewProofStep:
     # after the set_source_from_blob write-time validation that originally
     # produced it (the "validated once is not validated forever" T3 read-back).
 
-    def _state_with_tampered_source_options(self, options: dict[str, object]):
+    def _state_with_tampered_source_options(
+        self,
+        authority: SQLiteLocalSessionOperationAuthority,
+        context: SessionOperationContext,
+        options: dict[str, object],
+    ):
         """Build a valid CSV blob state, then overwrite source.options.
 
         Models persisted external-origin options that drifted between the
@@ -18082,7 +18564,9 @@ class TestPreviewProofStep:
         """
         import dataclasses
 
-        state = self._state_with_csv_source(schema_mode="observed")
+        state = self._state_with_csv_source(
+            session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
+        )
         source = _default_source(state)
         assert source is not None
         tampered = dataclasses.replace(source, options=options)
@@ -18097,19 +18581,25 @@ class TestPreviewProofStep:
 
         # schema.mode is not a recognised mode → get_raw_schema_config raises
         # ValueError. blob_ref must survive so the proof step inspects the blob.
-        state = self._state_with_tampered_source_options({"blob_ref": self.csv_blob_id, "schema": {"mode": "not_a_real_mode"}})
-        diagnostics = compute_proof_diagnostics(
-            state,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        blocking = [d for d in diagnostics if d["severity"] == "blocking"]
-        assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
-        # The schema-block builder's repair text must point at the schema knob,
-        # not at header/field_mapping resolution.
-        schema_diag = next(d for d in blocking if d["code"] == "csv_source_field_resolution_error")
-        assert "schema" in schema_diag["suggested_repair"]
-        assert "schema.mode" in schema_diag["suggested_repair"]
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_tampered_source_options(
+                authority, context, {"blob_ref": self.csv_blob_id, "schema": {"mode": "not_a_real_mode"}}
+            )
+            diagnostics = compute_proof_diagnostics(
+                state,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            blocking = [d for d in diagnostics if d["severity"] == "blocking"]
+            assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
+            # The schema-block builder's repair text must point at the schema knob,
+            # not at header/field_mapping resolution.
+            schema_diag = next(d for d in blocking if d["code"] == "csv_source_field_resolution_error")
+            assert "schema" in schema_diag["suggested_repair"]
+            assert "schema.mode" in schema_diag["suggested_repair"]
 
     def test_proof_malformed_columns_option_yields_blocking_diagnostic(self) -> None:
         """A malformed ``columns`` option (inspect wrap raises) blocks, no crash."""
@@ -18117,14 +18607,20 @@ class TestPreviewProofStep:
 
         # columns must be a sequence of str; an int member raises ValueError
         # inside _csv_source_columns, surfaced by the inspect-call wrap.
-        state = self._state_with_tampered_source_options({"blob_ref": self.csv_blob_id, "columns": ["order_id", 123]})
-        diagnostics = compute_proof_diagnostics(
-            state,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        blocking = [d for d in diagnostics if d["severity"] == "blocking"]
-        assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_tampered_source_options(
+                authority, context, {"blob_ref": self.csv_blob_id, "columns": ["order_id", 123]}
+            )
+            diagnostics = compute_proof_diagnostics(
+                state,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            blocking = [d for d in diagnostics if d["severity"] == "blocking"]
+            assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
 
     def test_proof_malformed_delimiter_option_yields_blocking_diagnostic(self) -> None:
         """A malformed ``delimiter`` option (inspect wrap raises) blocks, no crash."""
@@ -18132,14 +18628,18 @@ class TestPreviewProofStep:
 
         # delimiter must be a single character; a multi-char string raises
         # ValueError inside _csv_source_delimiter, surfaced by the inspect wrap.
-        state = self._state_with_tampered_source_options({"blob_ref": self.csv_blob_id, "delimiter": "||"})
-        diagnostics = compute_proof_diagnostics(
-            state,
-            session_engine=self.engine,
-            session_id=self.session_id,
-        )
-        blocking = [d for d in diagnostics if d["severity"] == "blocking"]
-        assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_tampered_source_options(authority, context, {"blob_ref": self.csv_blob_id, "delimiter": "||"})
+            diagnostics = compute_proof_diagnostics(
+                state,
+                session_engine=self.engine,
+                session_id=self.session_id,
+                data_dir=str(self.data_dir),
+                session_operation_authority=authority,
+                session_operation_context=context,
+            )
+            blocking = [d for d in diagnostics if d["severity"] == "blocking"]
+            assert any(d["code"] == "csv_source_field_resolution_error" for d in blocking), diagnostics
 
     # -- proof step integrity verification -----------------------------------
     # The proof step reads blob bytes through the same Tier-1 invariants as
@@ -18159,18 +18659,24 @@ class TestPreviewProofStep:
         """
         from elspeth.web.blobs.protocol import BlobIntegrityError
 
-        state = self._state_with_csv_source(schema_mode="observed")
-        # Tamper with the on-disk bytes after the row was inserted.
-        self.csv_storage_path.write_bytes(b"tampered,data\nX,Y\n")
-        with pytest.raises(BlobIntegrityError):
-            execute_tool(
-                "preview_pipeline",
-                {},
-                state,
-                _mock_catalog(),
-                session_engine=self.engine,
-                session_id=self.session_id,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
             )
+            # Tamper with the on-disk bytes after the row was inserted.
+            self.csv_storage_path.write_bytes(b"tampered,data\nX,Y\n")
+            with pytest.raises(BlobIntegrityError):
+                execute_tool(
+                    "preview_pipeline",
+                    {},
+                    state,
+                    _mock_catalog(),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    data_dir=str(self.data_dir),
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                )
 
     def test_proof_raises_audit_integrity_error_on_null_content_hash(self) -> None:
         """A ``ready`` blob with NULL content_hash is a DB-integrity anomaly.
@@ -18196,23 +18702,29 @@ class TestPreviewProofStep:
         # CHECK if defined. Use a raw SQL UPDATE that violates the
         # check guard if present, else falls through; the row's
         # presence on read with NULL hash is what we need.
-        state = self._state_with_csv_source(schema_mode="observed")
-        with self.engine.begin() as conn:
-            # Disable the row-level check by toggling pragma; sqlite
-            # 3.x respects this for the connection. Then null the hash.
-            conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
-            conn.execute(update(blobs_table).where(blobs_table.c.id == self.csv_blob_id).values(content_hash=None))
-            conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
-
-        with pytest.raises(AuditIntegrityError, match="NULL content_hash"):
-            execute_tool(
-                "preview_pipeline",
-                {},
-                state,
-                _mock_catalog(),
-                session_engine=self.engine,
-                session_id=self.session_id,
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            state = self._state_with_csv_source(
+                session_operation_authority=authority, session_operation_context=context, schema_mode="observed"
             )
+            with self.engine.begin() as conn:
+                # Disable the row-level check by toggling pragma; sqlite
+                # 3.x respects this for the connection. Then null the hash.
+                conn.exec_driver_sql("PRAGMA ignore_check_constraints = ON")
+                conn.execute(update(blobs_table).where(blobs_table.c.id == self.csv_blob_id).values(content_hash=None))
+                conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
+
+            with pytest.raises(AuditIntegrityError, match="NULL content_hash"):
+                execute_tool(
+                    "preview_pipeline",
+                    {},
+                    state,
+                    _mock_catalog(),
+                    session_engine=self.engine,
+                    session_id=self.session_id,
+                    data_dir=str(self.data_dir),
+                    session_operation_authority=authority,
+                    session_operation_context=context,
+                )
 
 
 class TestFieldPreservationWalk:
@@ -19332,8 +19844,8 @@ class TestExplainDanglingDestinations:
 class TestGetBlobContentReaderMixedVersion:
     """Readers must never pair one blob version's row with another's bytes.
 
-    ``_execute_update_blob`` swaps the storage file (``os.replace``) INSIDE
-    its DB transaction, before commit.  A reader that fetches the blob row
+    ``_execute_update_blob`` swaps the storage file (``os.replace``) before
+    committing the new metadata. A reader that fetches the blob row
     and the storage bytes without entering the same-session custody lock can
     therefore pair the old committed row (old content_hash) with the new
     bytes — escalating a false-positive ``BlobIntegrityError`` for a blob
@@ -19355,7 +19867,7 @@ class TestGetBlobContentReaderMixedVersion:
         engine = create_session_engine(f"sqlite:///{tmp_path / 'sessions.db'}")
         initialize_session_schema(engine)
 
-        session_id = f"reader-mixed-version-{uuid4()}"
+        session_id = str(uuid4())
         blob_id = str(uuid4())
         now = datetime.now(UTC)
         storage_dir = tmp_path / "blobs" / session_id
@@ -19393,82 +19905,89 @@ class TestGetBlobContentReaderMixedVersion:
 
         update_context = _verbatim_blob_context(engine, session_id, "new-content")
 
-        swapped = stdlib_threading.Event()
-        release_update = stdlib_threading.Event()
-        real_replace = stdlib_os.replace
+        with _blob_operation(engine, session_id) as (authority, context):
+            swapped = stdlib_threading.Event()
+            release_update = stdlib_threading.Event()
+            real_replace = stdlib_os.replace
 
-        def pausing_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
-            real_replace(src, dst, *args, **kwargs)
-            if Path(dst) == storage_path:
-                # The storage file now holds the NEW bytes while the update
-                # transaction (old row) has not committed yet.  Hold the
-                # window open so the reader thread can attempt its read.
-                swapped.set()
-                if not release_update.wait(timeout=10):
-                    raise TimeoutError("update thread was never released from the swap window")
+            def pausing_replace(src: Any, dst: Any, *args: Any, **kwargs: Any) -> None:
+                real_replace(src, dst, *args, **kwargs)
+                if Path(dst).name == storage_path.name and Path(src).name.endswith(".stage"):
+                    # The storage file now holds the NEW bytes while the update
+                    # transaction (old row) has not committed yet.  Hold the
+                    # window open so the reader thread can attempt its read.
+                    swapped.set()
+                    if not release_update.wait(timeout=10):
+                        raise TimeoutError("update thread was never released from the swap window")
 
-        monkeypatch.setattr("os.replace", pausing_replace)
+            monkeypatch.setattr("os.replace", pausing_replace)
 
-        update_results: list[Any] = []
-        update_failures: list[BaseException] = []
+            update_results: list[Any] = []
+            update_failures: list[BaseException] = []
 
-        def updater() -> None:
-            try:
-                update_results.append(
-                    execute_tool(
-                        "update_blob",
-                        {"blob_id": blob_id, "content": "new-content"},
-                        _empty_state(),
-                        _mock_catalog(),
-                        session_engine=engine,
-                        session_id=session_id,
-                        **update_context,
+            def updater() -> None:
+                try:
+                    update_results.append(
+                        execute_tool(
+                            "update_blob",
+                            {"blob_id": blob_id, "content": "new-content"},
+                            _empty_state(),
+                            _mock_catalog(),
+                            session_engine=engine,
+                            session_id=session_id,
+                            data_dir=str(tmp_path),
+                            session_operation_authority=authority,
+                            session_operation_context=context,
+                            **update_context,
+                        )
                     )
-                )
-            except BaseException as exc:  # pragma: no cover - failure diagnostics
-                update_failures.append(exc)
+                except BaseException as exc:  # pragma: no cover - failure diagnostics
+                    update_failures.append(exc)
 
-        reader_results: list[Any] = []
-        reader_failures: list[BaseException] = []
+            reader_results: list[Any] = []
+            reader_failures: list[BaseException] = []
 
-        def reader() -> None:
-            try:
-                reader_results.append(
-                    execute_tool(
-                        "get_blob_content",
-                        {"blob_id": blob_id},
-                        _empty_state(),
-                        _mock_catalog(),
-                        session_engine=engine,
-                        session_id=session_id,
+            def reader() -> None:
+                try:
+                    reader_results.append(
+                        execute_tool(
+                            "get_blob_content",
+                            {"blob_id": blob_id},
+                            _empty_state(),
+                            _mock_catalog(),
+                            session_engine=engine,
+                            session_id=session_id,
+                            data_dir=str(tmp_path),
+                            session_operation_authority=authority,
+                            session_operation_context=context,
+                        )
                     )
-                )
-            except BaseException as exc:
-                reader_failures.append(exc)
+                except BaseException as exc:
+                    reader_failures.append(exc)
 
-        update_thread = stdlib_threading.Thread(target=updater, name="blob-updater", daemon=True)
-        update_thread.start()
-        assert swapped.wait(timeout=5), "update never reached its file swap"
+            update_thread = stdlib_threading.Thread(target=updater, name="blob-updater", daemon=True)
+            update_thread.start()
+            assert swapped.wait(timeout=5), "update never reached its file swap"
 
-        reader_thread = stdlib_threading.Thread(target=reader, name="blob-reader", daemon=True)
-        reader_thread.start()
-        # Give the reader time to attempt its read inside the swap window.
-        # A correctly-serialised reader blocks on the session custody lock
-        # here; an unserialised reader pairs the old row with the new bytes.
-        time.sleep(0.5)
-        release_update.set()
-        update_thread.join(timeout=10)
-        reader_thread.join(timeout=10)
-        assert not update_thread.is_alive() and not reader_thread.is_alive()
+            reader_thread = stdlib_threading.Thread(target=reader, name="blob-reader", daemon=True)
+            reader_thread.start()
+            # Give the reader time to attempt its read inside the swap window.
+            # A correctly-serialised reader blocks on the session custody lock
+            # here; an unserialised reader pairs the old row with the new bytes.
+            time.sleep(0.5)
+            release_update.set()
+            update_thread.join(timeout=10)
+            reader_thread.join(timeout=10)
+            assert not update_thread.is_alive() and not reader_thread.is_alive()
 
-        assert update_failures == [], f"update_blob raised: {update_failures}"
-        assert update_results and update_results[0].success is True
-        assert reader_failures == [], (
-            f"get_blob_content escalated during the update swap/commit window: {reader_failures}; "
-            "the reader paired one version's row with another version's bytes"
-        )
-        assert reader_results and reader_results[0].success is True
-        assert reader_results[0].data["content"] == "new-content"
+            assert update_failures == [], f"update_blob raised: {update_failures}"
+            assert update_results and update_results[0].success is True
+            assert reader_failures == [], (
+                f"get_blob_content escalated during the update swap/commit window: {reader_failures}; "
+                "the reader paired one version's row with another version's bytes"
+            )
+            assert reader_results and reader_results[0].success is True
+            assert reader_results[0].data["content"] == "new-content"
 
 
 class TestBlobCrashStateReconciliation:
@@ -19476,7 +19995,7 @@ class TestBlobCrashStateReconciliation:
 
     ``_execute_update_blob`` preserves the prior bytes at a deterministic
     ``.{name}.pre-update`` sidecar across its swap+commit window, and
-    ``_execute_delete_blob`` stages bytes at a ``.{name}.delete-<hex>``
+    ``_execute_delete_blob`` stages bytes at a ``.{blob_id}.delete-<hex>``
     tombstone before its DELETE commits.  A crash inside either window
     leaves the filesystem one rename away from the committed row state;
     the committed ``content_hash`` is the arbiter.  Readers reconcile
@@ -19544,7 +20063,11 @@ class TestBlobCrashStateReconciliation:
                 )
             )
 
-    def _read_content(self) -> Any:
+    def _read_content(
+        self,
+        authority: SQLiteLocalSessionOperationAuthority,
+        context: SessionOperationContext,
+    ) -> Any:
         return execute_tool(
             "get_blob_content",
             {"blob_id": self.blob_id},
@@ -19552,6 +20075,9 @@ class TestBlobCrashStateReconciliation:
             _mock_catalog(),
             session_engine=self.engine,
             session_id=self.session_id,
+            data_dir=str(self.data_dir),
+            session_operation_authority=authority,
+            session_operation_context=context,
         )
 
     def test_update_crash_before_commit_restores_sidecar_version(self) -> None:
@@ -19559,7 +20085,8 @@ class TestBlobCrashStateReconciliation:
         self.storage_path.write_bytes(self.new_content)
         self.sidecar_path.write_bytes(self.old_content)
 
-        result = self._read_content()
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._read_content(authority, context)
 
         assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
         assert result.data["content"] == self.old_content.decode()
@@ -19571,7 +20098,8 @@ class TestBlobCrashStateReconciliation:
         self.storage_path.unlink()
         self.sidecar_path.write_bytes(self.old_content)
 
-        result = self._read_content()
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._read_content(authority, context)
 
         assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
         assert result.data["content"] == self.old_content.decode()
@@ -19594,7 +20122,8 @@ class TestBlobCrashStateReconciliation:
                 .values(content_hash=hashlib.sha256(committed).hexdigest(), size_bytes=len(committed))
             )
 
-        result = self._read_content()
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._read_content(authority, context)
 
         assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
         assert result.data["content"] == committed.decode()
@@ -19603,10 +20132,11 @@ class TestBlobCrashStateReconciliation:
 
     def test_delete_crash_before_commit_restores_tombstone_version(self) -> None:
         """row live, storage missing, one matching tombstone → restored."""
-        tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'0' * 32}")
+        tombstone = self.storage_path.with_name(f".{self.blob_id}.delete-{'0' * 32}")
         self.storage_path.rename(tombstone)
 
-        result = self._read_content()
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._read_content(authority, context)
 
         assert result.success is True, f"reader escalated on a recoverable crash state: {result.data}"
         assert result.data["content"] == self.old_content.decode()
@@ -19649,7 +20179,7 @@ class TestBlobCrashStateReconciliation:
             candidates = (self.storage_path, self.sidecar_path)
         else:
             self.storage_path.unlink()
-            tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'0' * 32}")
+            tombstone = self.storage_path.with_name(f".{self.blob_id}.delete-{'0' * 32}")
             tombstone.write_bytes(authoritative)
             candidates = (tombstone,)
 
@@ -19684,8 +20214,8 @@ class TestBlobCrashStateReconciliation:
         self.storage_path.write_bytes(b"garbage-bytes")
         self.sidecar_path.write_bytes(b"other-garbage")
 
-        with pytest.raises(BlobIntegrityError):
-            self._read_content()
+        with _blob_operation(self.engine, self.session_id) as (authority, context), pytest.raises(BlobIntegrityError):
+            self._read_content(authority, context)
         assert self.sidecar_path.exists(), "corrupt sidecar must be left in place for manual reconciliation"
 
 
@@ -19759,15 +20289,18 @@ class TestDeleteBlobDurableJournal:
     def test_successful_delete_leaves_no_journal_or_tombstone_debris(self) -> None:
         from elspeth.web.sessions.models import blob_deletion_cleanups_table
 
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            data_dir=self.data_dir,
-        )
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+                data_dir=str(self.data_dir),
+            )
 
         assert result.success is True, result.data
         assert not self.storage_path.exists()
@@ -19782,7 +20315,7 @@ class TestDeleteBlobDurableJournal:
 
         from elspeth.web.sessions.models import blob_deletion_cleanups_table, blobs_table
 
-        tombstone = self.storage_path.with_name(f".{self.storage_path.name}.delete-{'a' * 32}")
+        tombstone = self.storage_path.with_name(f".{self.blob_id}.delete-{'a' * 32}")
         self.storage_path.rename(tombstone)
         with self.engine.begin() as conn:
             journal_registered_at = datetime.now(UTC)
@@ -19798,15 +20331,18 @@ class TestDeleteBlobDurableJournal:
             )
             conn.execute(blobs_table.delete().where(blobs_table.c.id == self.blob_id))
 
-        result = execute_tool(
-            "delete_blob",
-            {"blob_id": self.blob_id},
-            _empty_state(),
-            _mock_catalog(),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            data_dir=self.data_dir,
-        )
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = execute_tool(
+                "delete_blob",
+                {"blob_id": self.blob_id},
+                _empty_state(),
+                _mock_catalog(),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                session_operation_authority=authority,
+                session_operation_context=context,
+                data_dir=str(self.data_dir),
+            )
 
         assert result.success is True, f"retry after a crash-after-commit must finalize the deletion: {result.data}"
         assert result.data == {"blob_id": self.blob_id, "deleted": True}
@@ -19819,22 +20355,20 @@ class TestDeleteBlobDurableJournal:
 class TestUpdateBlobSidecarCommitFailure:
     """A commit failure after the file swap must restore via the sidecar.
 
-    The update sequence parks the prior bytes at the deterministic
-    ``.{name}.pre-update`` sidecar, swaps the new bytes in, then commits.
+    The update sequence parks prior bytes at the operation-qualified backup,
+    swaps the new bytes in, then commits.
     When the transaction fails after the swap, the except-arm restores the
     sidecar over storage_path in one atomic rename — storage must hold the
     original bytes, and neither sidecar nor tempfile may remain.
     """
 
     def test_commit_failure_after_swap_restores_sidecar(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        import contextlib
         import hashlib
         from datetime import UTC, datetime
         from uuid import uuid4
 
         from sqlalchemy.pool import StaticPool
 
-        from elspeth.web.composer.tools import blobs as blobs_module
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import blobs_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
@@ -19881,35 +20415,52 @@ class TestUpdateBlobSidecarCommitFailure:
                 )
             )
 
-        real_locked_txn = blobs_module.locked_session_transaction
-
-        @contextlib.contextmanager
-        def commit_failing_txn(txn_engine: Any, txn_session_id: str) -> Any:
-            with real_locked_txn(txn_engine, txn_session_id) as conn:
-                yield conn
-                # Raising after the handler body (both renames done) but
-                # before the with-block commit models a commit-time fault:
-                # engine.begin() rolls the transaction back.
-                raise RuntimeError("simulated commit failure")
-
-        monkeypatch.setattr(blobs_module, "locked_session_transaction", commit_failing_txn)
-
         provenance_context = _verbatim_blob_context(engine, session_id, "replacement-bytes")
-        with pytest.raises(RuntimeError, match="simulated commit failure"):
-            execute_tool(
-                "update_blob",
-                {"blob_id": blob_id, "content": "replacement-bytes"},
-                _empty_state(),
-                _mock_catalog(),
-                session_engine=engine,
-                session_id=session_id,
-                **provenance_context,
-            )
+        with _blob_operation(engine, session_id) as (authority, context):
+            original_commit = engine.dialect.do_commit
+            fault_pending = False
+            injected = False
 
-        assert storage_path.read_bytes() == original, "storage must be restored from the sidecar after a commit failure"
-        assert list(storage_path.parent.iterdir()) == [storage_path], (
-            f"sidecar/tempfile debris left after rollback: {list(storage_path.parent.iterdir())}"
-        )
+            def arm_metadata_commit(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+                nonlocal fault_pending
+                if statement.lstrip().upper().startswith("UPDATE BLOBS SET "):
+                    fault_pending = True
+
+            def fail_metadata_commit(connection) -> None:
+                nonlocal fault_pending, injected
+                if fault_pending:
+                    fault_pending = False
+                    injected = True
+                    assert storage_path.read_bytes() == b"replacement-bytes"
+                    backups = list(storage_path.parent.glob("*.backup"))
+                    assert len(backups) == 1 and backups[0].read_bytes() == original
+                    raise RuntimeError("simulated commit failure")
+                original_commit(connection)
+
+            monkeypatch.setattr(engine.dialect, "do_commit", fail_metadata_commit)
+            event.listen(engine, "before_cursor_execute", arm_metadata_commit)
+            try:
+                with pytest.raises(RuntimeError, match="simulated commit failure"):
+                    execute_tool(
+                        "update_blob",
+                        {"blob_id": blob_id, "content": "replacement-bytes"},
+                        _empty_state(),
+                        _mock_catalog(),
+                        session_engine=engine,
+                        session_id=session_id,
+                        data_dir=str(tmp_path),
+                        session_operation_authority=authority,
+                        session_operation_context=context,
+                        **provenance_context,
+                    )
+            finally:
+                event.remove(engine, "before_cursor_execute", arm_metadata_commit)
+            assert injected
+
+            assert storage_path.read_bytes() == original, "storage must be restored from the sidecar after a commit failure"
+            assert list(storage_path.parent.iterdir()) == [storage_path], (
+                f"sidecar/tempfile debris left after rollback: {list(storage_path.parent.iterdir())}"
+            )
 
 
 class TestBlobCompositionReferenceGuards:
@@ -19951,6 +20502,7 @@ class TestBlobCompositionReferenceGuards:
         self.storage_path = storage_dir / f"{self.blob_id}_data.csv"
         self.content = b"reference-guard-bytes"
         self.content_sha = hashlib.sha256(self.content).hexdigest()
+        self.data_dir = str(tmp_path)
         self.storage_path.write_bytes(self.content)
 
         with self.engine.begin() as conn:
@@ -20010,7 +20562,13 @@ class TestBlobCompositionReferenceGuards:
             version=1,
         )
 
-    def _update(self, state: CompositionState) -> Any:
+    def _update(
+        self,
+        state: CompositionState,
+        authority: SQLiteLocalSessionOperationAuthority,
+        context: SessionOperationContext,
+        provenance_context: dict[str, str],
+    ) -> Any:
         return execute_tool(
             "update_blob",
             {"blob_id": self.blob_id, "content": "mutated-content"},
@@ -20018,10 +20576,18 @@ class TestBlobCompositionReferenceGuards:
             _mock_catalog(),
             session_engine=self.engine,
             session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "mutated-content"),
+            data_dir=str(self.data_dir),
+            session_operation_authority=authority,
+            session_operation_context=context,
+            **provenance_context,
         )
 
-    def _delete(self, state: CompositionState) -> Any:
+    def _delete(
+        self,
+        state: CompositionState,
+        authority: SQLiteLocalSessionOperationAuthority,
+        context: SessionOperationContext,
+    ) -> Any:
         return execute_tool(
             "delete_blob",
             {"blob_id": self.blob_id},
@@ -20029,6 +20595,9 @@ class TestBlobCompositionReferenceGuards:
             _mock_catalog(),
             session_engine=self.engine,
             session_id=self.session_id,
+            data_dir=str(self.data_dir),
+            session_operation_authority=authority,
+            session_operation_context=context,
         )
 
     def _assert_denied(self, result: Any, operation: str) -> None:
@@ -20037,30 +20606,42 @@ class TestBlobCompositionReferenceGuards:
 
     def test_update_denied_for_nested_source_inline_marker(self) -> None:
         state = self._state_with_source_options({"path": "rows.csv", "queries": self._marker()})
-        self._assert_denied(self._update(state), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(state, authority, context, provenance_context), "update_blob")
 
     def test_update_denied_for_nested_node_inline_marker_in_list(self) -> None:
         state = replace(_empty_state(), nodes=(self._node({"prompts": [self._marker()]}),))
-        self._assert_denied(self._update(state), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(state, authority, context, provenance_context), "update_blob")
 
     def test_update_denied_for_nested_output_inline_marker(self) -> None:
         state = replace(
             _empty_state(),
             outputs=(OutputSpec(name="result", plugin="json", options={"template": self._marker()}, on_write_failure="discard"),),
         )
-        self._assert_denied(self._update(state), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(state, authority, context, provenance_context), "update_blob")
 
     def test_update_denied_for_raw_storage_path_binding(self) -> None:
         state = self._state_with_source_options({"path": str(self.storage_path)})
-        self._assert_denied(self._update(state), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(state, authority, context, provenance_context), "update_blob")
 
     def test_update_denied_for_blob_path_sentinel(self) -> None:
         state = self._state_with_source_options({"path": f"blob:{self.blob_id}"})
-        self._assert_denied(self._update(state), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(state, authority, context, provenance_context), "update_blob")
 
     def test_update_allowed_for_unreferenced_blob(self) -> None:
         state = self._state_with_source_options({"path": "unrelated.csv"})
-        result = self._update(state)
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._update(state, authority, context, provenance_context)
         assert result.success is True, f"update of an unreferenced blob must succeed: {result.data}"
 
     def test_update_denied_while_pending_proposal_references_blob(self) -> None:
@@ -20088,22 +20669,27 @@ class TestBlobCompositionReferenceGuards:
                     updated_at=datetime.now(UTC),
                 )
             )
-        self._assert_denied(self._update(_empty_state()), "update_blob")
+        provenance_context = _verbatim_blob_context(self.engine, self.session_id, "mutated-content")
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            self._assert_denied(self._update(_empty_state(), authority, context, provenance_context), "update_blob")
 
     def test_delete_denied_for_nested_node_inline_marker(self) -> None:
         state = replace(_empty_state(), nodes=(self._node({"prompts": [self._marker()]}),))
-        result = self._delete(state)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._delete(state, authority, context)
         assert result.success is False, f"delete_blob succeeded against a composition-referenced blob: {result.data}"
         assert self.storage_path.exists(), "delete_blob removed the referenced blob's bytes"
 
     def test_delete_denied_for_top_level_source_blob_ref(self) -> None:
         state = self._state_with_source_options({"path": str(self.storage_path), "blob_ref": self.blob_id})
-        result = self._delete(state)
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._delete(state, authority, context)
         assert result.success is False, f"delete_blob succeeded against the current source's backing blob: {result.data}"
         assert self.storage_path.exists()
 
     def test_delete_allowed_once_unreferenced(self) -> None:
-        result = self._delete(_empty_state())
+        with _blob_operation(self.engine, self.session_id) as (authority, context):
+            result = self._delete(_empty_state(), authority, context)
         assert result.success is True, f"delete of an unreferenced blob must succeed: {result.data}"
         assert not self.storage_path.exists()
 

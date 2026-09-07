@@ -20,6 +20,7 @@ from sqlalchemy import Engine
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.schema import FieldDefinition, get_aggregation_contract_options, get_raw_schema_config
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.contracts.value_source import get_catalog_values
 from elspeth.core.expression_parser import ExpressionEvaluationError, ExpressionParser
@@ -88,6 +89,7 @@ from elspeth.web.interpretation_state import (
     materialize_state_for_authoring,
 )
 from elspeth.web.plugin_policy.models import PluginUnavailableReason
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 _AUTHORING_VALIDATION_COUNTER = metrics.get_meter("elspeth.web.composer.tools").create_counter(
     "composer.authoring_validation.total",
@@ -3625,6 +3627,9 @@ def compute_proof_diagnostics(
     *,
     session_engine: Engine | None = None,
     session_id: str | None = None,
+    data_dir: str | None = None,
+    session_operation_context: SessionOperationContext | None = None,
+    session_operation_authority: SessionOperationAuthority | None = None,
     blob_resolver: Callable[[str], ResolvedProofBlob | UnresolvedClaimedProofBlob | None] | None = None,
 ) -> list[Mapping[str, Any]]:
     """Inspect every blob-backed source within the authored-source proof cap.
@@ -3647,7 +3652,14 @@ def compute_proof_diagnostics(
             # lock — an unlocked read racing update_blob's in-transaction
             # file swap would escalate a false BlobIntegrityError
             # (elspeth-3d1d1fcb6c).
-            metadata, content = _locked_read_ready_blob(session_engine, session_id, resolved_blob_id)
+            metadata, content = _locked_read_ready_blob(
+                session_engine,
+                session_id,
+                resolved_blob_id,
+                data_dir=data_dir,
+                session_operation_context=session_operation_context,
+                session_operation_authority=session_operation_authority,
+            )
             if metadata is None:
                 return None
             if content is None:
@@ -3880,6 +3892,9 @@ def _execute_preview_pipeline(
         state,
         session_engine=context.session_engine,
         session_id=context.session_id,
+        data_dir=context.data_dir,
+        session_operation_context=context.session_operation_context,
+        session_operation_authority=context.session_operation_authority,
     )
     has_blocking_proof = any(d["severity"] == "blocking" for d in proof_diagnostics)
 

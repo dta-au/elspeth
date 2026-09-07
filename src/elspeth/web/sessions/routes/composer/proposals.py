@@ -397,6 +397,8 @@ async def accept_composition_proposal(
                     data_dir=str(request.app.state.settings.data_dir),
                     session_engine=request.app.state.session_engine,
                     session_id=str(session.id),
+                    session_operation_context=lease.context,
+                    session_operation_authority=service.session_operation_authority,
                     secret_service=request.app.state.scoped_secret_resolver,
                     user_id=str(user.user_id),
                     user_message_id=str(proposal.user_message_id) if proposal.user_message_id is not None else None,

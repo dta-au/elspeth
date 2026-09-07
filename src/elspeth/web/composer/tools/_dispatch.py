@@ -28,6 +28,7 @@ from sqlalchemy import Engine
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
 from elspeth.contracts.secrets import WebSecretResolver
+from elspeth.contracts.session_operation import SessionOperationContext
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import (
     REQUEST_INTERPRETATION_REVIEW_KIND_VALUES,
@@ -71,6 +72,7 @@ from elspeth.web.composer.tools.sessions import (
 )
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.secrets.wiring_policy import SecretWiringPolicy
+from elspeth.web.sessions.protocol import SessionOperationAuthority
 
 __all__ = [
     "_inject_prior_validation",
@@ -640,6 +642,8 @@ def execute_tool(
     data_dir: str | None = None,
     session_engine: Engine | None = None,
     session_id: str | None = None,
+    session_operation_context: SessionOperationContext | None = None,
+    session_operation_authority: SessionOperationAuthority | None = None,
     secret_service: WebSecretResolver | None = None,
     secret_wiring_policy: SecretWiringPolicy | None = None,
     user_id: str | None = None,
@@ -785,6 +789,8 @@ def execute_tool(
         require_data_dir_for_paths=require_data_dir_for_paths,
         session_engine=session_engine,
         session_id=session_id,
+        session_operation_context=session_operation_context,
+        session_operation_authority=session_operation_authority,
         secret_service=secret_service,
         secret_wiring_policy=secret_wiring_policy,
         user_id=user_id,

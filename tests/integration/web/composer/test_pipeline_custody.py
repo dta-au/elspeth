@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,9 +18,12 @@ from sqlalchemy import delete, select
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.canonical import stable_hash
-from elspeth.web.blobs.service import content_hash
+from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.blobs.service import StagedInlineCustody, _blob_custody_session_lock, content_hash, prepare_inline_custody_blob
 from elspeth.web.composer.pipeline_custody import (
+    InlineCustodyPublication,
     PipelineCustodyPreparation,
     finalize_pipeline_custody,
     finalize_pipeline_custody_on_connection,
@@ -32,6 +36,7 @@ from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.locking import sqlite_process_session_lock
 from elspeth.web.sessions.models import blobs_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -82,6 +87,31 @@ def _arguments(content: str = "private-inline-value\n42\n") -> dict[str, object]
         "outputs": [],
         "metadata": {"name": "custody proposal"},
     }
+
+
+def _commit_staged_custody(custody: PipelineCustodyPreparation, sessions: SessionServiceImpl, data_dir: Path) -> InlineCustodyPublication:
+    authority = sessions.session_operation_authority
+    context = authority.acquire(
+        session_id=custody.request.session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=120,
+    )
+    try:
+        with _blob_custody_session_lock(sessions._engine, str(custody.request.session_id)):
+            staged = prepare_inline_custody_blob(
+                data_dir=data_dir, request=custody.request, write_guard=partial(authority.compare_and_swap, context)
+            )
+            with sessions._engine.begin() as conn:
+                return finalize_pipeline_custody_on_connection(
+                    custody,
+                    conn=conn,
+                    staged=staged,
+                    max_storage_per_session=custody.max_storage_per_session,
+                    write_fence=None,
+                )
+    finally:
+        authority.release(context)
 
 
 def test_prepare_pipeline_custody_is_pure_and_hashes_only_safe_arguments(tmp_path: Path) -> None:
@@ -147,7 +177,7 @@ def test_finalize_refuses_ceiling_divergent_from_plan_time(tmp_path: Path) -> No
         finalize_pipeline_custody_on_connection(
             custody,
             conn=cast(Connection, object()),  # guard fires before the connection is touched
-            data_dir=tmp_path,
+            staged=cast(StagedInlineCustody, object()),  # the divergent ceiling precedes stage access too
             max_storage_per_session=1024,
             write_fence=None,
         )
@@ -176,14 +206,7 @@ async def test_failed_commit_reconciliation_preserves_a_committed_inline_stage(t
         session_id=session_id,
         max_storage_per_session=500 * 1024 * 1024,
     )
-    with engine.begin() as conn:
-        publication = finalize_pipeline_custody_on_connection(
-            custody,
-            conn=conn,
-            data_dir=tmp_path,
-            max_storage_per_session=500 * 1024 * 1024,
-            write_fence=None,
-        )
+    publication = _commit_staged_custody(custody, sessions, tmp_path)
 
     assert not publication.storage.exists()
     assert publication.staging.exists()
@@ -235,14 +258,26 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
 
     blocked = threading.Event()
     release = threading.Event()
-    real_write = blobs_service._write_or_validate_reserved_blob
+    real_write = blobs_service._atomic_write_blob
 
-    def gated_write(**kwargs: object) -> bool:
+    def gated_write(
+        storage: Path,
+        content: bytes,
+        *,
+        write_guard: Callable[[], None] | None = None,
+        directory_fd: int | None = None,
+    ) -> None:
         blocked.set()
         assert release.wait(timeout=30), "test harness never released the custody worker"
-        return real_write(**kwargs)
+        real_write(storage, content, write_guard=write_guard, directory_fd=directory_fd)
 
-    monkeypatch.setattr(blobs_service, "_write_or_validate_reserved_blob", gated_write)
+    monkeypatch.setattr(blobs_service, "_atomic_write_blob", gated_write)
+    operation_context = sessions.session_operation_authority.acquire(
+        session_id=session.id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=sessions.session_operation_owner_instance_id,
+        lease_seconds=120,
+    )
 
     async def finalize() -> BlobRecord:
         return await finalize_pipeline_custody(
@@ -251,11 +286,13 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
             data_dir=tmp_path,
             max_storage_per_session=500 * 1024 * 1024,
             write_fence=None,
+            session_operation_context=operation_context,
+            session_operation_authority=sessions.session_operation_authority,
         )
 
     try:
         settlement = asyncio.create_task(_await_custody_settlement(finalize()))
-        assert await asyncio.to_thread(blocked.wait, 5), "custody worker never reached the blocked write"
+        assert await run_sync_in_worker(blocked.wait, 5), "custody worker never reached the blocked write"
 
         # The planner gives up on the request while the worker is mid-flight.
         settlement.cancel()
@@ -292,6 +329,7 @@ async def test_cancelled_planner_leaves_blocked_custody_to_settle_exactly_once(t
 
     # The retry (next planner attempt) is idempotent: same row, no duplicate.
     retried = await finalize()
+    sessions.session_operation_authority.release(operation_context)
     assert str(retried.id) == str(custody.blob_id)
     with engine.connect() as conn:
         assert conn.execute(select(blobs_table.c.id).where(blobs_table.c.session_id == session_id)).all() == [(str(custody.blob_id),)]
@@ -320,14 +358,7 @@ async def test_failed_commit_reconciliation_removes_stage_when_committed_row_was
         session_id=session_id,
         max_storage_per_session=500 * 1024 * 1024,
     )
-    with engine.begin() as conn:
-        publication = finalize_pipeline_custody_on_connection(
-            custody,
-            conn=conn,
-            data_dir=tmp_path,
-            max_storage_per_session=500 * 1024 * 1024,
-            write_fence=None,
-        )
+    publication = _commit_staged_custody(custody, sessions, tmp_path)
     publication = replace(publication, cleanup_after_rollback=False)
     with engine.begin() as conn:
         conn.execute(delete(blobs_table).where(blobs_table.c.id == str(custody.blob_id)))

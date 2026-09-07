@@ -657,6 +657,40 @@ BlobReplacementPhase = Literal["intent", "swap_pending", "purge_pending"]
 
 
 @dataclass(frozen=True, slots=True)
+class BlobAtomicDeletionObligation:
+    """Post-commit purge from the live atomic deletion driver.
+
+    Atomic drivers delete metadata and insert this obligation together. They
+    record paths and timestamps, but no operation or content-hash evidence;
+    callers must not treat this narrower obligation as a qualified plan.
+    """
+
+    blob_id: UUID
+    session_id: UUID
+    storage_path: str
+    tombstone_path: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        if type(self.blob_id) is not UUID or type(self.session_id) is not UUID:
+            raise TypeError("BlobAtomicDeletionObligation identities must be exact UUID values")
+        if type(self.storage_path) is not str or not self.storage_path.strip():
+            raise ValueError("BlobAtomicDeletionObligation.storage_path must be nonblank")
+        if self.tombstone_path is not None:
+            if type(self.tombstone_path) is not str or not self.tombstone_path.strip():
+                raise ValueError("BlobAtomicDeletionObligation.tombstone_path must be nonblank when present")
+            if self.storage_path == self.tombstone_path:
+                raise ValueError("BlobAtomicDeletionObligation paths must differ")
+        if type(self.created_at) is not datetime or type(self.updated_at) is not datetime:
+            raise TypeError("BlobAtomicDeletionObligation timestamps must be exact datetimes")
+        if self.created_at.utcoffset() is None or self.updated_at.utcoffset() is None:
+            raise ValueError("BlobAtomicDeletionObligation timestamps must be timezone-aware")
+        if self.updated_at < self.created_at:
+            raise ValueError("BlobAtomicDeletionObligation.updated_at must not precede created_at")
+
+
+@dataclass(frozen=True, slots=True)
 class BlobDeletionPlan:
     """Durable, operation-qualified filesystem deletion obligation."""
 
@@ -856,6 +890,9 @@ def blob_record_snapshot_hash(record: BlobRecord) -> str:
 
 def names_same_blob(value: str, blob_id: str) -> bool:
     """Whether ``value`` names the blob ``blob_id``: the same UUID, in either hex case.
+
+    ``blob_id`` must be the canonical identifier from owned blob metadata.
+    This comparison is not a UUID validator for two arbitrary input strings.
 
     The binding path admits exactly one spelling variance — ``is_widened_blob_ref``
     matches a ``blob_ref`` against the hyphenated UUID form with ``[0-9a-fA-F]``

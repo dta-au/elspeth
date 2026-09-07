@@ -21,6 +21,7 @@ from uuid import UUID
 
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.blobs import (
+    BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
     BlobForkPlanEntry,
@@ -3474,6 +3475,10 @@ class SessionOperationBlobMutations(Protocol):
     ) -> BlobDeletionPlan: ...
 
     def read_blob_deletion(self, *, blob_id: UUID) -> BlobDeletionPlan | None: ...
+
+    def read_atomic_blob_deletion(self, *, blob_id: UUID) -> BlobAtomicDeletionObligation | None: ...
+
+    def retire_atomic_blob_deletion(self, *, obligation: BlobAtomicDeletionObligation) -> bool: ...
 
     def list_blob_deletions(self) -> tuple[BlobDeletionPlan, ...]: ...
 

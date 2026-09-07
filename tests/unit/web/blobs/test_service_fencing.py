@@ -15,14 +15,18 @@ from __future__ import annotations
 import errno
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 from sqlalchemy.pool import StaticPool
 
+from elspeth.contracts.blobs import BlobRecord
+from elspeth.contracts.enums import CreationModality
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationContext, SessionOperationKind
+from elspeth.web.blobs import service as blob_service_module
 from elspeth.web.blobs.protocol import BlobContentMissingError, BlobNotFoundError, BlobQuotaExceededError
 from elspeth.web.blobs.service import BlobServiceImpl, content_hash
 from elspeth.web.coordination.contracts import SessionOperationFenceLost
@@ -78,6 +82,40 @@ def compose_context(db_engine, session_id) -> SessionOperationContext:
 
 async def _ready_blob(blob_service: BlobServiceImpl, session_id: UUID, context: SessionOperationContext, content: bytes = b"a,b\n1,2\n"):
     return await blob_service.create_blob(session_id, "data.csv", content, "text/csv", session_operation_context=context)
+
+
+def _reserve_output_blob(
+    service: BlobServiceImpl, context: SessionOperationContext, run_id: UUID, *, filename: str = "output.csv"
+) -> BlobRecord:
+    blob_id = uuid4()
+    storage = service._storage_path(context.fence.session_id, str(blob_id), filename)
+    storage.parent.mkdir(parents=True, exist_ok=True)
+    record = BlobRecord(
+        id=blob_id,
+        session_id=UUID(context.fence.session_id),
+        filename=filename,
+        mime_type="text/csv",
+        size_bytes=0,
+        content_hash=None,
+        storage_path=str(storage),
+        created_at=datetime.now(UTC),
+        created_by="pipeline",
+        source_description=None,
+        status="pending",
+        creation_modality=CreationModality.VERBATIM,
+        created_from_message_id=None,
+        creating_model_identifier=None,
+        creating_model_version=None,
+        creating_provider=None,
+        creating_composer_skill_hash=None,
+        creating_arguments_hash=None,
+    )
+    authority = service._session_operation_authority
+    authority.mutate(context, lambda transaction: transaction.blobs.reserve_pending_output_blob(record=record))
+    authority.mutate(
+        context, lambda transaction: transaction.blobs.insert_blob_run_link(blob_id=blob_id, run_id=run_id, direction="output")
+    )
+    return record
 
 
 class TestOperationKindRefusal:
@@ -200,6 +238,292 @@ class TestSessionCustody:
             await blob_service.delete_blob(record.id, session_operation_context=stale)
         assert Path(record.storage_path).exists()
         assert len(await blob_service.list_blobs(session_id)) == 1
+
+
+class TestTakeoverDuringBlobMutation:
+    """A proof detached from its later effect does not authorize publication."""
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_takeover_before_file_publication(
+        self,
+        blob_service,
+        db_engine,
+        session_id,
+        compose_context,
+        monkeypatch,
+    ) -> None:
+        original_write = blob_service_module._atomic_write_blob
+        successor: SessionOperationContext | None = None
+        attempted_storage: Path | None = None
+
+        def takeover_then_write(
+            storage: Path,
+            content: bytes,
+            *,
+            write_guard: Any = None,
+            directory_fd: int | None = None,
+        ) -> None:
+            nonlocal successor, attempted_storage
+            attempted_storage = storage
+            successor = seed_live_compose_context(db_engine, session_id, owner_instance_id="successor")
+            original_write(storage, content, write_guard=write_guard, directory_fd=directory_fd)
+
+        monkeypatch.setattr(blob_service_module, "_atomic_write_blob", takeover_then_write)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await blob_service.create_blob(
+                session_id,
+                "stale.csv",
+                b"x\n1\n",
+                "text/csv",
+                session_operation_context=compose_context,
+            )
+
+        assert successor is not None
+        assert attempted_storage is not None
+        assert not attempted_storage.exists()
+        records = await blob_service.list_blobs(session_id)
+        assert all(record.status != "ready" for record in records)
+
+    @pytest.mark.asyncio
+    async def test_delete_refuses_takeover_before_file_removal(
+        self,
+        blob_service,
+        db_engine,
+        session_id,
+        compose_context,
+        monkeypatch,
+    ) -> None:
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        authority = blob_service._session_operation_authority
+        original_compare_and_swap = authority.compare_and_swap
+        successor: SessionOperationContext | None = None
+
+        def takeover_after_proof(context: SessionOperationContext) -> None:
+            nonlocal successor
+            original_compare_and_swap(context)
+            if successor is None:
+                successor = seed_live_compose_context(db_engine, session_id, owner_instance_id="successor")
+
+        monkeypatch.setattr(authority, "compare_and_swap", takeover_after_proof)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+
+        assert successor is not None
+        assert Path(record.storage_path).exists()
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(record.id))).scalar_one() == "ready"
+
+    @pytest.mark.asyncio
+    async def test_link_refuses_takeover_between_proof_and_insert(
+        self,
+        blob_service,
+        db_engine,
+        session_id,
+        compose_context,
+        monkeypatch,
+    ) -> None:
+        record = await _ready_blob(blob_service, session_id, compose_context)
+        run_id = UUID(
+            await _seed_active_run(
+                db_engine,
+                session_id,
+                session_operation_context=compose_context,
+                source={"plugin": "csv", "on_success": "out", "options": {"path": "input.csv"}},
+            )
+        )
+        execute_context = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        authority = blob_service._session_operation_authority
+        original_compare_and_swap = authority.compare_and_swap
+        original_mutate = authority.mutate
+        injected = False
+        proving = False
+
+        def takeover() -> None:
+            nonlocal injected
+            if not injected:
+                seed_live_operation_context(
+                    db_engine,
+                    session_id,
+                    operation_kind=SessionOperationKind.EXECUTE,
+                    owner_instance_id="successor",
+                )
+                injected = True
+
+        def raced_compare_and_swap(context: SessionOperationContext) -> None:
+            nonlocal proving
+            proving = True
+            try:
+                original_compare_and_swap(context)
+            finally:
+                proving = False
+            takeover()
+
+        def raced_mutate(context: SessionOperationContext, mutation: Any) -> Any:
+            if not proving:
+                takeover()
+            return original_mutate(context, mutation)
+
+        monkeypatch.setattr(authority, "compare_and_swap", raced_compare_and_swap)
+        monkeypatch.setattr(authority, "mutate", raced_mutate)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await blob_service.link_blob_to_run(
+                record.id,
+                run_id,
+                "input",
+                session_operation_context=execute_context,
+            )
+
+        assert injected
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blob_run_links_table).where(blob_run_links_table.c.blob_id == str(record.id))).all() == []
+
+    @pytest.mark.asyncio
+    async def test_finalize_refuses_takeover_during_output_read(
+        self,
+        blob_service,
+        db_engine,
+        session_id,
+        compose_context,
+        monkeypatch,
+    ) -> None:
+        run_id = UUID(
+            await _seed_active_run(
+                db_engine,
+                session_id,
+                session_operation_context=compose_context,
+                source={"plugin": "csv", "on_success": "out", "options": {"path": "input.csv"}},
+                status="running",
+            )
+        )
+        execute_context = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        pending = _reserve_output_blob(blob_service, execute_context, run_id)
+        storage = Path(pending.storage_path)
+        storage.write_bytes(b"result\n")
+        original_read_bytes = Path.read_bytes
+        successor: SessionOperationContext | None = None
+
+        def takeover_then_read(path: Path) -> bytes:
+            nonlocal successor
+            if successor is None and path == storage:
+                successor = seed_live_operation_context(
+                    db_engine,
+                    session_id,
+                    operation_kind=SessionOperationKind.EXECUTE,
+                    owner_instance_id="successor",
+                )
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", takeover_then_read)
+
+        with pytest.raises(SessionOperationFenceLost):
+            await blob_service.finalize_run_output_blobs(
+                run_id,
+                success=True,
+                session_operation_context=execute_context,
+            )
+
+        assert successor is not None
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(pending.id))).scalar_one() == "pending"
+        assert storage.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unbound", [False, True], ids=["predecessor-owned", "unbound"])
+    async def test_rejected_output_custody_never_restores_tombstone(
+        self, blob_service, db_engine, session_id, compose_context, unbound
+    ) -> None:
+        run_id = UUID(
+            await _seed_active_run(
+                db_engine,
+                session_id,
+                session_operation_context=compose_context,
+                source={"plugin": "csv", "on_success": "out", "options": {"path": "input.csv"}},
+                status="running",
+            )
+        )
+        predecessor = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        record = _reserve_output_blob(blob_service, predecessor, run_id)
+        if unbound:
+            with db_engine.begin() as conn:
+                conn.execute(
+                    update(blobs_table)
+                    .where(blobs_table.c.id == str(record.id))
+                    .values(
+                        custody_operation_id=None,
+                        custody_operation_epoch=None,
+                        custody_operation_kind=None,
+                    )
+                )
+        token = blob_service_module._blob_operation_path_token(
+            operation_id=predecessor.fence.operation_id,
+            operation_epoch=predecessor.fence.operation_epoch,
+            operation_kind=predecessor.operation_kind,
+        )
+        storage = Path(record.storage_path)
+        tombstone = storage.with_name(f".{record.id}.output-delete-{token}")
+        tombstone.write_bytes(b"predecessor output")
+        successor = seed_live_operation_context(
+            db_engine,
+            session_id,
+            operation_kind=SessionOperationKind.EXECUTE,
+            owner_instance_id="successor",
+        )
+
+        with pytest.raises(AuditIntegrityError, match="exact EXECUTE"):
+            await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=successor)
+
+        assert not storage.exists()
+        assert tombstone.read_bytes() == b"predecessor output"
+        with db_engine.connect() as conn:
+            assert conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(record.id))).scalar_one() == "pending"
+
+
+class TestBoundedBlobMutationArtifacts:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename", ["x" * 200, "é" * 100], ids=["ascii", "utf8"])
+    async def test_delete_accepts_maximum_valid_filename(self, blob_service, session_id, compose_context, filename) -> None:
+        record = await blob_service.create_blob(
+            session_id,
+            filename,
+            b"output",
+            "text/csv",
+            session_operation_context=compose_context,
+        )
+        await blob_service.delete_blob(record.id, session_operation_context=compose_context)
+        assert await blob_service.list_blobs(session_id) == []
+        assert list(Path(record.storage_path).parent.iterdir()) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("filename", ["x" * 200, "é" * 100], ids=["ascii", "utf8"])
+    async def test_failed_output_cleanup_accepts_maximum_valid_filename(
+        self,
+        blob_service,
+        db_engine,
+        session_id,
+        compose_context,
+        filename,
+    ) -> None:
+        run_id = UUID(
+            await _seed_active_run(
+                db_engine,
+                session_id,
+                session_operation_context=compose_context,
+                source={"plugin": "csv", "on_success": "out", "options": {"path": "input.csv"}},
+                status="running",
+            )
+        )
+        context = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
+        record = _reserve_output_blob(blob_service, context, run_id, filename=filename)
+        storage = Path(record.storage_path)
+        storage.write_bytes(b"partial output")
+        result = await blob_service.finalize_run_output_blobs(run_id, success=False, session_operation_context=context)
+        assert result.errors == ()
+        assert len(result.finalized) == 1
+        assert result.finalized[0].status == "error"
+        assert list(storage.parent.iterdir()) == []
 
 
 class TestRacedDeletionReadSeam:
@@ -394,7 +718,17 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         recorder = _RecordingAuthority(blob_service._session_operation_authority)
         blob_service._session_operation_authority = recorder
 
-        result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        blob_updates: list[str] = []
+
+        def record_blob_update(conn, cursor, statement, parameters, context, executemany) -> None:
+            if statement.lstrip().upper().startswith("UPDATE BLOBS SET"):
+                blob_updates.append(statement)
+
+        event.listen(db_engine, "after_cursor_execute", record_blob_update)
+        try:
+            result = await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=execute)
+        finally:
+            event.remove(db_engine, "after_cursor_execute", record_blob_update)
 
         assert list(result.errors) == []
         by_id = {record.id: record for record in result.finalized}
@@ -402,9 +736,12 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         assert by_id[written.id].size_bytes == len(content)
         assert by_id[written.id].content_hash == content_hash(content)
         assert by_id[unwritten.id].status == "error"
-        # One mutation per blob; the run's output set is read once under the CAS first.
-        assert recorder.mutations == [execute, execute]
-        assert recorder.standalone_cas == [execute]
+        # Two fenced output-set reads precede one metadata write per blob.
+        # File guards also revalidate the same authority between byte effects.
+        assert len(blob_updates) == 2
+        assert recorder.mutations == [execute, execute, execute, execute]
+        assert recorder.standalone_cas
+        assert all(context == execute for context in recorder.standalone_cas)
         with db_engine.connect() as conn:
             custody = (
                 conn.execute(select(blobs_table.c.custody_operation_id).where(blobs_table.c.id.in_([str(written.id), str(unwritten.id)])))
@@ -431,7 +768,7 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         Path(reserved.storage_path).write_bytes(b"late\n")
         second_execute = seed_live_operation_context(db_engine, session_id, operation_kind=SessionOperationKind.EXECUTE)
 
-        with pytest.raises(AuditIntegrityError, match="exact EXECUTE custody"):
+        with pytest.raises(AuditIntegrityError, match="exact EXECUTE operation"):
             await blob_service.finalize_run_output_blobs(run_id, success=True, session_operation_context=second_execute)
 
         with db_engine.connect() as conn:
@@ -459,10 +796,12 @@ class TestRunWritesGoThroughTheAuthorityFacet:
         assert failure.blob_id == reserved.id
         assert failure.exc_type == "BlobQuotaExceededError"
         assert failure.detail == str(BlobQuotaExceededError(str(session_id), current_bytes=0, limit_bytes=8))
-        # The quota-refused ready mutation and subsequent error mutation both
-        # use the reserving EXECUTE authority, after the run-level CAS.
-        assert recorder.mutations == [execute, execute]
-        assert recorder.standalone_cas == [execute]
+        # Both output listings, the quota-refused ready mutation and the error
+        # mutation use the reserving EXECUTE authority. Every filesystem guard
+        # also revalidates that exact context.
+        assert recorder.mutations == [execute, execute, execute, execute]
+        assert recorder.standalone_cas
+        assert all(context == execute for context in recorder.standalone_cas)
         with db_engine.connect() as conn:
             row = conn.execute(select(blobs_table).where(blobs_table.c.id == str(reserved.id))).one()
         assert (row.status, row.size_bytes, row.content_hash, row.custody_operation_id) == ("error", 0, None, None)

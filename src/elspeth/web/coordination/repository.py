@@ -25,6 +25,7 @@ from elspeth.contracts.blobs import (
     BLOB_STATUSES,
     STORAGE_MIME_TYPES,
     BlobActiveRunError,
+    BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
     BlobGuidedOperationFenceLostError,
@@ -2626,6 +2627,12 @@ class _RepositoryBlobMutations:
                 operation_kind = SessionOperationKind(cast(str, row.custody_operation_kind))
             except ValueError as exc:
                 raise AuditIntegrityError("pending blob reservation has invalid operation-kind custody") from exc
+            if operation_kind is SessionOperationKind.EXECUTE:
+                # Pipeline outputs retain their run's ownership until that
+                # EXECUTE operation finalizes them. A later COMPOSE create
+                # must neither collect their bytes nor reinterpret them as
+                # abandoned standalone uploads.
+                continue
             if operation_kind not in _BLOB_CREATION_OPERATION_KINDS:
                 raise AuditIntegrityError("pending blob reservation has invalid operation-kind custody")
             obligations.append(
@@ -2699,7 +2706,7 @@ class _RepositoryBlobMutations:
             raise AuditIntegrityError("blob deletion ledger identity was rebound outside session custody")
         blob = self._blob_record(blob_row) if blob_row is not None else None
         try:
-            return BlobDeletionPlan(
+            plan = BlobDeletionPlan(
                 blob_id=UUID(cleanup.blob_id),
                 session_id=UUID(cleanup.session_id),
                 storage_path=cleanup.storage_path,
@@ -2718,6 +2725,12 @@ class _RepositoryBlobMutations:
             )
         except (TypeError, ValueError) as exc:
             raise AuditIntegrityError("blob deletion ledger contains malformed durable evidence") from exc
+        if plan.phase == "purge_pending":
+            if blob is not None:
+                raise AuditIntegrityError("purge-pending deletion still has live blob metadata")
+        elif blob is None or blob_record_snapshot_hash(blob) != plan.blob_snapshot_hash:
+            raise AuditIntegrityError("uncommitted blob deletion requires exact live metadata before recovery")
+        return plan
 
     def _read_blob_deletion_locked(self, *, blob_id: UUID) -> BlobDeletionPlan | None:
         state = self.__state
@@ -2971,6 +2984,98 @@ class _RepositoryBlobMutations:
         state._require_active()
         self._require_operation_kinds(_BLOB_DELETION_RECOVERY_OPERATION_KINDS)
         return self._read_blob_deletion_locked(blob_id=blob_id)
+
+    def read_atomic_blob_deletion(self, *, blob_id: UUID) -> BlobAtomicDeletionObligation | None:
+        """Admit only the current atomic producer's all-NULL evidence schema."""
+        state = self.__state
+        state._require_active()
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
+        state._validate_uuid(blob_id, field_name="blob_id")
+        connection = _resolve_mutation_connection(state._connection_token)
+        cleanup = connection.execute(
+            select(blob_deletion_cleanups_table)
+            .where(
+                blob_deletion_cleanups_table.c.blob_id == str(blob_id),
+                blob_deletion_cleanups_table.c.session_id == state._session_id,
+            )
+            .with_for_update()
+        ).one_or_none()
+        if cleanup is None:
+            return None
+        if any(
+            value is not None
+            for value in (
+                cleanup.operation_id,
+                cleanup.operation_epoch,
+                cleanup.operation_kind,
+                cleanup.phase,
+                cleanup.blob_snapshot_hash,
+                cleanup.expected_file_present,
+                cleanup.expected_file_size,
+                cleanup.expected_file_hash,
+            )
+        ):
+            # Qualified evidence must validate completely; a partially populated
+            # row is neither producer's schema and cannot acquire atomic authority.
+            self._blob_deletion_plan(cleanup)
+            return None
+        if connection.execute(select(blobs_table.c.id).where(blobs_table.c.id == str(blob_id)).with_for_update()).first() is not None:
+            raise AuditIntegrityError("atomic blob deletion obligation still has live blob metadata")
+        try:
+            return BlobAtomicDeletionObligation(
+                blob_id=UUID(cleanup.blob_id),
+                session_id=UUID(cleanup.session_id),
+                storage_path=cleanup.storage_path,
+                tombstone_path=cleanup.tombstone_path,
+                created_at=_ensure_utc(cleanup.created_at),
+                updated_at=_ensure_utc(cleanup.updated_at),
+            )
+        except (TypeError, ValueError) as exc:
+            raise AuditIntegrityError("atomic blob deletion obligation contains malformed durable evidence") from exc
+
+    def retire_atomic_blob_deletion(self, *, obligation: BlobAtomicDeletionObligation) -> bool:
+        """Retire exact atomic evidence through the successor's live authority."""
+        state = self.__state
+        state._require_active()
+        self._require_operation_kinds(_BLOB_RECOVERY_WRITE_OPERATION_KINDS)
+        if type(obligation) is not BlobAtomicDeletionObligation:
+            raise TypeError("obligation must be an exact BlobAtomicDeletionObligation")
+        if str(obligation.session_id) != state._session_id:
+            raise AuditIntegrityError("atomic blob deletion obligation has mismatched session custody")
+        exact = self.read_atomic_blob_deletion(blob_id=obligation.blob_id)
+        if exact is None:
+            # Distinguish completed retirement from replacement by a phased plan.
+            if self._read_blob_deletion_locked(blob_id=obligation.blob_id) is not None:
+                raise AuditIntegrityError("atomic blob deletion obligation was replaced by qualified evidence")
+            live_blob = (
+                _resolve_mutation_connection(state._connection_token)
+                .execute(select(blobs_table.c.id).where(blobs_table.c.id == str(obligation.blob_id)).with_for_update())
+                .first()
+            )
+            if live_blob is not None:
+                raise AuditIntegrityError("retired atomic blob deletion identity has live metadata")
+            return False
+        if exact != obligation:
+            raise AuditIntegrityError("atomic blob deletion obligation no longer matches exact evidence")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            delete(blob_deletion_cleanups_table).where(
+                blob_deletion_cleanups_table.c.blob_id == str(obligation.blob_id),
+                blob_deletion_cleanups_table.c.session_id == state._session_id,
+                blob_deletion_cleanups_table.c.storage_path == obligation.storage_path,
+                blob_deletion_cleanups_table.c.tombstone_path == obligation.tombstone_path,
+                blob_deletion_cleanups_table.c.created_at == obligation.created_at,
+                blob_deletion_cleanups_table.c.updated_at == obligation.updated_at,
+                blob_deletion_cleanups_table.c.operation_id.is_(None),
+                blob_deletion_cleanups_table.c.operation_epoch.is_(None),
+                blob_deletion_cleanups_table.c.operation_kind.is_(None),
+                blob_deletion_cleanups_table.c.phase.is_(None),
+                blob_deletion_cleanups_table.c.blob_snapshot_hash.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_present.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_size.is_(None),
+                blob_deletion_cleanups_table.c.expected_file_hash.is_(None),
+            )
+        )
+        return result.rowcount == 1
 
     def list_blob_deletions(self) -> tuple[BlobDeletionPlan, ...]:
         """List ordinary durable deletion obligations for current recovery."""
@@ -3234,10 +3339,11 @@ class _RepositoryBlobMutations:
         )
         if row is None:
             raise SessionDerivedCustodyError
-        if row.status != "pending":
+        record = self._blob_record(row)
+        if record.status != "pending":
             raise BlobStateError(
                 str(blob_id),
-                message=f"Cannot finalize blob {blob_id} — status is '{row.status}', expected 'pending'",
+                message=f"Cannot finalize blob {blob_id} — status is '{record.status}', expected 'pending'",
             )
         if (
             row.custody_operation_id != operation_context.fence.operation_id

@@ -8145,12 +8145,28 @@ class TestAttemptProofRepair:
                 )
             )
 
+        sessions = _test_sessions_service(engine, tmp_path)
         self.service = ComposerServiceImpl.for_trained_operator(
             catalog=catalog,
             settings=settings,
-            sessions_service=_test_sessions_service(engine, tmp_path),
+            sessions_service=sessions,
             session_engine=engine,
         )
+        from elspeth.contracts.session_operation import SessionOperationKind
+        from tests.helpers.session_fences import ensure_session_fence
+
+        self.authority = sessions.session_operation_authority
+        ensure_session_fence(engine, session_id, owner_instance_id=sessions.session_operation_owner_instance_id)
+        self.operation_context = self.authority.acquire(
+            session_id=UUID(session_id),
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=sessions.session_operation_owner_instance_id,
+            lease_seconds=120,
+        )
+        try:
+            yield
+        finally:
+            self.authority.release(self.operation_context)
 
     def _replace_blob_content(self, body: bytes) -> None:
         from elspeth.web.blobs.service import content_hash as _content_hash
@@ -8179,6 +8195,8 @@ class TestAttemptProofRepair:
             catalog,
             session_engine=self.engine,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
+            session_operation_authority=self.authority,
         )
         assert result.success, result.data
         state = result.updated_state
@@ -8241,6 +8259,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
         assert outcome.action == "clear"
@@ -8256,6 +8275,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=_MAX_REPAIR_TURNS,
         )
         assert outcome.action == "blocked"
@@ -8269,6 +8289,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
         assert outcome.action == "repair_injected"
@@ -8292,6 +8313,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
 
@@ -8333,6 +8355,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=0,
         )
 
@@ -8361,6 +8384,7 @@ class TestAttemptProofRepair:
             state=state,
             llm_messages=messages,
             session_id=self.session_id,
+            session_operation_context=self.operation_context,
             repair_turns_used=1,
         )
         assert outcome.action == "repair_injected"
@@ -8382,6 +8406,7 @@ class TestAttemptProofRepair:
                 state=self._state_with_blocking_csv(),
                 llm_messages=[],
                 session_id=self.session_id,
+                session_operation_context=self.operation_context,
                 repair_turns_used=0,
             )
 
@@ -8413,6 +8438,7 @@ class TestAttemptProofRepair:
                 state=self._state_without_blob(),
                 llm_messages=messages,
                 session_id=self.session_id,
+                session_operation_context=self.operation_context,
                 repair_turns_used=0,
             )
         assert outcome.action == "repair_injected"

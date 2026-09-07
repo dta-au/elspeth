@@ -152,6 +152,7 @@ if TYPE_CHECKING:
     from elspeth.web.composer.service import ComposerServiceImpl
     from elspeth.web.sessions.protocol import (
         ComposerSessionPreferencesRecord,
+        SessionOperationAuthority,
         SessionServiceProtocol,
     )
 
@@ -310,6 +311,8 @@ async def _try_finalize_proposal_custody(
     engine: Engine,
     data_dir: str | Path,
     max_storage_per_session: int,
+    session_operation_context: SessionOperationContext | None,
+    session_operation_authority: SessionOperationAuthority | None,
 ) -> Literal["ready", "quota_exceeded"]:
     """Return an explicit quota outcome while preserving other failures."""
     try:
@@ -318,6 +321,8 @@ async def _try_finalize_proposal_custody(
             engine=engine,
             data_dir=data_dir,
             max_storage_per_session=max_storage_per_session,
+            session_operation_context=session_operation_context,
+            session_operation_authority=session_operation_authority,
         )
     except BlobQuotaExceededError:
         return "quota_exceeded"
@@ -571,6 +576,7 @@ class ToolBatchContext:
     cancellation_requested: asyncio.Event
     plugin_snapshot: PluginAvailabilitySnapshot
     policy_catalog: PolicyCatalogView
+    session_operation_authority: SessionOperationAuthority | None = None
 
 
 @dataclass(slots=True)
@@ -1134,6 +1140,8 @@ async def run_tool_batch(
                     require_data_dir_for_paths=True,
                     session_engine=ctx.service._session_engine,
                     session_id=session_id,
+                    session_operation_context=ctx.session_operation_context,
+                    session_operation_authority=ctx.session_operation_authority,
                     secret_service=ctx.service._secret_service,
                     secret_wiring_policy=ctx.service._secret_wiring_policy,
                     user_id=user_id,
@@ -1233,6 +1241,8 @@ async def run_tool_batch(
                             require_data_dir_for_paths=True,
                             session_engine=ctx.service._session_engine,
                             session_id=session_id,
+                            session_operation_context=ctx.session_operation_context,
+                            session_operation_authority=ctx.session_operation_authority,
                             secret_service=ctx.service._secret_service,
                             secret_wiring_policy=ctx.service._secret_wiring_policy,
                             user_id=user_id,
@@ -1308,6 +1318,8 @@ async def run_tool_batch(
                                 engine=ctx.service._session_engine,
                                 data_dir=ctx.service._data_dir,
                                 max_storage_per_session=ctx.service._settings.max_blob_storage_per_session_bytes,
+                                session_operation_context=ctx.session_operation_context,
+                                session_operation_authority=ctx.session_operation_authority,
                             )
                             if custody_outcome == "quota_exceeded":
                                 proposal_acceptable = False
@@ -1425,6 +1437,8 @@ async def run_tool_batch(
                         data_dir=ctx.service._data_dir,
                         session_engine=ctx.service._session_engine,
                         session_id=session_id,
+                        session_operation_context=ctx.session_operation_context,
+                        session_operation_authority=ctx.session_operation_authority,
                         secret_service=ctx.service._secret_service,
                         secret_wiring_policy=ctx.service._secret_wiring_policy,
                         user_id=user_id,
@@ -2202,6 +2216,8 @@ async def run_tool_batch(
                 data_dir=ctx.service._data_dir,
                 session_engine=ctx.service._session_engine,
                 session_id=session_id,
+                session_operation_context=ctx.session_operation_context,
+                session_operation_authority=ctx.session_operation_authority,
                 secret_service=ctx.service._secret_service,
                 secret_wiring_policy=ctx.service._secret_wiring_policy,
                 user_id=user_id,

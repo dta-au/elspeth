@@ -1343,6 +1343,125 @@ def test_guided_full_inline_custody_settles_atomically_with_its_originating_mess
     assert replay.json() == response.json()
 
 
+def test_guided_full_stages_inline_bytes_before_the_atomic_sql_cohort(composer_test_client, monkeypatch) -> None:
+    """A real route stage cannot retain the cohort's SQL writer transaction."""
+    from elspeth.web.blobs import service as blob_service_module
+
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "inline staging before SQL"}).json()
+    engine = composer_test_client.app.state.session_engine
+    active_writers: set[int] = set()
+    observed_stages: list[Path] = []
+
+    def track_write(conn, _cursor, _statement, _parameters, context, _executemany):
+        if _dml_target_table(context) is not None:
+            active_writers.add(id(conn))
+
+    def finish_transaction(conn):
+        active_writers.discard(id(conn))
+
+    original_write = blob_service_module._atomic_write_blob
+
+    def observe_write(storage, content, **kwargs):
+        assert not active_writers, "filesystem staging retained a SQL writer transaction"
+        original_write(storage, content, **kwargs)
+        assert not active_writers
+        observed_stages.append(storage)
+        assert storage.read_bytes() == _INLINE_CSV_CONTENT
+        with engine.connect() as conn:
+            assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+            assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+
+    monkeypatch.setattr(blob_service_module, "_atomic_write_blob", observe_write)
+    event.listen(engine, "before_cursor_execute", track_write)
+    event.listen(engine, "commit", finish_transaction)
+    event.listen(engine, "rollback", finish_transaction)
+    try:
+        response = composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000051",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", track_write)
+        event.remove(engine, "commit", finish_transaction)
+        event.remove(engine, "rollback", finish_transaction)
+    assert response.status_code == 200, response.text
+    assert len(observed_stages) == 1
+    assert not observed_stages[0].exists()
+    with engine.connect() as conn:
+        blob = conn.execute(select(blobs_table)).one()
+        assert Path(blob.storage_path).read_bytes() == _INLINE_CSV_CONTENT
+        assert conn.exec_driver_sql("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_guided_full_refuses_cohort_after_staged_bytes_lose_session_authority(composer_test_client, monkeypatch) -> None:
+    """A completed filesystem stage cannot authorize a later metadata commit."""
+    from elspeth.contracts.session_operation import SessionOperationContext
+    from elspeth.web.composer import pipeline_custody as pipeline_custody_module
+
+    composer_test_client.app.state.composer_service = _InlineCustodyPlanner()
+    session = composer_test_client.post("/api/sessions", json={"title": "inline staging fence loss"}).json()
+    service = composer_test_client.app.state.session_service
+    authority = service.session_operation_authority
+    contexts: list[SessionOperationContext] = []
+    staged_paths: list[Path] = []
+    original_compare = authority.compare_and_swap
+    original_prepare = pipeline_custody_module.prepare_inline_custody_blob
+    original_stage = service.stage_guided_full_pipeline_proposal
+    stage_refused = False
+
+    def capture_context(context):
+        original_compare(context)
+        contexts.append(context)
+
+    def release_after_staging(**kwargs):
+        staged = original_prepare(**kwargs)
+        staged_paths.append(staged.publication.staging)
+        assert staged.publication.staging.exists()
+        assert contexts
+        authority.release(contexts[-1])
+        return staged
+
+    async def observe_refusal(command, *, session_operation_context):
+        nonlocal stage_refused
+        try:
+            return await original_stage(command, session_operation_context=session_operation_context)
+        except GuidedOperationFenceLostError:
+            stage_refused = True
+            # Only after the real stage refuses the lost session authority,
+            # expire the abandoned worker's other lease. The route otherwise
+            # intentionally joins that live guided lease until it expires.
+            abandon_guided_worker_leases(
+                composer_test_client.app.state.session_engine,
+                session_id=session["id"],
+                operation_id="00000000-0000-4000-8000-000000000052",
+            )
+            raise
+
+    monkeypatch.setattr(authority, "compare_and_swap", capture_context)
+    monkeypatch.setattr(pipeline_custody_module, "prepare_inline_custody_blob", release_after_staging)
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", observe_refusal)
+    with pytest.raises(GuidedOperationFenceLostError):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000052",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
+    assert stage_refused
+    assert len(staged_paths) == 1
+    assert not staged_paths[0].exists()
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        assert conn.scalar(select(func.count()).select_from(blobs_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(chat_messages_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_states_table)) == 0
+        assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
+
+
 def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(composer_test_client) -> None:
     """The stage command trips when the route's settings-derived ceiling
     differs from the ceiling the plan authorized the preparation under —
