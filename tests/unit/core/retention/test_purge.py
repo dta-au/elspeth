@@ -1110,6 +1110,53 @@ class TestPurgePayloads:
         assert result.grade_update_failures == ()
 
 
+def test_purge_reports_concurrent_resume_without_misclassifying_corruption(db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = MockPayloadStore()
+    ref = store.store(b"payload")
+    with db.write_connection() as conn:
+        _create_run(conn, "resuming", status=RunStatus.FAILED, completed_at=datetime.now(UTC))
+        _create_node(conn, "resuming", "source")
+        _create_row(conn, "resuming", "source", "row", row_index=0, source_data_ref=ref)
+    manager = PurgeManager(db, store)
+    find_affected = manager._find_affected_run_ids
+
+    def resume_after_snapshot(refs: list[str]) -> set[str]:
+        affected = find_affected(refs)
+        RunCoordinationRepository(db.engine).acquire_run_leadership(
+            run_id="resuming", worker_id="successor", window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+        )
+        return affected
+
+    monkeypatch.setattr(manager, "_find_affected_run_ids", resume_after_snapshot)
+    result = manager.purge_payloads([ref])
+    assert result.grade_update_failures == ("resuming",)
+    assert result.deleted_count == 1
+    with db.connection() as conn:
+        run = conn.execute(runs_table.select().where(runs_table.c.run_id == "resuming")).one()
+        seat = conn.execute(run_coordination_table.select().where(run_coordination_table.c.run_id == "resuming")).one()
+    assert run.status == RunStatus.RUNNING.value
+    assert run.reproducibility_grade is None
+    assert seat.leader_worker_id == "successor"
+
+
+def test_purge_release_failure_preserves_original_integrity_error(db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = MockPayloadStore()
+    ref = store.store(b"payload")
+    with db.write_connection() as conn:
+        _create_run(conn, "corrupt", status=RunStatus.COMPLETED, completed_at=datetime.now(UTC), reproducibility_grade="invalid")
+        _create_node(conn, "corrupt", "source")
+        _create_row(conn, "corrupt", "source", "row", row_index=0, source_data_ref=ref)
+    release_error = OperationalError("release", {}, RuntimeError("connection lost"))
+
+    def fail_release(self: RunCoordinationRepository, *, token: CoordinationToken) -> None:
+        raise release_error
+
+    monkeypatch.setattr(RunCoordinationRepository, "release_seat", fail_release)
+    with pytest.raises(AuditIntegrityError) as caught:
+        PurgeManager(db, store).purge_payloads([ref])
+    assert caught.value.__cause__ is release_error
+
+
 class TestInterruptedRunNotPurgeEligible:
     """Regression test for Phase 0 fix #5: Interrupted run purge.
 

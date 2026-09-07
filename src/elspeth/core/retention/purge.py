@@ -478,7 +478,15 @@ class PurgeManager:
                 )
                 try:
                     update_grade_after_purge(self._db, coordination_token=authority, deleted_refs=deleted_refs)
-                finally:
+                except BaseException as mutation_error:
+                    try:
+                        coordination.release_seat(token=authority)
+                    except BaseException as release_error:
+                        # Cleanup must not replace an integrity failure with a
+                        # recoverable database error caught by the outer block.
+                        raise mutation_error from release_error
+                    raise
+                else:
                     coordination.release_seat(token=authority)
             except (
                 SQLAlchemyError,

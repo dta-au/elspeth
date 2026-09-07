@@ -704,7 +704,9 @@ class RunCoordinationRepository:
                 run_coordination_table.c.leader_worker_id,
                 run_coordination_table.c.leader_epoch,
                 run_coordination_table.c.leader_heartbeat_expires_at,
-            ).where(run_coordination_table.c.run_id == run_id)
+            )
+            .where(run_coordination_table.c.run_id == run_id)
+            .with_for_update()
         ).one_or_none()
         if seat is None:
             # Epoch-21 invariant: begin_run mints the seat in the same
@@ -874,7 +876,9 @@ class RunCoordinationRepository:
                 run_coordination_table.c.leader_worker_id,
                 run_coordination_table.c.leader_epoch,
                 run_coordination_table.c.leader_heartbeat_expires_at,
-            ).where(run_coordination_table.c.run_id == run_id)
+            )
+            .where(run_coordination_table.c.run_id == run_id)
+            .with_for_update()
         ).one_or_none()
         if seat is None:
             raise AuditIntegrityError(
@@ -883,6 +887,10 @@ class RunCoordinationRepository:
                 "or was written by incompatible code."
             )
         run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+        if run_status == RunStatus.RUNNING.value:
+            from elspeth.core.checkpoint.recovery import NonResumableRunError
+
+            raise NonResumableRunError(run_id, "run is not terminal; its running leader owns finalization")
         if run_status not in _EXPORT_SEAT_RUN_STATUSES:
             raise AuditIntegrityError(
                 f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. "

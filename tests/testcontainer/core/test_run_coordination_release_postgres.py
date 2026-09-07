@@ -76,6 +76,12 @@ def _set_postgresql_transaction_timeouts(conn: Any) -> None:
     conn.exec_driver_sql("SET LOCAL lock_timeout = '5000ms'")
 
 
+def _is_seat_lock_statement(normalized: str) -> bool:
+    return normalized.startswith("UPDATE RUN_COORDINATION") or (
+        normalized.startswith("SELECT") and "FROM RUN_COORDINATION" in normalized and "FOR UPDATE" in normalized
+    )
+
+
 def _run_takeover_contenders(
     first_db: LandscapeDB,
     first: Callable[[], object],
@@ -102,7 +108,7 @@ def _run_takeover_contenders(
         if contender is None or reached_update[contender].is_set():
             return
         normalized = " ".join(statement.upper().split())
-        if normalized.startswith("UPDATE RUN_COORDINATION"):
+        if _is_seat_lock_statement(normalized):
             reached_update[contender].set()
             if not release_update.wait(timeout=15):
                 raise TimeoutError(f"{contender} takeover timed out at the pre-UPDATE race seam")
@@ -486,7 +492,7 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
         name = threading.current_thread().name
         if name == "release" and normalized.startswith("UPDATE RUN_COORDINATION"):
             release_attempting_seat.set()
-        elif name == "acquire" and normalized.startswith("UPDATE RUN_COORDINATION"):
+        elif name == "acquire" and _is_seat_lock_statement(normalized):
             acquire_attempting_seat.set()
 
     def after_sql(_conn: Any, _cursor: Any, statement: str, _params: Any, _context: Any, _many: bool) -> None:
@@ -501,7 +507,7 @@ def test_release_and_takeover_share_seat_then_membership_lock_order(postgres_url
                 release_has_first_lock.set()
                 if not allow_release.wait(timeout=30):
                     raise TimeoutError("release interleaving gate timed out")
-        elif name == "acquire" and normalized.startswith("UPDATE RUN_COORDINATION"):
+        elif name == "acquire" and _is_seat_lock_statement(normalized) and not acquire_has_seat.is_set():
             acquire_has_seat.set()
             if not allow_acquire.wait(timeout=30):
                 raise TimeoutError("acquire interleaving gate timed out")

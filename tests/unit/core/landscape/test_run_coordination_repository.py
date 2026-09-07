@@ -490,7 +490,7 @@ class TestAcquireExportLeadership:
         repo.release_seat(token=token_a)
         image_before = _coordination_image(engine)
 
-        with pytest.raises(AuditIntegrityError, match="not terminal"):
+        with pytest.raises(NonResumableRunError, match="not terminal"):
             repo.acquire_export_leadership(run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
         assert _coordination_image(engine) == image_before
