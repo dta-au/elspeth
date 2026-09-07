@@ -611,7 +611,9 @@ with each probe's `binding.json`, and these receipt artifacts:
 
 The corresponding `.stream` files retain the facade output. Receipt-store
 subjects use the actual cookie-selected replica, and stored receipts remain
-bound to their candidate, revision and replica. Changing the deployment or
+bound to their candidate, revision and replica. Each Single-revision topology
+also carries the ARM `container_app_id`, allowing every receipt admission to
+recompute both replica-binding hashes from the receipt itself. Changing the deployment or
 probe inputs requires fresh evidence; a committed collector and passing local
 tests do not replace the live run or promote the platform support claim.
 
