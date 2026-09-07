@@ -53,6 +53,28 @@ against different work.
 > when false). Pass `--advance` (CLI) / `advance=true` (MCP) to walk the soft
 > transitions automatically.
 
+**A held ticket still accepts your measurement.** `comment_add` and
+`issue_update` (MCP) take an `expected_assignee` precondition. When you pass
+`actor` on a held issue, *your own* actor is the default expected holder —
+which is why a non-holder's comment returns `CONFLICT`. Passing the **current**
+holder's name as `expected_assignee` is a compare-and-swap acknowledgement — "I
+know who holds this" — not a claim steal, and it is the sanctioned way to post
+onto someone else's ticket. Both instinctive reactions to that `CONFLICT` are
+wrong: dropping the measurement loses evidence, and taking the claim races the
+holder. Take a claim only when the holder is genuinely gone, and then as
+`work_release` followed by an atomic `work_start` — never a bare assignee write.
+
+**Releasing a stale claim.** `work_release` clears the assignee and, by default,
+reverts a wip status to its open predecessor so the issue rejoins `work_ready`
+discovery. Pass `revert_status=false` when the work is genuinely in progress
+under a new owner, or when the issue's only `valid_transitions` entry is
+`closed` — a default release would otherwise try to walk it somewhere the
+workflow does not define. `if_held=true` makes the release idempotent: an
+unassigned issue is a no-op and an assigned one is released only if
+`expected_assignee` (or `actor`) matches. Leave the issue unclaimed afterwards
+and let the new owner claim atomically under its own actor name; do not write
+the name you *think* it uses.
+
 ## Guidance Sheets
 
 Load these when facing a specific challenge rather than reading upfront:
