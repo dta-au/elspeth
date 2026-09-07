@@ -629,7 +629,7 @@ scope, for the same reason its method name is not its owner (A6).
 | 70 | `mark_blocked_barrier_pending_sink_many` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | NO production caller at either layer. DELETE candidate — RAISED, not ruled |
 | 71 | `mark_blocked_barrier_terminal` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
 | 72 | `adopt_blocked_barrier_item` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
-| 73 | `reset_adoption_marker_to_pending` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.3 LIVE UNFENCED LEADER WRITE — elspeth-ee18e446ff (P1) |
+| 73 | `reset_adoption_marker_to_pending` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.3 was a live unfenced leader write; fixed and fenced in 0.8.0 — elspeth-ee18e446ff closed 2026-09-07 |
 | 74 | `adopt_group_losses` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
 | 75 | `reserve` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | no authority fence of any kind today (ordering CAS only) |
 | 76 | `claim_preparation` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
@@ -675,14 +675,22 @@ serves the finalize-time callers `run_lifecycle_repository.py:839`
 takes the other's type and neither is Optional. One verb with an optional or
 union-typed authority would be exactly option (B) in miniature.
 
-**R7.3 — `reset_adoption_marker_to_pending` is a live unfenced leader write** on
-the release branch (`scheduler/barrier.py:1204-1211`, a bare `begin_write`; the
-caller `BarrierRecoveryCoordinator` binds the token at
-`barrier_coordination.py:1662` and calls at `:2465`/`:2497`). Filed as
+**R7.3 — `reset_adoption_marker_to_pending` was a live unfenced leader write** on
+the release branch: a bare `begin_write` in `scheduler/barrier.py`, while its
+caller `BarrierRecoveryCoordinator` held the token and did not pass it. Filed as
 **elspeth-ee18e446ff, P1** — the priority follows the consequence, not the size of
 the fix: a deposed leader replaying an adoption reset unrefused is precisely what
-the epoch fence exists to prevent. The verb's docstring asserting it is
-deliberately fence-free is refuted in source (the two-takeover window).
+the epoch fence exists to prevent. The verb's docstring asserting it was
+deliberately fence-free was refuted in source (the two-takeover window).
+
+**Resolved in 0.8.0** (`f1770eb8b`, `6e2dc8360`; ticket closed 2026-09-07). The
+verb now takes a required keyword-only `CoordinationToken`, derives `run_id`
+from it, and opens `fenced_leader_transaction` as its first database effect; the
+facade forwards and both caller sites pass the token they hold. Pinned by the
+stale-token arm in `tests/unit/core/landscape/test_leader_fence_stale_token.py`
+— a deposed epoch raises `RunLeadershipLostError`, records exactly one
+`fence_refusal`, and mutates no marker. The pre-fix line numbers this finding
+originally cited are deliberately not carried forward; they no longer resolve.
 
 **R7.4 — `claim_pending_sink` is LEADER.** The evidence is the follower contract
 in `engine/orchestrator/follower.py`, quoted rather than asserted:
