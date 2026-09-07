@@ -25,6 +25,7 @@ from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationContext,
     SessionOperationFenceLost,
+    SessionOperationKind,
 )
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.sessions.protocol import (
@@ -809,10 +810,28 @@ def register_session_routes(router: APIRouter) -> None:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
     ) -> SessionResponse:
-        """Update a session's user-visible metadata. IDOR-protected."""
+        """Update a session's user-visible metadata. IDOR-protected.
+
+        The rename is a fenced session write (P4-D6 family A2b): it holds the
+        same COMPOSE operation the message writers hold, so a concurrent
+        compose, fork or archive is serialised against it rather than raced.
+        """
         session = await _verify_session_ownership(session_id, user, request)
         service = request.app.state.session_service
-        updated = await service.update_session_title(session.id, body.title)
+        async with (
+            await SessionOperationLease.acquire(
+                service.session_operation_authority,
+                session_id=session.id,
+                operation_kind=SessionOperationKind.COMPOSE,
+                owner_instance_id=service.session_operation_owner_instance_id,
+                lease_seconds=service.session_operation_lease_seconds,
+            ) as compose_operation_lease,
+        ):
+            updated = await service.update_session_title(
+                session.id,
+                body.title,
+                session_operation_context=compose_operation_lease.context,
+            )
         return _session_response(updated)
 
     @router.delete("/{session_id}", status_code=204)

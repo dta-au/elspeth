@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.web.composer import provider_telemetry
 from elspeth.web.composer.audit import llm_call_audit_envelope, llm_call_audit_summary
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.sessions import service as service_module
 from elspeth.web.sessions.models import chat_messages_table
 from elspeth.web.sessions.service import SessionServiceImpl
@@ -99,6 +100,14 @@ async def test_freeform_call_projects_only_after_audit_row_commit(engine, monkey
 @pytest.mark.asyncio
 async def test_freeform_rollback_projects_nothing(engine, monkeypatch) -> None:
     service = _service(engine)
+    # P4-D6 family A2b: the write is fenced, so an absent session is now
+    # refused at the FENCE, before a transaction is ever opened — which no
+    # longer exercises the rollback this test measures. Use a real session so
+    # the fence passes, and let the row fail at the DATABASE instead: an
+    # ``audit`` row carrying a parent violates the ``ck_chat_messages_parent_role``
+    # CHECK constraint, so the INSERT raises inside the transaction, the
+    # transaction unwinds, and the post-commit projection must not fire.
+    session_id = (await service.create_session("alice", "rollback telemetry", "local")).id
     observed: list[object] = []
     monkeypatch.setattr(
         service_module,
@@ -110,14 +119,22 @@ async def test_freeform_rollback_projects_nothing(engine, monkeypatch) -> None:
 
     with pytest.raises(IntegrityError):
         await service.add_message(
-            uuid4(),
+            session_id,
             "audit",
             llm_call_audit_summary(call),
             writer_principal="compose_loop",
             tool_calls=[llm_call_audit_envelope(call)],
+            parent_assistant_id=uuid4(),
         )
 
     assert observed == []
+    with engine.connect() as conn:
+        assert (
+            conn.execute(
+                select(func.count()).select_from(chat_messages_table).where(chat_messages_table.c.session_id == str(session_id))
+            ).scalar_one()
+            == 0
+        )
 
 
 @pytest.mark.asyncio
@@ -125,6 +142,19 @@ async def test_freeform_cancellation_projects_worker_commit_before_reraising(eng
     service = _service(engine)
     session_id = (await service.create_session("alice", "cancelled telemetry", "local")).id
     call = _call()
+    # P4-D6 family A2b: acquire the turn's COMPOSE operation BEFORE
+    # ``_run_sync`` is blocked below and pass it explicitly. The harness would
+    # otherwise acquire it through the same ``_run_sync`` this test suspends,
+    # so ``started`` would fire on the fence acquisition instead of on the
+    # message write the cancellation is aimed at.
+    compose_context = await service._run_sync(
+        lambda: service.session_operation_authority.acquire(
+            session_id=session_id,
+            operation_kind=SessionOperationKind.COMPOSE,
+            owner_instance_id=service.session_operation_owner_instance_id,
+            lease_seconds=service.session_operation_lease_seconds,
+        )
+    )
     started = threading.Event()
     release = threading.Event()
     worker_done = threading.Event()
@@ -166,6 +196,7 @@ async def test_freeform_cancellation_projects_worker_commit_before_reraising(eng
             llm_call_audit_summary(call),
             writer_principal="compose_loop",
             tool_calls=[llm_call_audit_envelope(call)],
+            session_operation_context=compose_context,
         )
     )
     assert await asyncio.to_thread(started.wait, 5)

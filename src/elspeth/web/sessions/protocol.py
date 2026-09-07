@@ -3230,6 +3230,8 @@ class SessionOperationSessionMutations(Protocol):
 
     def mark_session_updated(self, *, updated_at: datetime) -> None: ...
 
+    def set_title(self, *, title: str, updated_at: datetime) -> None: ...
+
     def record_composition_rejection(
         self,
         *,
@@ -3287,6 +3289,21 @@ class SessionOperationInterpretationMutations(Protocol):
         composer_skill_hash: str,
         created_at: datetime,
     ) -> InterpretationEventRecord: ...
+
+    def resolve_pending_event(
+        self,
+        *,
+        event_id: UUID,
+        choice: InterpretationChoice,
+        accepted_value: str | None,
+        resolved_at: datetime,
+        actor: str,
+        arguments_hash: str,
+        hash_domain_version: str,
+        runtime_model_identifier: str | None,
+        runtime_model_version: str | None,
+        resolved_prompt_template_hash: str | None,
+    ) -> None: ...
 
 
 class SessionOperationRunMutations(Protocol):
@@ -3935,7 +3952,7 @@ class SessionServiceProtocol(Protocol):
         session_id: UUID,
         title: str,
         *,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> SessionRecord: ...
 
     async def list_sessions(
@@ -4150,6 +4167,7 @@ class SessionServiceProtocol(Protocol):
         resolved_at: datetime | None = None,
         runtime_model_identifier: str | None = None,
         runtime_model_version: str | None = None,
+        session_operation_context: SessionOperationContext,
     ) -> tuple[InterpretationEventRecord, CompositionStateRecord]:
         """Commit a resolution and update the affected interpretation surface.
 
@@ -4277,7 +4295,7 @@ class SessionServiceProtocol(Protocol):
         raw_content: str | None = None,
         tool_call_id: str | None = None,
         parent_assistant_id: UUID | None = None,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> ChatMessageRecord: ...
 
@@ -4288,7 +4306,7 @@ class SessionServiceProtocol(Protocol):
         *,
         writer_principal: ChatMessageWriterPrincipal,
         composition_state_id: UUID | None = None,
-        session_operation_context: SessionOperationContext | None = None,
+        session_operation_context: SessionOperationContext,
         session_operation_kind: SessionOperationKind = SessionOperationKind.COMPOSE,
     ) -> None:
         """Persist one audit cohort all-or-nothing (elspeth-90231248dc).

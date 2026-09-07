@@ -245,7 +245,14 @@ async def recompose(
                 )
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    await _persist_llm_calls(service, session.id, llm_calls, pre_send_state_id, plugin_crash_pending=True)
+                    await _persist_llm_calls(
+                        service,
+                        session.id,
+                        llm_calls,
+                        pre_send_state_id,
+                        plugin_crash_pending=True,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 raise HTTPException(
                     status_code=502,
                     detail=_litellm_error_detail(
@@ -272,7 +279,14 @@ async def recompose(
                 )
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    await _persist_llm_calls(service, session.id, llm_calls, pre_send_state_id, plugin_crash_pending=True)
+                    await _persist_llm_calls(
+                        service,
+                        session.id,
+                        llm_calls,
+                        pre_send_state_id,
+                        plugin_crash_pending=True,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 raise HTTPException(
                     status_code=502,
                     detail=_litellm_error_detail(
@@ -299,7 +313,14 @@ async def recompose(
                 )
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    await _persist_llm_calls(service, session.id, llm_calls, pre_send_state_id, plugin_crash_pending=True)
+                    await _persist_llm_calls(
+                        service,
+                        session.id,
+                        llm_calls,
+                        pre_send_state_id,
+                        plugin_crash_pending=True,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 raise HTTPException(
                     status_code=502,
                     detail=_litellm_error_detail(
@@ -399,6 +420,7 @@ async def recompose(
                     service,
                     session.id,
                     pre_send_state_id,
+                    session_operation_context=compose_operation_lease.context,
                 )
                 raise HTTPException(status_code=status_code, detail=planner_response_body) from exc
             except ComposerServiceError as exc:
@@ -414,7 +436,14 @@ async def recompose(
                 )
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    await _persist_llm_calls(service, session.id, llm_calls, pre_send_state_id, plugin_crash_pending=True)
+                    await _persist_llm_calls(
+                        service,
+                        session.id,
+                        llm_calls,
+                        pre_send_state_id,
+                        plugin_crash_pending=True,
+                        session_operation_context=compose_operation_lease.context,
+                    )
                 raise HTTPException(
                     status_code=502,
                     detail={"error_type": "composer_error", "detail": str(exc)},
@@ -436,6 +465,7 @@ async def recompose(
                         llm_calls,
                         pre_send_state_id,
                         plugin_crash_pending=True,
+                        session_operation_context=compose_operation_lease.context,
                     )
 
             # Compute the post-compose guided_session and composer_meta.
@@ -644,6 +674,7 @@ async def recompose(
                     composition_state_id=post_compose_state_id,
                     raw_content=_turn_end.raw_content,
                     writer_principal="compose_loop",
+                    session_operation_context=compose_operation_lease.context,
                 )
             # Per-tool-call audit trail (recompose path; symmetric with
             # send_message). Tool rows and LLM sidecars are ONE turn cohort
@@ -658,6 +689,7 @@ async def recompose(
                 llm_composition_state_id=pre_send_state_id,
                 parent_assistant_id=assistant_msg.id,
                 plugin_crash_pending=False,
+                session_operation_context=compose_operation_lease.context,
             )
             await _publish_progress(
                 progress_sink,
@@ -714,6 +746,7 @@ async def recompose(
                             llm_calls,
                             pre_send_state_id,
                             plugin_crash_pending=True,
+                            session_operation_context=compose_operation_lease.context,
                         )
                     )
             with contextlib.suppress(asyncio.CancelledError):

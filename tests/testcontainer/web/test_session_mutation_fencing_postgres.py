@@ -58,6 +58,7 @@ from elspeth.web.sessions.models import (
     web_instances_table,
 )
 from elspeth.web.sessions.protocol import (
+    ChatMessageRecord,
     CompositionStateData,
     GuidedForkSettlementCommand,
     GuidedOperationClaimed,
@@ -695,6 +696,38 @@ def _fork_write_fence(
     )
 
 
+async def _add_message(
+    service: SessionServiceImpl,
+    session_id: UUID,
+    role: str,
+    content: str,
+    *,
+    writer_principal: str,
+) -> ChatMessageRecord:
+    """Write one message under a real COMPOSE operation, released afterwards.
+
+    P4-D6 family A2b (elspeth-99949c96ca): ``add_message`` has no unfenced arm
+    any more. The operation is acquired and released around the single write so
+    the fork claim that follows in these tests can take the session itself.
+    """
+    context = service.session_operation_authority.acquire(
+        session_id=session_id,
+        operation_kind=SessionOperationKind.COMPOSE,
+        owner_instance_id=service.session_operation_owner_instance_id,
+        lease_seconds=service.session_operation_lease_seconds,
+    )
+    try:
+        return await service.add_message(
+            session_id,
+            role,
+            content,
+            writer_principal=writer_principal,
+            session_operation_context=context,
+        )
+    finally:
+        service.session_operation_authority.release(context)
+
+
 async def _claim(
     service: SessionServiceImpl,
     session_id: UUID,
@@ -749,12 +782,7 @@ async def test_postgres_dual_fence_atomic_takeover_stale_refusal_and_fs_has_no_c
         )
     finally:
         await create_lease.close()
-    message = await first.add_message(
-        parent.id,
-        "user",
-        "fork here",
-        writer_principal="route_user_message",
-    )
+    message = await _add_message(first, parent.id, "user", "fork here", writer_principal="route_user_message")
     operation_id = str(uuid4())
     first_parent = await _claim(first, parent.id, operation_id)
     fence_statements: list[tuple[str, str]] = []
@@ -1021,12 +1049,7 @@ async def test_postgres_target_rename_holds_no_connection_and_release_cannot_dea
         )
     finally:
         await create_lease.close()
-    message = await first.add_message(
-        parent.id,
-        "user",
-        "fork",
-        writer_principal="route_user_message",
-    )
+    message = await _add_message(first, parent.id, "user", "fork", writer_principal="route_user_message")
     authority = await _claim(first, parent.id, str(uuid4()))
     staged = await first.fork_session(
         authority,
@@ -1157,12 +1180,7 @@ async def test_postgres_target_rename_paused_copy_reds_at_finalize_when_the_pare
         )
     finally:
         await create_lease.close()
-    message = await first.add_message(
-        parent.id,
-        "user",
-        "fork",
-        writer_principal="route_user_message",
-    )
+    message = await _add_message(first, parent.id, "user", "fork", writer_principal="route_user_message")
     authority = await _claim(first, parent.id, str(uuid4()))
     staged = await first.fork_session(
         authority,
@@ -1228,12 +1246,7 @@ async def test_postgres_archive_first_paused_gap_admits_no_guided_row_or_child(
     _register_instance(first_engine, first.session_operation_owner_instance_id)
     _register_instance(first_engine, second.session_operation_owner_instance_id)
     parent = await first.create_session(f"pg-archive-{uuid4()}", "Parent", "local")
-    message = await first.add_message(
-        parent.id,
-        "user",
-        "fork",
-        writer_principal="route_user_message",
-    )
+    message = await _add_message(first, parent.id, "user", "fork", writer_principal="route_user_message")
     blob_dir = shared / "blobs" / str(parent.id)
     blob_dir.mkdir(parents=True)
     (blob_dir / "held.bin").write_bytes(b"held")
@@ -1623,12 +1636,7 @@ async def test_postgres_archive_faults_never_touch_unrelated_session_rows(
     _register_instance(first_engine, second.session_operation_owner_instance_id)
     target = await first.create_session(f"pg-archive-fault-{uuid4()}", "Fault target", "local")
     unrelated = await first.create_session(f"pg-archive-control-{uuid4()}", "Untouched control", "local")
-    await first.add_message(
-        unrelated.id,
-        "user",
-        "control message",
-        writer_principal="route_user_message",
-    )
+    await _add_message(first, unrelated.id, "user", "control message", writer_principal="route_user_message")
     target_dir = shared / "blobs" / str(target.id)
     control_dir = shared / "blobs" / str(unrelated.id)
     target_dir.mkdir(parents=True)

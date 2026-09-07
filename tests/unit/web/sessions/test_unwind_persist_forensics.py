@@ -33,6 +33,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation, ComposerToo
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import (
     RunDiagnosticsAuditAuthority,
@@ -47,6 +48,23 @@ from elspeth.web.sessions.routes._helpers import (
     _persist_tool_invocations,
     _persist_turn_audit_cohort,
 )
+
+
+def _compose_context(session_id: UUID) -> SessionOperationContext:
+    """The COMPOSE operation the failing turn ran under (P4-D6 family A2b).
+
+    The persist helpers take the caller's operation as a required argument;
+    the unwind path they are exercised on here carries it like any other.
+    """
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id=f"unwind-forensics-{session_id}",
+            lease_token=f"unwind-forensics-token-{session_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 class _RecordingCounter:
@@ -144,13 +162,15 @@ async def test_llm_calls_unwind_counts_every_lost_row_and_names_every_model(unwi
         _llm_call("provider/model-c"),
     )
 
+    session_id = uuid4()
     with structlog.testing.capture_logs() as captured:
         await _persist_llm_calls(
             cast(SessionServiceProtocol, _FailingService()),
-            uuid4(),
+            session_id,
             calls,
             None,
             plugin_crash_pending=True,
+            session_operation_context=_compose_context(session_id),
         )
 
     assert unwind_counter.adds == [(3, {"helper": "llm_calls"})]
@@ -167,13 +187,15 @@ async def test_tool_invocations_unwind_counts_every_lost_row(unwind_counter: _Re
         _tool_invocation("upsert_node"),
     )
 
+    session_id = uuid4()
     with structlog.testing.capture_logs() as captured:
         result = await _persist_tool_invocations(
             cast(SessionServiceProtocol, _FailingService()),
-            uuid4(),
+            session_id,
             invocations,
             None,
             plugin_crash_pending=True,
+            session_operation_context=_compose_context(session_id),
         )
 
     assert result == ()
@@ -190,15 +212,17 @@ async def test_turn_cohort_unwind_counts_both_groups_and_names_every_model(unwin
         _llm_call("provider/model-b"),
     )
 
+    session_id = uuid4()
     with structlog.testing.capture_logs() as captured:
         result = await _persist_turn_audit_cohort(
             cast(SessionServiceProtocol, _FailingService()),
-            uuid4(),
+            session_id,
             invocations,
             calls,
             tool_composition_state_id=None,
             llm_composition_state_id=None,
             plugin_crash_pending=True,
+            session_operation_context=_compose_context(session_id),
         )
 
     assert result == ()

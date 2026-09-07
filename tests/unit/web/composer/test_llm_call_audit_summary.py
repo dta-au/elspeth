@@ -54,10 +54,30 @@ from elspeth.contracts.composer_planner_audit import (
 )
 from elspeth.web.composer.audit import llm_call_audit_summary
 from elspeth.web.composer.service import ComposerServiceImpl
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.guided_audit import prepare_guided_audit_rows
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_llm_calls
+
+
+def _compose_context(session_id: UUID) -> SessionOperationContext:
+    """The COMPOSE operation the audited turn ran under (P4-D6 family A2b).
+
+    The LLM-sidecar and planner-audit writers take the caller's operation as a
+    required argument; these tests measure the audit summary text, and carry
+    the fence exactly as the live compose turn does.
+    """
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id=f"llm-call-audit-{session_id}",
+            lease_token=f"llm-call-audit-token-{session_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+
 
 # Terminal states that mean "the turn ended normally". ``tool_calls`` is the
 # ordinary ending of every healthy iteration of a tool-using loop, which is
@@ -322,12 +342,14 @@ class TestAllThreeDrainSitesShareOneProjection:
     async def _helpers_site_content(call: ComposerLLMCall) -> str:
         service = _CapturingSessionService()
 
+        session_id = uuid4()
         await _persist_llm_calls(
             cast(SessionServiceProtocol, service),
-            uuid4(),
+            session_id,
             (call,),
             None,
             plugin_crash_pending=False,
+            session_operation_context=_compose_context(session_id),
         )
 
         (message,) = service.messages
@@ -344,13 +366,15 @@ class TestAllThreeDrainSitesShareOneProjection:
             planner_call_ordinal=1,
         )
 
+        planner_session_id = uuid4()
         await ComposerServiceImpl._persist_pipeline_planner_audit(
             cast(Any, host),
-            session_id=uuid4(),
+            session_id=planner_session_id,
             current_state_id=None,
             llm_calls=(planner_call,),
             planner_attempts=(_attempt(planner_call_ordinal=1),),
             invocations=(),
+            session_operation_context=_compose_context(planner_session_id),
         )
 
         message = service.messages[0]
@@ -403,13 +427,15 @@ async def test_freeform_planner_persistence_atomically_interleaves_physical_call
     failed_call = _call(status=ComposerLLMCallStatus.API_ERROR, planner_call_ordinal=1)
     response_call = _call(planner_call_ordinal=2)
 
+    planner_session_id = uuid4()
     await ComposerServiceImpl._persist_pipeline_planner_audit(
         cast(Any, host),
-        session_id=uuid4(),
+        session_id=planner_session_id,
         current_state_id=None,
         llm_calls=(failed_call, response_call),
         planner_attempts=(_attempt(planner_call_ordinal=2),),
         invocations=(),
+        session_operation_context=_compose_context(planner_session_id),
     )
 
     assert [message.kwargs["tool_calls"][0]["_kind"] for message in service.messages] == [

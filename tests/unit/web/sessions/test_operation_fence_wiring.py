@@ -405,6 +405,15 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     ),
                     type(None),
                 ),
+                # P4-D6 family A2b: the title route holds the same COMPOSE
+                # operation the other message writers hold.
+                "set_title": (
+                    (
+                        ("title", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("updated_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                    ),
+                    type(None),
+                ),
             },
         ),
         (
@@ -690,6 +699,23 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                         ("created_at", inspect.Parameter.KEYWORD_ONLY, datetime),
                     ),
                     sessions_protocol.InterpretationEventRecord,
+                ),
+                # P4-D6 family A2b: resolving a pending event is a fenced
+                # COMPOSE write on the interpretation authority.
+                "resolve_pending_event": (
+                    (
+                        ("event_id", inspect.Parameter.KEYWORD_ONLY, UUID),
+                        ("choice", inspect.Parameter.KEYWORD_ONLY, sessions_protocol.InterpretationChoice),
+                        ("accepted_value", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("resolved_at", inspect.Parameter.KEYWORD_ONLY, datetime),
+                        ("actor", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("arguments_hash", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("hash_domain_version", inspect.Parameter.KEYWORD_ONLY, str),
+                        ("runtime_model_identifier", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("runtime_model_version", inspect.Parameter.KEYWORD_ONLY, str | None),
+                        ("resolved_prompt_template_hash", inspect.Parameter.KEYWORD_ONLY, str | None),
+                    ),
+                    type(None),
                 ),
             },
         ),

@@ -24,9 +24,27 @@ from elspeth.contracts.composer_llm_audit import ComposerLLMCallStatus
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.llm_response_parsing import build_llm_call_record
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_turn_audit_cohort
+
+
+def _compose_context(session_id: UUID) -> SessionOperationContext:
+    """The COMPOSE operation a turn runs under (P4-D6 family A2b).
+
+    ``_persist_turn_audit_cohort`` no longer has an unfenced arm: the turn's
+    context is a required argument it must carry through to the cohort writer.
+    """
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id=f"turn-audit-cohort-{session_id}",
+            lease_token=f"turn-audit-cohort-token-{session_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 @dataclass
@@ -35,6 +53,7 @@ class _CapturedCohort:
     drafts: tuple[AuditMessageDraft, ...]
     writer_principal: str
     composition_state_id: UUID | None
+    session_operation_context: SessionOperationContext | None
 
 
 @dataclass
@@ -51,6 +70,7 @@ class _CohortCapturingService:
         *,
         writer_principal: str,
         composition_state_id: UUID | None = None,
+        session_operation_context: SessionOperationContext | None = None,
         **_fenced_kwargs: object,
     ) -> None:
         if self.raise_on_call is not None:
@@ -61,6 +81,7 @@ class _CohortCapturingService:
                 drafts=tuple(drafts),
                 writer_principal=writer_principal,
                 composition_state_id=composition_state_id,
+                session_operation_context=session_operation_context,
             )
         )
 
@@ -119,12 +140,16 @@ async def test_tool_and_llm_groups_settle_as_one_cohort_with_their_own_state_ids
         llm_composition_state_id=pre_state_id,
         parent_assistant_id=assistant_id,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     # ONE service call for the whole turn — the mechanism under test.
     (cohort,) = service.cohorts
     assert cohort.session_id == session_id
     assert cohort.writer_principal == "compose_loop"
+    # P4-D6 family A2b: the turn's operation reaches the cohort writer
+    # unchanged — the helper carries custody, it does not mint or drop it.
+    assert cohort.session_operation_context == _compose_context(session_id)
     # The cohort-level state id stays None; each group binds per-draft.
     assert cohort.composition_state_id is None
     tool_draft, llm_draft = cohort.drafts
@@ -143,15 +168,17 @@ async def test_tool_and_llm_groups_settle_as_one_cohort_with_their_own_state_ids
 @pytest.mark.asyncio
 async def test_no_parent_assistant_uses_audit_role_for_tool_rows() -> None:
     service = _CohortCapturingService()
+    session_id = uuid4()
 
     await _persist_turn_audit_cohort(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (_tool_invocation(),),
         (),
         tool_composition_state_id=None,
         llm_composition_state_id=None,
         plugin_crash_pending=True,
+        session_operation_context=_compose_context(session_id),
     )
 
     ((tool_draft,),) = [c.drafts for c in service.cohorts]
@@ -163,15 +190,17 @@ async def test_no_parent_assistant_uses_audit_role_for_tool_rows() -> None:
 @pytest.mark.asyncio
 async def test_both_groups_empty_is_a_noop() -> None:
     service = _CohortCapturingService()
+    session_id = uuid4()
 
     result = await _persist_turn_audit_cohort(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (),
         (),
         tool_composition_state_id=uuid4(),
         llm_composition_state_id=uuid4(),
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert result == ()
@@ -181,15 +210,17 @@ async def test_both_groups_empty_is_a_noop() -> None:
 @pytest.mark.asyncio
 async def test_unwind_failure_swallows_and_returns_no_bindings() -> None:
     service = _CohortCapturingService(raise_on_call=OperationalError("INSERT", {}, Exception("db down")))
+    session_id = uuid4()
 
     result = await _persist_turn_audit_cohort(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (_tool_invocation(),),
         (_llm_call(),),
         tool_composition_state_id=None,
         llm_composition_state_id=None,
         plugin_crash_pending=True,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert result == ()
@@ -198,14 +229,16 @@ async def test_unwind_failure_swallows_and_returns_no_bindings() -> None:
 @pytest.mark.asyncio
 async def test_success_path_failure_is_tier1_audit_corruption() -> None:
     service = _CohortCapturingService(raise_on_call=OperationalError("INSERT", {}, Exception("db down")))
+    session_id = uuid4()
 
     with pytest.raises(AuditIntegrityError, match="composer_turn_audit_cohort_persist_failed"):
         await _persist_turn_audit_cohort(
             cast(SessionServiceProtocol, service),
-            uuid4(),
+            session_id,
             (_tool_invocation(),),
             (_llm_call(),),
             tool_composition_state_id=None,
             llm_composition_state_id=None,
             plugin_crash_pending=False,
+            session_operation_context=_compose_context(session_id),
         )

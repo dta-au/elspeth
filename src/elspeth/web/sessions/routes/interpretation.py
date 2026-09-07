@@ -125,15 +125,27 @@ def register_interpretation_routes(router: APIRouter) -> None:
             runtime_model_identifier, runtime_model_version = _extract_runtime_model_snapshot(current_state, affected_node_id)
 
         try:
-            event, new_state = await service.resolve_interpretation_event(
-                session_id=session_id,
-                event_id=event_id,
-                choice=InterpretationChoice(body.choice),
-                amended_value=body.amended_value,
-                actor=actor,
-                runtime_model_identifier=runtime_model_identifier,
-                runtime_model_version=runtime_model_version,
-            )
+            compose_lock = await _get_session_compose_lock_registry(raw_request).get_lock(str(session_id))
+            async with (
+                compose_lock,
+                await SessionOperationLease.acquire(
+                    service.session_operation_authority,
+                    session_id=session_id,
+                    operation_kind=SessionOperationKind.COMPOSE,
+                    owner_instance_id=service.session_operation_owner_instance_id,
+                    lease_seconds=service.session_operation_lease_seconds,
+                ) as compose_operation_lease,
+            ):
+                event, new_state = await service.resolve_interpretation_event(
+                    session_id=session_id,
+                    event_id=event_id,
+                    choice=InterpretationChoice(body.choice),
+                    amended_value=body.amended_value,
+                    actor=actor,
+                    runtime_model_identifier=runtime_model_identifier,
+                    runtime_model_version=runtime_model_version,
+                    session_operation_context=compose_operation_lease.context,
+                )
         except InterpretationEventAlreadyResolvedError as exc:
             raise HTTPException(
                 status_code=409,

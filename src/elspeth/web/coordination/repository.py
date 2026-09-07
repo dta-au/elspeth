@@ -634,6 +634,32 @@ class _RepositorySessionMutations:
             )
         )
 
+    def set_title(self, *, title: str, updated_at: datetime) -> None:
+        """Rename the bound session under exact COMPOSE custody (P4-D6 family A2b).
+
+        The title route holds the same COMPOSE operation the other message
+        writers hold; a missing session row is a custody error here (the
+        service reports absence before it reaches this facet).
+        """
+        state = self.__state
+        state._require_active()
+        context = state._operation_context
+        if (
+            type(context) is not SessionOperationContext
+            or context.operation_kind is not SessionOperationKind.COMPOSE
+            or context.fence.session_id != state._session_id
+        ):
+            raise SessionOperationFenceLost(FenceLossReason.TOKEN_MISMATCH)
+        if type(title) is not str:
+            raise TypeError("title must be an exact str")
+        if type(updated_at) is not datetime:
+            raise TypeError("updated_at must be an exact datetime")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(sessions_table).where(sessions_table.c.id == state._session_id).values(title=title, updated_at=updated_at)
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
+
     def decide_and_soft_archive(
         self,
         *,
@@ -1346,6 +1372,53 @@ class _RepositoryInterpretationMutations:
         )
         row = connection.execute(select(interpretation_events_table).where(interpretation_events_table.c.id == str(event_id))).one()
         return self._event_record(row)
+
+    def resolve_pending_event(
+        self,
+        *,
+        event_id: UUID,
+        choice: InterpretationChoice,
+        accepted_value: str | None,
+        resolved_at: datetime,
+        actor: str,
+        arguments_hash: str,
+        hash_domain_version: str,
+        runtime_model_identifier: str | None,
+        runtime_model_version: str | None,
+        resolved_prompt_template_hash: str | None,
+    ) -> None:
+        """Settle one pending interpretation event under exact COMPOSE custody (P4-D6 family A2b).
+
+        The service selected the pending row under the session write lock in
+        this same transaction and computed the audit values; the immutability
+        trigger's IntegrityError is classified by the caller.
+        """
+        self._require_compose()
+        state = self.__state
+        state._validate_uuid(event_id, field_name="event_id")
+        if type(choice) is not InterpretationChoice:
+            raise TypeError("choice must be an exact InterpretationChoice")
+        if type(resolved_at) is not datetime:
+            raise TypeError("resolved_at must be an exact datetime")
+        result = _resolve_mutation_connection(state._connection_token).execute(
+            update(interpretation_events_table)
+            .where(interpretation_events_table.c.id == str(event_id))
+            .where(interpretation_events_table.c.session_id == state._session_id)
+            .where(interpretation_events_table.c.choice == InterpretationChoice.PENDING.value)
+            .values(
+                choice=choice.value,
+                accepted_value=accepted_value,
+                resolved_at=resolved_at,
+                actor=actor,
+                arguments_hash=arguments_hash,
+                hash_domain_version=hash_domain_version,
+                runtime_model_identifier_at_resolve=runtime_model_identifier,
+                runtime_model_version_at_resolve=runtime_model_version,
+                resolved_prompt_template_hash=resolved_prompt_template_hash,
+            )
+        )
+        if result.rowcount != 1:
+            raise SessionDerivedCustodyError
 
 
 @final

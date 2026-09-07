@@ -211,6 +211,11 @@ class DualFencedSessionServiceHarness(SessionServiceImpl):
         _wrapped.__name__ = name
         return _wrapped
 
+    # P4-D6 family A2b: the message/title/resolve writers require an exact
+    # operation; legacy tests that call them bare get a COMPOSE context here.
+    add_message = _kw_writer("add_message", SessionOperationKind.COMPOSE)
+    add_messages_atomic = _kw_writer("add_messages_atomic", SessionOperationKind.COMPOSE)
+    resolve_interpretation_event = _kw_writer("resolve_interpretation_event", SessionOperationKind.COMPOSE)
     create_pending_interpretation_event = _kw_writer("create_pending_interpretation_event", SessionOperationKind.COMPOSE)
     commit_transition_response = _kw_writer("commit_transition_response", SessionOperationKind.COMPOSE)
     create_composition_proposal = _kw_writer("create_composition_proposal", SessionOperationKind.COMPOSE)

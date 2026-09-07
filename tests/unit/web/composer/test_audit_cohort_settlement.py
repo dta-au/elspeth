@@ -43,6 +43,7 @@ from elspeth.web.composer.pipeline_proposal import AbsentBase, PipelineProposal,
 from elspeth.web.composer.protocol import ComposerConvergenceError
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
+from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.execution.schemas import ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
@@ -416,20 +417,26 @@ async def test_planner_success_path_cohort_is_all_or_nothing_at_every_write_inde
 
 async def _plan_and_stage_empty(service: ComposerServiceImpl, session_id: str, recorder: BufferingRecorder) -> Any:
     driver = cast(Any, service)
+    sessions_service = cast(Any, service._sessions_service)
     plugin_snapshot, policy_catalog = driver._plugin_policy_context(None)
-    return await driver._plan_and_stage_empty_pipeline(
-        message="build me a pipeline",
-        messages=[],
-        state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-        session_id=session_id,
-        current_state_id=None,
-        user_id="phase3-test-user",
-        progress=None,
-        user_message_id=str(uuid4()),
-        recorder=recorder,
-        plugin_snapshot=plugin_snapshot,
-        policy_catalog=policy_catalog,
-    )
+    # P4-D6 family A2b: the planner-evidence cohort is a fenced session write,
+    # so the staging turn runs under a real acquired COMPOSE operation exactly
+    # as the compose route does.
+    async with sessions_service._call_context(UUID(session_id), SessionOperationKind.COMPOSE) as compose_context:
+        return await driver._plan_and_stage_empty_pipeline(
+            message="build me a pipeline",
+            messages=[],
+            state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            session_id=session_id,
+            current_state_id=None,
+            user_id="phase3-test-user",
+            progress=None,
+            user_message_id=str(uuid4()),
+            recorder=recorder,
+            plugin_snapshot=plugin_snapshot,
+            policy_catalog=policy_catalog,
+            session_operation_context=compose_context,
+        )
 
 
 @pytest.mark.asyncio

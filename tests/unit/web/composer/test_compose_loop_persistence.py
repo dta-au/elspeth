@@ -28,6 +28,7 @@ from elspeth.web.composer.redaction import redact_tool_call_arguments, redact_to
 from elspeth.web.composer.service import ComposerServiceImpl
 from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata, ValidationSummary
 from elspeth.web.composer.tools._common import ToolResult
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions.models import (
     blobs_table,
     chat_messages_table,
@@ -35,10 +36,11 @@ from elspeth.web.sessions.models import (
     composition_states_table,
     interpretation_events_table,
     proposal_events_table,
+    session_operation_fences_table,
     sessions_table,
 )
 from elspeth.web.sessions.protocol import ComposerSessionPreferencesRecord, CompositionStateData
-from tests.helpers.session_fences import seed_live_compose_context
+from tests.helpers.session_fences import acquire_compose_context, seed_live_compose_context
 from tests.unit.web.composer._helpers import _stub_advisor_end_gate_clean  # noqa: F401  (autouse end-gate CLEAN stub)
 
 
@@ -363,14 +365,20 @@ async def test_current_planner_persistence_rejects_malformed_bound_content_hash(
         authority_arguments_hash=hashlib.sha256(authority_arguments_canonical.encode()).hexdigest(),
     )
 
-    with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
-        await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
-            session_id=UUID(result_session_id),
-            current_state_id=None,
-            llm_calls=(),
-            planner_attempts=(),
-            invocations=(invocation,),
-        )
+    # P4-D6 family A2b: the planner-audit cohort is a fenced session write, so
+    # the call carries the turn's real COMPOSE operation. The malformed hash is
+    # still refused before any row is drafted.
+    sessions_service = composer_service_with_real_sessions._sessions_service  # type: ignore[attr-defined]
+    async with acquire_compose_context(sessions_service, UUID(result_session_id)) as compose_context:
+        with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
+            await composer_service_with_real_sessions._persist_pipeline_planner_audit(  # type: ignore[attr-defined]
+                session_id=UUID(result_session_id),
+                current_state_id=None,
+                llm_calls=(),
+                planner_attempts=(),
+                invocations=(invocation,),
+                session_operation_context=compose_context,
+            )
 
 
 @pytest.mark.asyncio
@@ -2329,11 +2337,32 @@ async def test_plugin_crash_remains_primary_when_a_concurrent_writer_stales_the_
         if kwargs.get("plugin_crash_pending"):
             # The concurrent writer: advance the session's state head before
             # the unwind write reaches its expected-state check.
+            #
+            # P4-D6 family A2b: ``_insert_composition_state`` is now a
+            # SessionMutationAuthority boundary, so this writer must PROVE an
+            # operation like any other. It proves the one that is genuinely
+            # live on the session at this instant — read from the fence row
+            # rather than minted — because an unfenced racer can no longer
+            # reach the table at all. What the test measures is unchanged: the
+            # head advances underneath the unwind, and the unwind's
+            # expected-state check must lose.
             with sessions_service._engine.begin() as conn:  # type: ignore[attr-defined]
                 head = conn.execute(
                     text("SELECT id FROM composition_states WHERE session_id = :session_id ORDER BY version DESC LIMIT 1"),
                     {"session_id": result_session_id},
                 ).scalar_one_or_none()
+                live_fence = conn.execute(
+                    select(session_operation_fences_table).where(session_operation_fences_table.c.session_id == result_session_id)
+                ).one()
+                live_context = SessionOperationContext(
+                    fence=SessionOperationFence(
+                        session_id=result_session_id,
+                        operation_id=live_fence.operation_id,
+                        lease_token=live_fence.lease_token,
+                        operation_epoch=live_fence.operation_epoch,
+                    ),
+                    operation_kind=SessionOperationKind(live_fence.operation_kind),
+                )
                 with sessions_service._session_write_lock(conn, result_session_id):  # type: ignore[attr-defined]
                     sessions_service._insert_composition_state(  # type: ignore[attr-defined]
                         conn,
@@ -2343,6 +2372,7 @@ async def test_plugin_crash_remains_primary_when_a_concurrent_writer_stales_the_
                             derived_from_state_id=head,
                         ),
                         provenance="session_seed",
+                        session_operation_context=live_context,
                     )
         return await original_persist(**kwargs)
 

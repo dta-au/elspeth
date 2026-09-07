@@ -471,13 +471,17 @@ async def _prepare_accept_revert_handoff(
         },
         version_after=current.version + 1,
     )
-    bindings = await _persist_tool_invocations(
-        accept_service,
-        session.id,
-        (invocation,),
-        None,
-        plugin_crash_pending=False,
-    )
+    # P4-D6 family A2b: the dispatch audit rows are fenced session writes, so
+    # the accepting side holds its COMPOSE operation across them.
+    async with _compose_context(accept_service, session.id) as accept_audit_context:
+        bindings = await _persist_tool_invocations(
+            accept_service,
+            session.id,
+            (invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=accept_audit_context,
+        )
     assert len(bindings) == 1
     dispatch: PipelineDispatchAuditBinding = bindings[0]
     async with _compose_context(revert_service, session.id) as revert_reservation_context:

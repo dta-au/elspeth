@@ -17,9 +17,28 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.core.canonical import canonical_json
 from elspeth.web.composer.authority_hashing import composer_authority_canonical_json
+from elspeth.web.coordination.contracts import SessionOperationContext, SessionOperationFence, SessionOperationKind
 from elspeth.web.sessions._persist_payload import AuditMessageDraft
 from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
+
+
+def _compose_context(session_id: UUID) -> SessionOperationContext:
+    """The COMPOSE operation the drained turn ran under (P4-D6 family A2b).
+
+    ``_persist_tool_invocations`` takes the caller's operation as a required
+    argument; redaction is what these tests measure, and the fence travels
+    with the rows exactly as it does on the live route.
+    """
+    return SessionOperationContext(
+        fence=SessionOperationFence(
+            session_id=str(session_id),
+            operation_id=f"tool-invocation-redaction-{session_id}",
+            lease_token=f"tool-invocation-redaction-token-{session_id}",
+            operation_epoch=1,
+        ),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
 
 
 @dataclass
@@ -130,14 +149,16 @@ async def test_legacy_tool_invocation_persistence_redacts_advisor_payloads() -> 
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=uuid4(),
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert len(service.messages) == 1
@@ -216,14 +237,16 @@ async def test_legacy_tool_invocation_persistence_scrubs_type_driven_response_ca
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=uuid4(),
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert len(service.messages) == 1
@@ -274,14 +297,16 @@ async def test_legacy_persistence_aggregates_unknown_top_level_response_key_name
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=None,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     message = service.messages[0]
@@ -337,14 +362,16 @@ async def test_legacy_persistence_bounds_deep_response_before_recursive_projecti
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=None,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     message = service.messages[0]
@@ -430,14 +457,16 @@ async def test_legacy_persistence_scrubs_repair_argument_key_canaries(
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=uuid4(),
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     persisted_blob = json.dumps(
@@ -482,14 +511,16 @@ async def test_schema_valid_semantic_arg_error_persists_only_closed_argument_pro
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=None,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     message = service.messages[0]
@@ -562,15 +593,17 @@ async def test_legacy_set_pipeline_rejects_malformed_bound_content_hash() -> Non
         authority_arguments_hash=_hash_canonical(authority_arguments_canonical),
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     with pytest.raises(AuditIntegrityError, match="content hash is malformed"):
         await _persist_tool_invocations(
             cast(SessionServiceProtocol, service),
-            uuid4(),
+            session_id,
             (invocation,),
             composition_state_id=None,
             parent_assistant_id=None,
             plugin_crash_pending=False,
+            session_operation_context=_compose_context(session_id),
         )
 
     assert service.messages == []
@@ -638,14 +671,16 @@ async def test_legacy_non_arg_failures_use_closed_content_and_envelope_projectio
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=None,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     message = service.messages[0]
@@ -689,14 +724,16 @@ async def test_arg_error_result_for_response_model_tool_persists_without_success
         actor="composer-web:user-test",
     )
     service = _CapturingSessionService()
+    session_id = uuid4()
 
     await _persist_tool_invocations(
         cast(SessionServiceProtocol, service),
-        uuid4(),
+        session_id,
         (invocation,),
         composition_state_id=None,
         parent_assistant_id=None,
         plugin_crash_pending=False,
+        session_operation_context=_compose_context(session_id),
     )
 
     assert len(service.messages) == 1

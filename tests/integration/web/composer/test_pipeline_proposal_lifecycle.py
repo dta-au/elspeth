@@ -297,13 +297,17 @@ async def _persist_dispatch(
         ),
         version_after=1,
     )
-    bindings = await _persist_tool_invocations(
-        service,
-        session_id,
-        (invocation,),
-        None,
-        plugin_crash_pending=False,
-    )
+    # P4-D6 family A2b: the dispatch audit rows are fenced session writes, so
+    # the helper holds the turn's COMPOSE operation across them.
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        bindings = await _persist_tool_invocations(
+            service,
+            session_id,
+            (invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
     assert len(bindings) == 1
     return bindings[0]
 
@@ -321,13 +325,15 @@ async def _persist_failed_dispatch(
         version_before=0,
         actor="user:alice",
     )
-    await _persist_tool_invocations(
-        service,
-        session_id,
-        (finish_plugin_crash(audit, exc=RuntimeError("redacted")),),
-        None,
-        plugin_crash_pending=False,
-    )
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        await _persist_tool_invocations(
+            service,
+            session_id,
+            (finish_plugin_crash(audit, exc=RuntimeError("redacted")),),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
 
 
 def _settlement_kwargs(session_id: UUID, proposal_id: UUID, plan: PipelinePlanResult, binding: PipelineDispatchAuditBinding):
@@ -1011,10 +1017,18 @@ async def test_settlement_rejects_concurrent_successes_for_same_proposal_call_id
         result_payload=_pipeline_dispatch_result(pipeline_content_hash=state_hash),
         version_after=1,
     )
-    persisted = await asyncio.gather(
-        _persist_tool_invocations(service, session_id, (first,), None, plugin_crash_pending=False),
-        _persist_tool_invocations(service, session_id, (second,), None, plugin_crash_pending=False),
-    )
+    # P4-D6 family A2b: both racing writers belong to ONE turn, so they share
+    # the one COMPOSE operation that turn holds — the race under test is
+    # between the two dispatch records, not between two operations.
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        persisted = await asyncio.gather(
+            _persist_tool_invocations(
+                service, session_id, (first,), None, plugin_crash_pending=False, session_operation_context=compose_context
+            ),
+            _persist_tool_invocations(
+                service, session_id, (second,), None, plugin_crash_pending=False, session_operation_context=compose_context
+            ),
+        )
     binding = persisted[0][0]
 
     with pytest.raises(AuditIntegrityError, match=r"duplicate|exactly one|one durable|does not match"):
@@ -2423,13 +2437,15 @@ async def test_owned_pipeline_executor_mismatch_binds_hash_and_supports_recovery
     assert type(executor_content_hash) is str and len(executor_content_hash) == 64
     assert mismatch.dispatch.result_hash == stable_hash(result_payload)
 
-    bindings = await _persist_tool_invocations(
-        service,
-        session_id,
-        (mismatch.invocation,),
-        None,
-        plugin_crash_pending=False,
-    )
+    async with service._call_context(session_id, SessionOperationKind.COMPOSE) as compose_context:
+        bindings = await _persist_tool_invocations(
+            service,
+            session_id,
+            (mismatch.invocation,),
+            None,
+            plugin_crash_pending=False,
+            session_operation_context=compose_context,
+        )
     assert len(bindings) == 1
     persisted_binding = bindings[0]
     assert persisted_binding.tool_call_id == mismatch.dispatch.tool_call_id
