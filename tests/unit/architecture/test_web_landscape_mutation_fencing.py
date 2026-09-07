@@ -2129,8 +2129,6 @@ def _looks_like_landscape_receiver(
     if dotted is None:
         return False
     segments = {re.sub(r"(?<!^)(?=[A-Z])", "_", segment.removeprefix("_")).lower() for segment in dotted.split(".")}
-    if {"session_service", "trail"} & segments:
-        return False
     categories = {api.category for api in _MUTATION_APIS if api.method == method}
     if method in _COORDINATION_MUTATION_METHOD_NAMES:
         categories.add("coordination")
