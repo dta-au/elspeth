@@ -257,9 +257,8 @@ class TestFatalIntegrityLatch:
         with pytest.raises(AuditIntegrityError, match="registry row vanished"):
             thread.check_and_raise()
 
-    def test_unexpected_exception_logged_with_traceback_not_debug_busy(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A programming error is actionable: WARNING with traceback, not a
-        DEBUG 'busy' line — but still liveness-unknown (no latch, no crash)."""
+    def test_unexpected_exception_is_latched_and_logged(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Programming errors reach the drain without killing the beat thread."""
         import logging
 
         repo = _StubRepo()
@@ -270,7 +269,10 @@ class TestFatalIntegrityLatch:
             thread._step_beat()
 
         assert not thread._coordination_lost_event.is_set()
-        thread.check_and_raise()  # not fatal — must not raise
+        with pytest.raises(RuntimeError, match="repository contract regression") as raised:
+            thread.check_and_raise()
+        assert raised.value is repo.side_effect
+        assert thread._consecutive_busy == 0
         unexpected = [r for r in caplog.records if r.levelno >= logging.WARNING and r.exc_info]
         assert unexpected, "unexpected exceptions must be logged at WARNING+ with traceback"
 
@@ -336,6 +338,22 @@ class TestBusyTolerated:
 
 
 class TestHeartbeatDegraded:
+    @pytest.mark.parametrize("failure", [RuntimeError("broken writer"), pytest.param(None, id="tier1")])
+    def test_degraded_failure_is_latched_at_drain_boundary(self, failure: Exception | None) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        error = AuditIntegrityError("broken ledger") if failure is None else failure
+        repo = _StubRepo()
+        repo.side_effect = OperationalError("locked", None, None)
+        repo.degraded_exception = error
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+        with pytest.raises(type(error)) as raised:
+            thread.check_and_raise()
+        assert raised.value is error
+        assert not thread.coordination_lost
+
     def test_degraded_fires_at_threshold(self) -> None:
         """record_heartbeat_degraded is called when busy_count reaches k=3."""
         repo = _StubRepo()
@@ -392,6 +410,19 @@ class TestHeartbeatDegraded:
         thread._step_beat()  # fires, degraded raises — must NOT propagate
 
         assert not thread._coordination_lost_event.is_set()
+
+    def test_degraded_db_failure_is_logged_without_fatal_latch(self, caplog: pytest.LogCaptureFixture) -> None:
+        repo = _StubRepo()
+        repo.side_effect = OperationalError("locked", None, None)
+        repo.degraded_exception = OperationalError("degraded write failed", None, None)
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        thread.check_and_raise()
+        assert any(
+            record.getMessage() == "run_heartbeat: degraded event could not be recorded" and record.exc_info for record in caplog.records
+        )
 
     def test_degraded_correct_worker_id_and_run_id(self) -> None:
         """Degraded event carries the thread's own worker_id and run_id."""

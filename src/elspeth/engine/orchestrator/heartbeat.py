@@ -27,7 +27,8 @@ Design invariants enforced here:
   busy-timeout) is logged at DEBUG and counted toward the ``heartbeat_degraded``
   threshold ``k``; the thread never sets the latch on a DB error.
 - **Never self-terminate on DB errors** — the per-tick try/except swallows
-  contention and unexpected errors and continues looping; only a deliberate
+  contention and continues looping; unexpected errors latch a fatal failure
+  for the drain thread. Only a deliberate
   ``_stop_event.set()`` exits the loop. EXCEPTION: Tier-1 integrity errors
   (e.g. a vanished ``run_workers`` row) are corruption, not contention — they
   latch a fatal exception that ``check_and_raise`` re-raises at the next
@@ -47,14 +48,13 @@ Design invariants enforced here:
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 # Module import (not a from-import of TIER_1_ERRORS): the tuple is lazily
 # materialized via PEP 562 __getattr__, so only live attribute access sees
@@ -278,8 +278,7 @@ class RunHeartbeatThread:
         4. SQLITE_BUSY ``OperationalError`` → liveness-unknown; DEBUG log,
            count toward degraded threshold, continue.
         5. Any other exception (programming error / repository contract
-           regression) → liveness-unknown, but actionable: WARNING log with
-           traceback, count toward degraded threshold, continue.
+           regression) → latch the failure for the drain thread and log it.
 
         ADR-030 §B: ``snapshot.worker_role`` discriminates leader vs follower
         so that the deposed-latch is role-gated.  The field defaults to
@@ -358,29 +357,37 @@ class RunHeartbeatThread:
             if self._consecutive_busy >= self._degraded_threshold:
                 self._emit_degraded()
         except Exception as exc:
-            # Unexpected (programming error / repository contract regression):
-            # still liveness-unknown — no latch, no crash — but actionable, so
-            # log WITH traceback at WARNING, never a DEBUG 'busy' line.
-            self._consecutive_busy += 1
-            logger.warning(
-                "run_heartbeat: unexpected error for worker %r in run %r (consecutive=%d)",
+            # Keep the heartbeat thread alive while making the owned-contract
+            # failure authoritative at the next drain boundary.
+            self._fatal_exc = exc
+            self._fatal_event.set()
+            logger.error(
+                "run_heartbeat: unexpected error for worker %r in run %r — failing closed at next drain boundary",
                 self._token.worker_id,
                 self._token.run_id,
-                self._consecutive_busy,
                 exc_info=exc,
             )
-            if self._consecutive_busy >= self._degraded_threshold:
-                self._emit_degraded()
 
     def _emit_degraded(self) -> None:
         """Emit ``heartbeat_degraded`` event; best-effort, never raises."""
-        with contextlib.suppress(Exception):
+        try:
             self._repo.record_heartbeat_degraded(
                 run_id=self._token.run_id,
                 worker_id=self._token.worker_id,
                 failures=self._consecutive_busy,
                 now=self._now_fn(),
             )
+        except SQLAlchemyError:
+            # A diagnostic write failure cannot stop liveness updates, but
+            # must remain visible when the normal repository reporter fails.
+            logger.error("run_heartbeat: degraded event could not be recorded", exc_info=True)
+        except Exception as exc:
+            # Programming and Tier-1 failures are not DB availability. The
+            # caller is an exception handler, so re-raising here would kill
+            # the beat thread instead of notifying its owner.
+            self._fatal_exc = exc
+            self._fatal_event.set()
+            logger.error("run_heartbeat: degraded event invariant failed", exc_info=exc)
 
     # ------------------------------------------------------------------
     # Test seam: step a single beat synchronously

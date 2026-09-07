@@ -66,6 +66,8 @@ def _safe_cleanup_error_text(error: Exception) -> tuple[str, str, int]:
     """Return public-safe plugin exception text, digest, and raw length."""
     try:
         raw_text = str(error)
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except Exception:
         raw_text = f"<unrepresentable {type(error).__name__}>"
 

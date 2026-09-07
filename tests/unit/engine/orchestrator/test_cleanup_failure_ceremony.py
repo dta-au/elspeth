@@ -32,7 +32,7 @@ from elspeth.core.config import SourceSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
-from elspeth.engine.orchestrator.cleanup import cleanup_plugins
+from elspeth.engine.orchestrator.cleanup import _safe_cleanup_error_text, cleanup_plugins
 from tests.fixtures.base_classes import as_sink, as_source
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.fixtures.stores import MockPayloadStore
@@ -98,6 +98,29 @@ def _config_with_sensitive_failing_close_sink() -> PipelineConfig:
 
 class TestCleanupDoesNotMaskPendingException:
     """Direct cleanup_plugins contract: pending exception wins."""
+
+    def test_exception_formatting_preserves_tier1_failure(self) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        failure = AuditIntegrityError("formatter detected corruption")
+
+        class BrokenException(Exception):
+            def __str__(self) -> str:
+                raise failure
+
+        with pytest.raises(AuditIntegrityError) as raised:
+            _safe_cleanup_error_text(BrokenException())
+        assert raised.value is failure
+
+    def test_unrepresentable_exception_records_an_explicit_marker(self) -> None:
+        class BrokenException(Exception):
+            def __str__(self) -> str:
+                raise ValueError("bad formatter")
+
+        text, digest, length = _safe_cleanup_error_text(BrokenException())
+        assert text == "<unrepresentable BrokenException>"
+        assert length == len(text)
+        assert len(digest) == 16
 
     def test_handled_exception_does_not_suppress_cleanup_failure_when_caller_declares_no_pending_exception(
         self,
