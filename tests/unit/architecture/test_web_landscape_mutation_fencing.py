@@ -4941,8 +4941,29 @@ def _begin_run_edge_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]:
     return tuple(violations)
 
 
+def _elision_notice(total: int, shown: int, noun: str) -> str:
+    """The line that makes a truncated diagnostic say so.
+
+    A diagnostic that silently drops rows is worse than a short one: this gate's
+    own instruction is to RE-DERIVE A PIN FROM ITS PRINTED OUTPUT, and a reader
+    who counts a truncated list gets a wrong answer with nothing to signal it.
+    An elision in evidence handed to someone else is not neutral -- it is a
+    choice about what they may conclude, and it is invisible exactly where they
+    would need to notice it.
+    """
+    if total <= shown:
+        return ""
+    return f"\n  … {total - shown} further {noun} NOT SHOWN ({total} total). Do NOT re-derive a pin from this truncated list."
+
+
 def _format_violations(title: str, violations: Sequence[str]) -> str:
-    return title + f" ({len(violations)}):\n" + "\n".join(f"  {item}" for item in violations[:120])
+    shown = 120
+    return (
+        title
+        + f" ({len(violations)}):\n"
+        + "\n".join(f"  {item}" for item in violations[:shown])
+        + _elision_notice(len(violations), shown, "violations")
+    )
 
 
 def test_architecture_scanner_detects_duplicate_move_replace_and_write_set_drift() -> None:
@@ -7860,6 +7881,7 @@ def test_landscape_dml_identity_and_write_set_are_frozen() -> None:
             f"  {site.path}:{site.line} {site.symbol} {site.operation} {site.table} fp={site.fingerprint}#{site.ordinal}"
             for site in dml[:160]
         )
+        + _elision_notice(len(dml), 160, "DML identities")
     )
 
 
@@ -7875,6 +7897,7 @@ def test_landscape_production_caller_set_is_frozen() -> None:
         f"expected count/digest={_EXPECTED_CALL_COUNT}/{_EXPECTED_PRODUCTION_CALLER_SHA256}\n"
         f"actual count/digest={len(calls)}/{actual_digest}\n"
         + "\n".join(f"  {site.path}:{site.line} {site.symbol} {site.receiver}.{site.method}#{site.ordinal}" for site in calls[:260])
+        + _elision_notice(len(calls), 260, "callers")
     )
 
     assert sum(call.method in {"register_candidate", "register_verified_candidate", "bind_winner"} for call in calls) == 3
