@@ -1,7 +1,7 @@
 """Malformed-input honesty tests for the interpretation Tier-3 boundaries.
 
 Each test pins the raising invariant declared by the matching
-``@trust_boundary`` metadata in ``web/sessions/service.py``: the boundary
+``@trust_boundary`` metadata in ``web/sessions/pending_interpretation.py``: the boundary
 rejects a malformed persisted composer shape with
 ``InterpretationPlaceholderConsumedError`` instead of silently routing it to
 a legacy arm or defaulting it away. The ``trust_boundary.tests`` gate binds
@@ -19,6 +19,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.web.sessions.pending_interpretation import (
     _has_matching_vague_term_requirement,
     _matching_pending_requirement_index,
+    _patch_llm_transform_prompt,
     _patch_structured_interpretation_prompt,
     _require_mapping,
     _reviewed_content_identity,
@@ -119,6 +120,18 @@ def test_patch_structured_interpretation_prompt_rejects_non_list_requirements() 
     with pytest.raises(InterpretationPlaceholderConsumedError):
         _patch_structured_interpretation_prompt(
             options={"interpretation_requirements": "not-a-list"},
+            affected_node_id="n1",
+            user_term="recent",
+            accepted_value="last 30 days",
+        )
+
+
+@pytest.mark.parametrize("options", (None, [], {}, {"prompt_template": 7}))
+def test_patch_llm_transform_prompt_rejects_malformed_options(options: object) -> None:
+    state = _state_record([{"id": "n1", "node_type": "transform", "plugin": "llm", "options": options}])
+    with pytest.raises(InterpretationPlaceholderConsumedError):
+        _patch_llm_transform_prompt(
+            state,
             affected_node_id="n1",
             user_term="recent",
             accepted_value="last 30 days",

@@ -810,6 +810,22 @@ def _patch_structured_interpretation_prompt(
     return patched_options
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "composer-authored node options and prompt text carried by CompositionStateRecord; "
+        "its owned envelope freezes containers without validating nested option values"
+    ),
+    source_param="state",
+    suppresses=("R5",),
+    invariant=(
+        "raises InterpretationPlaceholderConsumedError if the target LLM node has missing or "
+        "non-mapping options, or a missing or non-string prompt_template; never coerces malformed "
+        "content or replaces it with a fabricated prompt"
+    ),
+    test_ref=("tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_patch_llm_transform_prompt_rejects_malformed_options"),
+    test_fingerprint="a6e4c9a4f2daa5bf9f74ddfd6d5dc7d805042174d328d7a50b029e026805605e",
+)
 def _patch_llm_transform_prompt(
     state: CompositionStateRecord,
     *,
@@ -880,14 +896,10 @@ def _patch_llm_transform_prompt(
                 f"{node_plugin!r}; only llm nodes carry interpretation placeholders"
             )
 
-        # ``composition_states.nodes`` is Tier-1 (our own audit data) but
-        # stored as schemaless JSON. Membership checks here are an
-        # offensive pattern: assert the invariant, raise a structured
-        # ValueError with a precise message. Direct indexing on the
-        # ``Mapping[str, Any]`` annotation lets a wrong type surface as a
-        # KeyError/TypeError at the operation site — informative crash
-        # rather than fabricated default, per CLAUDE.md offensive
-        # programming rules.
+        # The state envelope is owned; these nested options and prompt text
+        # are composer-authored content. CompositionStateRecord freezes the
+        # containers without proving these option shapes. Reject malformed
+        # content explicitly before constructing the patched node.
         if "options" not in node:
             raise InterpretationPlaceholderConsumedError(
                 f"_patch_llm_transform_prompt: node {affected_node_id!r} has no options "
