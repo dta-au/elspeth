@@ -4243,6 +4243,25 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # and it is conditional -- a future consumer that reads leader_worker_id or
     # seat_live from a worker_active=False snapshot would invalidate this
     # entry, not merely extend it.
+    #
+    # A SECOND objection, raised by the agent that wrote the method and NOT
+    # answered by the argument above, is recorded here because it is about the
+    # method rather than about this classification. The AuditIntegrityError for
+    # an absent role row is now reached from an unfenced read in a SECOND
+    # transaction, where the same check previously sat inside the single write
+    # transaction. That is a real structural change and it opens a window in
+    # which a row vanishing between the two would be reported as audit
+    # corruption rather than as a lost race.
+    #
+    # The window is currently UNREACHABLE, and that is measured rather than
+    # assumed: across all of src/, run_workers takes exactly one insert and
+    # seven updates and NO delete -- no SQLAlchemy delete, no raw SQL, no
+    # retention or purge path. Single-use identity doctrine keeps departed and
+    # evicted rows in place rather than removing them. So an absent row still
+    # means a token for a registration that never happened, which is the
+    # corruption the error names. If a delete on run_workers is ever
+    # introduced, that verdict stops being sound and this is the note that
+    # says so.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository._inactive_member_snapshot",
