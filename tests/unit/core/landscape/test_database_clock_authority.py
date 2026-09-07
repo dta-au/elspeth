@@ -218,6 +218,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._inactive_member_snapshot"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
@@ -5766,7 +5767,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         landscape_before = database_now()
         heartbeat = call_with_legacy_now(
             factory.run_coordination.worker_heartbeat,
-            worker_id=leader_worker_id,
+            member_token=token.membership,
             window_seconds=80.0,
         )
         landscape_after = database_now()

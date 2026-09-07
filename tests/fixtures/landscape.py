@@ -23,11 +23,11 @@ import pytest
 from sqlalchemy import insert, select
 
 from elspeth.contracts import NodeType
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.payload_store import PayloadStore
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
-from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.query_repository import QueryRepository
@@ -388,6 +388,29 @@ def leader_token_for(db: LandscapeDB, run_id: str) -> CoordinationToken:
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
+
+
+def member_token_for(engine: Tier1Engine, *, worker_id: str, run_id: str | None = None) -> WorkerMembershipToken:
+    """A worker's OWN membership token, read back from its ``run_workers`` row.
+
+    The member-scoped sibling of :func:`leader_token_for` (ADR-048 §5 as
+    amended 2026-09-07): the sanctioned way for a test to obtain a
+    :class:`WorkerMembershipToken` for a worker it did not admit through the
+    production path (``admit_follower`` / ``Orchestrator.join_run`` return the
+    token directly). Reading the row back proves the registration exists; the
+    row's status is NOT checked — a departed or evicted worker's token is
+    exactly what a membership-fence refusal test needs. ``worker_id`` is the
+    table's primary key, so ``run_id`` is optional and, when given, asserted.
+    ``engine`` is ``LandscapeDB.engine``.
+    """
+
+    with engine.connect() as conn:
+        row = conn.execute(select(run_workers_table.c.run_id).where(run_workers_table.c.worker_id == worker_id)).one_or_none()
+    if row is None:
+        raise AssertionError(f"worker {worker_id!r} has no run_workers row; admit_follower / register_run_leader_on registers one")
+    if run_id is not None and row.run_id != run_id:
+        raise AssertionError(f"worker {worker_id!r} is registered to run {row.run_id!r}, not {run_id!r}")
+    return WorkerMembershipToken(run_id=str(row.run_id), worker_id=worker_id)
 
 
 def leader_coordination_token(factory: RecorderFactory, run_id: str) -> CoordinationToken:

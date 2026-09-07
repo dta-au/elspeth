@@ -507,14 +507,30 @@ def test_f10_stale_leader_cannot_reconcile_source_completions(harness: _Harness)
 
 
 def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None:
-    """No new leader-fenced mutation surface may escape the F-10 cohort.
+    """No new fenced mutation surface may escape the F-10 cohort.
 
     The shared fence is complete-image tested above and the retained per-verb
     suites exercise the setup needed to make every payload write eligible.
     This architecture gate binds that evidence to the complete live caller
-    inventory so adding a fenced verb requires adding stale-token evidence.
+    inventory so adding a fenced verb requires adding stale-authority evidence.
+
+    BOTH fences are in scope (ADR-030 D4, restored by the ADR-048 amendment of
+    2026-09-07): ``fenced_leader_transaction`` (and its ``fenced_write``
+    wrapper) and ``fenced_member_transaction``. Leaving the member fence out
+    of this scan would let a future membership-fenced verb ship with no
+    refusal evidence at all — a fence that has become a formality.
+
+    Each verb declares HOW its refusal is evidenced, because not every fenced
+    verb propagates. A verb called from a ``finally`` arm reifies the refusal
+    instead: re-raising there would mask the exception being unwound. For
+    those, the evidence is the durable ``fence_refusal`` row plus zero
+    mutation, read back through a ``_fence_refusals`` helper — the same proof,
+    one layer down. Every other verb must still assert the exception.
     """
     expected = {
+        "depart_worker",
+        "release_seat",
+        "worker_heartbeat",
         "adopt_blocked_barrier_item",
         "adopt_group_losses",
         "complete_barrier",
@@ -550,7 +566,12 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             function_name = (
                 node.func.id if isinstance(node.func, ast.Name) else node.func.attr if isinstance(node.func, ast.Attribute) else None
             )
-            if function_name not in {"fenced_leader_transaction", "fenced_write", "_fenced_or_plain_write"}:
+            if function_name not in {
+                "fenced_leader_transaction",
+                "fenced_member_transaction",
+                "fenced_write",
+                "_fenced_or_plain_write",
+            }:
                 continue
             for keyword in node.keywords:
                 if keyword.arg == "verb" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
@@ -653,7 +674,25 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
             "tests/unit/core/landscape/test_leader_fence_stale_token.py",
             "test_run_lifecycle_verb_refused",
         ),
+        "release_seat": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_release_seat_refused",
+        ),
+        "depart_worker": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_depart_worker_refused_for_departed_member",
+        ),
+        "worker_heartbeat": (
+            "tests/unit/core/landscape/test_leader_fence_stale_token.py",
+            "test_worker_heartbeat_refused_for_evicted_member",
+        ),
     }
+    # Verbs whose refusal is REIFIED rather than propagated (see the
+    # docstring): each is called from a teardown or liveness arm where
+    # re-raising would mask the exception being unwound, so its evidence is
+    # the durable fence_refusal row rather than the exception.
+    reified_refusal_verbs = {"depart_worker", "release_seat", "worker_heartbeat"}
+    assert reified_refusal_verbs <= expected
     assert set(retained_tests) == expected
     for verb, (relative_path, test_name) in retained_tests.items():
         test_path = ROOT / relative_path
@@ -682,7 +721,13 @@ def test_f10_fenced_verb_inventory_has_retained_stale_refusal_coverage() -> None
                 if call_name in local_functions:
                     pending.append(local_functions[call_name])
         assert verb in reachable_calls, f"F-10 test {test_name!r} no longer invokes {verb!r}, directly or through a local helper"
-        assert "pytest.raises(RunLeadershipLostError)" in test_source, f"F-10 test {test_name!r} no longer asserts stale-token refusal"
+        if verb in reified_refusal_verbs:
+            assert "_fence_refusals" in reachable_calls, (
+                f"F-10 test {test_name!r} no longer reads back {verb!r}'s durable fence_refusal evidence; "
+                "a verb that swallows its refusal has no other proof the fence fired"
+            )
+        else:
+            assert "pytest.raises(RunLeadershipLostError)" in test_source, f"F-10 test {test_name!r} no longer asserts stale-token refusal"
 
 
 def test_f12_waiting_state_is_rejected_by_storage_without_mutation(harness: _Harness) -> None:

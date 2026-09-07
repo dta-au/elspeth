@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+    WorkerMembershipToken,
     mint_worker_id,
 )
 from elspeth.contracts.errors import JoinRefusedError
@@ -97,7 +98,7 @@ class JoinAdmissionService:
         settings: ElspethSettings,
         *,
         window_seconds: float | None = None,
-    ) -> str:
+    ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — new public entry point (ADR-030).
 
         NOT a ``resume()`` variant.  ``resume()`` keeps refusing
@@ -137,9 +138,12 @@ class JoinAdmissionService:
                 :data:`~elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS`).
 
         Returns:
-            The minted ``worker_id`` string (``worker:{run_id}:{uuid4().hex}``)
-            so the caller can construct a follower-mode ``RowProcessor`` with
-            ``lease_owner=worker_id``.
+            The follower's :class:`WorkerMembershipToken` — ``(run_id,
+            worker_id)`` with the minted ``worker:{run_id}:{uuid4().hex}``
+            identity — exactly as ``admit_follower`` established it. The
+            caller threads it by value into ``build_follower_processor``; it is
+            the follower's only authority (ADR-030 D4; ADR-048 amendment) and
+            is never constructed outside the repository.
 
         Raises:
             JoinRefusedError: Filesystem preflight failed, run is not RUNNING,
@@ -162,11 +166,9 @@ class JoinAdmissionService:
         worker_id = mint_worker_id(run_id)
 
         factory = RecorderFactory(self._db, payload_store=None)
-        factory.run_coordination.admit_follower(
+        return factory.run_coordination.admit_follower(
             run_id=run_id,
             worker_id=worker_id,
             config_hash=joiner_config_hash,
             window_seconds=_window,
         )
-
-        return worker_id

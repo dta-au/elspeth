@@ -52,6 +52,7 @@ from sqlalchemy import delete, insert, select
 
 from elspeth.contracts import RowResult, TokenInfo
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.events import EngineSpanCompleted, EngineSpanName, EngineSpanStatus
@@ -249,6 +250,14 @@ def _build(
         scheduler_lease_owner=lease_owner,
         scheduler_heartbeat_seconds=heartbeat_seconds,
         coordination_token=(leader_coordination_token(setup.factory, setup.run_id) if bind_leader_token else None),
+        # ADR-030 D4 type split: a FOLLOWER carries exactly its membership
+        # authority for its registered lease owner (harness construction — no
+        # membership-fenced verb is reached from this processor yet).
+        member_token=(
+            WorkerMembershipToken(run_id=setup.run_id, worker_id=lease_owner)
+            if mode is ProcessorMode.FOLLOWER and lease_owner is not None
+            else None
+        ),
         run_coordination=(setup.factory.run_coordination if bind_run_coordination else None),
         clock=clock,
         mode=mode,

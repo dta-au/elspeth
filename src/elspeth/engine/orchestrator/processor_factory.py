@@ -42,7 +42,7 @@ from elspeth.engine.scheduler_drain import ProcessorMode
 if TYPE_CHECKING:
     from elspeth.contracts import RouteDestination
     from elspeth.contracts.config.runtime import RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.types import (
         BranchName,
@@ -161,6 +161,7 @@ def build_row_processor(
     scheduler_heartbeat_seconds: int = 60,
     barrier_restore: BarrierJournalRestoreContext | None = None,
     coordination_token: CoordinationToken | None = None,
+    member_token: WorkerMembershipToken | None = None,
 ) -> tuple[RowProcessor, dict[CoalesceName, NodeID], CoalesceExecutor | None]:
     """Build a RowProcessor with all supporting infrastructure.
 
@@ -191,6 +192,10 @@ def build_row_processor(
     - run_coordination: derived from token presence — a follower passes
       ``coordination_token=None``, so it never receives the §C.2 housekeeping
       repository. RowProcessor validates the FOLLOWER invariants fail-closed.
+    - member_token: passed through unchanged (bound once in RowProcessor's
+      ``__init__``). A follower supplies the ``WorkerMembershipToken`` its
+      admission returned; the leader path leaves it None (ADR-030 D4 type
+      split — RowProcessor rejects a leader carrying one).
 
     Returns:
         Tuple of (processor, coalesce_node_map, coalesce_executor).
@@ -478,6 +483,7 @@ def build_row_processor(
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
         coordination_token=coordination_token,
+        member_token=member_token,
         # §C.2 path 1 (slice 4): leader housekeeping sweep — evict dead
         # non-leader members then reap their expired item leases. None for a
         # follower or tokenless direct construction; absence never selects

@@ -3,13 +3,20 @@
 Owns the ``run_coordination`` seat row, the ``run_workers`` registry, and the
 ``run_coordination_events`` ledger (design
 docs/architecture/design-notes/option-c-multi-worker-coordination-design-2026-06-11.md §A.2/§B.4/§C/§G).
-Two shared fence constructs live here and in the schema module — one
-definition, one dedicated unit test each (design §G):
+Three shared fence constructs live here and in the schema module — one
+definition, one dedicated unit test each (design §G; ADR-030 D4's three fences
+restored by the ADR-048 amendment of 2026-09-07):
 
 - :func:`verify_and_extend_leader_fence` (this module) — the leader epoch
-  fence, emitted as the FIRST statement of every leader-fenced transaction;
+  fence, emitted as the FIRST statement of every leader-fenced transaction
+  (``fenced_leader_transaction``); the authority is a ``CoordinationToken``;
+- :func:`verify_membership_fence` (this module) — the membership fence in its
+  D7 verify-UPDATE form, emitted as the FIRST statement of every
+  membership-fenced transaction (``fenced_member_transaction``); the authority
+  is a ``WorkerMembershipToken``;
 - ``active_worker_fence_clause`` (schema module) — the membership EXISTS
-  predicate slice 4 compiles into the claim/enqueue verbs.
+  predicate slice 4 compiles into the claim/enqueue verbs (the in-statement
+  form of the same fence).
 
 Every coordination state transition writes its event row in the SAME
 transaction as the state change (the scheduler_events discipline). The one
@@ -30,15 +37,16 @@ verb                        consumer
 ==========================  =======================================================
 register_run_leader_on      slice 2/3: ``begin_run`` (uniformity rule, epoch 1)
 acquire_run_leadership      slice 2/3: ``resume()``'s first durable act (§B.4)
-release_seat                slice 2/3: run/resume teardown + ceremony arms
+release_seat                slice 2/3: run/resume teardown + ceremony arms (LEADER-fenced)
 live_leader                 implemented now; WIRED in slice 4 (entry-guard precision)
 record_fence_refusal        slice 2: every fenced verb's refusal path
 verify_and_extend_fence     slice 2: finalize/run-status/checkpoint/barrier/ingest
-worker_heartbeat            slice 4: the dedicated heartbeat thread (§A.3)
+worker_heartbeat            slice 4: the dedicated heartbeat thread (§A.3) (MEMBER-fenced)
 record_heartbeat_degraded   slice 4: heartbeat thread after k busy failures (§A.3)
-evict_worker                slice 4: leader housekeeping sweep (§C.2 path 1)
-depart_worker               slice 5: follower clean exit (§B.1 step 5)
-admit_follower              slice 5: ``elspeth join`` atomic admission (§B.1 step 2)
+evict_worker                slice 4: leader housekeeping sweep (§C.2 path 1) (LEADER-fenced)
+depart_worker               slice 5: follower clean exit (§B.1 step 5) (MEMBER-fenced)
+admit_follower              slice 5: ``elspeth join`` atomic admission (§B.1 step 2);
+                            returns the follower's ``WorkerMembershipToken``
 ==========================  =======================================================
 """
 
@@ -59,16 +67,19 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from elspeth.contracts.coordination import (
+    DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
     CoordinationToken,
     LeaderInfo,
     RegisteredWorker,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
     RunLeadershipLostError,
+    RunMembershipLostError,
     WriteLockHeldError,
 )
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -85,8 +96,10 @@ from elspeth.core.landscape.schema import (
 __all__ = [
     "RunCoordinationRepository",
     "fenced_leader_transaction",
+    "fenced_member_transaction",
     "record_coordination_event",
     "verify_and_extend_leader_fence",
+    "verify_membership_fence",
 ]
 
 logger = logging.getLogger(__name__)
@@ -411,6 +424,93 @@ def fenced_leader_transaction(
             leader_epoch=token.leader_epoch,
             recorded_at=datetime.now(UTC),
             context={"verb": verb},
+        )
+        raise
+
+
+def verify_membership_fence(
+    conn: Connection,
+    *,
+    member_token: WorkerMembershipToken,
+    verb: str,
+) -> None:
+    """The membership fence (ADR-030 D4, second fence) in its D7 verify-UPDATE form.
+
+    MUST be the first statement of the caller's ``BEGIN IMMEDIATE``
+    transaction: the conditional UPDATE on ``run_workers`` matching
+    ``(run_id, worker_id, status='active')`` takes the row lock that an
+    EXISTS subquery's snapshot would not hold under PostgreSQL READ COMMITTED
+    (ADR-030 D7), and rowcount 0 raising here unwinds the whole transaction
+    before any payload write. Single-use identity doctrine: ``departed`` and
+    ``evicted`` rows never return to ``active``, so a refusal is permanent
+    for this identity.
+
+    The verify-UPDATE writes the row's own status back (``status='active'``
+    where ``status='active'``): the fence proves and locks membership, it does
+    not extend liveness. Run-level liveness is the heartbeat thread's job
+    (``worker_heartbeat``), so a member's ``heartbeat_expires_at`` moves only
+    when that verb says so — a departing or claiming member must never look
+    fresher than its last beat.
+
+    On rowcount 0 raises :class:`RunMembershipLostError`. The caller (or
+    :func:`fenced_member_transaction`) records the ``fence_refusal`` event on
+    a fresh connection AFTER its rollback completes.
+    """
+    result = conn.execute(
+        update(run_workers_table)
+        .where(
+            run_workers_table.c.run_id == member_token.run_id,
+            run_workers_table.c.worker_id == member_token.worker_id,
+            run_workers_table.c.status == "active",
+        )
+        .values(status="active")
+    )
+    if result.rowcount != 1:
+        raise RunMembershipLostError(
+            run_id=member_token.run_id,
+            worker_id=member_token.worker_id,
+            verb=verb,
+        )
+
+
+@contextmanager
+def fenced_member_transaction(
+    engine: Tier1Engine,
+    *,
+    member_token: WorkerMembershipToken,
+    verb: str,
+) -> Iterator[Connection]:
+    """One membership-fenced ``BEGIN IMMEDIATE`` transaction, refusal-evented.
+
+    The member-scoped sibling of :func:`fenced_leader_transaction`: composes
+    :func:`~elspeth.core.landscape.database.begin_write` with
+    :func:`verify_membership_fence` as the first statement, and — on a fence
+    miss — records the ``fence_refusal`` event on a fresh connection AFTER the
+    payload transaction has rolled back, then re-raises
+    :class:`RunMembershipLostError`. The refusal row carries
+    ``leader_epoch=NULL`` (a member holds no epoch) and names the fence in its
+    context so the ledger distinguishes it from a leader-fence refusal.
+
+    Member-fenced verbs are the follower's own liveness and departure writes
+    and, in wave 2, the claim/enqueue verbs; item-scoped writes additionally
+    keep their item-lease CAS (``expected_lease_owner``) as the payload's own
+    WHERE — D4's third fence.
+    """
+    try:
+        with begin_write(engine) as conn:
+            verify_membership_fence(conn, member_token=member_token, verb=verb)
+            yield conn
+    except RunMembershipLostError:
+        # The begin_write context has exited (rolled back) by the time we get
+        # here, so the fresh-connection write cannot deadlock on our own lock.
+        _record_best_effort_event(
+            engine,
+            run_id=member_token.run_id,
+            event_type="fence_refusal",
+            worker_id=member_token.worker_id,
+            leader_epoch=None,
+            recorded_at=datetime.now(UTC),
+            context={"verb": verb, "fence": "membership"},
         )
         raise
 
@@ -809,16 +909,24 @@ class RunCoordinationRepository:
         return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
 
     def release_seat(self, *, token: CoordinationToken) -> None:
-        """Graceful leader shutdown: CAS the seat vacant + depart own row. Idempotent.
+        """Graceful leader shutdown: vacate the seat + depart own row, leader-fenced. Idempotent.
 
-        Rowcount 0 on the seat CAS (already released, or deposed) is a
-        silent no-op — release is best-effort hygiene on teardown/ceremony
-        paths, never a fence. A missing run-scoped active membership rolls the
-        seat CAS back, so the seat clear, membership departure, and evidence
-        insert are one atomic transition.
+        The seat is a run-scoped row, so vacating it is a LEADER write
+        (ADR-030 D4): the verify-and-extend epoch fence is the first statement
+        and proves the caller still holds this epoch before the seat is
+        cleared. A fence miss (already released, or deposed) is this verb's
+        declared no-op: release is teardown hygiene called from ``finally``
+        arms where a second leadership-lost signal would mask the first, so
+        the refusal is swallowed here and the ``fence_refusal`` event the
+        fence recorded is its durable evidence — zero mutation either way. A
+        missing run-scoped active membership rolls the whole transaction back
+        (fence extension included), so the seat clear, membership departure,
+        and evidence insert are one atomic transition.
         """
         try:
-            with begin_write(self._engine) as conn:
+            with fenced_leader_transaction(
+                self._engine, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="release_seat"
+            ) as conn:
                 database_now = read_landscape_transaction_time(conn)
                 released = conn.execute(
                     update(run_coordination_table)
@@ -830,7 +938,13 @@ class RunCoordinationRepository:
                     .values(leader_worker_id=None, leader_heartbeat_expires_at=None, updated_at=database_now)
                 )
                 if released.rowcount != 1:
-                    return
+                    # The fence just matched this exact seat inside the same
+                    # IMMEDIATE transaction, so this arm is unreachable by
+                    # construction; it stays as a fail-closed integrity backstop.
+                    raise AuditIntegrityError(
+                        f"release_seat: the seat for run {token.run_id!r} passed its epoch fence but the vacate UPDATE matched "
+                        f"{released.rowcount} rows; the run_coordination row changed inside one IMMEDIATE transaction."
+                    )
                 departed = conn.execute(
                     update(run_workers_table)
                     .where(
@@ -852,6 +966,11 @@ class RunCoordinationRepository:
                     context={"worker_row_departed": True},
                 )
         except _ReleaseMembershipMiss:
+            return
+        except RunLeadershipLostError:
+            # Already released or deposed: the declared idempotent no-op. The
+            # fence recorded the refusal; the caller (a teardown arm) has no
+            # further action to take on this seat.
             return
 
     def live_leader(self, *, run_id: str) -> LeaderInfo | None:
@@ -938,68 +1057,104 @@ class RunCoordinationRepository:
 
     # ── registry membership (slice-4/5 consumers) ────────────────────────
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
-        """Worker-row liveness CAS + seat snapshot, one transaction (§A.3).
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
+        """Member-fenced worker-row beat + seat snapshot, one transaction (§A.3).
 
-        SLICE-4 CONSUMER: the dedicated heartbeat thread. Semantics pinned by
-        the design: rowcount 0 ⇒ ``worker_active=False`` (this worker is no
-        longer active — the thread latches its coordination-lost flag on
-        THAT, never on a DB error). A leader beats BOTH rows in one
-        transaction (identity CAS on the seat — no epoch parameter here; the
-        fenced verbs are the epoch arbiters), so the two liveness clocks can
-        never skew in the dangerous worker-fresher-than-seat direction.
+        SLICE-4 CONSUMER: the dedicated heartbeat thread. The membership fence
+        is the first statement (ADR-030 D4); its refusal — this worker is no
+        longer ``active`` (departed at finalize, or evicted) — is this verb's
+        DECLARED outcome, ``worker_active=False``, with the seat read back on
+        a plain connection so the snapshot stays whole: the thread latches its
+        coordination-lost flag on THAT, never on a DB error, and the
+        ``fence_refusal`` row the fence recorded is the durable evidence of
+        the zombie beat. A leader beats BOTH rows in one transaction (identity
+        CAS on the seat — no epoch parameter here; the leader-fenced verbs are
+        the epoch arbiters), so the two liveness clocks can never skew in the
+        dangerous worker-fresher-than-seat direction.
+
+        A token for a row that does not exist at all is not a coordination
+        outcome: registration precedes the heartbeat thread by construction,
+        so a vanished row is audit corruption (``AuditIntegrityError``).
         """
-        with begin_write(self._engine) as conn:
+        try:
+            with fenced_member_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
+                database_now = read_landscape_transaction_time(conn)
+                role = conn.execute(
+                    select(run_workers_table.c.role).where(
+                        run_workers_table.c.run_id == member_token.run_id,
+                        run_workers_table.c.worker_id == member_token.worker_id,
+                    )
+                ).scalar_one()
+                conn.execute(
+                    update(run_workers_table)
+                    .where(
+                        run_workers_table.c.run_id == member_token.run_id,
+                        run_workers_table.c.worker_id == member_token.worker_id,
+                    )
+                    .values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds))
+                )
+                if role == "leader":
+                    conn.execute(
+                        update(run_coordination_table)
+                        .where(
+                            run_coordination_table.c.run_id == member_token.run_id,
+                            run_coordination_table.c.leader_worker_id == member_token.worker_id,
+                        )
+                        .values(leader_heartbeat_expires_at=database_now + timedelta(seconds=window_seconds), updated_at=database_now)
+                    )
+                # The seat's liveness is decided in SQL against the transaction's
+                # database time (ADR-047): NULL expiry or vacant seat reads dead.
+                seat = conn.execute(
+                    select(
+                        run_coordination_table.c.leader_worker_id,
+                        run_coordination_table.c.leader_epoch,
+                        (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
+                    ).where(run_coordination_table.c.run_id == member_token.run_id)
+                ).one_or_none()
+        except RunMembershipLostError:
+            return self._inactive_member_snapshot(member_token)
+        return CoordinationSnapshot(
+            leader_worker_id=None if seat is None else seat.leader_worker_id,
+            leader_epoch=0 if seat is None else int(seat.leader_epoch),
+            seat_live=seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live),
+            worker_active=True,
+            worker_role=role,  # ADR-030 §B: follower sees foreign leader_worker_id normally
+        )
+
+    def _inactive_member_snapshot(self, member_token: WorkerMembershipToken) -> CoordinationSnapshot:
+        """The refused beat's snapshot: role and seat read back, ``worker_active=False``.
+
+        Plain read connection: the refused transaction has rolled back and its
+        refusal event is written. A row that is absent altogether is
+        corruption (a token exists for a registration that never happened or
+        was deleted), not a departed member.
+        """
+        with self._engine.connect() as conn:
             database_now = read_landscape_transaction_time(conn)
-            member = conn.execute(
-                select(run_workers_table.c.run_id, run_workers_table.c.role).where(run_workers_table.c.worker_id == worker_id)
-            ).one_or_none()
-            if member is None:
+            role = conn.execute(
+                select(run_workers_table.c.role).where(
+                    run_workers_table.c.run_id == member_token.run_id,
+                    run_workers_table.c.worker_id == member_token.worker_id,
+                )
+            ).scalar_one_or_none()
+            if role is None:
                 raise AuditIntegrityError(
-                    f"worker_heartbeat for unregistered worker_id={worker_id!r}; "
+                    f"worker_heartbeat for unregistered worker_id={member_token.worker_id!r} in run {member_token.run_id!r}; "
                     "registration precedes the heartbeat thread by construction."
                 )
-            beat = conn.execute(
-                update(run_workers_table)
-                .where(
-                    run_workers_table.c.worker_id == worker_id,
-                    run_workers_table.c.status == "active",
-                )
-                .values(heartbeat_expires_at=database_now + timedelta(seconds=window_seconds))
-            )
-            worker_active = beat.rowcount == 1
-            if worker_active and member.role == "leader":
-                conn.execute(
-                    update(run_coordination_table)
-                    .where(
-                        run_coordination_table.c.run_id == member.run_id,
-                        run_coordination_table.c.leader_worker_id == worker_id,
-                    )
-                    .values(leader_heartbeat_expires_at=database_now + timedelta(seconds=window_seconds), updated_at=database_now)
-                )
-            # The seat's liveness is decided in SQL against the transaction's
-            # database time (ADR-047): NULL expiry or vacant seat reads dead.
             seat = conn.execute(
                 select(
                     run_coordination_table.c.leader_worker_id,
                     run_coordination_table.c.leader_epoch,
                     (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
-                ).where(run_coordination_table.c.run_id == member.run_id)
+                ).where(run_coordination_table.c.run_id == member_token.run_id)
             ).one_or_none()
-        if seat is None:
-            seat_live = False
-            leader_worker_id = None
-            leader_epoch = 0
-        else:
-            leader_worker_id = seat.leader_worker_id
-            leader_epoch = int(seat.leader_epoch)
-            seat_live = leader_worker_id is not None and bool(seat.seat_live)
         return CoordinationSnapshot(
-            leader_worker_id=leader_worker_id,
-            leader_epoch=leader_epoch,
-            seat_live=seat_live,
-            worker_active=worker_active,
-            worker_role=member.role,  # ADR-030 §B: follower sees foreign leader_worker_id normally
+            leader_worker_id=None if seat is None else seat.leader_worker_id,
+            leader_epoch=0 if seat is None else int(seat.leader_epoch),
+            seat_live=seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live),
+            worker_active=False,
+            worker_role=role,
         )
 
     def admit_follower(
@@ -1009,8 +1164,8 @@ class RunCoordinationRepository:
         worker_id: str,
         config_hash: str,
         window_seconds: float,
-    ) -> None:
-        """§B.1 step 2: atomic IMMEDIATE follower admission.
+    ) -> WorkerMembershipToken:
+        """§B.1 step 2: atomic IMMEDIATE follower admission; returns the membership token.
 
         SLICE-5 CONSUMER: ``elspeth join`` (which performs the filesystem
         preflight BEFORE calling this). Refuses with
@@ -1019,6 +1174,11 @@ class RunCoordinationRepository:
         must never be the first process on an abandoned run). Seat liveness
         is judged against the Landscape database clock read inside this
         transaction (ADR-047).
+
+        The returned :class:`WorkerMembershipToken` is the ONLY production
+        source of a follower's membership authority (ADR-048 amendment): the
+        follower threads it by value into its heartbeat and departure verbs
+        and, in wave 2, its claim verbs. A caller never constructs one.
         """
         with begin_write(self._engine) as conn:
             database_now = read_landscape_transaction_time(conn)
@@ -1063,37 +1223,50 @@ class RunCoordinationRepository:
                 recorded_at=database_now,
                 context={"role": "follower", "entry_point": "join"},
             )
+        return WorkerMembershipToken(run_id=run_id, worker_id=worker_id)
 
-    def depart_worker(self, *, worker_id: str) -> None:
-        """CAS ``active → departed`` + ``worker_depart`` event. Idempotent.
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        """Member-fenced ``active → departed`` + ``worker_depart`` event. Idempotent.
 
-        SLICE-5 CONSUMER: follower clean exit (§B.1 step 5). No-op when the
-        row already left ``active`` (e.g. finalize's leftover-member hygiene
-        departed it first).
+        SLICE-5 CONSUMER: follower clean exit (§B.1 step 5), always from a
+        teardown arm. The membership fence is the first statement (ADR-030
+        D4); its refusal — the row already left ``active`` (finalize's
+        leftover-member hygiene departed it first, or the leader evicted it)
+        — is this verb's declared idempotent no-op: nothing is written and the
+        ``fence_refusal`` row the fence recorded is the evidence that a
+        departed identity tried to depart again.
         """
-        with begin_write(self._engine) as conn:
-            database_now = read_landscape_transaction_time(conn)
-            member = conn.execute(select(run_workers_table.c.run_id).where(run_workers_table.c.worker_id == worker_id)).one_or_none()
-            if member is None:
-                return
-            departed = conn.execute(
-                update(run_workers_table)
-                .where(
-                    run_workers_table.c.worker_id == worker_id,
-                    run_workers_table.c.status == "active",
+        try:
+            with fenced_member_transaction(self._engine, member_token=member_token, verb="depart_worker") as conn:
+                database_now = read_landscape_transaction_time(conn)
+                departed = conn.execute(
+                    update(run_workers_table)
+                    .where(
+                        run_workers_table.c.run_id == member_token.run_id,
+                        run_workers_table.c.worker_id == member_token.worker_id,
+                        run_workers_table.c.status == "active",
+                    )
+                    .values(status="departed", departed_at=database_now)
                 )
-                .values(status="departed", departed_at=database_now)
-            )
-            if departed.rowcount == 1:
+                if departed.rowcount != 1:
+                    # The fence just matched this exact active row inside the
+                    # same IMMEDIATE transaction; unreachable by construction,
+                    # kept as a fail-closed integrity backstop.
+                    raise AuditIntegrityError(
+                        f"depart_worker: worker {member_token.worker_id!r} passed its membership fence but the departure UPDATE "
+                        f"matched {departed.rowcount} rows; the run_workers row changed inside one IMMEDIATE transaction."
+                    )
                 record_coordination_event(
                     conn,
-                    run_id=member.run_id,
+                    run_id=member_token.run_id,
                     event_type="worker_depart",
-                    worker_id=worker_id,
+                    worker_id=member_token.worker_id,
                     leader_epoch=None,
                     recorded_at=database_now,
                     context={},
                 )
+        except RunMembershipLostError:
+            return
 
     def evict_worker(
         self,

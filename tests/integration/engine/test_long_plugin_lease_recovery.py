@@ -60,7 +60,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seed_ready_row,
 )
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
-from tests.fixtures.landscape import expire_lease
+from tests.fixtures.landscape import expire_lease, member_token_for
 from tests.fixtures.plugins import CollectSink
 from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
 
@@ -218,8 +218,7 @@ def _run_follower_attempt(
         clock = _SharedFileClock(Path(clock_path))
         follower = build_follower_processor(
             factory=factory,
-            run_id=run_id,
-            worker_id=worker_id,
+            member_token=member_token_for(db.engine, worker_id=worker_id, run_id=run_id),
             graph=graph,
             config=config,
             payload_store=payload_store,

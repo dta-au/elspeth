@@ -10,6 +10,10 @@ Value objects threaded through the leader/follower coordination protocol
 - :class:`CoordinationToken` — the fencing token carried by value into every
   leader-fenced verb; never re-read mid-run. ``leader_epoch`` is THE fence:
   a takeover bumps it, instantly refusing the deposed leader everywhere.
+- :class:`WorkerMembershipToken` — the membership token carried by value into
+  every membership-fenced verb (ADR-030 D4's second fence: the holder is an
+  ``active`` ``run_workers`` row). Established by ``admit_follower``; the
+  leader derives its own through ``CoordinationToken.membership``.
 - :class:`LeaderInfo` — read-only seat snapshot (``live_leader``); the
   slice-4 entry-guard precision upgrade consumes it.
 - :class:`CoordinationSnapshot` — returned by ``worker_heartbeat`` so
@@ -35,6 +39,7 @@ __all__ = [
     "CoordinationToken",
     "LeaderInfo",
     "RegisteredWorker",
+    "WorkerMembershipToken",
     "mint_worker_id",
 ]
 
@@ -86,6 +91,41 @@ class CoordinationToken:
     run_id: str
     worker_id: str
     leader_epoch: int
+
+    @property
+    def membership(self) -> WorkerMembershipToken:
+        """The leader's own membership: the weaker authority derived from the stronger.
+
+        Every seat mint (``register_run_leader_on``, the takeover CAS, the
+        export-seat CAS) inserts the leader's ``run_workers`` row in the same
+        transaction as the seat, so a leader IS a member by construction and
+        this derivation never invents a row. The reverse derivation does not
+        exist: a :class:`WorkerMembershipToken` cannot produce a leader token.
+        """
+        return WorkerMembershipToken(run_id=self.run_id, worker_id=self.worker_id)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerMembershipToken:
+    """Membership fencing token: ``(run_id, worker_id)`` — ADR-030 D4's second fence.
+
+    Proves the holder is an *active* member of the run, nothing more: no
+    epoch, no seat. Established by ``admit_follower`` (the follower's own
+    ``run_workers`` row) and derived by the leader from its
+    :class:`CoordinationToken` (``CoordinationToken.membership``). Threaded by
+    value into every membership-fenced verb; ``fenced_member_transaction``
+    verify-UPDATEs the ``run_workers`` row for ``(run_id, worker_id,
+    status='active')`` as the first statement of the verb's transaction and
+    refuses with ``RunMembershipLostError`` on rowcount 0.
+
+    Nominal (ADR-032): a distinct owned class, no Protocol, no union with and
+    no inheritance from :class:`CoordinationToken`. A leader-scoped verb that
+    accepted this type would be unprovable, which is exactly the fail-open
+    class the two-type split exists to close (ADR-048 amendment 2026-09-07).
+    """
+
+    run_id: str
+    worker_id: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -98,7 +98,7 @@ if TYPE_CHECKING:
     from elspeth.contracts import CommittedAggregationOutputReceipt, CommittedAggregationResidual, CommittedCoalesceResidual
     from elspeth.contracts.audit import Row as AuditRow
     from elspeth.contracts.audit import Token as AuditToken
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.events import TelemetryEvent
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.core.landscape.scheduler import BarrierRestoreReadModel
@@ -457,6 +457,7 @@ class RowProcessor:
         scheduler_lease_seconds: int = 300,
         scheduler_heartbeat_seconds: int = 60,
         coordination_token: CoordinationToken | None = None,
+        member_token: WorkerMembershipToken | None = None,
         run_coordination: RunCoordinationRepository | None = None,
         follower_barrier_node_ids: frozenset[NodeID] | None = None,
         mode: ProcessorMode = ProcessorMode.LEADER,
@@ -527,6 +528,16 @@ class RowProcessor:
                 passes ``scheduler_lease_owner=token.worker_id`` — the §A.1
                 registered worker identity IS the lease owner. A distinct
                 leader lease owner is rejected at construction.
+            member_token: Membership fencing token (ADR-030 D4's second
+                fence; ADR-048 amendment 2026-09-07). Carried by value for
+                the membership-fenced verbs a FOLLOWER drives; the value
+                ``admit_follower`` returned, never constructed here. The two
+                authority types are a TYPE distinction, not a flag: FOLLOWER
+                requires ``member_token`` and forbids ``coordination_token``;
+                LEADER forbids ``member_token`` (a leader derives its own
+                membership from its coordination token). Its ``worker_id``
+                must equal ``scheduler_lease_owner`` and its ``run_id`` this
+                processor's run.
             run_coordination: Optional RunCoordinationRepository for leader
                 housekeeping (§C.2 path 1, slice 4): enumerating dead non-leader
                 workers and calling ``evict_worker`` for each. None = no
@@ -555,8 +566,9 @@ class RowProcessor:
                 tokenless harnesses recover through the repository's named
                 legacy adapter rather than this processor mode.
                 FOLLOWER is validated fail-closed below: it requires
-                ``coordination_token=None``, ``run_coordination=None``, and
-                an explicit ``scheduler_lease_owner``; it gates the public
+                ``coordination_token=None``, ``run_coordination=None``, an
+                explicit ``scheduler_lease_owner`` and a ``member_token``
+                naming that owner; it gates the public
                 :meth:`drain_follower_ready_work` surface and the follower
                 skip of scheduler maintenance (ADR-030 §C.3).
         """
@@ -715,6 +727,7 @@ class RowProcessor:
             create_work_item=self._work_items.create,
         )
         self._coordination_token = coordination_token
+        self._member_token = member_token
         self._run_coordination = run_coordination
         # ADR-030 §G (slice 5): _scheduler_lease_owner_registered is True when
         # the lease owner is a run_workers identity. Production paths pass the
@@ -746,11 +759,17 @@ class RowProcessor:
         # gate: it is already structural — empty aggregation_settings plus
         # coalesce_executor=None make the intake pass a no-op.)
         self._mode = mode
+        # ADR-030 D4 / ADR-048 amendment: the two authority types are a TYPE
+        # distinction, never a flag. A follower carries exactly a
+        # WorkerMembershipToken; a leader carries exactly a CoordinationToken
+        # (its membership is derived, never carried alongside). A processor
+        # holding both — or the wrong one — is the wrong-mode bug this guard
+        # exists to catch, before any verb can be reached.
         if mode is ProcessorMode.FOLLOWER:
             if coordination_token is not None:
                 raise OrchestrationInvariantError(
                     "ProcessorMode.FOLLOWER forbids a coordination_token: a follower must never "
-                    "present an epoch fence (ADR-030 §B.1 — the fenced verbs are leader-only). "
+                    "present an epoch fence (ADR-030 §B.1 — the leader-fenced verbs are leader-only). "
                     "A follower carrying a leader fence is the wrong-mode bug this flag exists to catch."
                 )
             if run_coordination is not None:
@@ -766,6 +785,24 @@ class RowProcessor:
                     "membership-fence key (ADR-030 §A.1/§G); an anonymous minted owner cannot "
                     "pass the claim fence."
                 )
+            if member_token is None:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires a member_token: a follower's authority is its "
+                    "WorkerMembershipToken (ADR-030 D4 membership fence), the value admit_follower "
+                    "returned. A follower without one cannot present membership to any fenced verb."
+                )
+            if member_token.run_id != run_id or member_token.worker_id != self._scheduler_lease_owner:
+                raise OrchestrationInvariantError(
+                    "ProcessorMode.FOLLOWER requires member_token to name this processor's run and its "
+                    f"scheduler_lease_owner: got member_token=({member_token.run_id!r}, {member_token.worker_id!r}) "
+                    f"for run_id={run_id!r}, scheduler_lease_owner={self._scheduler_lease_owner!r} (ADR-030 §A.1)."
+                )
+        elif member_token is not None:
+            raise OrchestrationInvariantError(
+                "ProcessorMode.LEADER forbids a member_token: a leader's membership is derived from its "
+                "coordination_token (CoordinationToken.membership), never carried alongside it. A leader "
+                "holding a follower's authority type is the wrong-mode bug this guard exists to catch."
+            )
         self._scheduler_lease_seconds = scheduler_lease_seconds
         if scheduler_heartbeat_seconds <= 0:
             raise OrchestrationInvariantError(f"scheduler_heartbeat_seconds must be positive, got {scheduler_heartbeat_seconds}")

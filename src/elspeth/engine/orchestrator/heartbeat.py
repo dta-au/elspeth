@@ -63,7 +63,7 @@ import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-    CoordinationToken,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
 
@@ -93,7 +93,7 @@ class _HeartbeatSnapshot(Protocol):
 class _HeartbeatRepository(Protocol):
     """Repository operations required by ``RunHeartbeatThread``."""
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> _HeartbeatSnapshot: ...
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> _HeartbeatSnapshot: ...
 
     def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None: ...
 
@@ -103,7 +103,7 @@ class RunHeartbeatThread:
 
     Lifecycle::
 
-        thread = RunHeartbeatThread(repo, token=token, now_fn=..., ...)
+        thread = RunHeartbeatThread(repo, member_token=member_token, now_fn=..., ...)
         thread.start()
         try:
             # run body — call thread.check_and_raise() at every boundary
@@ -117,9 +117,13 @@ class RunHeartbeatThread:
         :class:`~elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository`
         instance backed by the run's engine, typed structurally here to avoid
         importing the concrete repository into the orchestrator layer.
-    token:
-        The leader's coordination token (worker_id + run_id); used to detect
-        seat deposition (snapshot ``leader_worker_id`` ≠ our ``worker_id``).
+    member_token:
+        This worker's :class:`~elspeth.contracts.coordination.WorkerMembershipToken`
+        (run_id + worker_id). The heartbeat is a MEMBER write (ADR-030 D4):
+        a follower carries the token ``admit_follower`` returned, a leader
+        derives its own from its coordination token
+        (``CoordinationToken.membership``). Also used to detect seat
+        deposition (snapshot ``leader_worker_id`` ≠ our ``worker_id``).
     heartbeat_seconds:
         Beat cadence; defaults to
         :data:`~elspeth.contracts.coordination.DEFAULT_RUN_HEARTBEAT_SECONDS`
@@ -146,7 +150,7 @@ class RunHeartbeatThread:
         self,
         repo: _HeartbeatRepository,
         *,
-        token: CoordinationToken,
+        member_token: WorkerMembershipToken,
         heartbeat_seconds: float = DEFAULT_RUN_HEARTBEAT_SECONDS,
         window_seconds: float = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         now_fn: Callable[[], datetime] | None = None,
@@ -154,7 +158,7 @@ class RunHeartbeatThread:
         degraded_threshold: int = _DEFAULT_DEGRADED_THRESHOLD,
     ) -> None:
         self._repo = repo
-        self._token = token
+        self._token = member_token
         self._heartbeat_seconds = heartbeat_seconds
         self._window_seconds = window_seconds
         self._now_fn: Callable[[], datetime] = now_fn if now_fn is not None else lambda: datetime.now(UTC)
@@ -181,7 +185,7 @@ class RunHeartbeatThread:
         self._fatal_event = threading.Event()
         self._fatal_exc: BaseException | None = None
 
-        self._thread = threading.Thread(target=self._run, daemon=True, name=f"run-heartbeat:{token.run_id[:8]}")
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"run-heartbeat:{member_token.run_id[:8]}")
         self._consecutive_busy: int = 0
 
     # ------------------------------------------------------------------
@@ -257,17 +261,21 @@ class RunHeartbeatThread:
         # Final beat on exit: keeps the seat live until release_seat is called
         # (stop() is called in the finally block just before release_seat).
         # A known-terminal follower skips it because finalize may already have
-        # departed the follower row. Best-effort — never raises.
-        if not self._skip_final_beat_event.is_set():
+        # departed the follower row, and a worker that has already learned it
+        # lost membership has nothing left to keep live — a second beat would
+        # only be a second membership-fence refusal. Best-effort — never raises.
+        if not self._skip_final_beat_event.is_set() and not self._coordination_lost_event.is_set():
             self._beat_once()
 
     def _beat_once(self) -> None:
         """Execute one heartbeat tick; NEVER raises.
 
-        Three outcomes:
+        Outcomes:
         1. ``worker_active=True``, and (if leader) snapshot
            ``leader_worker_id==our_id`` → healthy; reset busy counter.
-        2. ``worker_active=False`` → coordination lost; latch the flag.
+        2. ``worker_active=False`` (the membership fence refused this beat —
+           ADR-030 D4; the repository returns the refusal as this declared
+           outcome) → coordination lost; latch the flag.
            For a LEADER ONLY: foreign ``leader_worker_id`` (deposed) also
            latches.  A follower seeing a foreign leader is the NORMAL case
            (the follower is never the leader); follower deposed-latch is
@@ -289,7 +297,7 @@ class RunHeartbeatThread:
         """
         try:
             snapshot = self._repo.worker_heartbeat(
-                worker_id=self._token.worker_id,
+                member_token=self._token,
                 window_seconds=self._window_seconds,
             )
             # Reset busy counter on any successful DB round-trip.

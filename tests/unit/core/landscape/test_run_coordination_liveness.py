@@ -43,7 +43,7 @@ from sqlalchemy.exc import OperationalError
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
-    CoordinationToken,
+    WorkerMembershipToken,
     mint_worker_id,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
@@ -58,7 +58,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
-from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now, member_token_for
 from tests.helpers.run_coordination import register_run_leader
 
 # ---------------------------------------------------------------------------
@@ -140,23 +140,6 @@ def _age_deadlines(engine: Tier1Engine, leader_id: str, *, remaining: timedelta,
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == leader_id).values(heartbeat_expires_at=aged))
 
 
-def _make_thread(
-    repo: RunCoordinationRepository,
-    *,
-    token: CoordinationToken,
-    now: datetime = NOW,
-) -> RunHeartbeatThread:
-    """Stub-free helper: real repo, deterministic (no sleeps, no real wall-clock)."""
-    return RunHeartbeatThread(
-        repo,
-        token=token,
-        heartbeat_seconds=15.0,
-        window_seconds=WINDOW,
-        now_fn=lambda: now,
-        wait_fn=lambda _: False,  # never actually waits
-    )
-
-
 # ---------------------------------------------------------------------------
 # Stub repo for thread tests that need controlled side-effects
 # ---------------------------------------------------------------------------
@@ -171,8 +154,8 @@ class _StubRepo:
         self.degraded_calls: list[dict[str, object]] = []
         self.degraded_raise: Exception | None = None
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
+        self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         if not self.side_effects:
             raise AssertionError("_StubRepo: no more side_effects configured")
         result = self.side_effects.pop(0)
@@ -218,7 +201,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         # The heartbeat thread's next tick: the beat carries no clock, the
         # deadline is the Landscape database clock + WINDOW (ADR-047).
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id=leader_id, window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=member_token_for(engine, worker_id=leader_id), window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         # Snapshot fields.
@@ -274,7 +257,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         seat_before = _seat_row(engine)
         follower_before = _worker_row(engine, follower_id)
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id=follower_id, window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=member_token_for(engine, worker_id=follower_id), window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         # Snapshot reports the seat as viewed — leader_worker_id matches but
@@ -309,7 +292,9 @@ class TestBusyToleranceNeverEvicts:
 
         Contrast arm: a rowcount-0 beat (worker_active=False) DOES set the latch.
         """
-        token = CoordinationToken(run_id=RUN_ID, worker_id="worker-busy", leader_epoch=1)
+        # Mock-only construction (D8.7): the repository is a stub, so there is
+        # no run_workers row to read the membership back from.
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-busy")
         repo = _StubRepo()
 
         # k-1 busy ticks then a success.
@@ -319,7 +304,7 @@ class TestBusyToleranceNeverEvicts:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             heartbeat_seconds=15.0,
             window_seconds=WINDOW,
             now_fn=lambda: NOW,
@@ -345,10 +330,10 @@ class TestBusyToleranceNeverEvicts:
         evicted_snapshot = CoordinationSnapshot(leader_worker_id=None, leader_epoch=1, seat_live=False, worker_active=False)
         repo2 = _StubRepo()
         repo2.side_effects = [evicted_snapshot]
-        token2 = CoordinationToken(run_id=RUN_ID, worker_id="worker-evicted", leader_epoch=1)
+        token2 = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-evicted")
         thread2 = RunHeartbeatThread(
             repo2,
-            token=token2,
+            member_token=token2,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
@@ -383,7 +368,7 @@ class TestHeartbeatDegradedEvent:
         # Replace the repo's worker_heartbeat with a stubbed busy side-effect
         # while letting record_heartbeat_degraded write to the real DB.
         class _BusyStubRepo:
-            def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
+            def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
                 raise OperationalError("stmt", {}, Exception("database is locked"))
 
             def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
@@ -392,7 +377,7 @@ class TestHeartbeatDegradedEvent:
         k = 3
         thread = RunHeartbeatThread(
             _BusyStubRepo(),
-            token=token,
+            member_token=token.membership,
             heartbeat_seconds=15.0,
             window_seconds=WINDOW,
             now_fn=lambda: NOW,
@@ -422,7 +407,7 @@ class TestHeartbeatDegradedEvent:
         """An unwritable degraded event (record_heartbeat_degraded raises) must
         NOT propagate out of the thread — degraded eventing is best-effort.
         """
-        token = CoordinationToken(run_id=RUN_ID, worker_id="worker-busy-2", leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-busy-2")
         repo = _StubRepo()
         busy = OperationalError("stmt", {}, Exception("database is locked"))
         repo.side_effects = [busy, busy, busy]
@@ -430,7 +415,7 @@ class TestHeartbeatDegradedEvent:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
             degraded_threshold=3,
@@ -464,7 +449,7 @@ class TestForeignLeaderFatalLatch:
         SEAT snapshot, not the row state — independent of the eviction fence.
         """
         our_id = "worker-A"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
 
         # Snapshot: our worker row is still active, BUT the seat shows worker-B.
@@ -478,7 +463,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
@@ -498,7 +483,7 @@ class TestForeignLeaderFatalLatch:
         re-emit (the flag is already set, re-setting an Event is idempotent).
         """
         our_id = "worker-A2"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
 
         foreign = CoordinationSnapshot(leader_worker_id="worker-C", leader_epoch=3, seat_live=True, worker_active=True)
@@ -506,7 +491,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
@@ -526,7 +511,7 @@ class TestForeignLeaderFatalLatch:
         matters.  The latch is only for a FOREIGN takeover.
         """
         our_id = "worker-A3"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
         # Vacant seat (our row still active).
         vacant = CoordinationSnapshot(leader_worker_id=None, leader_epoch=1, seat_live=False, worker_active=True)
@@ -534,7 +519,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )

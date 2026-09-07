@@ -42,11 +42,12 @@ from sqlalchemy import event, insert, select, update
 
 from elspeth.contracts import CheckpointDraft, ExportStatus, NodeType, RunStatus
 from elspeth.contracts.audit import SecretResolutionInput
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
+    RunMembershipLostError,
 )
 from elspeth.contracts.preflight import CommencementGateResult, PreflightResult
 from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStatus
@@ -55,7 +56,10 @@ from elspeth.core.checkpoint.manager import CheckpointManager
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.run_coordination_repository import (
+    RunCoordinationRepository,
+    fenced_member_transaction,
+)
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     batch_members_table,
@@ -170,6 +174,38 @@ def _fence_refusals(db: LandscapeDB, verb: str) -> list[dict[str, object]]:
             .all()
         )
     return [dict(row) for row in rows if json.loads(str(row["context_json"])).get("verb") == verb]
+
+
+def _seat_image(db: LandscapeDB) -> tuple[object, ...]:
+    """The seat row as a whole tuple — the zero-mutation witness for a refused seat write."""
+    with db.engine.connect() as conn:
+        return tuple(conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID)).one())
+
+
+def _worker_image(db: LandscapeDB, worker_id: str) -> tuple[object, ...]:
+    """A ``run_workers`` row as a whole tuple — the zero-mutation witness for a refused member write."""
+    with db.engine.connect() as conn:
+        return tuple(conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == worker_id)).one())
+
+
+def _depart_member(db: LandscapeDB, worker_id: str) -> None:
+    """Leave ``active`` by the follower's own exit; single-use identity — it never returns."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == worker_id)
+            .values(status="departed", departed_at=read_landscape_transaction_time(conn))
+        )
+
+
+def _evict_member(db: LandscapeDB, worker_id: str) -> None:
+    """Leave ``active`` by the leader's §C.2 housekeeping sweep — the other stale-membership cause."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == worker_id)
+            .values(status="evicted", evicted_at=read_landscape_transaction_time(conn), evicted_by_worker_id="worker:sweep")
+        )
 
 
 def _seed_row_and_token(db: LandscapeDB, *, sequence: int) -> tuple[str, str]:
@@ -943,6 +979,114 @@ class TestStaleTokenFenceRefusals:
             rows = conn.execute(select(rows_table.c.row_id)).scalars().all()
         assert rows == []
         assert len(_fence_refusals(db, "create_row_with_token")) == 1
+
+    def test_release_seat_refused(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The seat is a RUN-scoped row, so vacating it is a LEADER write (ADR-030 D4).
+
+        A deposed leader's teardown must not vacate the seat its usurper now
+        holds. The refusal is swallowed at the verb (release is a ``finally``
+        arm where a second leadership-lost signal would mask the first), so
+        the contract here is zero mutation plus the fence's own evidence.
+        """
+        repo = RunCoordinationRepository(db.engine)
+        _bump_epoch(db)
+        seat_before = _seat_image(db)
+        worker_before = _worker_image(db, WORKER)
+
+        repo.release_seat(token=token)  # declared no-op, never raises
+
+        assert _seat_image(db) == seat_before, "a deposed leader must not vacate the usurper's seat"
+        assert _worker_image(db, WORKER) == worker_before
+        refusals = _fence_refusals(db, "release_seat")
+        assert len(refusals) == 1
+        assert refusals[0]["leader_epoch"] == token.leader_epoch
+
+
+class TestStaleMembershipTokenFenceRefusals:
+    """ADR-030 D4's SECOND fence: a departed or evicted member is refused.
+
+    The member-scoped analogue of :class:`TestStaleTokenFenceRefusals`. The
+    stale authority here is a :class:`WorkerMembershipToken` whose
+    ``run_workers`` row left ``active`` — the single-use identity doctrine
+    means it never returns — and the contract is the same three parts:
+    the refusal, exactly one ``fence_refusal`` event naming the verb and the
+    membership fence, and ZERO payload mutation because
+    :func:`verify_membership_fence` is the FIRST statement of the verb's
+    IMMEDIATE transaction.
+
+    Both member-fenced verbs are teardown/liveness writes that REIFY the
+    refusal as a declared outcome rather than propagating it
+    (``worker_active=False``; the idempotent departure no-op), so the raise
+    itself is pinned once on the helper.
+    """
+
+    def test_fenced_member_transaction_raises_and_rolls_back(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The helper's own contract: the payload never runs, one refusal event."""
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _depart_member(db, WORKER)
+        seat_before = _seat_image(db)
+
+        with (
+            pytest.raises(RunMembershipLostError) as excinfo,
+            fenced_member_transaction(db.engine, member_token=member, verb="probe") as conn,
+        ):
+            conn.execute(update(run_coordination_table).values(leader_worker_id="usurper"))
+
+        assert (excinfo.value.run_id, excinfo.value.worker_id, excinfo.value.verb) == (RUN_ID, WORKER, "probe")
+        assert _seat_image(db) == seat_before, "the payload rolled back with the fence"
+        refusals = _fence_refusals(db, "probe")
+        assert len(refusals) == 1
+        assert refusals[0]["leader_epoch"] is None, "a member holds no epoch"
+        assert json.loads(str(refusals[0]["context_json"]))["fence"] == "membership"
+
+    def test_worker_heartbeat_refused_for_evicted_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """A zombie beat cannot revive membership, and cannot extend the seat."""
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _evict_member(db, WORKER)
+        seat_before = _seat_image(db)
+        worker_before = _worker_image(db, WORKER)
+
+        snapshot = repo.worker_heartbeat(member_token=member, window_seconds=80.0)
+
+        assert snapshot.worker_active is False, "the refusal IS the declared coordination-lost outcome"
+        assert _worker_image(db, WORKER) == worker_before, "an evicted row never returns to active"
+        assert _seat_image(db) == seat_before, "a refused beat must not extend the seat it no longer holds"
+        assert len(_fence_refusals(db, "worker_heartbeat")) == 1
+
+    def test_depart_worker_refused_for_departed_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The second departure writes nothing and emits no second ``worker_depart``."""
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+        _depart_member(db, WORKER)
+        worker_before = _worker_image(db, WORKER)
+
+        repo.depart_worker(member_token=member)  # declared idempotent no-op
+
+        assert _worker_image(db, WORKER) == worker_before
+        with db.engine.connect() as conn:
+            departs = conn.execute(
+                select(run_coordination_events_table.c.event_id)
+                .where(run_coordination_events_table.c.run_id == RUN_ID)
+                .where(run_coordination_events_table.c.event_type == "worker_depart")
+            ).all()
+        assert departs == [], "the fence refused before the departure CAS could write its event"
+        assert len(_fence_refusals(db, "depart_worker")) == 1
+
+    def test_member_fence_admits_an_active_member(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """The positive arm: an active row passes and the payload commits.
+
+        Without this, every arm above would still pass if the fence refused
+        unconditionally — the failure mode that turns a fence into an outage.
+        """
+        repo = RunCoordinationRepository(db.engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER)
+
+        snapshot = repo.worker_heartbeat(member_token=member, window_seconds=80.0)
+
+        assert snapshot.worker_active is True
+        assert snapshot.worker_role == "leader", "the leader IS a member (CoordinationToken.membership)"
+        assert _fence_refusals(db, "worker_heartbeat") == []
 
 
 class TestStrictPendingSinkOwnerCAS:

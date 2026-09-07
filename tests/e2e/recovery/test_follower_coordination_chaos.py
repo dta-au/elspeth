@@ -41,7 +41,6 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -65,7 +64,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
-from tests.fixtures.landscape import expire_lease
+from tests.fixtures.landscape import expire_lease, member_token_for
 
 _GUARD_LIVE_SEAT_WINDOW_SECONDS = 10**9
 
@@ -163,10 +162,14 @@ class TestFollowerIsolation:
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
         ):
-            follower_b = _orchestrator(crashed).join_run(
-                run_id=crashed.run_id,
-                settings=types.SimpleNamespace(),
-                window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+            follower_b = (
+                _orchestrator(crashed)
+                .join_run(
+                    run_id=crashed.run_id,
+                    settings=types.SimpleNamespace(),
+                    window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                )
+                .worker_id
             )
 
         # Seed one READY row for follower-A to claim.
@@ -265,10 +268,14 @@ class TestFollowerIsolation:
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
         ):
-            follower_b = _orchestrator(crashed).join_run(
-                run_id=crashed.run_id,
-                settings=types.SimpleNamespace(),
-                window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+            follower_b = (
+                _orchestrator(crashed)
+                .join_run(
+                    run_id=crashed.run_id,
+                    settings=types.SimpleNamespace(),
+                    window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                )
+                .worker_id
             )
 
         # Seed two READY rows using direct enqueue (safe with multiple rows).
@@ -335,10 +342,14 @@ class TestFollowerIsolation:
             patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
         ):
-            follower_b = _orchestrator(crashed).join_run(
-                run_id=crashed.run_id,
-                settings=types.SimpleNamespace(),
-                window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+            follower_b = (
+                _orchestrator(crashed)
+                .join_run(
+                    run_id=crashed.run_id,
+                    settings=types.SimpleNamespace(),
+                    window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+                )
+                .worker_id
             )
 
         # Seed two disjoint READY rows using direct enqueue (safe with multiple rows).
@@ -556,10 +567,10 @@ class TestFollowerChaos:
             )
         )
 
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
             wait_fn=lambda _: None,
@@ -689,10 +700,10 @@ class TestFollowerChaos:
             with crashed.db.engine.begin() as conn:
                 conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
 
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
             wait_fn=_wait,

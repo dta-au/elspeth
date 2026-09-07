@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -336,7 +337,7 @@ def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(post
     db = LandscapeDB.from_url(postgres_url)
     repo = RunCoordinationRepository(db.engine)
     _seed_run(db, run_id=run_id, now=now, status="failed")
-    register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=5)
+    token = register_run_leader(repo, run_id=run_id, worker_id=worker_id, window_seconds=5)
     events_before = _coordination_events(db, run_id=run_id)
 
     at_equality = (
@@ -344,7 +345,7 @@ def test_postgresql_active_leader_heartbeat_extends_both_rows_without_event(post
     )
     beat_from = landscape_database_now(db.engine)
     with stamp_inside_next_transaction(db.engine, at_equality):
-        snapshot = repo.worker_heartbeat(worker_id=worker_id, window_seconds=5)
+        snapshot = repo.worker_heartbeat(member_token=token.membership, window_seconds=5)
     beat_until = landscape_database_now(db.engine)
     try:
         assert snapshot.worker_active is True
@@ -385,7 +386,7 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
         repo = RunCoordinationRepository(db.engine)
         _seed_run(db, run_id=run_id, now=now)
         register_run_leader(repo, run_id=run_id, worker_id=leader_id, window_seconds=30)
-        repo.admit_follower(
+        follower = repo.admit_follower(
             run_id=run_id,
             worker_id=follower_id,
             config_hash="config",
@@ -398,7 +399,7 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
         events_before = _coordination_events(db, run_id=run_id)
 
         departed_from = landscape_database_now(db.engine)
-        repo.depart_worker(worker_id=follower_id)
+        repo.depart_worker(member_token=follower)
         departed_until = landscape_database_now(db.engine)
 
         with db.read_only_connection() as conn:
@@ -424,15 +425,22 @@ def test_postgresql_departed_follower_heartbeat_cannot_revive_membership(postgre
         departed_image = capture_state_engine_image(db, run_id=run_id)
 
         snapshot = repo.worker_heartbeat(
-            worker_id=follower_id,
+            member_token=follower,
             window_seconds=30,
         )
 
         assert snapshot.worker_active is False
         assert snapshot.worker_role == "follower"
         assert snapshot.leader_worker_id == leader_id
-        assert capture_state_engine_image(db, run_id=run_id) == departed_image
-        assert _coordination_events(db, run_id=run_id) == events_after_depart
+        # Zero mutation on PostgreSQL too: the departed row and the seat are
+        # byte-identical; the only new row is the membership fence's refusal
+        # evidence (leader_epoch NULL — a member holds no epoch).
+        events_after_beat = _coordination_events(db, run_id=run_id)
+        assert events_after_beat[:-1] == events_after_depart
+        refusal = events_after_beat[-1]
+        assert (refusal["event_type"], refusal["worker_id"], refusal["leader_epoch"]) == ("fence_refusal", follower_id, None)
+        assert json.loads(str(refusal["context_json"])) == {"fence": "membership", "verb": "worker_heartbeat"}
+        assert departed_image.diff(capture_state_engine_image(db, run_id=run_id)).changed_tables == {"run_coordination_events"}
     finally:
         db.close()
 

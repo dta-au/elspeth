@@ -40,7 +40,7 @@ from sqlalchemy import create_engine, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError
 
-from elspeth.contracts.coordination import CoordinationToken, mint_worker_id
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     JoinRefusedError,
@@ -713,10 +713,19 @@ class TestReleaseSeatAndLiveLeader:
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         repo.release_seat(token=token)
         events_after_first = _events(engine)
+        seat_after_first = _seat_row(engine)
+        worker_after_first = _worker_row(engine, token.worker_id)
 
-        repo.release_seat(token=token)  # no error, no second event
+        repo.release_seat(token=token)  # no error: the leader fence refuses the vacated seat
 
-        assert _events(engine) == events_after_first
+        # Zero mutation; the only new row is the fence's own refusal evidence.
+        assert _seat_row(engine) == seat_after_first
+        assert _worker_row(engine, token.worker_id) == worker_after_first
+        new_events = _events(engine)[len(events_after_first) :]
+        assert [(e["event_type"], e["worker_id"], e["leader_epoch"]) for e in new_events] == [
+            ("fence_refusal", token.worker_id, token.leader_epoch)
+        ]
+        assert json.loads(str(new_events[0]["context_json"])) == {"verb": "release_seat"}
 
     def test_release_with_stale_epoch_is_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine)
@@ -731,7 +740,13 @@ class TestReleaseSeatAndLiveLeader:
 
         assert _seat_row(engine) == seat_before
         assert _worker_row(engine, token.worker_id) == worker_before
-        assert _events(engine) == events_before
+        # The stale epoch is refused by the leader fence: zero mutation plus
+        # exactly one fence_refusal row carrying the stale epoch.
+        new_events = _events(engine)[len(events_before) :]
+        assert [(e["event_type"], e["worker_id"], e["leader_epoch"]) for e in new_events] == [
+            ("fence_refusal", token.worker_id, token.leader_epoch + 1)
+        ]
+        assert json.loads(str(new_events[0]["context_json"])) == {"verb": "release_seat"}
 
     def test_release_with_foreign_worker_is_zero_mutation(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         foreign_run_id = "run-coord-foreign"
@@ -760,7 +775,14 @@ class TestReleaseSeatAndLiveLeader:
             token.worker_id: _worker_row(engine, token.worker_id),
             foreign.worker_id: _worker_row(engine, foreign.worker_id),
         } == workers_before
-        assert {RUN_ID: _events(engine), foreign_run_id: _events(engine, foreign_run_id)} == events_before
+        # The foreign identity is refused by RUN_ID's leader fence: the refusal
+        # is evidenced under RUN_ID (the run it claimed), the foreign run is
+        # untouched.
+        assert _events(engine, foreign_run_id) == events_before[foreign_run_id]
+        new_events = _events(engine)[len(events_before[RUN_ID]) :]
+        assert [(e["event_type"], e["worker_id"], e["leader_epoch"]) for e in new_events] == [
+            ("fence_refusal", foreign.worker_id, token.leader_epoch)
+        ]
 
     def test_release_requires_active_membership_in_token_run(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         """A seat identity cannot authorize departure of membership owned by another run."""
@@ -846,7 +868,7 @@ class TestRegistryVerbs:
             )
 
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id=token.worker_id, window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=token.membership, window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         assert snapshot.worker_active is True
@@ -868,17 +890,24 @@ class TestRegistryVerbs:
         usurper = mint_worker_id(RUN_ID)
         repo.acquire_run_leadership(run_id=RUN_ID, worker_id=usurper, window_seconds=WINDOW)
 
-        snapshot = repo.worker_heartbeat(worker_id=deposed.worker_id, window_seconds=WINDOW)
+        events_before = _events(engine)
+        snapshot = repo.worker_heartbeat(member_token=deposed.membership, window_seconds=WINDOW)
 
         assert snapshot.worker_active is False  # the coordination-lost latch signal
         assert snapshot.leader_worker_id == usurper  # foreign leader: fatal for a leader-mode process
+        # The takeover evicted the deposed leader's row, so its beat is a
+        # membership-fence refusal: one evidence row, leader_epoch NULL.
+        refusals = _events(engine)[len(events_before) :]
+        assert [(e["event_type"], e["worker_id"], e["leader_epoch"]) for e in refusals] == [("fence_refusal", deposed.worker_id, None)]
+        assert json.loads(str(refusals[0]["context_json"])) == {"fence": "membership", "verb": "worker_heartbeat"}
 
     def test_admit_follower_happy_path_and_refusals(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
         follower = mint_worker_id(RUN_ID)
-        repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        assert member == WorkerMembershipToken(run_id=RUN_ID, worker_id=follower)
         worker = _worker_row(engine, follower)
         assert worker["role"] == "follower"
         assert worker["status"] == "active"
@@ -899,16 +928,24 @@ class TestRegistryVerbs:
         _seed_run(engine, status="running")
         register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
         follower = mint_worker_id(RUN_ID)
-        repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id=follower, config_hash="config", window_seconds=WINDOW)
 
-        repo.depart_worker(worker_id=follower)
+        repo.depart_worker(member_token=member)
         assert _worker_row(engine, follower)["status"] == "departed"
         departs = [e for e in _events(engine) if e["event_type"] == "worker_depart"]
         assert len(departs) == 1
+        departed_row = _worker_row(engine, follower)
 
-        repo.depart_worker(worker_id=follower)  # no-op
-        repo.depart_worker(worker_id="worker:ghost:0")  # unregistered: no-op
+        # Idempotent by fence: a departed identity and a never-registered one
+        # are both refused by the membership verify-UPDATE — zero mutation,
+        # one fence_refusal evidence row each, no second worker_depart.
+        repo.depart_worker(member_token=member)
+        repo.depart_worker(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="worker:ghost:0"))
+        assert _worker_row(engine, follower) == departed_row
         assert len([e for e in _events(engine) if e["event_type"] == "worker_depart"]) == 1
+        refusals = [e for e in _events(engine) if e["event_type"] == "fence_refusal"]
+        assert [(e["worker_id"], e["leader_epoch"]) for e in refusals] == [(follower, None), ("worker:ghost:0", None)]
+        assert {json.loads(str(e["context_json"]))["verb"] for e in refusals} == {"depart_worker"}
 
     def test_evict_worker_grace_predicate_and_fence(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
         _seed_run(engine, status="running")
@@ -1053,7 +1090,7 @@ class TestRunCoordinationTruthTables:
     ) -> None:
         _seed_run(engine)
         leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        repo.admit_follower(
+        follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
             config_hash="config",
@@ -1068,7 +1105,7 @@ class TestRunCoordinationTruthTables:
         follower_before = _worker_row(engine, "follower")
 
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id="follower", window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=follower, window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         follower_after = _worker_row(engine, "follower")
@@ -1092,24 +1129,30 @@ class TestRunCoordinationTruthTables:
     ) -> None:
         _seed_run(engine)
         register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
-        repo.admit_follower(
+        follower = repo.admit_follower(
             run_id=RUN_ID,
             worker_id="follower",
             config_hash="config",
             window_seconds=WINDOW,
         )
         departed_from = landscape_database_now(engine)
-        repo.depart_worker(worker_id="follower")
+        repo.depart_worker(member_token=follower)
         departed_until = landscape_database_now(engine)
         before = _coordination_image(engine)
 
         snapshot = repo.worker_heartbeat(
-            worker_id="follower",
+            member_token=follower,
             window_seconds=WINDOW,
         )
 
         assert snapshot.worker_active is False
-        assert _coordination_image(engine) == before
+        # Zero mutation: the only delta is the membership fence's own refusal
+        # evidence (one fence_refusal row, leader_epoch NULL, fence named).
+        after = _coordination_image(engine)
+        refusal = after["run_coordination_events"][-1]
+        assert {**after, "run_coordination_events": after["run_coordination_events"][:-1]} == before
+        assert (refusal["event_type"], refusal["worker_id"], refusal["leader_epoch"]) == ("fence_refusal", "follower", None)
+        assert json.loads(str(refusal["context_json"])) == {"fence": "membership", "verb": "worker_heartbeat"}
         departed = _worker_row(engine, "follower")
         assert departed["status"] == "departed"
         assert_stamped_between(cast(datetime, departed["departed_at"]), start=departed_from, end=departed_until)

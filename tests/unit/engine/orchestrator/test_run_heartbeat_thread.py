@@ -42,7 +42,7 @@ from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
-    CoordinationToken,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
@@ -71,8 +71,8 @@ class _StubRepo:
         self.worker_heartbeat_calls: list[dict[str, Any]] = []
         self.record_heartbeat_degraded_calls: list[dict[str, Any]] = []
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
+        self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         if self.side_effects:
             result = self.side_effects.pop(0)
             if isinstance(result, Exception):
@@ -96,7 +96,9 @@ class _StubRepo:
 
 _RUN_ID = "run-heartbeat-test"
 _WORKER_ID = f"worker:{_RUN_ID}:abc123"
-_TOKEN = CoordinationToken(run_id=_RUN_ID, worker_id=_WORKER_ID, leader_epoch=1)
+# The heartbeat is a MEMBER write (ADR-030 D4): the thread carries a
+# WorkerMembershipToken — a leader's is derived from its coordination token.
+_TOKEN = WorkerMembershipToken(run_id=_RUN_ID, worker_id=_WORKER_ID)
 
 # Healthy snapshot: our worker is active, our worker is the leader.
 _HEALTHY_SNAPSHOT = CoordinationSnapshot(
@@ -134,7 +136,7 @@ def _make_thread(
         now_fn = lambda: datetime.now(UTC)  # noqa: E731
     return RunHeartbeatThread(
         repo,
-        token=_TOKEN,
+        member_token=_TOKEN,
         heartbeat_seconds=DEFAULT_RUN_HEARTBEAT_SECONDS,
         window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
         now_fn=now_fn,
@@ -505,7 +507,7 @@ class TestLifecycle:
         # the production shape; stop() signals the event, the thread exits.
         thread_obj = RunHeartbeatThread(
             repo,
-            token=_TOKEN,
+            member_token=_TOKEN,
             wait_fn=None,  # default: stop_event.wait
         )
         thread_obj.start()
@@ -520,7 +522,7 @@ class TestLifecycle:
 
         thread_obj = RunHeartbeatThread(
             repo,
-            token=_TOKEN,
+            member_token=_TOKEN,
             wait_fn=None,
         )
         thread_obj.start()
@@ -535,7 +537,7 @@ class TestLifecycle:
         repo.snapshot = _EVICTED_SNAPSHOT
         thread_obj = RunHeartbeatThread(
             repo,
-            token=_TOKEN,
+            member_token=_TOKEN,
             wait_fn=None,
         )
         thread_obj.start()
@@ -553,7 +555,7 @@ class TestLifecycle:
         """The heartbeat thread is a daemon so it does not block process exit."""
         thread_obj = RunHeartbeatThread(
             _StubRepo(),
-            token=_TOKEN,
+            member_token=_TOKEN,
         )
         assert thread_obj._thread.daemon is True
 
@@ -565,7 +567,7 @@ class TestLifecycle:
 
         thread_obj = RunHeartbeatThread(
             repo,
-            token=_TOKEN,
+            member_token=_TOKEN,
             wait_fn=None,
         )
         thread_obj.start()
@@ -584,7 +586,7 @@ class TestLifecycle:
 
         thread_obj = RunHeartbeatThread(
             repo,
-            token=_TOKEN,
+            member_token=_TOKEN,
             wait_fn=None,
         )
         thread_obj.start()
@@ -623,7 +625,7 @@ class TestFollowerHeartbeatRoleGating:
     def test_follower_foreign_leader_does_not_latch(self) -> None:
         """worker_role='follower' + foreign leader_worker_id → no latch."""
         follower_worker_id = f"worker:{_RUN_ID}:follower-abc"
-        follower_token = CoordinationToken(run_id=_RUN_ID, worker_id=follower_worker_id, leader_epoch=0)
+        follower_token = WorkerMembershipToken(run_id=_RUN_ID, worker_id=follower_worker_id)
         repo = _StubRepo()
         # Snapshot: our row is active (worker_active=True), but leader is a
         # DIFFERENT process — normal for a follower.
@@ -637,7 +639,7 @@ class TestFollowerHeartbeatRoleGating:
 
         thread = RunHeartbeatThread(
             repo,
-            token=follower_token,
+            member_token=follower_token,
             heartbeat_seconds=DEFAULT_RUN_HEARTBEAT_SECONDS,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             wait_fn=lambda _: False,
@@ -651,7 +653,7 @@ class TestFollowerHeartbeatRoleGating:
     def test_follower_eviction_does_latch(self) -> None:
         """worker_role='follower' + worker_active=False → latch set (evicted)."""
         follower_worker_id = f"worker:{_RUN_ID}:follower-xyz"
-        follower_token = CoordinationToken(run_id=_RUN_ID, worker_id=follower_worker_id, leader_epoch=0)
+        follower_token = WorkerMembershipToken(run_id=_RUN_ID, worker_id=follower_worker_id)
         repo = _StubRepo()
         repo.snapshot = CoordinationSnapshot(
             leader_worker_id="worker:some-run:the-leader",
@@ -663,7 +665,7 @@ class TestFollowerHeartbeatRoleGating:
 
         thread = RunHeartbeatThread(
             repo,
-            token=follower_token,
+            member_token=follower_token,
             heartbeat_seconds=DEFAULT_RUN_HEARTBEAT_SECONDS,
             window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
             wait_fn=lambda _: False,
