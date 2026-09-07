@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import pytest
 from fastapi import FastAPI
+from structlog.testing import capture_logs
 
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
 from elspeth.web.composer import tutorial_telemetry as tutorial_telemetry_module
@@ -55,10 +58,39 @@ def test_abandon_route_increments_counter(monkeypatch) -> None:
 def test_completed_telemetry_does_not_replace_committed_outcome(monkeypatch) -> None:
     monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_COMPLETED_COUNTER", _FailingCounter())
 
-    assert tutorial_telemetry_module.record_tutorial_completed_path("first_time") is None
+    with capture_logs() as logs:
+        assert tutorial_telemetry_module.record_tutorial_completed_path("first_time") is None
+    assert logs == [{"event": "tutorial_telemetry_failed", "operation": "completed", "error_type": "RuntimeError", "log_level": "error"}]
 
 
 def test_abandon_telemetry_is_best_effort(monkeypatch) -> None:
     monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_ABANDON_COUNTER", _FailingCounter())
 
-    assert tutorial_telemetry_module.record_tutorial_abandoned() is None
+    with capture_logs() as logs:
+        assert tutorial_telemetry_module.record_tutorial_abandoned() is None
+    assert logs == [{"event": "tutorial_telemetry_failed", "operation": "abandoned", "error_type": "RuntimeError", "log_level": "error"}]
+
+
+@pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+@pytest.mark.parametrize("site", ["completed", "abandoned", "fallback_logger"])
+def test_tutorial_metric_boundaries_propagate_integrity_failures(monkeypatch, error_class, site) -> None:
+    failure = error_class("tutorial telemetry integrity failure")
+
+    class FailingBoundary:
+        def add(self, *args, **kwargs) -> None:
+            raise failure
+
+        def error(self, *args, **kwargs) -> None:
+            raise failure
+
+    with pytest.raises(error_class) as caught:
+        if site == "completed":
+            monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_COMPLETED_COUNTER", FailingBoundary())
+            tutorial_telemetry_module.record_tutorial_completed_path("first_time")
+        elif site == "abandoned":
+            monkeypatch.setattr(tutorial_telemetry_module, "_TUTORIAL_ABANDON_COUNTER", FailingBoundary())
+            tutorial_telemetry_module.record_tutorial_abandoned()
+        else:
+            monkeypatch.setattr(tutorial_telemetry_module, "_log", FailingBoundary())
+            tutorial_telemetry_module._log_telemetry_failure(operation="completed", error_type="RuntimeError")
+    assert caught.value is failure

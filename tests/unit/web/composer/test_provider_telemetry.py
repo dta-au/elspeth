@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.web.composer.audit import llm_call_audit_envelope
 
 
@@ -85,6 +86,36 @@ def test_metric_recorder_failure_cannot_replace_settled_outcome(monkeypatch) -> 
     monkeypatch.setattr(module, "_PROVIDER_CALL_DURATION", _FailingInstrument())
 
     assert module.record_settled_composer_provider_calls((_call(),), surface="guided") is None
+
+
+@pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+@pytest.mark.parametrize("site", ["provider", "request", "fallback_logger"])
+def test_metric_boundaries_propagate_integrity_failures(monkeypatch, error_class, site) -> None:
+    module = importlib.import_module("elspeth.web.composer.provider_telemetry")
+    failure = error_class("metric integrity failure")
+
+    class FailingBoundary:
+        def add(self, *args, **kwargs) -> None:
+            raise failure
+
+        def record(self, *args, **kwargs) -> None:
+            raise failure
+
+        def error(self, *args, **kwargs) -> None:
+            raise failure
+
+    with pytest.raises(error_class) as caught:
+        if site == "provider":
+            monkeypatch.setattr(module, "_PROVIDER_CALL_COUNTER", FailingBoundary())
+            module.record_settled_composer_provider_calls((_call(),), surface="guided")
+        elif site == "request":
+            monkeypatch.setattr(module, "_REQUEST_DURATION", FailingBoundary())
+            token = module.begin_composer_request_metrics(surface="guided")
+            module.finish_composer_request_metrics(token, status="completed")
+        else:
+            monkeypatch.setattr(module, "_log", FailingBoundary())
+            module._log_projection_failure(operation="provider_calls", error_type="RuntimeError")
+    assert caught.value is failure
 
 
 def test_settled_freeform_audit_message_projects_only_owned_call_facts(monkeypatch) -> None:

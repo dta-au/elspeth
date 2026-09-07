@@ -388,19 +388,14 @@ def build_source_data_contract_draft(
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-@observation_boundary(
-    tier=3,
-    source="a persisted interpretation requirement's accepted_value / a persisted interpretation event's "
-    "accepted draft text, round-tripped through sessions.db storage",
-    source_param="value",
-    suppresses=("R5",),
-    invariant="returns the parsed demanded-field tuple or None to abstain; every malformed branch abstains. "
-    "Abstention strips nothing from the recomputed demand, so the card can stay closed only when "
-    "the independently stored accepted_artifact_hash exactly matches the full current demand — the "
-    "hash, never this parse, is the acknowledgement authority",
-)
 def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...] | None:
-    """Parse fields only from a complete, current contract draft."""
+    """Recognize a complete current draft, returning None for other shapes.
+
+    These drafts are server-authored by build_source_data_contract_draft;
+    persistence does not turn them into Tier-3 input. This recognizer confers
+    no acknowledgement authority: resolved_source_data_contract_fields also
+    requires coherent review evidence and an exact artifact hash.
+    """
     try:
         payload = json.loads(value)
     except (TypeError, ValueError):
@@ -440,14 +435,6 @@ def _validated_source_data_contract_fields(
     return tuple(demanded)
 
 
-@observation_boundary(
-    tier=3,
-    source="a persisted pre-v2 source_data_contract event's immutable llm_draft",
-    source_param="value",
-    suppresses=("R5",),
-    invariant="returns fields only for the complete legacy-v1 draft shape; malformed or current-version payloads "
-    "return None, and callers may use the result only to supersede the old pending card with a current review",
-)
 def parse_legacy_source_data_contract_fields(value: str) -> tuple[str, ...] | None:
     """Parse exact v1 fields solely to migrate pending pre-v2 cards."""
     try:
@@ -462,15 +449,6 @@ def parse_legacy_source_data_contract_fields(value: str) -> tuple[str, ...] | No
     )
 
 
-@observation_boundary(
-    tier=3,
-    source="a persisted resolved source_data_contract requirement's accepted_value and accepted_artifact_hash",
-    source_param="value",
-    suppresses=("R5",),
-    invariant="returns fields only for a complete current-v2 artifact or an exact coherent legacy-v1 artifact; "
-    "legacy fields are used solely to remove the old stamp while recomputing a resolvable current review demand, "
-    "never to admit execution",
-)
 def source_data_contract_fields_for_demand_recompute(
     value: str,
     artifact_hash: str | None,

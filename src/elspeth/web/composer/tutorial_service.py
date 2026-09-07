@@ -19,6 +19,7 @@ from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 
 from elspeth.contracts import CallType
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.plugin_capabilities import PluginCapability
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.schema import (
@@ -143,6 +144,8 @@ async def _close_tutorial_execute_lease_before_transfer(lease: SessionOperationL
             continue
     try:
         close_task.result()
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except BaseException as close_error:
         if cancellation is None:
             raise

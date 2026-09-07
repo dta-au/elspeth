@@ -277,6 +277,15 @@ def _optional_mapping(value: Any, path: str) -> Mapping[str, Any]:
     return _require_mapping(value, path)
 
 
+@trust_boundary(
+    tier=3,
+    source="operator-supplied YAML option values before JSON persistence",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises RuntimeYamlImportError for non-string mapping keys at every nested mapping or sequence depth",
+    test_ref="tests/unit/web/composer/test_yaml_importer.py::test_reject_non_string_mapping_keys_rejects_nested_non_string_keys",
+    test_fingerprint="ae8670eee6a8bf082898aa8f3a9844fd6affea3c11f8124d3098cc84ae672013",
+)
 def _reject_non_string_mapping_keys(value: object, path: str) -> None:
     """Reject keys that JSON persistence would stringify ambiguously."""
     if isinstance(value, Mapping):

@@ -12,6 +12,7 @@ from typing import Literal, cast
 import structlog
 from opentelemetry import metrics
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall, ComposerLLMCallStatus
 
 ComposerTelemetrySurface = Literal["freeform", "guided"]
@@ -72,6 +73,8 @@ def _log_projection_failure(*, operation: str, error_type: str) -> None:
             operation=operation,
             error_type=error_type,
         )
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except Exception:
         # Telemetry and its fallback logger are both subordinate to the
         # already-committed audit outcome.
@@ -136,6 +139,8 @@ def _record_provider_call_facts(
         try:
             _PROVIDER_CALL_COUNTER.add(1, attributes)
             _PROVIDER_CALL_DURATION.record(fact.latency_ms / 1_000, attributes)
+        except contract_errors.TIER_1_ERRORS:
+            raise
         except Exception as exc:
             _log_projection_failure(operation="provider_calls", error_type=type(exc).__name__)
 
@@ -224,6 +229,8 @@ def finish_composer_request_metrics(
     try:
         _REQUEST_DURATION.record(max(0.0, time.monotonic() - state.started_monotonic), attributes)
         _REQUEST_PROVIDER_CALLS.record(state.provider_call_count, attributes)
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except Exception as exc:
         _log_projection_failure(operation="request", error_type=type(exc).__name__)
 

@@ -15,6 +15,7 @@ from typing import Any, Literal, TypedDict
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.guided.protocol import BLOB_REF_PATH_PREFIX
 from elspeth.web.composer.guided_blob_refs import GUIDED_REVIEWED_BLOB_PATH_KEYS, validate_guided_reviewed_blob_ref
 from elspeth.web.composer.redaction import REDACTED_BLOB_SOURCE_PATH
@@ -389,6 +390,14 @@ def _acknowledged_guarantee_fields(source: SourceSpec, field_path: str) -> froze
     return frozenset()
 
 
+@observation_boundary(
+    tier=3,
+    source="planner-authored source option value projected into the implicit-decision report",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="returns a frozen string set only for a list or tuple of strings; other values return None, "
+    "preventing _is_user_acknowledged_guarantee from attributing malformed options to a user acknowledgement",
+)
 def _string_field_set(value: object) -> frozenset[str] | None:
     if not isinstance(value, (list, tuple)) or not all(isinstance(field, str) for field in value):
         return None

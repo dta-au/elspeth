@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from elspeth.contracts import CallStatus, CallType, NodeType
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
@@ -32,6 +34,24 @@ from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
 from tests.fixtures.landscape import make_factory, make_landscape_db
 from tests.helpers.session_fences import RecordingSessionOperationAuthority
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_class", [FrameworkBugError, AuditIntegrityError])
+async def test_pretransfer_cleanup_integrity_failure_wins_racing_cancellation(error_class) -> None:
+    failure = error_class("lease cleanup integrity failure")
+    closing_task: asyncio.Task[None] | None = None
+
+    class FailingLease:
+        async def close(self) -> None:
+            assert closing_task is not None
+            closing_task.cancel()
+            raise failure
+
+    closing_task = asyncio.create_task(tutorial_service_module._close_tutorial_execute_lease_before_transfer(FailingLease()))
+    with pytest.raises(error_class) as caught:
+        await closing_task
+    assert caught.value is failure
 
 
 def _make_tutorial_settings(data_dir: Path, **overrides: Any) -> WebSettings:

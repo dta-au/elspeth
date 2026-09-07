@@ -19,6 +19,7 @@ from elspeth.web.composer.yaml_importer import (
     _optional_str,
     _outputs_from_runtime_sinks,
     _queues_from_runtime_mapping,
+    _reject_non_string_mapping_keys,
     _reject_unimportable_sections,
     _reject_yaml_aliases,
     _require_mapping,
@@ -34,6 +35,12 @@ from elspeth.web.composer.yaml_importer import (
 )
 
 _REPO_ROOT = Path(__file__).resolve().parents[4]
+
+
+@pytest.mark.parametrize("value", [{1: "bad"}, {"nested": [{2: "bad"}]}, ({"nested": {3: "bad"}},)])
+def test_reject_non_string_mapping_keys_rejects_nested_non_string_keys(value: object) -> None:
+    with pytest.raises(RuntimeYamlImportError, match="non-string mapping key"):
+        _reject_non_string_mapping_keys(value, "options")
 
 
 def test_require_str_rejects_non_string_value() -> None:
