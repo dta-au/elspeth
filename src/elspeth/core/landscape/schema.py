@@ -630,12 +630,8 @@ edges_table = Table(
 #    ``data_flow_repository.create_row`` raises ``AuditIntegrityError`` when
 #    these values are not explicitly provided ("Do not fabricate
 #    source_row_index or ingest_sequence from row_index"), but the
-#    prohibition lives in an exception string at one write boundary. The
-#    cache-replay write path (``write_repository.record_synthesised_run``)
-#    uses the row-index fallback only for single-source runs; multi-source
-#    synthesised rows must provide explicit source_node_index,
-#    source_row_index, ingest_sequence, and source_data_hash before the
-#    writer inserts them. Tracked under filigree elspeth-92afea0d23
+#    prohibition lives in an exception string at one write boundary.
+#    Tracked under filigree elspeth-92afea0d23
 #    (elspeth-lints rule with the same enforcement status as
 #    ``trust_tier.tier_model``).
 #

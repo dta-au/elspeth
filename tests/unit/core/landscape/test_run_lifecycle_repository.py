@@ -1603,36 +1603,6 @@ class TestBeginRunOpenrouterCatalogSnapshotValidation:
             )
 
 
-class TestWriteRepositoryOpenrouterCatalogSnapshotValidation:
-    """Pin the same hex-shape guard at the synthesised-run write site."""
-
-    def test_record_synthesised_run_rejects_non_hex_sha256(self) -> None:
-        from datetime import UTC, datetime
-
-        from elspeth.contracts import NodeType
-        from elspeth.contracts.synthesised_audit import SynthesisedNodeSpec
-        from elspeth.core.landscape.write_repository import LandscapeWriteRepository
-
-        db = make_landscape_db()
-        repo = LandscapeWriteRepository(db)
-        node_specs = (
-            SynthesisedNodeSpec(node_type=NodeType.SOURCE, plugin_name="csv_file", plugin_version="1.0"),
-            SynthesisedNodeSpec(node_type=NodeType.SINK, plugin_name="json_file", plugin_version="1.0"),
-        )
-        with pytest.raises(LandscapeRecordError, match="openrouter_catalog_sha256 must be 64 lowercase hex chars"):
-            repo.record_synthesised_run(
-                pipeline_yaml="version: 1",
-                rows=(),
-                source_data_hash="0" * 64,
-                llm_call_count=0,
-                node_specs=node_specs,
-                started_at=datetime.now(UTC),
-                metadata={"seeded_from_cache": True, "cache_key": "c" * 64},
-                openrouter_catalog_sha256="not-a-sha",
-                openrouter_catalog_source="bundled",
-            )
-
-
 # ---------------------------------------------------------------------------
 # Immutability backstop beneath the epoch fence + complete_run diagnosis order
 # (ADR-030 §D / §H — slice 2 test campaign §4)
