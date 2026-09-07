@@ -52,6 +52,7 @@ from tests.fixtures.landscape import (
     expire_sink_effect_lease,
     insert_crashed_leader_seat,
     leader_coordination_token,
+    leader_token_for,
     register_test_node,
 )
 
@@ -258,7 +259,7 @@ def test_configured_total_limits_fail_before_content_store_or_registry_writes(
         with pytest.raises(ValueError, match=error):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(**overrides),
                 signing_key=None,
                 content_store=store,
@@ -309,7 +310,7 @@ def test_candidate_verification_reads_run_outside_the_write_transaction(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -347,7 +348,7 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         with caplog.at_level("ERROR"), pytest.raises(RuntimeError, match="primary export failure"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -415,7 +416,7 @@ def test_spool_close_failure_does_not_fail_a_registered_export(
         with caplog.at_level("ERROR"):
             snapshot = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -436,7 +437,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -448,7 +449,7 @@ def test_registry_hit_reuses_verified_winner_without_rewriting_content(tmp_path:
         ):
             second = prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=store,
@@ -477,7 +478,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -485,7 +486,7 @@ def test_production_filesystem_store_materializes_and_reopens_snapshot(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=config,
             signing_key=None,
             content_store=store,
@@ -510,7 +511,7 @@ def test_hmac_snapshot_streaming_derivation_and_production_verification(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -539,7 +540,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         _insert_terminal_run(db)
         prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 signing_mode="hmac_sha256",
                 signer_key_id="audit-key-v1",
@@ -553,7 +554,7 @@ def test_single_export_rotation_policy_refuses_a_different_signer_winner(
         with pytest.raises(ValueError, match="single_export"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(
                     signing_mode="hmac_sha256",
                     signer_key_id="audit-key-v2",
@@ -583,7 +584,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         _insert_terminal_run(db)
         first = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=old_store,
@@ -591,7 +592,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         )
         second = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=new_store,
@@ -605,7 +606,7 @@ def test_rotated_store_reuses_prior_winner_only_through_persistent_resolver(
         with pytest.raises(LookupError, match=r"audit-store-v1.*unresolvable"):
             prepare_audit_export_snapshot(
                 db,
-                run_id="run-export",
+                coordination_token=leader_token_for(db, "run-export"),
                 config=_config(),
                 signing_key=None,
                 content_store=new_store,
@@ -636,7 +637,7 @@ def test_interrupted_audit_export_effect_reuses_snapshot_and_publishes_once(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(),
             signing_key=None,
             content_store=store,
@@ -731,7 +732,7 @@ def test_json_sink_replays_verified_snapshot_and_exact_manifest_after_response_l
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(
                 format="json",
                 signing_mode="hmac_sha256" if signed else "unsigned",
@@ -805,7 +806,7 @@ def test_csv_sink_recovers_exact_bundle_without_republication(
         _insert_terminal_run(db)
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=leader_token_for(db, "run-export"),
             config=_config(format="csv"),
             signing_key=None,
             content_store=store,
@@ -1022,9 +1023,17 @@ def test_resume_audit_export_recovers_lost_publication_response_end_to_end(
         assert poll_sleeps
         assert all(0.0 < seconds <= 0.25 for seconds in poll_sleeps)
         assert sum(poll_sleeps) <= lease_ttl.total_seconds() + 0.25
+        # Both resume attempts released the export seat on the way out
+        # (ADR-048 §4), so this re-derivation takes the seat the way a third
+        # export leader would rather than reading a vacant one back.
+        assertion_token = RecorderFactory(db).run_coordination.acquire_export_leadership(
+            run_id="run-export",
+            worker_id="audit-export-assertion-worker",
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        )
         snapshot = prepare_audit_export_snapshot(
             db,
-            run_id="run-export",
+            coordination_token=assertion_token,
             config=_config(),
             signing_key=None,
             content_store=store,

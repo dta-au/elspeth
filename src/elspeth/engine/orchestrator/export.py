@@ -168,6 +168,11 @@ def export_landscape(
 
     if type(worker_id) is not str or not worker_id.strip():
         raise ValueError("audit export worker_id must be a non-empty exact string")
+    # ADR-048 §2: the snapshot registry write is fenced against the seat this
+    # token names, so a run_id that is not the token's run would fence one run
+    # and write another. Fail closed before any export effect.
+    if run_id != coordination_token.run_id:
+        raise ValueError(f"audit export for run {run_id!r} attempted under a leader token for run {coordination_token.run_id!r}")
 
     # No isinstance gate on AuditExportContentStore: it is a runtime_checkable
     # Protocol, so the check admits any object carrying the right attribute names
@@ -220,7 +225,7 @@ def export_landscape(
 
     snapshot = prepare_audit_export_snapshot(
         db,
-        run_id=run_id,
+        coordination_token=coordination_token,
         config=export_config,
         signing_key=signing_key,
         content_store=audit_export_content_store,

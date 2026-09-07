@@ -395,6 +395,29 @@ class _LegacyExportLandscapeJSON:
         assert exporter.call_args.kwargs["read_model"] is not None
         assert sink.node_id is None
 
+    def test_export_landscape_refuses_a_token_for_another_run(self) -> None:
+        """ADR-048 §2: the export writes are fenced against the token's seat.
+
+        A ``run_id`` that is not the token's run would fence one run's seat and
+        register another run's snapshot. This refusal is what stops the unit
+        wrapper's minted default from papering over a real wiring mismatch —
+        it fires before any export effect, so nothing needs patching.
+        """
+        _sink, factory = _make_sink_and_factory()
+
+        with pytest.raises(ValueError, match="under a leader token for run 'other-run'"):
+            _production_export_landscape(
+                object(),
+                "run-1",
+                self._make_settings(),
+                factory,
+                payload_store=object(),
+                audit_export_content_store=_AuditContentStoreDouble(),
+                audit_export_content_store_resolver=AuditExportContentStoreResolver(),
+                worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="other-run", worker_id="worker:runtime-worker", leader_epoch=1),
+            )
+
     def test_export_preflight_passes_explicit_audit_snapshot_kind(self) -> None:
         sink, factory = _make_sink_and_factory()
 

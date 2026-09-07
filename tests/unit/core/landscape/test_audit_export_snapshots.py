@@ -23,8 +23,9 @@ from elspeth.contracts.audit_export import (
     RegisteredAuditExportContent,
     derive_audit_export_bundle,
 )
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import RunStatus
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
 from elspeth.contracts.hashing import canonical_json
 from elspeth.contracts.sink_effects import AuditExportFormat, AuditExportSignedManifestInput, AuditExportSigningMode
 from elspeth.core.landscape.database import LandscapeDB
@@ -36,7 +37,14 @@ from elspeth.core.landscape.execution.audit_export_snapshots import (
     VerifiedAuditExportCandidate,
 )
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import audit_export_snapshot_chunks_table, audit_export_snapshots_table, runs_table
+from elspeth.core.landscape.schema import (
+    audit_export_snapshot_chunks_table,
+    audit_export_snapshots_table,
+    run_coordination_events_table,
+    run_coordination_table,
+    runs_table,
+)
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for
 
 COMPLETED_AT = datetime(2026, 7, 16, 1, 2, 3, 456789, tzinfo=UTC)
 COMPLETED_AT_TEXT = "2026-07-16T01:02:03.456789Z"
@@ -89,6 +97,11 @@ def _insert_terminal_run(db: LandscapeDB, run_id: str = "run-export") -> None:
                 openrouter_catalog_source="bundled",
             )
         )
+        # The registry write is leader-fenced (ADR-048 §2) and the fence reads
+        # this seat back. A run written by raw SQL has none, so leave the one a
+        # finished run's leader left: the fence predicate is identity+epoch, so
+        # an expired seat still passes its own leader's fence.
+        insert_crashed_leader_seat(connection, run_id=run_id)
 
 
 def _derivation_config(*, signed: bool = False) -> AuditExportDerivationConfig:
@@ -202,8 +215,23 @@ def _candidate(
     return AuditExportSnapshotCandidate(snapshot=snapshot, chunks=chunks)
 
 
-def _repository() -> AuditExportSnapshotRepository:
-    return AuditExportSnapshotRepository()
+def _repository(db: LandscapeDB) -> AuditExportSnapshotRepository:
+    return AuditExportSnapshotRepository(db.engine)
+
+
+def _leader_token(db: LandscapeDB, run_id: str = "run-export") -> CoordinationToken:
+    """The run's OWN seat, read back — never minted here (ADR-048 §5)."""
+    return leader_token_for(db, run_id)
+
+
+def _allow_any_signer_rotation(_existing_signer_key_id: str) -> None:
+    """The caller's rotation policy; these scenarios do not exercise rotation."""
+
+
+def _resolver_for(store: _MemoryContentStore) -> AuditExportContentStoreResolver:
+    resolver = AuditExportContentStoreResolver()
+    resolver.register(store)
+    return resolver
 
 
 def _signed_manifest_verifier(content: bytes, descriptor: AuditExportSignedManifestInput) -> None:
@@ -220,12 +248,14 @@ def _record_signature_verifier(unsigned_bytes: bytes, signature: str) -> None:
         raise ValueError("invalid record HMAC")
 
 
-def _register_candidate(connection: object, candidate: AuditExportSnapshotCandidate, store: _MemoryContentStore):
+def _register_candidate(db: LandscapeDB, candidate: AuditExportSnapshotCandidate, store: _MemoryContentStore):
+    """Register through the leader-fenced verb, which owns its own transaction."""
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
-    return _repository().register_candidate(
-        connection,  # type: ignore[arg-type]
+    return _repository(db).register_candidate(
         candidate,
+        coordination_token=_leader_token(db),
+        assert_signer_rotation_allowed=_allow_any_signer_rotation,
         content_store_resolver=resolver,
         limits=AuditExportSnapshotReadLimits(),
         signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -286,10 +316,8 @@ def test_registry_cas_inserts_once_and_reuses_exact_winner() -> None:
     candidate = _candidate(store)
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            first = _register_candidate(connection, candidate, store)
-        with db.engine.begin() as connection:
-            second = _register_candidate(connection, candidate, store)
+        first = _register_candidate(db, candidate, store)
+        second = _register_candidate(db, candidate, store)
 
         assert first.inserted is True
         assert second.inserted is False
@@ -310,25 +338,25 @@ def test_registry_cas_reuses_byte_identical_winner_from_prior_content_store() ->
     resolver.register(new_store)
     old_candidate = _candidate(old_store)
     new_candidate = _candidate(new_store)
-    repository = _repository()
+    repository = _repository(db)
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            first = repository.register_candidate(
-                connection,
-                old_candidate,
-                content_store_resolver=resolver,
-                limits=AuditExportSnapshotReadLimits(),
-                signed_manifest_verifier=lambda _content, _descriptor: None,
-            )
-        with db.engine.begin() as connection:
-            second = repository.register_candidate(
-                connection,
-                new_candidate,
-                content_store_resolver=resolver,
-                limits=AuditExportSnapshotReadLimits(),
-                signed_manifest_verifier=lambda _content, _descriptor: None,
-            )
+        first = repository.register_candidate(
+            old_candidate,
+            coordination_token=_leader_token(db),
+            assert_signer_rotation_allowed=_allow_any_signer_rotation,
+            content_store_resolver=resolver,
+            limits=AuditExportSnapshotReadLimits(),
+            signed_manifest_verifier=lambda _content, _descriptor: None,
+        )
+        second = repository.register_candidate(
+            new_candidate,
+            coordination_token=_leader_token(db),
+            assert_signer_rotation_allowed=_allow_any_signer_rotation,
+            content_store_resolver=resolver,
+            limits=AuditExportSnapshotReadLimits(),
+            signed_manifest_verifier=lambda _content, _descriptor: None,
+        )
 
         assert first.inserted is True
         assert second.inserted is False
@@ -344,12 +372,11 @@ def test_registry_lookup_exact_checks_every_shaping_field_and_signer_id() -> Non
     candidate = _candidate(store)
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            _register_candidate(connection, candidate, store)
+        _register_candidate(db, candidate, store)
         with db.engine.connect() as connection:
-            assert _repository().find_winner(connection, _registry_key()) is not None
+            assert _repository(db).find_winner(connection, _registry_key()) is not None
             with pytest.raises(AuditIntegrityError, match="registry key"):
-                _repository().find_winner(connection, replace(_registry_key(), signer_key_id="rotated-key"))
+                _repository(db).find_winner(connection, replace(_registry_key(), signer_key_id="rotated-key"))
     finally:
         db.close()
 
@@ -361,10 +388,9 @@ def test_same_registry_key_with_divergent_candidate_fails_closed() -> None:
     divergent = _candidate(store, records=[{"record_type": "run", "value": "divergent"}])
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            _register_candidate(connection, first, store)
-        with db.engine.begin() as connection, pytest.raises(AuditIntegrityError, match="divergent"):
-            _register_candidate(connection, divergent, store)
+        _register_candidate(db, first, store)
+        with pytest.raises(AuditIntegrityError, match="divergent"):
+            _register_candidate(db, divergent, store)
         with db.engine.connect() as connection:
             assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 1
             assert connection.scalar(select(func.count()).select_from(audit_export_snapshot_chunks_table)) == 1
@@ -380,11 +406,11 @@ def test_bound_winner_reader_resolves_only_registered_store_content() -> None:
     candidate = _candidate(store)
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            winner = _register_candidate(connection, candidate, store).winner
+        winner = _register_candidate(db, candidate, store).winner
 
-        effect_input = _repository().bind_winner(
+        effect_input = _repository(db).bind_winner(
             winner,
+            coordination_token=_leader_token(db),
             content_store_resolver=resolver,
             limits=AuditExportSnapshotReadLimits(),
             signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -408,12 +434,13 @@ def test_bound_winner_rejects_chunk_seal_not_derived_from_registered_bytes() -> 
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, forged)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match="chunk seal"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -437,7 +464,7 @@ def test_register_verified_candidate_registers_without_content_store_reads() -> 
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
     candidate = _candidate(store)
-    repository = _repository()
+    repository = _repository(db)
     try:
         _insert_terminal_run(db)
         verified = repository.verify_candidate(
@@ -448,13 +475,20 @@ def test_register_verified_candidate_registers_without_content_store_reads() -> 
         )
         reads_after_verification = len(store.opened)
 
-        with db.engine.begin() as connection:
-            registration = repository.register_verified_candidate(connection, verified)
+        registration = repository.register_verified_candidate(
+            verified,
+            coordination_token=_leader_token(db),
+            assert_signer_rotation_allowed=_allow_any_signer_rotation,
+        )
 
         assert registration.inserted is True
         assert len(store.opened) == reads_after_verification
-        with pytest.raises(TypeError, match="VerifiedAuditExportCandidate"), db.engine.begin() as connection:
-            repository.register_verified_candidate(connection, candidate)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="VerifiedAuditExportCandidate"):
+            repository.register_verified_candidate(
+                candidate,  # type: ignore[arg-type]
+                coordination_token=_leader_token(db),
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
+            )
     finally:
         db.close()
 
@@ -464,7 +498,7 @@ def test_register_verified_candidate_rejects_replaced_carrier() -> None:
     store = _MemoryContentStore()
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
-    repository = _repository()
+    repository = _repository(db)
     try:
         _insert_terminal_run(db)
         verified = repository.verify_candidate(
@@ -481,8 +515,12 @@ def test_register_verified_candidate_rejects_replaced_carrier() -> None:
         )
 
         for forged in forged_carriers:
-            with pytest.raises(TypeError, match="from verify_candidate"), db.engine.begin() as connection:
-                repository.register_verified_candidate(connection, forged)
+            with pytest.raises(TypeError, match="from verify_candidate"):
+                repository.register_verified_candidate(
+                    forged,
+                    coordination_token=_leader_token(db),
+                    assert_signer_rotation_allowed=_allow_any_signer_rotation,
+                )
 
         with db.engine.connect() as connection:
             assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 0
@@ -499,10 +537,11 @@ def test_registration_rejects_forged_graph_before_registry_insert() -> None:
     forged = _forge_chunk_seal(store, _candidate(store))
     try:
         _insert_terminal_run(db)
-        with pytest.raises(AuditIntegrityError, match="chunk seal"), db.engine.begin() as connection:
-            _repository().register_candidate(
-                connection,
+        with pytest.raises(AuditIntegrityError, match="chunk seal"):
+            _repository(db).register_candidate(
                 forged,
+                coordination_token=_leader_token(db),
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -564,12 +603,13 @@ def test_bound_winner_recomputes_persisted_graph_hashes_from_registered_bytes(
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, forged)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match=message):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -601,12 +641,13 @@ def test_bound_winner_rejects_noncanonical_registered_record_bytes() -> None:
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, forged)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match="non-canonical record bytes"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -636,12 +677,13 @@ def test_bound_winner_rejects_record_hmac_not_derived_from_unsigned_record_bytes
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, forged)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match="record HMAC"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=_signed_manifest_verifier,
@@ -665,12 +707,13 @@ def test_bound_winner_rejects_final_manifest_bytes_not_derived_from_graph() -> N
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, candidate)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(candidate.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(candidate.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match="signed manifest bytes"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -694,12 +737,13 @@ def test_bound_winner_rejects_final_manifest_signature_metadata_not_derived_from
         _insert_terminal_run(db)
         with db.engine.begin() as connection:
             _insert_unverified_candidate(connection, forged)
-            winner = _repository().find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
+            winner = _repository(db).find_winner(connection, AuditExportSnapshotRegistryKey.from_snapshot(forged.snapshot))
             assert winner is not None
 
         with pytest.raises(AuditIntegrityError, match="signed manifest bytes"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=resolver,
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=_signed_manifest_verifier,
@@ -715,11 +759,11 @@ def test_winner_store_resolution_failure_never_substitutes_current_store() -> No
     candidate = _candidate(store)
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            winner = _register_candidate(connection, candidate, store).winner
+        winner = _register_candidate(db, candidate, store).winner
         with pytest.raises(LookupError, match="unresolvable"):
-            _repository().bind_winner(
+            _repository(db).bind_winner(
                 winner,
+                coordination_token=_leader_token(db),
                 content_store_resolver=AuditExportContentStoreResolver(),
                 limits=AuditExportSnapshotReadLimits(),
                 signed_manifest_verifier=lambda _content, _descriptor: None,
@@ -729,41 +773,252 @@ def test_winner_store_resolution_failure_never_substitutes_current_store() -> No
 
 
 def test_current_acceptance_limits_are_enforced_without_changing_identity() -> None:
+    db = LandscapeDB.in_memory()
     store = _MemoryContentStore()
     candidate = _candidate(store)
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
-    winner = _repository().winner_from_candidate(candidate)
+    try:
+        _insert_terminal_run(db)
+        winner = _repository(db).winner_from_candidate(candidate)
 
-    with pytest.raises(ValueError, match="configured reader limits"):
-        _repository().bind_winner(
-            winner,
-            content_store_resolver=resolver,
-            limits=AuditExportSnapshotReadLimits(max_total_bytes=candidate.snapshot.total_bytes - 1),
-            signed_manifest_verifier=lambda _content, _descriptor: None,
-        )
+        with pytest.raises(ValueError, match="configured reader limits"):
+            _repository(db).bind_winner(
+                winner,
+                coordination_token=_leader_token(db),
+                content_store_resolver=resolver,
+                limits=AuditExportSnapshotReadLimits(max_total_bytes=candidate.snapshot.total_bytes - 1),
+                signed_manifest_verifier=lambda _content, _descriptor: None,
+            )
+    finally:
+        db.close()
 
 
 def test_reader_rechecks_content_bytes_before_yielding_any_bad_chunk() -> None:
+    db = LandscapeDB.in_memory()
     store = _MemoryContentStore()
     candidate = _candidate(store)
     resolver = AuditExportContentStoreResolver()
     resolver.register(store)
-    winner = _repository().winner_from_candidate(candidate)
-    reader = (
-        _repository()
-        .bind_winner(
-            winner,
-            content_store_resolver=resolver,
+    try:
+        _insert_terminal_run(db)
+        winner = _repository(db).winner_from_candidate(candidate)
+        reader = (
+            _repository(db)
+            .bind_winner(
+                winner,
+                coordination_token=_leader_token(db),
+                content_store_resolver=resolver,
+                limits=AuditExportSnapshotReadLimits(),
+                signed_manifest_verifier=lambda _content, _descriptor: None,
+            )
+            .reader
+        )
+        store.content[candidate.chunks[0].content_ref] = b"tampered\n"
+
+        with pytest.raises(ValueError, match=r"chunk (size|hash)"):
+            list(reader.iter_verified_chunks())
+    finally:
+        db.close()
+
+
+def test_register_verified_candidate_refused(  # F-10 retained stale-token evidence
+) -> None:
+    """A deposed export leader's registry CAS is refused with zero mutation.
+
+    The F-10 contract for every fenced verb (ADR-030 §H): the epoch fence is
+    the FIRST statement of the write transaction, so a stale token raises
+    ``RunLeadershipLostError``, records exactly one ``fence_refusal`` event
+    naming the verb, and leaves no registry row behind.
+    """
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    try:
+        _insert_terminal_run(db)
+        repository = _repository(db)
+        verified = repository.verify_candidate(
+            _candidate(store),
+            content_store_resolver=_resolver_for(store),
             limits=AuditExportSnapshotReadLimits(),
             signed_manifest_verifier=lambda _content, _descriptor: None,
         )
-        .reader
-    )
-    store.content[candidate.chunks[0].content_ref] = b"tampered\n"
+        stale = _leader_token(db)
+        # A takeover bumped the seat epoch out from under this worker.
+        with db.engine.begin() as connection:
+            connection.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == "run-export")
+                .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
+            )
 
-    with pytest.raises(ValueError, match=r"chunk (size|hash)"):
-        list(reader.iter_verified_chunks())
+        with pytest.raises(RunLeadershipLostError):
+            repository.register_verified_candidate(
+                verified,
+                coordination_token=stale,
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
+            )
+
+        with db.engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 0
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshot_chunks_table)) == 0
+            refusals = [
+                dict(row)
+                for row in connection.execute(
+                    select(run_coordination_events_table).where(run_coordination_events_table.c.event_type == "fence_refusal")
+                )
+                .mappings()
+                .all()
+            ]
+        assert len(refusals) == 1
+        assert json.loads(str(refusals[0]["context_json"]))["verb"] == "register_verified_candidate"
+    finally:
+        db.close()
+
+
+def test_register_candidate_refused(  # F-10 retained stale-token evidence
+) -> None:
+    """The verify-and-register convenience verb owns its own fence, and refuses too.
+
+    ``register_candidate`` does not delegate to
+    :func:`register_verified_candidate`; it opens its own fenced transaction,
+    so it needs its own stale-token evidence rather than inheriting it.
+    """
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    candidate = _candidate(store)
+    try:
+        _insert_terminal_run(db)
+        stale = _leader_token(db)
+        with db.engine.begin() as connection:
+            connection.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == "run-export")
+                .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
+            )
+
+        with pytest.raises(RunLeadershipLostError):
+            _repository(db).register_candidate(
+                candidate,
+                coordination_token=stale,
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
+                content_store_resolver=_resolver_for(store),
+                limits=AuditExportSnapshotReadLimits(),
+                signed_manifest_verifier=lambda _content, _descriptor: None,
+            )
+
+        with db.engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 0
+            refusals = [
+                dict(row)
+                for row in connection.execute(
+                    select(run_coordination_events_table).where(run_coordination_events_table.c.event_type == "fence_refusal")
+                )
+                .mappings()
+                .all()
+            ]
+        assert len(refusals) == 1
+        assert json.loads(str(refusals[0]["context_json"]))["verb"] == "register_candidate"
+    finally:
+        db.close()
+
+
+def test_registration_refuses_a_candidate_from_another_run() -> None:
+    """ADR-048 §2: the token's run is the only run an export may register.
+
+    Without this the fence would extend the seat of one run while the CAS
+    inserted another run's snapshot — a leader with no authority over the
+    bytes it seals.
+    """
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    candidate = _candidate(store)
+    try:
+        _insert_terminal_run(db)
+        _insert_terminal_run(db, run_id="run-other")
+        repository = _repository(db)
+        verified = repository.verify_candidate(
+            candidate,
+            content_store_resolver=_resolver_for(store),
+            limits=AuditExportSnapshotReadLimits(),
+            signed_manifest_verifier=lambda _content, _descriptor: None,
+        )
+
+        with pytest.raises(AuditIntegrityError, match="under a leader token for run 'run-other'"):
+            repository.register_verified_candidate(
+                verified,
+                coordination_token=_leader_token(db, "run-other"),
+                assert_signer_rotation_allowed=_allow_any_signer_rotation,
+            )
+
+        with db.engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 0
+    finally:
+        db.close()
+
+
+def test_bound_winner_refuses_a_winner_from_another_run() -> None:
+    """The bound reader publishes audit bytes; it must belong to the token's run."""
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    candidate = _candidate(store)
+    try:
+        _insert_terminal_run(db)
+        _insert_terminal_run(db, run_id="run-other")
+        winner = _register_candidate(db, candidate, store).winner
+
+        with pytest.raises(AuditIntegrityError, match="bound under a leader token for run 'run-other'"):
+            _repository(db).bind_winner(
+                winner,
+                coordination_token=_leader_token(db, "run-other"),
+                content_store_resolver=_resolver_for(store),
+                limits=AuditExportSnapshotReadLimits(),
+                signed_manifest_verifier=lambda _content, _descriptor: None,
+            )
+    finally:
+        db.close()
+
+
+def test_signer_rotation_recheck_runs_inside_the_fenced_write_and_blocks_the_insert() -> None:
+    """The rotation policy is rechecked under the registry's own write lock.
+
+    The recheck used to sit in the orchestrator's raw ``write_connection``
+    beside the CAS. It now runs inside the leader-fenced transaction the
+    repository opens, so the policy decision and the insert it authorises
+    still cannot be interleaved by another writer.
+    """
+    db = LandscapeDB.in_memory()
+    store = _MemoryContentStore()
+    try:
+        _insert_terminal_run(db)
+        first = _register_candidate(db, _candidate(store), store)
+        assert first.inserted is True
+        sealed_signer_key_id = first.winner.snapshot.signer_key_id
+        seen: list[str] = []
+
+        def refuse_rotation(existing_signer_key_id: str) -> None:
+            seen.append(existing_signer_key_id)
+            raise ValueError("single_export rotation policy refuses a different signer_key_id")
+
+        divergent = _candidate(store, records=[{"record_type": "run", "value": "divergent"}])
+        repository = _repository(db)
+        verified = repository.verify_candidate(
+            divergent,
+            content_store_resolver=_resolver_for(store),
+            limits=AuditExportSnapshotReadLimits(),
+            signed_manifest_verifier=lambda _content, _descriptor: None,
+        )
+        with pytest.raises(ValueError, match="rotation policy"):
+            repository.register_verified_candidate(
+                verified,
+                coordination_token=_leader_token(db),
+                assert_signer_rotation_allowed=refuse_rotation,
+            )
+
+        assert seen == [sealed_signer_key_id]
+        with db.engine.connect() as connection:
+            assert connection.scalar(select(func.count()).select_from(audit_export_snapshots_table)) == 1
+    finally:
+        db.close()
 
 
 def test_sealed_registry_rows_remain_database_immutable() -> None:
@@ -771,8 +1026,7 @@ def test_sealed_registry_rows_remain_database_immutable() -> None:
     store = _MemoryContentStore()
     try:
         _insert_terminal_run(db)
-        with db.engine.begin() as connection:
-            _register_candidate(connection, _candidate(store), store)
+        _register_candidate(db, _candidate(store), store)
         with pytest.raises(IntegrityError), db.engine.begin() as connection:
             connection.execute(update(audit_export_snapshots_table).values(content_store_id="replacement"))
         with pytest.raises(IntegrityError), db.engine.begin() as connection:

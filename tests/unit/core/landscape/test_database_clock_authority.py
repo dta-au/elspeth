@@ -219,6 +219,8 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token"),
         ("src/elspeth/core/landscape/data_flow/tokens.py", "RowTokenRepository.create_row_with_token_transaction"),
+        ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_candidate"),
+        ("src/elspeth/core/landscape/execution/audit_export_snapshots.py", "AuditExportSnapshotRepository.register_verified_candidate"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._finalize_on"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._validate_effect_authority"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization.finalize"),
