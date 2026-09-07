@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from sqlalchemy import create_engine, event, insert, select, update
+from sqlalchemy import create_engine, delete, event, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import IntegrityError, OperationalError
 
@@ -157,6 +157,26 @@ def test_batched_coordination_event_context_rejects_mutation() -> None:
     )
     with pytest.raises(TypeError):
         cast(MutableMapping[str, str], event_row.context)["reason"] = "changed_after_construction"
+
+
+@pytest.mark.parametrize("role", ["leader", "follower"])
+def test_worker_heartbeat_missing_seat_refuses_without_liveness_write(
+    engine: Tier1Engine, repo: RunCoordinationRepository, role: str
+) -> None:
+    _seed_run(engine)
+    leader_id = mint_worker_id(RUN_ID)
+    register_run_leader(repo, run_id=RUN_ID, worker_id=leader_id, window_seconds=WINDOW)
+    worker_id = leader_id
+    if role == "follower":
+        worker_id = mint_worker_id(RUN_ID)
+        repo.admit_follower(run_id=RUN_ID, worker_id=worker_id, config_hash="config", window_seconds=WINDOW)
+    with engine.begin() as conn:
+        conn.execute(delete(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID))
+        conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=NOW))
+    before = _coordination_image(engine)
+    with pytest.raises(AuditIntegrityError, match="no run_coordination seat"):
+        repo.worker_heartbeat(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=worker_id), window_seconds=WINDOW)
+    assert _coordination_image(engine) == before
 
 
 def _seat_row(engine: Tier1Engine, run_id: str = RUN_ID) -> dict[str, object]:

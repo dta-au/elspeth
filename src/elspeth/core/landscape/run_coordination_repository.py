@@ -61,7 +61,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
-from types import MappingProxyType
 
 from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Connection
@@ -84,6 +83,7 @@ from elspeth.contracts.errors import (
     RunMembershipLostError,
     WriteLockHeldError,
 )
+from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.canonical import canonical_json
 from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas
@@ -224,8 +224,7 @@ class CoordinationEventRow:
     context: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
-        if self.context is not None:
-            object.__setattr__(self, "context", MappingProxyType(dict(self.context)))
+        freeze_fields(self, "context")
 
 
 def record_coordination_events(conn: Connection, *, run_id: str, events: Sequence[CoordinationEventRow]) -> None:
@@ -1131,12 +1130,17 @@ class RunCoordinationRepository:
                         (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"),
                     ).where(run_coordination_table.c.run_id == member_token.run_id)
                 ).one_or_none()
+                if seat is None:
+                    raise AuditIntegrityError(
+                        f"Run {member_token.run_id!r} has no run_coordination seat row; "
+                        "worker registration requires a seat created atomically by begin_run."
+                    )
         except RunMembershipLostError:
             return WorkerMembershipLost(member_token=member_token)
         return CoordinationSnapshot(
-            leader_worker_id=None if seat is None else seat.leader_worker_id,
-            leader_epoch=0 if seat is None else int(seat.leader_epoch),
-            seat_live=seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live),
+            leader_worker_id=seat.leader_worker_id,
+            leader_epoch=int(seat.leader_epoch),
+            seat_live=seat.leader_worker_id is not None and bool(seat.seat_live),
             worker_active=True,
             worker_role=role,  # ADR-030 §B: follower sees foreign leader_worker_id normally
         )
