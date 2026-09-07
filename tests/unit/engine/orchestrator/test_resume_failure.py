@@ -17,16 +17,16 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from elspeth.contracts import Checkpoint, NodeID, ResumedRow, ResumePoint, RoutingMode, RunStatus
+from elspeth.contracts import Checkpoint, NodeID, PluginSchema, ResumedRow, ResumePoint, RoutingMode, RunStatus
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenOutcome
 from elspeth.contracts.checkpoint import ResumeCheck
 from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken
 from elspeth.contracts.enums import NodeType, TerminalOutcome, TerminalPath
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.events import RunSummary
-from elspeth.contracts.payload_store import PayloadStore
+from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError, PayloadStore
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.plugin_protocols import SinkProtocol, SourceProtocol, TransformProtocol
 from elspeth.contracts.run_result import RunResult
@@ -47,13 +47,13 @@ from elspeth.engine.coalesce_executor import CoalesceExecutor
 from elspeth.engine.orchestrator import PipelineConfig, prepare_for_run
 from elspeth.engine.orchestrator.cleanup import cleanup_plugins
 from elspeth.engine.orchestrator.core import Orchestrator
-from elspeth.engine.orchestrator.resume import run_resume_processing_loop, setup_resume_context
+from elspeth.engine.orchestrator.resume import _ResumeAuditSnapshot, run_resume_processing_loop, setup_resume_context
 from elspeth.engine.orchestrator.run_state import LoopContext, LoopResult, ResumeState, _RunFailedWithPartialResultError
 from elspeth.engine.orchestrator.types import ExecutionCounters
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.testing import make_row_result, make_source_row
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
 
 
@@ -189,6 +189,178 @@ def _admit_resume_point(orch: Orchestrator, resume_point: ResumePoint) -> Any:
         "elspeth.engine.orchestrator.resume.CheckpointCompatibilityValidator.validate",
         return_value=ResumeCheck(can_resume=True),
     )
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "error"),
+    [
+        pytest.param("workset", RuntimeError("workset read failed"), id="workset"),
+        pytest.param("workset", KeyboardInterrupt(), id="workset-interrupted"),
+        pytest.param("payload", PayloadNotFoundError("missing-payload"), id="missing-payload"),
+        pytest.param("payload", IntegrityError("corrupt-payload"), id="corrupt-payload"),
+        pytest.param("payload", ValueError("schema decode failed"), id="schema-decode"),
+        pytest.param("batches", RuntimeError("batch repair failed"), id="batch-repair"),
+        pytest.param("heartbeat", RuntimeError("heartbeat startup failed"), id="heartbeat-start"),
+        pytest.param("heartbeat-constructor", RuntimeError("heartbeat construction failed"), id="heartbeat-constructor"),
+    ],
+)
+def test_post_acquisition_resume_failure_finalizes_and_releases(failure_stage: str, error: BaseException) -> None:
+    """A failed restore must relinquish the real seat immediately, before expiry."""
+    from sqlalchemy import select
+
+    from elspeth.core.landscape.schema import run_coordination_table, run_workers_table
+
+    setup = make_recorder_with_run()
+    db, factory, run_id = setup.db, setup.factory, setup.run_id
+    factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=setup.coordination_token)
+    factory.run_coordination.release_seat(token=setup.coordination_token)
+    orch = _make_orchestrator(db)
+    checkpoint = Checkpoint(
+        checkpoint_id="restore-failure-checkpoint",
+        run_id=run_id,
+        sequence_number=1,
+        created_at=datetime.now(UTC),
+        upstream_topology_hash="a" * 64,
+        format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+    )
+    resume_point = ResumePoint(checkpoint=checkpoint, sequence_number=1)
+    recovery = MagicMock(spec=RecoveryManager)
+    recovery.get_resume_workset.return_value = ResumeWorkSet(row_ids=(), incomplete_by_row={}, buffered_token_ids=frozenset())
+    recovery.get_unprocessed_row_data_by_source.return_value = []
+    snapshot = _ResumeAuditSnapshot(
+        factory=factory,
+        recovery=recovery,
+        run_id=run_id,
+        worker_id="resume-restore-worker",
+        schema_contracts_by_source={NodeID(setup.source_node_id): SchemaContract(mode="OBSERVED", fields=())},
+        source_names_by_source={NodeID(setup.source_node_id): "source"},
+        source_lifecycle_by_source={NodeID(setup.source_node_id): "loaded"},
+        source_schema_classes={},
+    )
+    if failure_stage == "workset":
+        recovery.get_resume_workset.side_effect = error
+    elif failure_stage == "payload":
+        recovery.get_unprocessed_row_data_by_source.side_effect = error
+
+    with (
+        _admit_resume_point(orch, resume_point),
+        patch.object(orch._resume_coordinator, "_load_resume_audit_snapshot", return_value=snapshot),
+        patch.object(
+            orch._resume_coordinator,
+            "_repair_resume_batches",
+            return_value=({}, False),
+            side_effect=error if failure_stage == "batches" else None,
+        ),
+        patch("elspeth.engine.orchestrator.resume.RunHeartbeatThread") as heartbeat,
+        patch.object(orch._ceremony, "safe_flush_telemetry") as flush,
+    ):
+        if failure_stage == "heartbeat":
+            heartbeat.return_value.start.side_effect = error
+        elif failure_stage == "heartbeat-constructor":
+            heartbeat.side_effect = error
+        with pytest.raises(type(error)) as raised:
+            orch.resume(
+                resume_point,
+                MagicMock(spec=PipelineConfig),
+                MagicMock(spec=ExecutionGraph),
+                payload_store=MockPayloadStore(),
+            )
+        assert raised.value is error
+
+    run = factory.run_lifecycle.get_run(run_id)
+    assert run is not None
+    assert run.status == RunStatus.FAILED
+    with db.engine.connect() as conn:
+        seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).one()
+        worker = conn.execute(
+            select(run_workers_table).where(
+                run_workers_table.c.run_id == run_id,
+                run_workers_table.c.worker_id == snapshot.worker_id,
+            )
+        ).one()
+    assert seat.leader_worker_id is None
+    assert worker.status == "departed"
+    flush.assert_called_once_with()
+
+
+class _StoredResumeSchema(PluginSchema):
+    amount: int
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected_error"),
+    [
+        ("missing", ValueError),
+        ("invalid-json", AuditIntegrityError),
+        ("schema", ValidationError),
+    ],
+)
+def test_real_payload_restore_failure_releases_reconstruction_seat(damage: str, expected_error: type[Exception]) -> None:
+    """Exercise actual payload retrieval and decoding after the leadership CAS."""
+    from sqlalchemy import select, update
+
+    from elspeth.core.landscape.schema import rows_table, run_coordination_table
+
+    store = MockPayloadStore()
+    setup = make_recorder_with_run(payload_store=store)
+    factory, db, run_id = setup.factory, setup.db, setup.run_id
+    row = factory.data_flow.create_row(
+        run_id,
+        setup.source_node_id,
+        0,
+        {"amount": "invalid" if damage == "schema" else 1},
+        source_row_index=0,
+        ingest_sequence=0,
+    )
+    assert row.source_data_ref is not None
+    if damage == "missing":
+        store.delete(row.source_data_ref)
+    elif damage == "invalid-json":
+        damaged_ref = store.store(b"not JSON")
+        with db.write_connection() as conn:
+            conn.execute(update(rows_table).where(rows_table.c.row_id == row.row_id).values(source_data_ref=damaged_ref))
+    factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=setup.coordination_token)
+    factory.run_coordination.release_seat(token=setup.coordination_token)
+    checkpoint = Checkpoint(
+        checkpoint_id="payload-restore-checkpoint",
+        run_id=run_id,
+        sequence_number=1,
+        created_at=datetime.now(UTC),
+        upstream_topology_hash="a" * 64,
+        format_version=Checkpoint.CURRENT_FORMAT_VERSION,
+    )
+    orch = _make_orchestrator(db)
+    recovery = RecoveryManager(db, MagicMock(spec=CheckpointManager))
+    source_id = NodeID(setup.source_node_id)
+    snapshot = _ResumeAuditSnapshot(
+        factory=factory,
+        recovery=recovery,
+        run_id=run_id,
+        worker_id="payload-restore-worker",
+        schema_contracts_by_source={source_id: SchemaContract(mode="OBSERVED", fields=())},
+        source_names_by_source={source_id: "source"},
+        source_lifecycle_by_source={source_id: "loaded"},
+        source_schema_classes={source_id: _StoredResumeSchema},
+    )
+    with (
+        patch.object(orch._resume_coordinator, "_load_resume_audit_snapshot", return_value=snapshot),
+        patch.object(
+            recovery,
+            "get_resume_workset",
+            return_value=ResumeWorkSet(row_ids=(row.row_id,), incomplete_by_row={}, buffered_token_ids=frozenset()),
+        ),
+        patch.object(orch._ceremony, "safe_flush_telemetry") as flush,
+        pytest.raises(expected_error),
+    ):
+        orch._resume_coordinator.reconstruct_resume_state(ResumePoint(checkpoint=checkpoint, sequence_number=1), store)
+    run = factory.run_lifecycle.get_run(run_id)
+    assert run is not None
+    assert run.status == RunStatus.FAILED
+    with db.engine.connect() as conn:
+        seat = conn.execute(select(run_coordination_table).where(run_coordination_table.c.run_id == run_id)).one()
+    assert seat.leader_epoch == setup.coordination_token.leader_epoch + 1
+    assert seat.leader_worker_id is None
+    flush.assert_called_once_with()
 
 
 # Protocol-specced plugin doubles. ``SourceProtocol``/``SinkProtocol``/

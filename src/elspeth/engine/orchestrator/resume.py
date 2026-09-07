@@ -632,56 +632,59 @@ class ResumeCoordinator:
         # Stage 2 — THE FIRST DURABLE ACT: the seat-acquisition CAS (epoch 21,
         # ADR-030 §B.4 — TOCTOU closure). A CAS loser raises NonResumableRunError
         # with zero mutation. See _acquire_resume_leadership.
+        reconstruction_start_time = time.perf_counter()
         coordination_token = self._acquire_resume_leadership(snapshot)
 
-        # Stage 2.5 — compute the resume WORK SET, AFTER the seat CAS. The work
-        # set (row-replay IDs + incomplete-token continuations) is derived from
-        # token_outcomes / tokens / node_states / the scheduler journal — all
-        # row-level state a competing resume leader mutates. Reading it BEFORE
-        # the CAS is a stale check-then-act: a contender that won leadership
-        # first, wrote terminal outcomes / new incomplete tokens, then
-        # died or relinquished (returning the run to FAILED), would leave this
-        # attempt to win the CAS and replay a work set read before those writes
-        # — duplicating already-completed rows and missing newly-incomplete
-        # tokens. Recomputing here, under the leadership exclusivity the CAS
-        # just established, makes the read authoritative: no other resume can be
-        # concurrently mutating this run's row-level state once we hold the seat.
-        # The topology-stable reads (manifest drift, source-lifecycle
-        # completeness, schema/contract maps) legitimately stay pre-CAS in
-        # _load_resume_audit_snapshot; only the work set moves here.
-        workset = snapshot.recovery.get_resume_workset(snapshot.run_id)
+        try:
+            # Stage 2.5 — compute the work set under acquired leadership.
+            # Row outcomes and incomplete tokens can change between a pre-CAS
+            # read and acquisition; replaying that stale set duplicates completed
+            # rows and misses new incomplete tokens. Topology-stable reads stay
+            # in _load_resume_audit_snapshot before the CAS.
+            workset = snapshot.recovery.get_resume_workset(snapshot.run_id)
 
-        # Unprocessed-row payload restore, AFTER the seat CAS (elspeth-e3d1310b93).
-        # get_unprocessed_row_data_by_source retrieves + json-decodes +
-        # Pydantic-validates every unprocessed payload blob from the payload
-        # store, driven by the post-CAS work-set row_ids. Running it after
-        # acquire_run_leadership means a LOSING resume contender is refused
-        # (NonResumableRunError, zero mutation) BEFORE paying that read cost —
-        # the CAS guards the expensive input boundary, not just durable mutation.
-        unprocessed_rows = snapshot.recovery.get_unprocessed_row_data_by_source(
-            snapshot.run_id,
-            payload_store,
-            source_schema_classes=snapshot.source_schema_classes,
-            row_ids=workset.row_ids,
-        )
+            # A CAS loser must be refused before expensive payload reads and
+            # schema decoding (elspeth-e3d1310b93). The winner owns cleanup for
+            # any restoration failure from this point (elspeth-245b21351b).
+            unprocessed_rows = snapshot.recovery.get_unprocessed_row_data_by_source(
+                snapshot.run_id,
+                payload_store,
+                source_schema_classes=snapshot.source_schema_classes,
+                row_ids=workset.row_ids,
+            )
 
-        # Stage 3 — durable post-CAS repair (only the seat winner may run it):
-        # rewrite incomplete batches + detect restored barrier work.
-        batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot)
+            # Stage 3 — only the seat winner may rewrite incomplete batches.
+            batch_id_remap, has_restored_barrier_work = self._repair_resume_batches(snapshot)
 
-        return ResumeState(
-            factory=snapshot.factory,
-            run_id=snapshot.run_id,
-            unprocessed_rows=unprocessed_rows,
-            incomplete_by_row=workset.incomplete_by_row,
-            recovery_manager=snapshot.recovery,
-            schema_contracts_by_source=snapshot.schema_contracts_by_source,
-            source_names_by_source=snapshot.source_names_by_source,
-            source_lifecycle_by_source=snapshot.source_lifecycle_by_source,
-            has_restored_barrier_work=has_restored_barrier_work,
-            batch_id_remap=batch_id_remap,
-            coordination_token=coordination_token,
-        )
+            return ResumeState(
+                factory=snapshot.factory,
+                run_id=snapshot.run_id,
+                unprocessed_rows=unprocessed_rows,
+                incomplete_by_row=workset.incomplete_by_row,
+                recovery_manager=snapshot.recovery,
+                schema_contracts_by_source=snapshot.schema_contracts_by_source,
+                source_names_by_source=snapshot.source_names_by_source,
+                source_lifecycle_by_source=snapshot.source_lifecycle_by_source,
+                has_restored_barrier_work=has_restored_barrier_work,
+                batch_id_remap=batch_id_remap,
+                coordination_token=coordination_token,
+            )
+        except BaseException:
+            # resume() cannot own this cleanup: no ResumeState has returned to
+            # it yet. Direct reconstruction callers have the same obligation.
+            # No heartbeat or trace scope has started during reconstruction.
+            try:
+                with best_effort("Failure ceremony during resume reconstruction", run_id=snapshot.run_id):
+                    self._ceremony.emit_failed_ceremony(
+                        snapshot.run_id,
+                        snapshot.factory,
+                        reconstruction_start_time,
+                        coordination_token=coordination_token,
+                    )
+                    snapshot.factory.run_coordination.release_seat(token=coordination_token)
+            finally:
+                self._ceremony.safe_flush_telemetry()
+            raise
 
     def _load_resume_audit_snapshot(
         self, resume_point: ResumePoint, payload_store: PayloadStore, *, worker_id: str | None
@@ -1020,43 +1023,25 @@ class ResumeCoordinator:
                 "reconstruct_resume_state — acquire_run_leadership must always return "
                 "a token or raise; a None result is an orchestration invariant violation."
             )
-        # The token reaches every fenced collaborator (checkpoint writes,
-        # finalize, ceremonies) as a parameter of the call, by value (ADR-048 §3).
-        schema_contracts_by_source = state.schema_contracts_by_source
-        unprocessed_rows = state.unprocessed_rows
-        # F1 fix: pre-computed by _reconstruct_resume_state; forwarded to the loop.
-        incomplete_by_row = state.incomplete_by_row
-        recovery_manager = state.recovery_manager
-        resume_checkpoint_id = resume_point.checkpoint.checkpoint_id
         resume_start_time = time.perf_counter()
-
-        # ADR-030 §A.3 (slice 4): start the dedicated heartbeat thread AFTER
-        # the seat is minted (coordination_token is live) and the token is
-        # bound, BEFORE the try/except block.  Mirrors the run() path in
-        # core.py.  The thread beats both the run_workers row and the
-        # run_coordination seat in ONE BEGIN IMMEDIATE transaction so the two
-        # liveness clocks cannot skew.
-        #
-        # Correct sequencing (design §A.3 "joined before release_seat"):
-        # stop() is called as the FIRST statement in every except handler that
-        # calls release_seat AND in the success path just before release_seat.
-        # The finally block additionally calls stop() as a safety net
-        # (idempotent) to cover any exit path that did not already stop.
-        _heartbeat = RunHeartbeatThread(
-            factory.run_coordination,
-            member_token=coordination_token.membership,
-        )
-        _heartbeat.start()
-
-        # 5. Process unprocessed rows (with graceful shutdown support)
-
-        # When shutdown_event is provided (testing), skip signal handler
-        # installation and use the caller's event directly.
-        shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
+        _heartbeat: RunHeartbeatThread | None = None
         resume_failure_counter_baseline: ExecutionCounters | None = None
         trace_stack = ExitStack()
 
         try:
+            # Startup belongs to the cleanup boundary too: construction or
+            # Thread.start() can fail after the resume has acquired its seat.
+            _heartbeat = RunHeartbeatThread(factory.run_coordination, member_token=coordination_token.membership)
+            _heartbeat.start()
+
+            # The token reaches each fenced collaborator by value (ADR-048 §3).
+            schema_contracts_by_source = state.schema_contracts_by_source
+            unprocessed_rows = state.unprocessed_rows
+            incomplete_by_row = state.incomplete_by_row
+            recovery_manager = state.recovery_manager
+            resume_checkpoint_id = resume_point.checkpoint.checkpoint_id
+            shutdown_ctx = nullcontext(shutdown_event) if shutdown_event is not None else shutdown_handler_context()
+
             durable_run = factory.run_lifecycle.get_run(run_id)
             if durable_run is None:
                 raise AuditIntegrityError(f"Cannot resume run {run_id!r}: durable run record is missing")
@@ -1192,7 +1177,8 @@ class ResumeCoordinator:
             )
         except GracefulShutdownError as shutdown_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
-            _heartbeat.stop()
+            if _heartbeat is not None:
+                _heartbeat.stop()
             with best_effort("Interrupted ceremony on resume graceful shutdown", run_id=run_id):
                 self._ceremony.emit_interrupted_ceremony(
                     run_id, factory, shutdown_exc, resume_start_time, coordination_token=coordination_token
@@ -1205,7 +1191,8 @@ class ResumeCoordinator:
             raise  # Propagate to CLI
         except _RunFailedWithPartialResultError as failed_exc:
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
-            _heartbeat.stop()
+            if _heartbeat is not None:
+                _heartbeat.stop()
             failed_result = _resume_failure_result_from_baseline(
                 run_id,
                 baseline=resume_failure_counter_baseline,
@@ -1223,12 +1210,13 @@ class ResumeCoordinator:
                 if coordination_token is not None:
                     factory.run_coordination.release_seat(token=coordination_token)
             raise failed_exc.original_error.with_traceback(failed_exc.original_traceback) from None
-        except Exception:
+        except BaseException:
             # Finalize as FAILED to prevent the run from being stuck in RUNNING
             # permanently (which blocks future resume attempts). The outer broad-except
             # is justified — any unhandled exception during resume needs ceremony.
             # ADR-030 §A.3: stop the heartbeat thread before the seat is released.
-            _heartbeat.stop()
+            if _heartbeat is not None:
+                _heartbeat.stop()
             with best_effort("Generic failure ceremony on resume", run_id=run_id):
                 self._ceremony.emit_failed_ceremony(run_id, factory, resume_start_time, coordination_token=coordination_token)
                 # Seat hygiene: after the FAILED finalize succeeded.
@@ -1239,14 +1227,18 @@ class ResumeCoordinator:
             # ADR-030 §A.3: safety-net stop (idempotent) — covers any exit
             # path that did not already stop the thread (e.g. an exception
             # raised before any except handler ran release_seat).
-            _heartbeat.stop()
             try:
-                self._ceremony.safe_flush_telemetry()
+                if _heartbeat is not None:
+                    _heartbeat.stop()
             finally:
                 try:
-                    trace_stack.close()
+                    self._ceremony.safe_flush_telemetry()
                 finally:
-                    _heartbeat.raise_fatal_failure()
+                    try:
+                        trace_stack.close()
+                    finally:
+                        if _heartbeat is not None:
+                            _heartbeat.raise_fatal_failure()
 
     def process_resumed_rows(
         self,
