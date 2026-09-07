@@ -27,7 +27,7 @@ from elspeth.contracts.audit_export import (
     derive_audit_export_bundle,
 )
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import CoalesceCollisionError
 from elspeth.contracts.hashing import canonical_json as contract_canonical_json
 from elspeth.contracts.hashing import stable_hash
@@ -4211,11 +4211,20 @@ def _pending_sink_redrive_recovery_case(
         original_reserve = SinkEffectReservation.reserve
         reservation_faults: list[str] = []
 
-        def stop_before_reservation(reservation: SinkEffectReservation, request: Any) -> Any:
+        def stop_before_reservation(
+            reservation: SinkEffectReservation,
+            request: Any,
+            *,
+            coordination_token: CoordinationToken,
+        ) -> Any:
+            # A double is a SECOND SPELLING OF A SIGNATURE and goes stale silently:
+            # `reserve` is leader-fenced (ADR-048), so this stand-in must carry the
+            # token and forward it, or the four scenarios it serves fail with a
+            # TypeError that looks like a defect in the code under test.
             if not reservation_faults:
                 reservation_faults.append("before_sink_effect_reservation")
                 raise RuntimeError("injected DAG corpus crash before sink-effect reservation")
-            return original_reserve(reservation, request)
+            return original_reserve(reservation, request, coordination_token=coordination_token)
 
         try:
             with patch.object(SinkEffectReservation, "reserve", new=stop_before_reservation):
