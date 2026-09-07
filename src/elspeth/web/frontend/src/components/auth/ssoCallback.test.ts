@@ -89,6 +89,20 @@ describe("ssoFailureMessage", () => {
     expect(ssoFailureMessage({ kind: "malformed" })).toBe(SSO_GENERIC_FAILURE);
   });
 
+  it("does not tell a rebound they were disabled, nor name the address that changed", () => {
+    // R3. In R5's carve-out the identity is still active and only the login
+    // is refused, so collapsing this into the disabled sentence would tell
+    // the last active human admin something untrue about their account.
+    const rebound = ssoFailureMessage({ kind: "error", category: "sso_identity_rebound" });
+    expect(rebound).not.toBe(SSO_FAILURE_MESSAGES.sso_identity_disabled);
+    expect(rebound).toMatch(/administrator/);
+    expect(rebound).not.toMatch(/disabled/);
+    // Whoever holds this subject now may not be the person the previous
+    // address belonged to; the page must not hand them that fact.
+    expect(rebound).not.toMatch(/@/);
+    expect(rebound).not.toMatch(/email|address/i);
+  });
+
   it("has a sentence for every category, none of which echoes the category", () => {
     for (const [category, message] of Object.entries(SSO_FAILURE_MESSAGES)) {
       expect(message.length).toBeGreaterThan(0);

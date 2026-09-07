@@ -46,6 +46,18 @@ def _noop(_identity_id: str, _username: str, _quota_written: bool) -> None:
     return None
 
 
+def _no_rebound(_event: object) -> None:
+    """R3 recorder for the cases that are not about R3.
+
+    Every one of these fixtures logs in as ``local``, which R3 excludes, so
+    this is never invoked -- and it is a no-op that RETURNS rather than one
+    that asserts, because a test asserting it was never called would be
+    pinning the exclusion in the wrong file. The exclusion's own tests live
+    with the authority.
+    """
+    return None
+
+
 def _record_no_retirement(_outcome: IdentityRetired) -> None:
     return None
 
@@ -70,6 +82,7 @@ def _ensure(authority: RepositoryIdentityAuthority, *, activate: bool, **claim_o
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_no_rebound,
     )
 
 
@@ -332,6 +345,7 @@ def test_the_admission_audit_runs_before_the_activation_commits(authority) -> No
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=lambda identity_id, username, _quota: seen.append((identity_id, username)),
+        record_rebound=_no_rebound,
     )
 
     assert seen == [(outcome.record.identity_id, "ada")]
@@ -356,6 +370,7 @@ def test_a_failed_admission_audit_rolls_the_whole_activation_back(engine, author
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
             record_admission=_audit_fails,
+            record_rebound=_no_rebound,
         )
 
     # Nothing survives: no identity, and therefore no quota row either.
@@ -382,6 +397,7 @@ def test_a_retry_after_a_failed_audit_admits_and_audits(authority) -> None:
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
             record_admission=_fails_once,
+            record_rebound=_no_rebound,
         )
 
     outcome = authority.ensure_identity(
@@ -390,6 +406,7 @@ def test_a_retry_after_a_failed_audit_admits_and_audits(authority) -> None:
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_fails_once,
+        record_rebound=_no_rebound,
     )
 
     assert outcome.record.is_active is True
@@ -406,6 +423,7 @@ def test_a_pending_admission_writes_no_audit(authority) -> None:
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=lambda identity_id, _username, _quota: seen.append(identity_id),
+        record_rebound=_no_rebound,
     )
 
     assert seen == []
@@ -425,6 +443,7 @@ def test_a_returning_active_user_writes_no_second_audit(authority) -> None:
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
             record_admission=recorder,
+            record_rebound=_no_rebound,
         )
 
     assert len(seen) == 1
@@ -481,6 +500,7 @@ def test_the_loser_does_not_write_a_second_activation_audit(authority, monkeypat
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=lambda identity_id, _username, _quota: seen.append(identity_id),
+        record_rebound=_no_rebound,
     )
 
     assert outcome.activated_now is False
@@ -529,6 +549,7 @@ def test_no_quota_is_claimed_when_no_quota_row_is_written(engine, authority, tok
         quota_tokens_per_day=tokens,
         quota_storage_bytes=storage,
         record_admission=lambda _i, _u, _q: None,
+        record_rebound=_no_rebound,
     )
 
     assert outcome.quota_written is False
@@ -545,6 +566,7 @@ def test_a_written_quota_row_is_reported_to_the_caller(authority) -> None:
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=lambda _i, _u, quota_written: seen.append(quota_written),
+        record_rebound=_no_rebound,
     )
 
     assert outcome.quota_written is True

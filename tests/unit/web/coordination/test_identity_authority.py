@@ -140,6 +140,7 @@ def _pending(authority: RepositoryIdentityAuthority, subject: str) -> IdentityRe
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_noop,
     ).record
 
 
@@ -562,6 +563,7 @@ def test_a_first_login_binds_to_the_pre_provisioned_row(authority) -> None:
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_noop,
     )
     assert outcome.created is False
     assert outcome.record.identity_id == provisioned.record.identity_id
@@ -970,6 +972,7 @@ def test_ensure_identity_lands_pending_and_writes_no_quota(engine, authority) ->
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_noop,
     )
     assert outcome.created is True and outcome.record.access_state == "pending"
     assert _quota_rows(engine, outcome.record.identity_id) == []
@@ -987,6 +990,7 @@ def test_ensure_identity_admission_audit_reports_the_written_allowance(authority
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=record_admission,
+        record_rebound=_noop,
     )
     assert seen == [(outcome.record.identity_id, "ada", True)]
     assert outcome.activated_now is True and outcome.quota_written is True
@@ -1003,6 +1007,7 @@ def test_a_failed_admission_audit_rolls_the_activation_back(engine, authority) -
             quota_tokens_per_day=_TOKENS,
             quota_storage_bytes=_STORAGE,
             record_admission=refuse,
+            record_rebound=_noop,
         )
     assert authority.read_identity_by_natural_key(provider="local", subject="ada") is None
 
@@ -1015,6 +1020,7 @@ def test_a_returning_login_never_upgrades_or_downgrades(authority) -> None:
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_noop,
     )
     assert again.created is False and again.record.identity_id == pending.identity_id
     assert again.record.access_state == "pending"
@@ -1038,6 +1044,7 @@ def test_the_loser_of_a_first_login_race_binds_to_the_winner(engine, authority, 
         quota_tokens_per_day=_TOKENS,
         quota_storage_bytes=_STORAGE,
         record_admission=_noop,
+        record_rebound=_noop,
     )
     assert outcome.created is False and outcome.activated_now is False
     with engine.connect() as conn:
@@ -1103,3 +1110,309 @@ def test_local_identity_retirer_binds_the_local_provider_reason_and_recorder(eng
     impostor: Any = object()
     with pytest.raises(TypeError):
         local_identity_retirer(impostor, recorder)
+
+
+# --------------------------------------------------------------------------
+# R3 / D32: the verified email behind a provider subject changed.
+#
+# The detection columns shipped with the identity epoch and compared nothing
+# until this landed (elspeth-9c25083a03). Every case below is a state
+# assertion against the row, not a call assertion against a spy: R3's whole
+# purpose is what the identity looks like afterwards.
+# --------------------------------------------------------------------------
+
+
+def _sso_claims(subject: str = "ada", *, email: str | None = "ada@example.com", provider: Any = "vanguard") -> IdentityClaims:
+    """An IdP login. ``_claims`` defaults to ``local``, which R3 excludes."""
+    return _claims(subject, provider=provider, email=email)
+
+
+def _login(authority: RepositoryIdentityAuthority, claims: IdentityClaims, *, record_rebound: Any = _noop) -> Any:
+    return authority.ensure_identity(
+        claims=claims,
+        activate=False,
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record_admission=_noop,
+        record_rebound=record_rebound,
+    )
+
+
+def _sso_bootstrap(authority: RepositoryIdentityAuthority, subject: str = "root", *, email: str = "root@old.example") -> Any:
+    """Seed the first admin as an IdP identity.
+
+    ``_bootstrap`` mints a ``local`` row, and ``(provider, subject)`` is the
+    identity key -- so an SSO login for the same subject would bind to a
+    DIFFERENT identity and these tests would assert against a row R3 never
+    touched.
+    """
+    return authority.bootstrap_admin(
+        claims=_sso_claims(subject, email=email),
+        note="bootstrap",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+
+
+def _activate(authority: RepositoryIdentityAuthority, actor: IdentityAdminActor, identity_id: str, role: Any = "user") -> Any:
+    return authority.activate_identity(
+        actor=actor,
+        identity_id=identity_id,
+        role=role,
+        note="admitted",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+
+
+def test_rebound_disables_the_identity_records_the_reason_and_refuses_the_login(engine, authority) -> None:
+    """The whole of R3 on an ordinary identity, in one pass."""
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+    assert first.rebound_refused is False
+    recorder = _Recorder()
+
+    second = _login(authority, _sso_claims(email="ada@new.example"), record_rebound=recorder)
+
+    assert second.rebound_refused is True
+    assert second.record.access_state == "disabled"
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.access_state == "disabled"
+    assert row.disable_reason == "rebound"
+    assert row.rebound_at is not None
+    # Actor ``system``: no administrator decided this, so none is named.
+    assert row.disabled_by_identity_id is None
+    assert row.disabled_at is not None
+    # The baseline is NOT rebased by the detection -- only an admin's
+    # re-enable does that, and rebasing here would erase the evidence.
+    assert row.subject_email_at_first_seen == "ada@old.example"
+    # Current state follows the login, so an admin sees what it changed to.
+    assert row.email == "ada@new.example"
+    assert [type(outcome).__name__ for outcome in recorder.outcomes] == ["IdentityRebound"]
+    assert recorder.outcomes[0].previous_email == "ada@old.example"
+    assert recorder.outcomes[0].current_email == "ada@new.example"
+
+
+def test_rebound_does_not_run_the_edge_revocation_cascade(engine, authority) -> None:
+    """D32's second binding: edge revocation is unrecoverable and this fires on a rename."""
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    subordinate = _login(authority, _sso_claims("ada", email="ada@old.example")).record
+    _activate(authority, actor, subordinate.identity_id)
+    # A separate approver: R8 forbids root holding ``approver`` beside ``admin``.
+    overseer = _pending(authority, "iris")
+    _activate(authority, actor, overseer.identity_id, role="approver")
+    _edge(authority, actor, overseer.identity_id, subordinate.identity_id)
+
+    _login(authority, _sso_claims("ada", email="ada@new.example"))
+
+    still_live = authority.list_relationships(identity_id=subordinate.identity_id, include_revoked=False, limit=50, offset=0)
+    assert [held.revoked_at for held in still_live] == [None]
+    assert _identity_row(engine, subordinate.identity_id).access_state == "disabled"
+
+
+def test_rebound_of_the_last_active_human_admin_refuses_the_login_but_leaves_them_active(engine, authority) -> None:
+    """R5's carve-out. Disabling here would brick the container into C2's lockout."""
+    root = _sso_bootstrap(authority, "root", email="root@old.example")
+    assert authority.count_active_human_admins() == 1
+    recorder = _Recorder()
+
+    outcome = _login(authority, _sso_claims("root", email="root@new.example"), record_rebound=recorder)
+
+    assert outcome.rebound_refused is True
+    assert outcome.record.access_state == "active"
+    row = _identity_row(engine, root.record.identity_id)
+    assert row.access_state == "active"
+    assert row.disable_reason is None
+    # The observation still happened and an admin must see it.
+    assert row.rebound_at is not None
+    # NO identity_disabled event: asserting a disable that did not happen
+    # would put false evidence in the trail. The refused login's own
+    # auth_failure row carries the sso_identity_rebound category.
+    assert recorder.outcomes == []
+
+
+def test_rebound_of_a_non_last_admin_disables_them_through_the_population_lock_retry(engine, authority, monkeypatch) -> None:
+    """The attempt-2 path, EXERCISED -- not asserted to exist.
+
+    Attempt 1 runs without R5's population lock and discovers the target
+    holds deployment admin, which it may not lock in that order; it rolls
+    back and attempt 2 re-runs with the population taken first. The spy
+    records the flag each attempt was given, so a refactor that silently
+    stopped retrying (or started locking on every login) fails here.
+    """
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    second_admin = _login(authority, _sso_claims("bob", email="bob@old.example")).record
+    # ``admin`` is not an ACTIVATION role (D14 keeps container operations
+    # separate from workload roles): admit with none, then grant it.
+    _activate(authority, actor, second_admin.identity_id, role="none")
+    _grant(authority, actor, second_admin.identity_id, "admin")
+    assert authority.count_active_human_admins() == 2
+
+    attempts: list[bool] = []
+    original = RepositoryIdentityAuthority._ensure_identity_once
+
+    def _spy(self: Any, **kwargs: Any) -> Any:
+        attempts.append(kwargs["lock_admin_population"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", _spy)
+
+    outcome = _login(authority, _sso_claims("bob", email="bob@new.example"))
+
+    # Attempt 1 without the lock, attempt 2 with it. Exactly two: the retry
+    # is bounded structurally, not by a counter.
+    assert attempts == [False, True]
+    assert outcome.rebound_refused is True
+    row = _identity_row(engine, second_admin.identity_id)
+    assert row.access_state == "disabled"
+    assert row.disable_reason == "rebound"
+    # R5 is unharmed: the container still has an administrator.
+    assert authority.count_active_human_admins() == 1
+
+
+def test_an_ordinary_login_never_takes_the_admin_population_lock(authority, monkeypatch) -> None:
+    """The other half of the retry's justification: the hot path is untouched."""
+    attempts: list[bool] = []
+    original = RepositoryIdentityAuthority._ensure_identity_once
+
+    def _spy(self: Any, **kwargs: Any) -> Any:
+        attempts.append(kwargs["lock_admin_population"])
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", _spy)
+
+    _login(authority, _sso_claims("ada"))
+    _login(authority, _sso_claims("ada"))
+
+    assert attempts == [False, False]
+
+
+def test_a_failed_rebound_audit_rolls_the_disable_back(engine, authority) -> None:
+    """The module's ordering rule: a disable this trail cannot hold does not commit."""
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+
+    with pytest.raises(_AuditOutage):
+        _login(authority, _sso_claims(email="ada@new.example"), record_rebound=_refuse_audit)
+
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.access_state == "pending"
+    assert row.rebound_at is None
+    assert row.disable_reason is None
+    assert row.subject_email_at_first_seen == "ada@old.example"
+
+
+def test_a_recased_address_is_the_same_address(engine, authority) -> None:
+    """A false positive here costs someone their access over a display change."""
+    first = _login(authority, _sso_claims(email="Ada@Example.COM"))
+
+    outcome = _login(authority, _sso_claims(email="  ada@example.com  "))
+
+    assert outcome.rebound_refused is False
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.access_state == "pending"
+    assert row.rebound_at is None
+
+
+def test_a_login_carrying_no_email_is_an_absent_email_not_a_changed_one(engine, authority) -> None:
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+
+    outcome = _login(authority, _sso_claims(email=None))
+
+    assert outcome.rebound_refused is False
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.rebound_at is None
+    assert row.subject_email_at_first_seen == "ada@old.example"
+
+
+def test_a_pre_provisioned_row_adopts_a_baseline_on_first_login_rather_than_tripping(engine, authority) -> None:
+    """Otherwise the admitted-in-advance cohort is exempt from R3 forever."""
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    provisioned = authority.pre_provision_identity(
+        actor=actor,
+        provider="vanguard",
+        subject="ada",
+        username=None,
+        organisation_id=None,
+        role="user",
+        note="cohort",
+        quota_tokens_per_day=_TOKENS,
+        quota_storage_bytes=_STORAGE,
+        record=_noop,
+    )
+    assert _identity_row(engine, provisioned.record.identity_id).subject_email_at_first_seen is None
+
+    outcome = _login(authority, _sso_claims(email="ada@example.com"))
+
+    assert outcome.rebound_refused is False
+    row = _identity_row(engine, provisioned.record.identity_id)
+    assert row.subject_email_at_first_seen == "ada@example.com"
+    assert row.rebound_at is None
+    assert row.access_state == "active"
+
+    # And the adopted baseline is live: the NEXT change trips.
+    assert _login(authority, _sso_claims(email="ada@new.example")).rebound_refused is True
+
+
+def test_local_auth_is_excluded_because_its_subject_is_the_username(engine, authority) -> None:
+    """A local user who changes their email address must not lock themselves out."""
+    first = _login(authority, _claims("ada", provider="local", email="ada@old.example"))
+
+    outcome = _login(authority, _claims("ada", provider="local", email="ada@new.example"))
+
+    assert outcome.rebound_refused is False
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.access_state == "pending"
+    assert row.rebound_at is None
+    assert row.disable_reason is None
+
+
+def test_an_already_disabled_row_does_not_restamp_rebound_at_on_every_attempt(engine, authority) -> None:
+    """``rebound_at`` records when it was observed, not when it was last retried."""
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+    _login(authority, _sso_claims(email="ada@new.example"))
+    stamped = _identity_row(engine, first.record.identity_id).rebound_at
+
+    recorder = _Recorder()
+    outcome = _login(authority, _sso_claims(email="ada@newer.example"), record_rebound=recorder)
+
+    assert outcome.rebound_refused is False  # ``admit`` refuses it on state
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.rebound_at == stamped
+    assert row.email == "ada@new.example"
+    assert recorder.outcomes == []
+
+
+def test_re_enabling_a_rebound_rebases_the_baseline_and_clears_the_stamp(engine, authority) -> None:
+    """R3's third binding: without it R3 re-trips on the next login forever."""
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+    _login(authority, _sso_claims(email="ada@new.example"))
+
+    authority.enable_identity(actor=actor, identity_id=first.record.identity_id, note="renamed", record=_noop)
+
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.access_state == "active"
+    assert row.subject_email_at_first_seen == "ada@new.example"
+    assert row.rebound_at is None
+    # The proof that matters: the next login is admitted rather than re-tripped.
+    assert _login(authority, _sso_claims(email="ada@new.example")).rebound_refused is False
+    assert _identity_row(engine, first.record.identity_id).access_state == "active"
+
+
+def test_an_ordinary_re_enable_does_not_adopt_the_current_address_as_the_baseline(engine, authority) -> None:
+    """Only a rebound rebases. An admin disable must not silently retrust an address."""
+    root = _bootstrap(authority)
+    actor = _actor(root.record.identity_id)
+    first = _login(authority, _sso_claims(email="ada@old.example"))
+    _activate(authority, actor, first.record.identity_id)
+    authority.disable_identity(actor=actor, identity_id=first.record.identity_id, reason="leave of absence", record=_noop)
+
+    authority.enable_identity(actor=actor, identity_id=first.record.identity_id, note="back", record=_noop)
+
+    row = _identity_row(engine, first.record.identity_id)
+    assert row.subject_email_at_first_seen == "ada@old.example"

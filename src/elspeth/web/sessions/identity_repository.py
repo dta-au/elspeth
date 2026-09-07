@@ -71,6 +71,19 @@ class EnsureIdentityOutcome:
     # write none -- and an audit event claiming an allowance that no row
     # records would tell an auditor the opposite of the truth.
     quota_written: bool
+    # R3: the verified email behind this provider subject changed, so this
+    # login is REFUSED however the row now reads.
+    #
+    # It is a separate fact from ``record.access_state`` because the two
+    # genuinely come apart: R5's carve-out leaves the last active human admin
+    # ``active`` -- disabling them would brick the container -- and refuses
+    # the login anyway. A caller that inferred the refusal from the state
+    # would admit exactly that person, who is the one identity in the
+    # deployment it can least afford to be wrong about.
+    #
+    # No default: this is a refusal, and a construction site that forgets it
+    # must be a type error rather than an admission.
+    rebound_refused: bool
 
 
 # Write the ``identity_activated`` + ``quota_set`` pair for a first admission.

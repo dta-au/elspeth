@@ -98,9 +98,11 @@ class AuthAuditWriter(Protocol):
         identity_id: str | None = None,
     ) -> None: ...
 
-    # Two members with no ``request``: a self-admitting deployment activates
-    # inside the login worker, where there is none to read, and a credential
-    # deletion retires its identity from whichever surface deleted it.
+    # Three members with no ``request``: a self-admitting deployment activates
+    # inside the login worker, where there is none to read; a credential
+    # deletion retires its identity from whichever surface deleted it; and an
+    # R3 rebound disable is the authority's own act, audited separately from
+    # the login that tripped it.
     def record_identity_admitted(
         self,
         *,
@@ -119,6 +121,16 @@ class AuthAuditWriter(Protocol):
         username: str,
         retired_subject: str,
         reason: str,
+    ) -> None: ...
+
+    def record_identity_rebound(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        previous_email: str,
+        current_email: str,
     ) -> None: ...
 
     def record_logout(
@@ -668,6 +680,60 @@ class AuthAuditRecorder:
                     "cause": "credential_deleted",
                     "retired_subject": _bounded_text(retired_subject),
                     "reason": _bounded_text(reason),
+                },
+            )
+
+    def record_identity_rebound(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        previous_email: str,
+        current_email: str,
+    ) -> None:
+        """Write the ``identity_disabled`` row for an R3 rebound disable.
+
+        A rebound IS a disable -- ``access_state`` becomes ``disabled`` with
+        ``disable_reason='rebound'`` -- so it takes the disable's event type
+        and the metadata carries what distinguishes it from an
+        administrator's. The actor is ``system``: no person decided this, and
+        naming one would put an administrator's identity on a row they never
+        touched.
+
+        Not request-bound. The refused LOGIN writes its own ``auth_failure``
+        row carrying the request context and the ``sso_identity_rebound``
+        category; this row is the authority's state change, and the two join
+        on ``identity_id``. Inventing request columns here would assert the
+        disable was decided by whoever happened to trip it.
+
+        BOTH ADDRESSES ARE RECORDED, and that is the point of the row. Which
+        address a subject used to resolve to is the whole forensic content of
+        a rebound: an administrator deciding whether to re-enable needs to see
+        what changed to what. ``identities`` keeps current state and
+        ``enable_identity`` rebases the baseline, so this trail is the only
+        place the previous address survives at all.
+
+        Runs inside the authority's transaction, so a disable this trail
+        cannot hold does not commit.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DISABLED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_disabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "cause": "rebound",
+                    "previous_email": _bounded_text(previous_email),
+                    "current_email": _bounded_text(current_email),
                 },
             )
 

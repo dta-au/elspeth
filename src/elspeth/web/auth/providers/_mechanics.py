@@ -192,14 +192,20 @@ def map_vanguard(id_claims: IdTokenClaims, userinfo: UserinfoClaims | None) -> I
     detection columns on ``identities`` exist precisely because it may not
     be. The mapping does not care: it keys on ``sub`` either way.
 
-    Those columns are RECORDING ONLY. ``subject_email_at_first_seen`` is
-    written at first sight and compared nowhere, ``rebound_at`` is only ever
-    written NULL, and no ``disable_reason='rebound'`` exists in the tree: the
-    R3 refusal is specified (spec §Refusals R3, D32) and NOT implemented
-    (elspeth-9c25083a03). An earlier version of this docstring said "R3
-    notices if the email behind a subject changes", which asserted behaviour
-    the tree does not have. Until R3 is built, a provider that recycles a
-    subject binds the new holder to the prior one's identity row.
+    R3 NOW NOTICES (elspeth-9c25083a03). ``ensure_identity`` compares the
+    verified email of every IdP login against ``subject_email_at_first_seen``
+    under the identity row's lock; a change stamps ``rebound_at``, sets
+    ``access_state='disabled'`` with ``disable_reason='rebound'`` and actor
+    ``system``, and refuses the login as ``sso_identity_rebound``. R5's
+    carve-out is the one exception: the last active human admin keeps
+    ``active`` -- disabling them would brick the container -- and only their
+    login is refused.
+
+    Between the identity epoch and that fix these columns were RECORDING ONLY,
+    and two versions of this docstring were wrong in opposite directions: one
+    claimed R3 noticed when nothing compared the columns, the next said R3 was
+    unimplemented and stayed after it was built. What makes the claim checkable
+    is the ``disable_reason``: grep the tree for ``REBOUND_DISABLE_REASON``.
 
     ``abn`` becomes ``organisation_id``. The display name is assembled from
     name parts because VANguard does not send a composed ``name``.

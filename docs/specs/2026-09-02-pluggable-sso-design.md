@@ -83,11 +83,29 @@ also moved: the profile is written and keys on `sub` either way
 (`map_vanguard`), and the detection columns `subject_email_at_first_seen`
 and `rebound_at` are on `identities`. What a live token pair still settles
 is whether that `sub` is stable and non-email — the subject is an email
-today — which is exactly why those columns exist. **The R3 refusal itself is
-specified (§Refusals R3, D32) and is not yet implemented:** `rebound_at` is
-only ever written `NULL`, `subject_email_at_first_seen` is written at first
-sight and compared nowhere, and no `disable_reason='rebound'` exists in the
-tree. D10's ruling — no `principals` table, identity merge an unbuilt admin
+today — which is exactly why those columns exist.
+
+**[rev2.13] R3 is now implemented** (elspeth-9c25083a03).
+`ensure_identity` compares every IdP login's verified email against
+`subject_email_at_first_seen` under the identity row's lock; a change stamps
+`rebound_at`, sets `access_state='disabled'` with `disable_reason='rebound'`
+and actor `system`, writes the `identity_disabled` row, and refuses the login
+as `sso_identity_rebound`. R5's carve-out leaves the last active human admin
+`active` and refuses only their login, and that case writes NO
+`identity_disabled` row — asserting a disable that did not happen would put
+false evidence in the trail — so it is audited by the refused login's own
+`auth_failure` row. Re-enabling a rebound rebases the baseline to the new
+address and clears `rebound_at`, without which R3 re-trips forever.
+
+Note what this did NOT wait for. rev2.12 recorded the refusal as
+outstanding partly because a live token pair had not settled whether `sub`
+is stable — but the comparison is `claims.email` against the stored
+baseline, and that is identical whether the subject is an email or an opaque
+id. A stable non-email subject makes R3 never fire; it does not make it fire
+differently. The deferral did not survive inspection, and nothing about D10
+gated it.
+
+D10's ruling — no `principals` table, identity merge an unbuilt admin
 action — is unchanged and correct.
 
 ## Architecture
@@ -424,7 +442,14 @@ Closed set, each an explicit exception class, never a `detail` prefix:
 `error_description` never stored), `sso_token_exchange_failed`,
 `sso_id_token_invalid`, `sso_claim_check_failed`, `sso_userinfo_invalid`,
 `sso_identity_disabled`, `sso_access_pending`, `sso_handoff_invalid`,
-`provider_unavailable`.
+`provider_unavailable`, and **[rev2.13]** `sso_identity_rebound`.
+
+Thirteen, pinned by `test_every_failure_category_is_distinct` and mirrored
+into the SPA's `SSO_FAILURE_MESSAGES` by a parity test that reads the
+TypeScript. `sso_identity_rebound` is deliberately NOT folded into
+`sso_identity_disabled`: under R5's carve-out the identity is not disabled at
+all, so the disabled sentence would tell the last active human admin
+something untrue about their own account.
 
 ### Deleted outright [rev2]
 

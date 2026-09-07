@@ -175,6 +175,28 @@ class SsoAccessPending(SsoLoginError):
         super().__init__(detail)
 
 
+class SsoIdentityRebound(SsoLoginError):
+    """R3: the verified email behind this provider subject changed.
+
+    Distinct from ``SsoIdentityDisabled`` because the two are not the same
+    event and, in R5's carve-out, the identity is not disabled at all -- the
+    last active human admin keeps ``active`` because disabling them would
+    brick the container, and only the login is refused. Reusing the disabled
+    category there would tell that person their account was disabled when it
+    was not, and would file the refusal under the wrong cause in the trail.
+
+    The detail names no address. Whoever is holding this subject now may not
+    be the person the old address belongs to, and telling them what it was
+    would hand a recycled-subject attacker the very fact the refusal exists
+    to protect.
+    """
+
+    category: ClassVar[str] = "sso_identity_rebound"
+
+    def __init__(self, detail: str = "This account needs an administrator's attention before you can sign in") -> None:
+        super().__init__(detail)
+
+
 class SsoHandoffInvalid(SsoLoginError):
     """Unknown, already used, or expired handoff code."""
 
@@ -216,6 +238,7 @@ SSO_FAILURE_CATEGORIES: Final[frozenset[str]] = frozenset(
         SsoUserinfoInvalid.category,
         SsoIdentityDisabled.category,
         SsoAccessPending.category,
+        SsoIdentityRebound.category,
         SsoHandoffInvalid.category,
         PROVIDER_UNAVAILABLE_CATEGORY,
     }
