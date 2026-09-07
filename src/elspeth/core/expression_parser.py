@@ -886,6 +886,17 @@ class ExpressionParser:
         """
         return self._is_boolean_node(self._ast.body)
 
+    @trust_boundary(
+        tier=3,
+        source="one expression node of the parsed AST of a user-authored pipeline expression — externally authored content",
+        source_param="node",
+        suppresses=("R5",),
+        invariant=(
+            "returns True for comparisons, unary not, boolean literals, boolean-only and/or operands, "
+            "and ternaries with two boolean branches; other syntax returns False without evaluation; never raises"
+        ),
+        non_raising=True,
+    )
     def _is_boolean_node(self, node: ast.expr) -> bool:
         """Recursively check if an AST node returns a boolean."""
         # Comparisons always return bool
