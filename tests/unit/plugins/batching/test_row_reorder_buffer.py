@@ -23,6 +23,68 @@ from elspeth.plugins.infrastructure.batching.row_reorder_buffer import (
 class TestRowReorderBufferBasics:
     """Basic functionality tests."""
 
+    def test_eviction_admits_exactly_one_late_completion(self) -> None:
+        buffer: RowReorderBuffer[str] = RowReorderBuffer()
+        ticket = buffer.submit("row-1")
+        assert buffer.evict(ticket)
+        impostor = RowTicket(ticket.sequence, "other-row", ticket.submitted_at)
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            buffer.complete(impostor, "wrong")
+        assert buffer.complete(ticket, "late") is False
+        with pytest.raises(KeyError):
+            buffer.complete(ticket, "duplicate")
+        with pytest.raises(TimeoutError):
+            buffer.wait_for_next_release(timeout=0)
+
+    def test_unknown_and_released_tickets_are_not_late_results(self) -> None:
+        buffer: RowReorderBuffer[str] = RowReorderBuffer()
+        with pytest.raises(KeyError):
+            buffer.complete(RowTicket(0, "unknown", 0.0), "wrong")
+        ticket = buffer.submit("row-1")
+        assert buffer.complete(ticket, "ready") is True
+        assert buffer.wait_for_next_release(timeout=0).result == "ready"
+        with pytest.raises(KeyError):
+            buffer.complete(ticket, "duplicate")
+
+    def test_shutdown_discards_only_valid_admitted_late_completion(self) -> None:
+        buffer: RowReorderBuffer[str] = RowReorderBuffer()
+        ticket = buffer.submit("row-1")
+        buffer.shutdown()
+        assert buffer.pending_count == 0
+        with pytest.raises(KeyError):
+            buffer.complete(RowTicket(1, "unknown", 0.0), "wrong")
+        assert buffer.complete(ticket, "late") is False
+        assert buffer.pending_count == 0
+        with pytest.raises(KeyError):
+            buffer.complete(ticket, "duplicate")
+
+    def test_shutdown_drains_completed_rows_across_cancelled_gaps(self) -> None:
+        buffer: RowReorderBuffer[str] = RowReorderBuffer()
+        first = buffer.submit("first")
+        gap = buffer.submit("cancelled")
+        last = buffer.submit("last")
+        buffer.complete(first, "first")
+        buffer.complete(last, "last")
+        buffer.shutdown()
+        assert buffer.wait_for_next_release(timeout=0).result == "first"
+        assert buffer.wait_for_next_release(timeout=0).result == "last"
+        with pytest.raises(ShutdownError):
+            buffer.wait_for_next_release(timeout=0)
+        assert buffer.complete(gap, "late") is False
+
+    def test_eviction_bookkeeping_does_not_retain_abandoned_ticket(self) -> None:
+        import gc
+        import weakref
+
+        buffer: RowReorderBuffer[str] = RowReorderBuffer()
+        ticket = buffer.submit("row-1")
+        ticket_ref = weakref.ref(ticket)
+        assert buffer.evict(ticket)
+        del ticket
+        gc.collect()
+        assert ticket_ref() is None
+        assert len(buffer._evicted) == 0
+
     def test_single_row_submit_complete_release(self) -> None:
         """Single row flows through correctly."""
         buffer: RowReorderBuffer[str] = RowReorderBuffer(max_pending=10)

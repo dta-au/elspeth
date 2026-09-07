@@ -488,7 +488,7 @@ class WebScrapeTransform(BaseTransform):
     name = "web_scrape"
     determinism = Determinism.EXTERNAL_CALL
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:3491adc519b4c410"
+    source_file_hash: str | None = "sha256:3f7fcb93381553cf"
     config_model = WebScrapeConfig
     passes_through_input = True
     fetches_http = True
@@ -842,10 +842,10 @@ class WebScrapeTransform(BaseTransform):
         # secret-bearing query values, so redaction happens at construction.
         safe_url = fingerprint_url(safe_request.original_url)
 
-        content_type_raw = response.headers.get("content-type", "")
-        content_type_lower = content_type_raw.split(";", 1)[0].strip().lower()
+        content_type_raw = response.headers.get("content-type")
+        content_type_lower = None if content_type_raw is None else content_type_raw.split(";", 1)[0].strip().lower()
         _TEXT_CONTENT_TYPES = ("text/", "application/xhtml+xml")
-        if not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES):
+        if content_type_lower is None or not any(content_type_lower.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES):
             return TransformResult.error(
                 {
                     "reason": "non_text_content_type",

@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from threading import Condition, Lock
 from typing import Any
+from weakref import WeakValueDictionary
 
 from elspeth.contracts.reorder_primitives import UNFILLED
 
@@ -24,7 +25,7 @@ class ShutdownError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class RowTicket:
     """Handle for a row submitted to the buffer.
 
@@ -148,6 +149,10 @@ class RowReorderBuffer[T]:
 
         # Pending entries: sequence -> entry
         self._pending: dict[int, _PendingEntry[T]] = {}
+        # Retain eviction identity only while a worker/caller still owns the
+        # ticket. Cancelled queued work cannot leave permanent tombstones.
+        self._evicted: WeakValueDictionary[int, RowTicket] = WeakValueDictionary()
+        self._issued: WeakValueDictionary[int, RowTicket] = WeakValueDictionary()
 
         # Shutdown flag
         self._shutdown = False
@@ -211,13 +216,14 @@ class RowReorderBuffer[T]:
                 row_id=row_id,
                 submitted_at=now,
             )
+            self._issued[seq] = ticket
 
             self._total_submitted += 1
             self._max_observed_pending = max(self._max_observed_pending, len(self._pending))
 
             return ticket
 
-    def complete(self, ticket: RowTicket, result: T) -> None:
+    def complete(self, ticket: RowTicket, result: T) -> bool:
         """Mark a row as complete with its result.
 
         Called by worker threads when processing finishes. The result will
@@ -230,8 +236,17 @@ class RowReorderBuffer[T]:
         Raises:
             KeyError: If ticket was never submitted
             ValueError: If ticket was already completed
+
+        Returns:
+            True if queued for release; False for one verified late completion
+            after eviction or shutdown. Unknown tickets remain errors.
         """
         with self._lock:
+            if ticket.sequence in self._evicted:
+                if self._evicted[ticket.sequence] != ticket:
+                    raise RuntimeError("Evicted ticket identity mismatch")
+                del self._evicted[ticket.sequence]
+                return False
             if ticket.sequence not in self._pending:
                 raise KeyError(f"Ticket {ticket.sequence} (row_id={ticket.row_id}) was never submitted")
 
@@ -251,6 +266,7 @@ class RowReorderBuffer[T]:
             # Wake release waiter - use notify() not notify_all() to avoid thundering herd
             # Only one waiter can be next in sequence
             self._release_condition.notify()
+            return True
 
     def wait_for_next_release(self, timeout: float | None = None) -> RowBufferEntry[T]:
         """Block until the next FIFO-ordered result is ready.
@@ -305,6 +321,8 @@ class RowReorderBuffer[T]:
                         # Remove from pending
                         del self._pending[self._next_release_seq]
                         self._next_release_seq += 1
+                        while self._next_release_seq not in self._pending and self._next_release_seq < self._next_submit_seq:
+                            self._next_release_seq += 1
                         self._total_released += 1
                         self._total_wait_time_ms += buffer_wait_ms
 
@@ -361,6 +379,7 @@ class RowReorderBuffer[T]:
                 return False  # Already complete, will be released soon
 
             # Remove from pending
+            self._evicted[ticket.sequence] = ticket
             del self._pending[ticket.sequence]
 
             # Advance past any gaps (this sequence and any other evicted ones)
@@ -379,6 +398,15 @@ class RowReorderBuffer[T]:
         """Signal shutdown. Wakes all waiters with ShutdownError."""
         with self._lock:
             self._shutdown = True
+            # Preserve completed entries for graceful drain. Incomplete entries
+            # have been abandoned; keep only weak identity for workers still
+            # holding tickets, so queued cancellations retain no row state.
+            for sequence, ticket in tuple(self._issued.items()):
+                if sequence in self._pending and not self._pending[sequence].is_complete:
+                    self._evicted[sequence] = ticket
+            self._pending = {sequence: entry for sequence, entry in self._pending.items() if entry.is_complete}
+            while self._next_release_seq not in self._pending and self._next_release_seq < self._next_submit_seq:
+                self._next_release_seq += 1
             # Wake ALL waiters for shutdown (exception to notify() rule)
             self._submit_condition.notify_all()
             self._release_condition.notify_all()

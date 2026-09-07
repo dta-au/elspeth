@@ -2340,6 +2340,25 @@ def test_b3_10_binary_content_type_returns_error(mock_ctx):
 
 
 @respx.mock
+@pytest.mark.parametrize("headers, expected", [({}, None), ({"content-type": ""}, "")])
+def test_missing_and_empty_content_type_remain_distinct_in_error(mock_ctx, headers, expected):
+    """Rejected external headers retain absence rather than fabricating bytes."""
+    respx.get(f"https://{_TEST_IP}:443/page").mock(
+        return_value=httpx.Response(200, content=b"<html><body>Hello</body></html>", headers=headers)
+    )
+    transform = _make_basic_transform()
+    transform.on_start(mock_ctx)
+
+    with patch("socket.getaddrinfo", _mock_getaddrinfo()):
+        result = transform.process(make_pipeline_row({"url": "https://example.com/page"}), mock_ctx)
+
+    assert result.status == "error"
+    assert result.reason["reason"] == "non_text_content_type"
+    assert result.reason["content_type"] == expected
+    assert result.row is None
+
+
+@respx.mock
 def test_b3_10_image_content_type_returns_error(mock_ctx):
     """An image content-type (image/png) must return error, not a fingerprint (B3.10)."""
     respx.get(f"https://{_TEST_IP}:443/img").mock(

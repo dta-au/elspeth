@@ -13,7 +13,7 @@ from __future__ import annotations
 import threading
 import traceback
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import structlog
@@ -102,6 +102,8 @@ class BatchTransformMixin(BatchTransformRuntime):
     _batch_name: str
     _batch_submissions: dict[tuple[str, str], RowTicket]
     _batch_submissions_lock: threading.Lock
+    _batch_failure_lock: threading.Lock
+    _batch_worker_failure: BaseException | None
     _batch_wait_timeout: float  # Timeout for waiter.wait() in executor
     _pool_size: int = 30  # Max concurrent rows; used by executor to cap adapter max_pending
 
@@ -169,6 +171,8 @@ class BatchTransformMixin(BatchTransformRuntime):
         # Track submissions by (token_id, state_id) for eviction on timeout
         self._batch_submissions = {}
         self._batch_submissions_lock = threading.Lock()
+        self._batch_failure_lock = threading.Lock()
+        self._batch_worker_failure = None
 
         # Row reorder buffer with backpressure
         self._batch_buffer = RowReorderBuffer(
@@ -184,7 +188,7 @@ class BatchTransformMixin(BatchTransformRuntime):
 
         # Release thread - emits results in FIFO order
         self._batch_release_thread = threading.Thread(
-            target=self._release_loop,
+            target=self._run_release_loop,
             name=f"{self._batch_name}-release",
             daemon=False,  # Non-daemon: ensure clean shutdown
         )
@@ -212,6 +216,7 @@ class BatchTransformMixin(BatchTransformRuntime):
             ShutdownError: If batch processing is shut down
         """
         # Guard: reject rows after shutdown signal (before touching buffer)
+        self._raise_batch_worker_failure()
         if self._batch_shutdown.is_set():
             raise ShutdownError("Batch processing has been shut down")
 
@@ -233,7 +238,7 @@ class BatchTransformMixin(BatchTransformRuntime):
 
         # Submit to worker pool
         try:
-            self._batch_executor.submit(
+            future = self._batch_executor.submit(
                 self._process_and_complete,
                 ticket,
                 token,
@@ -258,6 +263,35 @@ class BatchTransformMixin(BatchTransformRuntime):
                 retryable=False,
             )
             self._complete_ticket(ticket, token, shutdown_result, state_id)
+        else:
+            future.add_done_callback(self._record_batch_worker_failure)
+
+    def _record_batch_worker_failure(self, future: Future[None]) -> None:
+        """Keep failures that can no longer travel through an evicted waiter."""
+        if future.cancelled():
+            return
+        failure = future.exception()
+        if failure is not None:
+            with self._batch_failure_lock:
+                if self._batch_worker_failure is None:
+                    self._batch_worker_failure = failure
+
+    def _raise_batch_worker_failure(self) -> None:
+        """Surface a failed worker on the orchestrator's next lifecycle call."""
+        with self._batch_failure_lock:
+            failure = self._batch_worker_failure
+        if failure is not None:
+            raise failure
+
+    def _run_release_loop(self) -> None:
+        """Retain a release-thread crash for the orchestrator lifecycle too."""
+        try:
+            self._release_loop()
+        except BaseException as failure:
+            with self._batch_failure_lock:
+                if self._batch_worker_failure is None:
+                    self._batch_worker_failure = failure
+            raise
 
     def _process_and_complete(
         self,
@@ -313,9 +347,11 @@ class BatchTransformMixin(BatchTransformRuntime):
         state_id: str | None,
     ) -> None:
         """Complete a ticket, discarding late results after timeout eviction."""
-        try:
-            self._batch_buffer.complete(ticket, (token, result, state_id))
-        except (KeyError, ShutdownError):
+        if not self._batch_buffer.complete(ticket, (token, result, state_id)):
+            from elspeth.contracts import ExceptionResult
+
+            if isinstance(result, ExceptionResult):
+                raise result.exception
             _logger.debug(
                 "late_result_discarded",
                 token_id=token.token_id,
@@ -338,6 +374,16 @@ class BatchTransformMixin(BatchTransformRuntime):
             This prevents stale results from being delivered to retry attempts.
         """
         while True:
+            try:
+                entry = self._batch_buffer.wait_for_next_release(timeout=1.0)
+            except TimeoutError:
+                # Only the buffer's poll timeout means no result is ready.
+                continue
+            except ShutdownError:
+                # Only buffer shutdown ends the release loop. Output failures
+                # of the same type must still reach the row's waiter.
+                break
+
             # Reset per-iteration to detect pre-unpack failures (Bug 2 fix).
             # If an exception occurs before entry.result is unpacked, token/state_id
             # remain None, preventing the handler from using stale values from a
@@ -345,9 +391,6 @@ class BatchTransformMixin(BatchTransformRuntime):
             token: TokenInfo | None = None
             state_id: str | None = None
             try:
-                # Block until next result is ready (FIFO order)
-                entry = self._batch_buffer.wait_for_next_release(timeout=1.0)
-
                 # Unpack token, result, and state_id for retry-safe routing
                 token, result, state_id = entry.result
 
@@ -359,17 +402,6 @@ class BatchTransformMixin(BatchTransformRuntime):
                 # Emit to output port with state_id for correct waiter matching
                 # The port may block if downstream is applying backpressure
                 self._batch_output.emit(token, result, state_id)
-
-            except TimeoutError:
-                # Normal during low load - just loop and try again
-                continue
-
-            except ShutdownError:
-                # Buffer was shut down - exit cleanly.
-                # This is the ONLY exit path: shutdown_batch_processing() waits for
-                # workers to finish, then calls buffer.shutdown(), so all completed
-                # results have been drained by this point.
-                break
 
             except Exception as e:
                 if token is None:
@@ -392,6 +424,8 @@ class BatchTransformMixin(BatchTransformRuntime):
                 except contract_errors.TIER_1_ERRORS:
                     raise  # Tier 1 errors must crash immediately
                 except Exception as emit_err:
+                    if isinstance(e, contract_errors.TIER_1_ERRORS):
+                        raise e from emit_err
                     # Port is completely broken — crash the release thread.
                     # A broken output port is a system bug: silently continuing
                     # would lose this token's result (waiter hangs until timeout)
@@ -413,6 +447,7 @@ class BatchTransformMixin(BatchTransformRuntime):
         Raises:
             TimeoutError: If not all rows complete in time
         """
+        self._raise_batch_worker_failure()
         deadline = threading.Event()
         start = threading.Event()
 
@@ -433,6 +468,7 @@ class BatchTransformMixin(BatchTransformRuntime):
             deadline.set()
             checker.join(timeout=1.0)  # Give it a moment to exit cleanly
             raise TimeoutError(f"Flush timeout: {self._batch_buffer.pending_count} rows still pending")
+        self._raise_batch_worker_failure()
 
     def evict_submission(self, token_id: str, state_id: str) -> bool:
         """Evict a submission from the buffer.
@@ -502,6 +538,9 @@ class BatchTransformMixin(BatchTransformRuntime):
                 f"Release thread for {self._batch_name} did not stop within {timeout}s. "
                 f"In-flight results may not have been drained — pipeline cannot report success."
             )
+        with self._batch_submissions_lock:
+            self._batch_submissions.clear()
+        self._raise_batch_worker_failure()
 
     # --- Observability ---
 
