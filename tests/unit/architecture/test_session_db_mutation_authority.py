@@ -4254,14 +4254,25 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # corruption rather than as a lost race.
     #
     # The window is currently UNREACHABLE, and that is measured rather than
-    # assumed: across all of src/, run_workers takes exactly one insert and
-    # seven updates and NO delete -- no SQLAlchemy delete, no raw SQL, no
-    # retention or purge path. Single-use identity doctrine keeps departed and
-    # evicted rows in place rather than removing them. So an absent row still
-    # means a token for a registration that never happened, which is the
-    # corruption the error names. If a delete on run_workers is ever
-    # introduced, that verdict stops being sound and this is the note that
-    # says so.
+    # assumed. Enumerating every DML verb applied to run_workers across all of
+    # src/ -- enumerating, not searching for the spelling one expects, because
+    # finding no `delete(run_workers_table)` would only prove that string was
+    # absent -- the verb set is {insert, update}:
+    #
+    #   1 insert / 7 updates / 0 DELETES, on this tree. The SEVENTH update is
+    #   this lane's own membership fence, in its D7 verify-UPDATE form; the
+    #   pre-membership-fence tree reads 6, so the count is tree-dependent and
+    #   the ZERO is the figure the verdict actually rests on.
+    #
+    # No raw SQL names the table and no retention or purge path touches it.
+    # Single-use identity doctrine is why: departed and evicted rows keep their
+    # row and change status rather than being removed. So a row cannot vanish
+    # between the two reads, and an absent row still means a token for a
+    # registration that never happened -- the corruption the error names.
+    #
+    # If a DELETE on run_workers is ever introduced, that verdict stops being
+    # sound. This note is the condition, kept here rather than in a handover,
+    # because whoever adds that delete will be reading this repository.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository._inactive_member_snapshot",
