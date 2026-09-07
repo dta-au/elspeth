@@ -545,8 +545,8 @@ def _row_union_branches(value: Any, path: str) -> dict[str, str] | tuple[str, ..
     suppresses=("R1", "R5"),
     invariant=(
         "raises RuntimeYamlImportError on non-mapping entries, unknown structural fields, missing "
-        "plugin/on_success, inline blob_ref, or conflicting validation-failure spellings; a single "
-        "missing or malformed on_validation_failure falls back to 'discard'"
+        "plugin/on_success, inline blob_ref, conflicting validation-failure spellings, or non-string "
+        "non-null on_validation_failure; missing, null, and empty routes canonicalize to 'discard'"
     ),
     test_ref="tests/unit/web/composer/test_yaml_importer.py::test_source_from_runtime_entry_rejects_non_mapping_entry",
     test_fingerprint="464ba44200f35d34d3eed43f62f4a50595385f53a9879dde0a9bd1e898dc8bae",
@@ -570,10 +570,8 @@ def _source_from_runtime_entry(source_name: str, entry: Any) -> SourceSpec:
         raise RuntimeYamlImportError(f"{path} contains conflicting on_validation_failure values at the entry and options levels")
     if on_validation_failure is None:
         on_validation_failure = option_on_validation_failure
-    if not isinstance(on_validation_failure, str):
-        # Non-string spellings are malformed at this Tier-3 boundary; fold
-        # them into the unspecified case per the decorator invariant.
-        on_validation_failure = None
+    if on_validation_failure is not None and not isinstance(on_validation_failure, str):
+        raise RuntimeYamlImportError(f"{path}.on_validation_failure must be a string or null")
     # None and "" both mean 'discard' via the shared canonicalizer — the
     # single owner of that fold (elspeth-bcd7051143), shared with every
     # composer source-authoring seam.

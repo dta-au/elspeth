@@ -356,18 +356,43 @@ def test_composition_state_from_runtime_yaml_rejects_nested_non_string_option_ke
         composition_state_from_runtime_yaml(doc)
 
 
-@pytest.mark.parametrize("authored", ["", None, 17])
-def test_source_from_runtime_entry_canonicalizes_unroutable_validation_failure_to_discard(
+@pytest.mark.parametrize("authored", ["", None])
+def test_source_from_runtime_entry_canonicalizes_unspecified_validation_failure_to_discard(
     authored: object,
 ) -> None:
-    """elspeth-bcd7051143 pin: missing, empty, and non-string spellings all
-    fall back to 'discard' through the shared source-validation-failure
-    canonicalizer — the single owner every authoring seam routes through."""
+    """Null and empty strings use the shared canonicalizer's unspecified route."""
     spec = _source_from_runtime_entry(
         "s",
         {"plugin": "csv", "on_success": "rows", "options": {}, "on_validation_failure": authored},
     )
     assert spec.on_validation_failure == "discard"
+
+
+@pytest.mark.parametrize("carrier", ["entry", "options"])
+@pytest.mark.parametrize("authored", [17, False, [], {"route": "quarantine"}])
+def test_runtime_yaml_import_rejects_malformed_source_validation_failure(carrier: str, authored: object) -> None:
+    entry: dict[str, object] = {"plugin": "csv", "on_success": "rows"}
+    if carrier == "entry":
+        entry["on_validation_failure"] = authored
+    else:
+        entry["options"] = {"on_validation_failure": authored}
+    document = yaml.safe_dump({"sources": {"primary": entry}})
+    with pytest.raises(RuntimeYamlImportError, match=r"sources\.primary\.on_validation_failure must be a string or null"):
+        composition_state_from_runtime_yaml(document)
+
+
+@pytest.mark.parametrize("carrier", ["entry", "options"])
+@pytest.mark.parametrize("spelling", ["missing", "null", "empty"])
+def test_runtime_yaml_import_preserves_unspecified_source_validation_failure(carrier: str, spelling: str) -> None:
+    entry: dict[str, object] = {"plugin": "csv", "on_success": "rows"}
+    if spelling != "missing":
+        authored = None if spelling == "null" else ""
+        if carrier == "entry":
+            entry["on_validation_failure"] = authored
+        else:
+            entry["options"] = {"on_validation_failure": authored}
+    state = composition_state_from_runtime_yaml(yaml.safe_dump({"sources": {"primary": entry}}))
+    assert state.sources["primary"].on_validation_failure == "discard"
 
 
 def test_nodes_from_runtime_list_rejects_non_sequence_section() -> None:
