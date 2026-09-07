@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from elspeth.contracts.coordination import LeaderInfo
+from elspeth.contracts.coordination import LeaderInfo, WorkerMembershipToken
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.types import NodeID
@@ -48,8 +48,8 @@ class _RunCoordination:
             seat_live=True,
         )
 
-    def depart_worker(self, *, worker_id: str) -> None:
-        self.departed.append(worker_id)
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        self.departed.append(member_token.worker_id)
 
 
 class _Heartbeat:
@@ -151,8 +151,9 @@ def test_builder_emits_follower_row_as_root_in_durable_run_trace() -> None:
     ):
         follower = build_follower_processor(
             factory=factory,  # type: ignore[arg-type]
-            run_id=_RUN_ID,
-            worker_id=_WORKER_ID,
+            # Stub factory, no registry to read back: the token is the value a
+            # real admit_follower would have returned for this identity.
+            member_token=WorkerMembershipToken(run_id=_RUN_ID, worker_id=_WORKER_ID),
             graph=_Graph(),  # type: ignore[arg-type]
             config=config,  # type: ignore[arg-type]
             payload_store=object(),  # type: ignore[arg-type]

@@ -3521,7 +3521,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b50078a98f79748e",
         1,
         None,
-        line=4121,
+        line=4122,
     ),
     # src/elspeth/web/blobs/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -4252,6 +4252,12 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=1173,
     ),
+    # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
+    # ONLY -- same symbol, same fingerprint, same domain -- because the
+    # membership fence added ~200 lines above them. This manifest is
+    # POSITION-DEPENDENT (it pins path:line per writer), unlike the fencing
+    # gate's DML digest, which is position-independent. A re-pin here is a
+    # POSITION movement and must never be ledgered as threading.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository.live_leader",
@@ -4260,7 +4266,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "2b52f58624e1e33d",
         1,
         None,
-        line=866,
+        line=999,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4271,7 +4277,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1254,
+        line=1406,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4282,7 +4288,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1279,
+        line=1431,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",

@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -220,6 +221,7 @@ def _build_processor(graph: ExecutionGraph, config: PipelineConfig, settings: El
         telemetry=None,
         mode=mode,
         scheduler_lease_owner="follower-1" if mode is ProcessorMode.FOLLOWER else None,
+        member_token=WorkerMembershipToken(run_id=setup.run_id, worker_id="follower-1") if mode is ProcessorMode.FOLLOWER else None,
     )
     return processor
 

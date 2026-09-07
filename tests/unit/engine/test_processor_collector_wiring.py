@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from elspeth.contracts import TokenInfo, TransformResult
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -128,6 +129,7 @@ def _build(
         scheduler=setup.factory.scheduler,
         scheduler_lease_owner=LEADER_OWNER if leader else "follower-1",
         coordination_token=leader_coordination_token(setup.factory, setup.run_id) if leader else None,
+        member_token=None if leader else WorkerMembershipToken(run_id=setup.run_id, worker_id="follower-1"),
         clock=clock,
         mode=mode,
         collector_executor=cast(Any, executor),

@@ -33,20 +33,23 @@ Tests:
 from __future__ import annotations
 
 import json
+from dataclasses import fields
 from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
-from sqlalchemy import create_engine, insert, select, update
+from sqlalchemy import create_engine, event, insert, select, update
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationSnapshot,
-    CoordinationToken,
+    WorkerMembershipLost,
+    WorkerMembershipToken,
     mint_worker_id,
 )
-from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
@@ -58,7 +61,7 @@ from elspeth.core.landscape.schema import (
     runs_table,
 )
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
-from tests.fixtures.landscape import assert_stamped_between, landscape_database_now
+from tests.fixtures.landscape import assert_stamped_between, landscape_database_now, member_token_for
 from tests.helpers.run_coordination import register_run_leader
 
 # ---------------------------------------------------------------------------
@@ -140,23 +143,6 @@ def _age_deadlines(engine: Tier1Engine, leader_id: str, *, remaining: timedelta,
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == leader_id).values(heartbeat_expires_at=aged))
 
 
-def _make_thread(
-    repo: RunCoordinationRepository,
-    *,
-    token: CoordinationToken,
-    now: datetime = NOW,
-) -> RunHeartbeatThread:
-    """Stub-free helper: real repo, deterministic (no sleeps, no real wall-clock)."""
-    return RunHeartbeatThread(
-        repo,
-        token=token,
-        heartbeat_seconds=15.0,
-        window_seconds=WINDOW,
-        now_fn=lambda: now,
-        wait_fn=lambda _: False,  # never actually waits
-    )
-
-
 # ---------------------------------------------------------------------------
 # Stub repo for thread tests that need controlled side-effects
 # ---------------------------------------------------------------------------
@@ -166,13 +152,15 @@ class _StubRepo:
     """Minimal typed stub — avoids unspecced MagicMock to keep mock baseline clean."""
 
     def __init__(self) -> None:
-        self.side_effects: list[CoordinationSnapshot | Exception] = []
+        self.side_effects: list[CoordinationSnapshot | WorkerMembershipLost | Exception] = []
         self.worker_heartbeat_calls: list[dict[str, object]] = []
         self.degraded_calls: list[dict[str, object]] = []
         self.degraded_raise: Exception | None = None
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
+    def worker_heartbeat(
+        self, *, member_token: WorkerMembershipToken, window_seconds: float
+    ) -> CoordinationSnapshot | WorkerMembershipLost:
+        self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         if not self.side_effects:
             raise AssertionError("_StubRepo: no more side_effects configured")
         result = self.side_effects.pop(0)
@@ -218,7 +206,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         # The heartbeat thread's next tick: the beat carries no clock, the
         # deadline is the Landscape database clock + WINDOW (ADR-047).
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id=leader_id, window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=member_token_for(engine, worker_id=leader_id), window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         # Snapshot fields.
@@ -274,7 +262,7 @@ class TestLeaderHeartbeatBeatsBothRows:
         seat_before = _seat_row(engine)
         follower_before = _worker_row(engine, follower_id)
         before = landscape_database_now(engine)
-        snapshot = repo.worker_heartbeat(worker_id=follower_id, window_seconds=WINDOW)
+        snapshot = repo.worker_heartbeat(member_token=member_token_for(engine, worker_id=follower_id), window_seconds=WINDOW)
         after = landscape_database_now(engine)
 
         # Snapshot reports the seat as viewed — leader_worker_id matches but
@@ -303,13 +291,75 @@ class TestLeaderHeartbeatBeatsBothRows:
 class TestBusyToleranceNeverEvicts:
     """§A.3 :128-129 — OperationalError from worker_heartbeat is liveness-UNKNOWN."""
 
+    def test_known_membership_loss_survives_post_refusal_read_failure(self) -> None:
+        engine = _make_engine()
+        repo = RunCoordinationRepository(engine)
+        _seed_run(engine)
+        leader = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        repo.depart_worker(member_token=member)
+        refusal_written = False
+        attempted_reads: list[str] = []
+
+        def fail_read_after_refusal(
+            conn: Connection, cursor: object, statement: str, parameters: object, context: object, executemany: bool
+        ) -> None:
+            nonlocal refusal_written
+            if statement.startswith("INSERT INTO run_coordination_events"):
+                refusal_written = True
+            elif refusal_written and statement.lstrip().upper().startswith("SELECT"):
+                attempted_reads.append(statement)
+                raise OperationalError(statement, {}, Exception("post-refusal connection lost"))
+
+        thread = RunHeartbeatThread(repo, member_token=member)
+        event.listen(engine, "before_cursor_execute", fail_read_after_refusal)
+        try:
+            thread._step_beat()
+        finally:
+            event.remove(engine, "before_cursor_execute", fail_read_after_refusal)
+
+        assert refusal_written, "positive control: the membership fence refused and emitted evidence"
+        assert thread.coordination_lost, "known membership loss must latch without a second read"
+        with pytest.raises(RunWorkerEvictedError):
+            thread.check_and_raise()
+        assert attempted_reads == []
+        assert _seat_row(engine)["leader_worker_id"] == leader.worker_id
+
+    @pytest.mark.parametrize("verb", ["depart_worker", "worker_heartbeat"])
+    def test_unregistered_identity_is_corruption(self, verb: str) -> None:
+        engine = _make_engine()
+        repo = RunCoordinationRepository(engine)
+        _seed_run(engine)
+        member = WorkerMembershipToken(run_id=RUN_ID, worker_id="never-registered")
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            if verb == "depart_worker":
+                repo.depart_worker(member_token=member)
+            else:
+                repo.worker_heartbeat(member_token=member, window_seconds=WINDOW)
+
+    def test_refused_heartbeat_has_no_seat_snapshot_fields(self) -> None:
+        engine = _make_engine()
+        repo = RunCoordinationRepository(engine)
+        _seed_run(engine)
+        register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
+        member = repo.admit_follower(run_id=RUN_ID, worker_id="follower", config_hash="config", window_seconds=WINDOW)
+        repo.depart_worker(member_token=member)
+
+        result = repo.worker_heartbeat(member_token=member, window_seconds=WINDOW)
+
+        assert isinstance(result, WorkerMembershipLost)
+        assert result.member_token == member
+        assert [field.name for field in fields(result)] == ["member_token"]
+
     def test_heartbeat_busy_is_liveness_unknown_never_evicts(self) -> None:
         """The thread catches OperationalError (SQLITE_BUSY) at the tick
         boundary and does NOT set the coordination-lost latch.
 
-        Contrast arm: a rowcount-0 beat (worker_active=False) DOES set the latch.
+        Contrast arm: a refused membership outcome DOES set the latch.
         """
-        token = CoordinationToken(run_id=RUN_ID, worker_id="worker-busy", leader_epoch=1)
+        # Mock-only construction (D8.7): the repository is a stub, so there is
+        # no run_workers row to read the membership back from.
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-busy")
         repo = _StubRepo()
 
         # k-1 busy ticks then a success.
@@ -319,7 +369,7 @@ class TestBusyToleranceNeverEvicts:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             heartbeat_seconds=15.0,
             window_seconds=WINDOW,
             now_fn=lambda: NOW,
@@ -341,19 +391,19 @@ class TestBusyToleranceNeverEvicts:
         assert not thread._coordination_lost_event.is_set(), "success after busy: latch must stay False"
         thread.check_and_raise()  # must not raise
 
-        # Contrast arm: a worker_active=False snapshot DOES set the latch.
-        evicted_snapshot = CoordinationSnapshot(leader_worker_id=None, leader_epoch=1, seat_live=False, worker_active=False)
+        # Contrast arm: a refused membership outcome DOES set the latch.
+        token2 = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-evicted")
+        evicted_snapshot = WorkerMembershipLost(member_token=token2)
         repo2 = _StubRepo()
         repo2.side_effects = [evicted_snapshot]
-        token2 = CoordinationToken(run_id=RUN_ID, worker_id="worker-evicted", leader_epoch=1)
         thread2 = RunHeartbeatThread(
             repo2,
-            token=token2,
+            member_token=token2,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
         thread2._step_beat()
-        assert thread2._coordination_lost_event.is_set(), "worker_active=False must set latch"
+        assert thread2._coordination_lost_event.is_set(), "membership refusal must set latch"
         with pytest.raises(RunWorkerEvictedError) as exc_info:
             thread2.check_and_raise()
         assert exc_info.value.worker_id == "worker-evicted"
@@ -383,7 +433,7 @@ class TestHeartbeatDegradedEvent:
         # Replace the repo's worker_heartbeat with a stubbed busy side-effect
         # while letting record_heartbeat_degraded write to the real DB.
         class _BusyStubRepo:
-            def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> CoordinationSnapshot:
+            def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> CoordinationSnapshot:
                 raise OperationalError("stmt", {}, Exception("database is locked"))
 
             def record_heartbeat_degraded(self, *, run_id: str, worker_id: str, failures: int, now: datetime) -> None:
@@ -392,7 +442,7 @@ class TestHeartbeatDegradedEvent:
         k = 3
         thread = RunHeartbeatThread(
             _BusyStubRepo(),
-            token=token,
+            member_token=token.membership,
             heartbeat_seconds=15.0,
             window_seconds=WINDOW,
             now_fn=lambda: NOW,
@@ -422,7 +472,7 @@ class TestHeartbeatDegradedEvent:
         """An unwritable degraded event (record_heartbeat_degraded raises) must
         NOT propagate out of the thread — degraded eventing is best-effort.
         """
-        token = CoordinationToken(run_id=RUN_ID, worker_id="worker-busy-2", leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id="worker-busy-2")
         repo = _StubRepo()
         busy = OperationalError("stmt", {}, Exception("database is locked"))
         repo.side_effects = [busy, busy, busy]
@@ -430,7 +480,7 @@ class TestHeartbeatDegradedEvent:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
             degraded_threshold=3,
@@ -464,7 +514,7 @@ class TestForeignLeaderFatalLatch:
         SEAT snapshot, not the row state — independent of the eviction fence.
         """
         our_id = "worker-A"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
 
         # Snapshot: our worker row is still active, BUT the seat shows worker-B.
@@ -478,7 +528,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
@@ -498,7 +548,7 @@ class TestForeignLeaderFatalLatch:
         re-emit (the flag is already set, re-setting an Event is idempotent).
         """
         our_id = "worker-A2"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
 
         foreign = CoordinationSnapshot(leader_worker_id="worker-C", leader_epoch=3, seat_live=True, worker_active=True)
@@ -506,7 +556,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )
@@ -526,7 +576,7 @@ class TestForeignLeaderFatalLatch:
         matters.  The latch is only for a FOREIGN takeover.
         """
         our_id = "worker-A3"
-        token = CoordinationToken(run_id=RUN_ID, worker_id=our_id, leader_epoch=1)
+        token = WorkerMembershipToken(run_id=RUN_ID, worker_id=our_id)
         repo = _StubRepo()
         # Vacant seat (our row still active).
         vacant = CoordinationSnapshot(leader_worker_id=None, leader_epoch=1, seat_live=False, worker_active=True)
@@ -534,7 +584,7 @@ class TestForeignLeaderFatalLatch:
 
         thread = RunHeartbeatThread(
             repo,
-            token=token,
+            member_token=token,
             now_fn=lambda: NOW,
             wait_fn=lambda _: False,
         )

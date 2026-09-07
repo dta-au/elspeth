@@ -42,6 +42,7 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Engine
 
     from elspeth.contracts import SinkProtocol, SourceProtocol
+    from elspeth.contracts.coordination import WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_context import PluginContext
     from elspeth.contracts.run_result import RunResult
@@ -141,7 +142,7 @@ def _join_after_follower_sink_preflight(
     orchestrator: Orchestrator,
     run_id: str,
     settings: ElspethSettings,
-) -> tuple[str, PluginBundle, Mapping[str, SinkProtocol], Mapping[str, str], object]:
+) -> tuple[WorkerMembershipToken, PluginBundle, Mapping[str, SinkProtocol], Mapping[str, str], object]:
     """Join only after the exact follower execution sinks earn admission."""
     from elspeth.engine.orchestrator.preflight import SinkEffectExecutionPurpose
 
@@ -151,8 +152,8 @@ def _join_after_follower_sink_preflight(
         plugins,
         purpose=SinkEffectExecutionPurpose.FOLLOWER,
     )
-    worker_id = orchestrator.join_run(run_id, settings)
-    return worker_id, plugins, execution_sinks, execution_sink_modes, admission
+    member_token = orchestrator.join_run(run_id, settings)
+    return member_token, plugins, execution_sinks, execution_sink_modes, admission
 
 
 def _run_doctor_command(
@@ -3653,7 +3654,7 @@ def join(
         orchestrator = Orchestrator(db)
 
         try:
-            worker_id = orchestrator.join_run(run_id, settings_config)
+            member_token = orchestrator.join_run(run_id, settings_config)
         except JoinRefusedError as e:
             if output_format == "json":
                 import json as json_mod
@@ -3677,8 +3678,9 @@ def join(
             typer.echo(f"Sink effect preflight failed: {e}", err=True)
             raise typer.Exit(1) from None
 
-        # Derive the per-worker hex suffix from the minted worker_id
-        # (format: worker:{run_id}:{HEX}).
+        # The registered identity IS the membership token's worker_id (§A.1);
+        # derive the per-worker hex suffix from it (format: worker:{run_id}:{HEX}).
+        worker_id = member_token.worker_id
         worker_hex = worker_id.split(":")[-1]
 
         # Emit admission line.
@@ -3786,8 +3788,7 @@ def join(
 
         follower_proc = build_follower_processor(
             factory=factory,
-            run_id=run_id,
-            worker_id=worker_id,
+            member_token=member_token,
             graph=execution_graph,
             config=pipeline_config,
             payload_store=payload_store,
@@ -3904,7 +3905,7 @@ def join(
                 from elspeth.engine._best_effort import best_effort
 
                 with best_effort("Follower depart after startup failure", run_id=run_id, worker_id=worker_id):
-                    factory.run_coordination.depart_worker(worker_id=worker_id)
+                    factory.run_coordination.depart_worker(member_token=member_token)
 
             # Mirror the leader's teardown via the canonical cleanup_plugins:
             # on_complete then close, each hook individually guarded so one

@@ -51,7 +51,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_token_for
+from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_token_for, member_token_for
 from tests.helpers.state_engine import capture_state_engine_image
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
@@ -291,17 +291,19 @@ def _join_follower_process(
         patch("elspeth.engine.orchestrator.join_admission.resolve_config", return_value={}),
         patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=config_hash),
     ):
-        worker_id = Orchestrator(db).join_run(
+        member_token = Orchestrator(db).join_run(
             run_id=run_id,
             settings=types.SimpleNamespace(),  # type: ignore[arg-type]  # resolved settings are patched at this process boundary
             window_seconds=10**9,
         )
-    Path(worker_id_path).write_text(worker_id, encoding="utf-8")
+    Path(worker_id_path).write_text(member_token.worker_id, encoding="utf-8")
 
 
 def _depart_follower_process(db: LandscapeDB, worker_id: str, now_iso: str) -> None:
+    # A separate process: read the membership admit_follower registered back
+    # from the registry (ADR-048 §5 as amended) rather than constructing it.
     RunCoordinationRepository(db.engine).depart_worker(
-        worker_id=worker_id,
+        member_token=member_token_for(db.engine, worker_id=worker_id),
     )
 
 
@@ -351,7 +353,7 @@ def _worker_heartbeat_process(
 ) -> None:
     """RC-03: heartbeat an active registered worker through production."""
     snapshot = RunCoordinationRepository(db.engine).worker_heartbeat(
-        worker_id=worker_id,
+        member_token=member_token_for(db.engine, worker_id=worker_id),
         window_seconds=10**9,
     )
     assert snapshot.worker_active is True
@@ -1215,7 +1217,13 @@ def test_registered_process_coordination_release_takeover_join_depart_and_evict(
     ) as stale_release:
         stale_release.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         _release_and_assert_clean(stale_release)
-    assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == winner_image
+    # The seat is a RUN-scoped row, so vacating it is a LEADER write (ADR-030
+    # D4): the deposed leader's release is refused by the epoch fence in
+    # another process. Zero payload mutation — the winner's seat, both worker
+    # rows and every state table are byte-identical; the ONLY delta is the
+    # fence's own refusal evidence, which is durable by design.
+    after_stale_release = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
+    assert winner_image.diff(after_stale_release).changed_tables == {"run_coordination_events"}
 
     departing_path = tmp_path / "departing-worker-id"
     with spawn_database_process_at_seam(
@@ -1361,7 +1369,9 @@ def test_registered_process_coordination_release_takeover_join_depart_and_evict(
         worker_id: [event["event_type"] for event in events if event["worker_id"] == worker_id]
         for worker_id in (first_leader_id, second_leader_id, departing_id, evicted_id)
     }
-    assert event_types_by_worker[first_leader_id] == ["worker_register", "leader_acquire", "leader_release"]
+    # The trailing fence_refusal is the stale release above: the deposed
+    # leader's second, out-of-epoch release attempt, refused and evidenced.
+    assert event_types_by_worker[first_leader_id] == ["worker_register", "leader_acquire", "leader_release", "fence_refusal"]
     assert event_types_by_worker[second_leader_id] == ["worker_register", "leader_acquire"]
     assert event_types_by_worker[departing_id] == ["worker_register", "worker_depart"]
     assert event_types_by_worker[evicted_id] == ["worker_register", "worker_evict"]

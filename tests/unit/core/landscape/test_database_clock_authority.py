@@ -5792,7 +5792,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
         landscape_before = database_now()
         heartbeat = call_with_legacy_now(
             factory.run_coordination.worker_heartbeat,
-            worker_id=leader_worker_id,
+            member_token=token.membership,
             window_seconds=80.0,
         )
         landscape_after = database_now()

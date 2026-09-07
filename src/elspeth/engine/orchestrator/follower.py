@@ -100,7 +100,7 @@ from sqlalchemy.exc import OperationalError
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-    CoordinationToken,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
@@ -174,10 +174,11 @@ class FollowerProcessor:
         ``ProcessorMode.FOLLOWER`` :class:`RowProcessor` — no source, no
         barrier executors, no checkpoint coordinator). Only the narrow
         :class:`FollowerWorkSource` surface is driven.
-    token:
-        The follower's coordination token (worker_id + run_id, role=follower).
-        Used to start the heartbeat thread and to call ``depart_worker`` on
-        exit.
+    member_token:
+        The follower's :class:`WorkerMembershipToken` — the value
+        ``admit_follower`` returned at admission (ADR-030 D4; ADR-048
+        amendment). Threaded by value into the heartbeat thread and into
+        ``depart_worker`` on exit; never constructed here.
     run_coordination:
         :class:`RunCoordinationRepository` for ``depart_worker`` and run-status
         polling.
@@ -205,7 +206,7 @@ class FollowerProcessor:
         self,
         processor: FollowerWorkSource,
         *,
-        token: CoordinationToken,
+        member_token: WorkerMembershipToken,
         run_coordination: RunCoordinationRepository,
         factory: RecorderFactory,
         clock: Clock | None = None,
@@ -217,7 +218,7 @@ class FollowerProcessor:
         trace_started_at: datetime | None = None,
     ) -> None:
         self._processor = processor
-        self._token = token
+        self._token = member_token
         self._run_coordination = run_coordination
         self._factory = factory
         self._heartbeat_seconds = heartbeat_seconds
@@ -279,7 +280,7 @@ class FollowerProcessor:
         """Drive the follower while any production trace scope is active."""
         heartbeat = RunHeartbeatThread(
             self._run_coordination,
-            token=self._token,
+            member_token=self._token,
             heartbeat_seconds=self._heartbeat_seconds,
             window_seconds=self._window_seconds,
         )
@@ -457,20 +458,21 @@ class FollowerProcessor:
     def _best_effort_depart(self) -> None:
         """Call depart_worker, containing only transient operational DB failures.
 
-        ``depart_worker`` is atomic (single ``begin_write`` CAS + event insert)
-        and reifies the benign "finalize already departed this row" race as a
-        normal return, so the only residual failure it is entitled to survive
-        is a transient ``OperationalError`` from a cross-connection depart
-        race (lock contention, connection loss). That is recorded at WARNING
-        and contained: coordination-event writes are loss-tolerant, and a
-        worker whose depart did not persist is reclaimed by lease expiry.
+        ``depart_worker`` is atomic (one membership-fenced transaction: fence,
+        departure CAS, event insert) and reifies the benign "finalize already
+        departed this row" race as a normal return (the fence's refusal is the
+        verb's declared no-op), so the only residual failure it is entitled to
+        survive is a transient ``OperationalError`` from a cross-connection
+        depart race (lock contention, connection loss). That is recorded at
+        WARNING and contained: coordination-event writes are loss-tolerant, and
+        a worker whose depart did not persist is reclaimed by lease expiry.
         Anything else — an ``IntegrityError`` (the CAS and audit-event insert
         share one transaction, so a constraint failure there is corruption
         evidence, not an established race), Tier-1 audit-integrity errors,
         and programming failures — propagates.
         """
         try:
-            self._run_coordination.depart_worker(worker_id=self._token.worker_id)
+            self._run_coordination.depart_worker(member_token=self._token)
         except OperationalError:
             logger.warning(
                 "follower %r: depart_worker hit a transient DB failure; lease expiry will reclaim the seat",
@@ -482,8 +484,7 @@ class FollowerProcessor:
 def build_follower_processor(
     *,
     factory: RecorderFactory,
-    run_id: str,
-    worker_id: str,
+    member_token: WorkerMembershipToken,
     graph: ExecutionGraph,
     config: PipelineConfig,
     payload_store: PayloadStore,
@@ -511,21 +512,25 @@ def build_follower_processor(
       at those nodes and calls ``mark_blocked`` rather than running them row-wise
     - ``run_coordination=None`` — followers do NOT run the §C.2 housekeeping
       eviction sweep (leader-only)
-    - ``coordination_token=None`` — followers present no epoch fence (they
-      only drive the item-layer CAS verbs, which fence on lease_owner)
-    - ``scheduler_lease_owner=worker_id`` — the registered worker identity IS
-      the scheduler lease_owner (§A.1); also threads the membership fence into
-      ``enqueue_ready`` (task e, slice 5)
+    - ``coordination_token=None`` / ``member_token=<admission token>`` — a
+      follower presents no epoch fence and carries exactly its membership
+      authority (ADR-030 D4; the RowProcessor FOLLOWER guard is this type
+      distinction): it drives the item-layer CAS verbs, which fence on
+      lease_owner, and the membership-fenced verbs, which fence on the token
+    - ``scheduler_lease_owner=member_token.worker_id`` — the registered worker
+      identity IS the scheduler lease_owner (§A.1); also threads the membership
+      fence into ``enqueue_ready`` (task e, slice 5)
 
-    The token/run_coordination Nones remain correct ABSENCES; the explicit
-    mode flag, not their None-ness, now drives follower branch selection, and
-    RowProcessor validates the combination fail-closed at construction.
+    The coordination_token/run_coordination Nones remain correct ABSENCES; the
+    explicit mode flag, not their None-ness, drives follower branch selection,
+    and RowProcessor validates the combination fail-closed at construction.
 
     Args:
         factory: RecorderFactory bound to the run's audit DB.
-        run_id: The run being joined.
-        worker_id: The follower's registered worker identity (from
-            :meth:`Orchestrator.join_run`).
+        member_token: The follower's :class:`WorkerMembershipToken` as returned
+            by :meth:`Orchestrator.join_run` (``admit_follower``'s value). The
+            run being joined IS ``member_token.run_id``; the registered worker
+            identity IS ``member_token.worker_id``.
         graph: The run's :class:`ExecutionGraph` (from the pipeline config).
         config: The run's :class:`PipelineConfig`.
         payload_store: PayloadStore for row payload persistence.
@@ -538,7 +543,6 @@ def build_follower_processor(
     Returns:
         A :class:`FollowerProcessor` ready to drive via :meth:`FollowerProcessor.run`.
     """
-    from elspeth.contracts.coordination import CoordinationToken
     from elspeth.engine.orchestrator.graph_wiring import (
         assign_plugin_node_ids,
         build_source_id_map,
@@ -548,6 +552,7 @@ def build_follower_processor(
     from elspeth.engine.scheduler_drain import ProcessorMode
     from elspeth.engine.spans import SpanFactory
 
+    run_id = member_token.run_id
     durable_run = factory.run_lifecycle.get_run(run_id)
     if durable_run is None:
         raise AuditIntegrityError(f"Cannot build follower processor: run {run_id!r} not found in Landscape")
@@ -586,17 +591,17 @@ def build_follower_processor(
     # path) so GateExecutor has the correct edge_id for routing events.
     edge_map = load_edge_map(factory.data_flow, run_id)
 
-    # Coordination token: followers carry their own token for the heartbeat
-    # thread, but do NOT use it as an epoch fence (no leader-fenced verbs).
-    # coordination_token=None keeps _require_coordination_token unreachable
-    # and derives run_coordination=None (no §C.2 housekeeping sweep) — both
-    # remain correct ABSENCES; ProcessorMode.FOLLOWER, not their None-ness,
-    # drives follower branch selection, and RowProcessor validates the
-    # combination fail-closed.
+    # Authority: a follower carries its WorkerMembershipToken (the value
+    # admit_follower returned) and NO CoordinationToken — it never presents an
+    # epoch fence. coordination_token=None keeps _require_coordination_token
+    # unreachable and derives run_coordination=None (no §C.2 housekeeping
+    # sweep) — both remain correct ABSENCES; ProcessorMode.FOLLOWER, not their
+    # None-ness, drives follower branch selection, and RowProcessor validates
+    # the combination fail-closed (member token present, leader token absent).
     #
     # The follower's run_workers row is required for the membership fence on
     # enqueue_ready / claim_ready — the fence is keyed on scheduler_lease_owner,
-    # which equals worker_id here (§A.1).
+    # which equals member_token.worker_id here (§A.1).
     processor, _coalesce_node_map, _coalesce_executor = build_row_processor(
         graph=graph,
         config=config,
@@ -614,20 +619,17 @@ def build_follower_processor(
         max_workers=concurrency_config.max_workers if concurrency_config is not None else None,
         telemetry=telemetry,
         mode=ProcessorMode.FOLLOWER,
-        scheduler_lease_owner=worker_id,  # §A.1: registered identity = lease owner
+        scheduler_lease_owner=member_token.worker_id,  # §A.1: registered identity = lease owner
         scheduler_lease_seconds=scheduler_lease_seconds,
         scheduler_heartbeat_seconds=scheduler_heartbeat_seconds,
         barrier_restore=None,  # follower: never restores barriers
         coordination_token=None,  # follower: no epoch fence
+        member_token=member_token,  # follower: exactly its membership authority
     )
-
-    # Follower token for the heartbeat thread (worker_id, run_id, epoch=0
-    # sentinel — followers have no epoch; heartbeat uses worker_id only).
-    follower_token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=0)
 
     return FollowerProcessor(
         processor=processor,
-        token=follower_token,
+        member_token=member_token,
         run_coordination=factory.run_coordination,
         factory=factory,
         clock=clock,

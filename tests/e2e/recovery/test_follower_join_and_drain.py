@@ -80,7 +80,7 @@ from tests.e2e.recovery.harness import (
 from tests.e2e.recovery.test_suspended_winner_fences import (
     _work_item,
 )
-from tests.fixtures.landscape import expire_leader_seat
+from tests.fixtures.landscape import expire_leader_seat, member_token_for
 
 if TYPE_CHECKING:
     from scripts.state_engine_profile_reporter import RuntimeProfileReporter
@@ -124,11 +124,14 @@ def _join_follower(crashed: Any, leader_token: CoordinationToken) -> str:
         patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_hash),
     ):
         orch = _orchestrator(crashed)
+        # join_run returns the follower's WorkerMembershipToken; the e2e
+        # helpers key on the worker_id string and read the token back from the
+        # registry (member_token_for) where a FollowerProcessor needs it.
         return orch.join_run(
             run_id=crashed.run_id,
             settings=types.SimpleNamespace(),
             window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
-        )
+        ).worker_id
 
 
 def _seed_ready_row(crashed: Any, *, ingest_sequence: int) -> tuple[str, str]:
@@ -653,11 +656,11 @@ class TestFollowerLifecycle:
             recorded_waits.append(seconds)
             _call_count[0] += 1
 
-        follower_token = CoordinationToken(run_id=run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id, run_id=run_id)
 
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=coord_repo,
             factory=factory,
             wait_fn=_wait,
@@ -699,10 +702,10 @@ class TestFollowerLifecycle:
                 with crashed.db.engine.begin() as conn:
                     conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
 
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=real_coord,
             factory=real_factory,
             wait_fn=_wait,
@@ -735,10 +738,10 @@ class TestFollowerLifecycle:
             conn.execute(update(runs_table).where(runs_table.c.run_id == crashed.run_id).values(status=RunStatus.FAILED.value))
 
         stub_proc = _DrainFollowerReadyWork()
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
             wait_fn=lambda _: None,
@@ -778,11 +781,11 @@ class TestFollowerLifecycle:
         expire_leader_seat(crashed.db, crashed.run_id)
 
         stub_proc = _DrainFollowerReadyWork()
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
 
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
             wait_fn=lambda _: None,
@@ -825,10 +828,10 @@ class TestFollowerLifecycle:
         # First drain call raises KeyboardInterrupt (simulates SIGINT mid-loop).
         stub_proc = _DrainFollowerReadyWork(exception=KeyboardInterrupt)
 
-        follower_token = CoordinationToken(run_id=crashed.run_id, worker_id=follower_id, leader_epoch=0)
+        follower_token = member_token_for(crashed.db.engine, worker_id=follower_id)
         follower = FollowerProcessor(
             processor=stub_proc,
-            token=follower_token,
+            member_token=follower_token,
             run_coordination=crashed.factory.run_coordination,
             factory=crashed.factory,
             wait_fn=lambda _: None,
@@ -1152,7 +1155,7 @@ def _run_real_follower(
         worker_id=f"worker:{run_id}:real-leader",
         window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
-    worker_id = Orchestrator(db).join_run(
+    member_token = Orchestrator(db).join_run(
         run_id,
         settings,
         window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
@@ -1180,8 +1183,7 @@ def _run_real_follower(
     )
     follower = build_follower_processor(
         factory=factory,
-        run_id=run_id,
-        worker_id=worker_id,
+        member_token=member_token,
         graph=execution_graph,
         config=follower_config,
         payload_store=payload_store,

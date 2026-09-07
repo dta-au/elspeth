@@ -491,7 +491,7 @@ class RunLifecycleCoordinator:
         # explicit stop.
         _heartbeat = RunHeartbeatThread(
             factory.run_coordination,
-            token=coordination_token,
+            member_token=coordination_token.membership,
         )
         _heartbeat.start()
 

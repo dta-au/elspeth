@@ -32,7 +32,7 @@ from unittest.mock import patch
 import pytest
 from sqlalchemy import insert, select, update
 
-from elspeth.contracts.coordination import mint_worker_id
+from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
 from elspeth.contracts.errors import JoinRefusedError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -151,8 +151,12 @@ class TestJoinAdmissionHappyPath:
         fake_settings = types.SimpleNamespace()
         with _PATCH_RESOLVE, _PATCH_HASH_SENTINEL:
             orch = _orchestrator(db)
-            worker_id = orch.join_run(run_id=RUN_ID, settings=fake_settings)
+            member = orch.join_run(run_id=RUN_ID, settings=fake_settings)
 
+        # join_run returns the follower's membership token — the exact value
+        # admit_follower established — naming the run and a fresh identity.
+        assert member == WorkerMembershipToken(run_id=RUN_ID, worker_id=member.worker_id)
+        worker_id = member.worker_id
         # worker_id has the expected shape
         assert worker_id.startswith(f"worker:{RUN_ID}:")
         assert len(worker_id.rsplit(":", 1)[1]) == 32  # uuid4().hex
@@ -460,7 +464,7 @@ class TestSeatLivenessBoundary:
         _begin_run_with_leader(db)
         fake_settings = types.SimpleNamespace()
 
-        def stamp_seat_at_database_now_and_join(database_now: datetime) -> str:
+        def stamp_seat_at_database_now_and_join(database_now: datetime) -> WorkerMembershipToken:
             with db.write_connection() as conn:
                 stamped = read_landscape_transaction_time(conn)
                 assert stamped == database_now
@@ -473,7 +477,7 @@ class TestSeatLivenessBoundary:
                 return _orchestrator(db).join_run(run_id=RUN_ID, settings=fake_settings)
 
         # Equality arm, inside one whole SQLite database second.
-        worker_id = on_fresh_database_second(db.engine, stamp_seat_at_database_now_and_join)
+        worker_id = on_fresh_database_second(db.engine, stamp_seat_at_database_now_and_join).worker_id
         assert worker_id.startswith(f"worker:{RUN_ID}:")
         assert [w["status"] for w in _worker_rows(db) if w["worker_id"] == worker_id] == ["active"]
 

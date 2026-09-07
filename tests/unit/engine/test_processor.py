@@ -30,7 +30,7 @@ import pytest
 # For node registration
 from elspeth.contracts import NodeType, RouteDestination, RowResult, SourceRow, TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.audit import TokenRef
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, WorkerMembershipToken
 from elspeth.contracts.data import PluginSchema as _PermissiveSchema
 from elspeth.contracts.declaration_contracts import _attach_contract_name_from_dispatcher
 from elspeth.contracts.engine import CommittedAggregationOutputReceipt
@@ -447,14 +447,17 @@ def _make_processor(
     """Create a RowProcessor with sensible defaults.
 
     ``mode=ProcessorMode.FOLLOWER`` builds the follower half of a real
-    multi-worker composition over the same DB: no coordination token (the
-    fenced verbs are leader-only, ADR-030 §B.1) and a REQUIRED registered
-    ``scheduler_lease_owner`` — RowProcessor validates both fail-closed.
+    multi-worker composition over the same DB: membership authority for the
+    REQUIRED registered ``scheduler_lease_owner`` and no leader token.
+    RowProcessor validates both authority and identity at construction.
     """
     if scheduler_lease_owner is not None:
         _register_test_worker(factory, scheduler_lease_owner, run_id=run_id)
-    if mode is ProcessorMode.FOLLOWER and scheduler_lease_owner is None:
-        raise ValueError("_make_processor(mode=FOLLOWER) requires a registered scheduler_lease_owner")
+    member_token = None
+    if mode is ProcessorMode.FOLLOWER:
+        if scheduler_lease_owner is None:
+            raise ValueError("_make_processor(mode=FOLLOWER) requires a registered scheduler_lease_owner")
+        member_token = WorkerMembershipToken(run_id=run_id, worker_id=scheduler_lease_owner)
 
     coalesce_nodes = dict(coalesce_node_ids or {})
     traversal_steps = dict(node_step_map or {})
@@ -559,6 +562,7 @@ def _make_processor(
         # verbs are leader-fenced; bind the run's own epoch-1 seat token.
         # A follower never carries one.
         coordination_token=leader_coordination_token(factory, run_id) if mode is ProcessorMode.LEADER else None,
+        member_token=member_token,
         mode=mode,
         source_node_id=NodeID(source_node_id),
         source_on_success=source_on_success,

@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     )
     from elspeth.contracts.audit_export import AuditExportContentStore, AuditExportContentStoreResolver
     from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeConcurrencyConfig
-    from elspeth.contracts.coordination import CoordinationToken
+    from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.plugin_policy_audit import WebPluginPolicyEvidence
     from elspeth.contracts.preflight import PreflightResult
@@ -364,7 +364,7 @@ class Orchestrator:
         settings: ElspethSettings,
         *,
         window_seconds: float | None = None,
-    ) -> str:
+    ) -> WorkerMembershipToken:
         """§B.1: atomic follower admission — public entry point (ADR-030).
 
         Delegates to :class:`JoinAdmissionService`, which owns the follower

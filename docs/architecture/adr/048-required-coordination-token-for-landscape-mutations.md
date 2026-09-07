@@ -98,6 +98,16 @@ the threading lands; until then they stay violations with an honest label.
 
 ### 1. `CoordinationToken` is a required, keyword-only parameter of every Landscape mutation API
 
+> **CORRECTED 2026-09-07 — see the amendment "§1 overreached ADR-030 D4".** The
+> paragraph below requires the *leader* token on all 90 APIs. That overreached
+> ADR-030 D4, which is the design of record and specifies THREE fences, not one.
+> What survives unchanged is everything about the *shape* of the parameter —
+> required, keyword-only, exactly one concrete owned class, never a Protocol or
+> a union. What changes is that the concrete class is chosen per verb SCOPE:
+> `CoordinationToken` for run-scoped writes, `WorkerMembershipToken` for
+> member-, item- and claim-scoped ones. Read this section as the shape rule and
+> the amendment as the scope rule.
+
 Every one of the 90 APIs takes `*, coordination_token: CoordinationToken`. Not
 `token: CoordinationToken | None = None`, not `token: object`, not a
 string-quoted annotation, not a defaulted parameter, and not a positional one.
@@ -149,6 +159,23 @@ there is nothing to hold and the plugin cannot write. That is the intended
 failure mode.
 
 ### 4. The web execution service is a token boundary, not a token source
+
+> **CORRECTED 2026-09-07.** The six `ExecutionServiceImpl.update_run_status`
+> reaches named below are **not Landscape reaches**. They are
+> `SessionService.update_run_status` (`src/elspeth/web/sessions/service.py:10044`,
+> protocol `web/sessions/protocol.py:4553`) called as
+> `self._session_service.update_run_status` at `web/execution/service.py:1857`,
+> `:2100`, `:2508`, `:2778`, `:2949` and `:3269` — a different symbol against the
+> **Sessions** database. The Landscape verb
+> `RunLifecycleRepository.update_run_status` has **no production caller at all**.
+> The paragraph below described SCANNER ROWS, not a defect: the scanner could
+> not resolve those receivers and rowed them as "unknown mutation receiver", and
+> the prose then read the rows as reaches. Nothing was fixed, because nothing was
+> broken. The receiver-precision gate rule of 2026-09-07 resolves the receiver to
+> the owned Sessions type and the six rows leave — a GATE CORRECTION, never
+> threading. `web/app.py::_finalize_orphaned_landscape_runs` reaching
+> `complete_run` IS a real Landscape reach and the rest of this section governs
+> it unchanged.
 
 `ExecutionServiceImpl` currently reaches `update_run_status` at four points in
 `_run_pipeline` plus `_handle_pipeline_submission_failure` and
@@ -234,8 +261,13 @@ prefix, file, or repository-level allowance is not available: the outbox is the
 audit trail's own durability path, and a wildcard over it is a wildcard over the
 evidence.
 
-*(Ruling requested from the hub 2026-09-06; recorded here as the ADR's proposed
-position. The live state until D8THREAD is a correctly-labelled red.)*
+**RULED 2026-09-07 (EMC3): the named exact exception, `temporary=True`, sunset at
+Task 8B.** The drain is not fenced, because there is no run to fence it against
+(`sidecar_journal_outbox` has no `run_id` column — see the amendment's run-less
+writer table). The write set pinned above is **incomplete** and is corrected in
+the amendment: the same table also takes an `INSERT` at `journal.py:298`, and the
+`DELETE` at `:401` is one statement executed once per acknowledged sequence
+inside a `for` loop, not once per call.
 
 ### 9. What this ADR does not decide
 
@@ -407,3 +439,427 @@ Estimate: 60–120 h as planned. D8.3 and D8.4 carry most of the caller surface
   forwarding call only when the attribute is bound solely in `__init__` from
   an exact token parameter and the call sits below a fail-closed `is None`
   guard.
+
+## Amendment 2026-09-07 — §1 overreached ADR-030 D4; the three-fence split restored
+
+**What this amendment is.** §1 of this ADR required a `CoordinationToken` — the
+*leader* token — on every one of the 90 mutation APIs. That overreached
+[ADR-030](030-multi-worker-deployment-shape.md) **D4**, which is the design of
+record and specifies **three** fences, not one:
+
+| D4 fence | applies to | the predicate |
+|---|---|---|
+| leader epoch verify-and-extend CAS | run-scoped write verbs | `run_coordination` matches `(run_id, worker_id, leader_epoch)` |
+| membership fence | claim/enqueue and member-scoped verbs | a `run_workers` row for `(run_id, worker_id)` with `status='active'` |
+| item-lease CAS | item-scoped writes | the payload's own `expected_lease_owner` WHERE |
+
+Requiring the leader token on item-scoped and claim/enqueue verbs does not make
+those writes safer. It makes them **impossible for the worker that legitimately
+performs them**: a follower holds no seat and no epoch, so under §1 as written
+either the follower cannot write at all, or it is handed a leader token it has
+no right to — and the second is the fail-open class this programme exists to
+close. This amendment restores D4's split and names the owned authority type for
+each fence. It does **not** add "a follower arm" to a leader design; it removes
+an over-broad requirement that the leader design never made.
+
+### A1. The tree had ONE fence wearing two names
+
+Before this amendment there was no shared transaction-level membership fence.
+Heartbeat and departure already used active-membership UPDATE predicates, and
+scheduler claims used membership EXISTS predicates. The two shared transaction
+helpers both enforced leader authority:
+
+- `run_coordination_repository.py::fenced_leader_transaction` — the real fence.
+- `scheduler/fencing.py::fenced_write` — **a thin wrapper over it**, not an
+  independent construct.
+
+`fenced_member_transaction` adds a shared membership transaction helper beside
+the leader helper. Scheduler claim/enqueue adoption remains subsequent work;
+this amendment does not certify that every D4 mutation path is migrated.
+
+### A2. Option (A): a second owned type, not one type with two meanings
+
+Two options were on the table. Option (B) — keep `CoordinationToken` and let its
+meaning depend on the verb — is **rejected**. Under (B) a leader-scoped verb that
+accidentally accepted a follower's token would be *unprovable*: there is no
+annotation, no gate rule and no test that can tell the two apart, because they
+are the same class. Option (A) is adopted:
+
+`WorkerMembershipToken(run_id, worker_id)` — frozen, slotted, **nominal**
+([ADR-032](032-validate-by-trust-domain.md)). No Protocol, no union with
+`CoordinationToken`, no inheritance in either direction. Established by
+`admit_follower`, which returns it; a leader derives its own through
+`CoordinationToken.membership`, because every seat mint — `register_run_leader_on`
+(`run_coordination_repository.py:530`), the takeover CAS
+(`_acquire_run_leadership_on`) and the export-seat CAS
+(`_acquire_export_leadership_on`) — inserts the leader's `run_workers` row in the
+same transaction as the seat. A leader IS a member by construction, so the
+derivation invents nothing. **The reverse derivation does not exist.**
+
+The gate admits **exactly one concrete type per verb class**. A leader-scoped
+verb annotated with the member type is a violation, and so is the converse. No
+verb accepts both, and neither type is ever spelled `| None`.
+
+`fenced_member_transaction` composes `begin_write` with `verify_membership_fence`
+as the first statement, in D7's **verify-UPDATE** form so the rowcount is the
+proof rather than an EXISTS subquery's snapshot (which under PostgreSQL READ
+COMMITTED would not hold the row lock).
+
+That last clause is **measured, not asserted**, because a lock claim cannot be
+proven on SQLite — one writer runs at a time there regardless, so a no-op lock
+and a correct one are indistinguishable at the assertion. Replacing the
+verify-UPDATE with the equivalent un-locked `SELECT` and running both forms:
+
+| form | 131 SQLite tests | PostgreSQL two-writer contention proof |
+|---|---|---|
+| verify-UPDATE (this design) | pass | pass |
+| `SELECT` snapshot (D7's warning) | **pass — the defect is invisible** | **fails**: both writers pass the fence, and the loser's payload CAS matches 0 rows and raises `AuditIntegrityError` |
+
+So the row lock is load-bearing and only the container suite can say so. Every
+membership-fence contention claim in this amendment rests on
+`tests/testcontainer/core/test_run_coordination_release_postgres.py`, repeated
+per race because a single green pass cannot be told from luck. On rowcount 0,
+the same transaction checks that the registration exists. An absent registration
+is `AuditIntegrityError`; an inactive registration rolls the transaction back
+and raises `RunMembershipLostError`, the sibling of `RunLeadershipLostError`,
+recording a `fence_refusal` event on a fresh connection exactly as the leader
+fence does. The refusal row carries `leader_epoch=NULL` — a member holds no epoch
+— and names the fence in its context so the ledger can tell the two apart.
+
+A refused heartbeat returns `WorkerMembershipLost`, an owned outcome without
+seat fields. The heartbeat thread latches membership loss without another
+database read. This closes elspeth-9c4f6c43a7: a failed read after an established
+refusal cannot turn known loss into an unknown heartbeat result. `RowProcessor`
+also checks both authority parameters nominally, so matching run and worker
+identities cannot substitute one token class for the other.
+
+### A3. Scope table — all 90 APIs
+
+Scope classes: **LEADER** (leader seat only), **MEMBER** (a worker's own
+liveness/departure, or a write both roles make), **ITEM** (follower-reachable
+while processing a claimed work item), **CLAIM** (claim/enqueue/heartbeat-lease).
+ITEM keeps the item-lease CAS as D4's third fence *in addition to* the membership
+fence; the membership fence proves who the worker is, the lease CAS proves the
+work item is still theirs.
+
+Totals: **LEADER 68, ITEM 13, CLAIM 5, MEMBER 5** (91 rows for 90 APIs, because
+`record_token_outcome` splits per R7.2). The source is the coordinator's
+`verb-scope-classification.md`, corrected where the code disagreed — every
+correction is named in the notes column or in A4/A5 below.
+
+One axis note, because it caused a real disagreement while this table was
+built: **the scope column means REACHABILITY, not verb kind.** CLAIM is the one
+class whose name suggests a kind, and reading it that way puts
+`claim_pending_sink` and the four sink-effect lease verbs in it. They are
+leader-only by caller chain, so they are LEADER here. A verb's name is not its
+scope, for the same reason its method name is not its owner (A6).
+
+| # | verb | facade | scope | authority type | fence | notes |
+|---|---|---|---|---|---|---|
+| 1 | `begin_run` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS | epoch-one creation exception (§6); sunsets at Task 8B |
+| 2 | `complete_run` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 3 | `record_source_field_resolution` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 4 | `record_run_source` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 5 | `update_run_source_contract` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 6 | `update_run_status` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS | NO production caller — the six web reaches are Sessions writes (§4 correction) |
+| 7 | `record_secret_resolutions` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 8 | `record_preflight_results` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 9 | `record_readiness_check` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.8 latent trap; the follower arm is silently skipped — elspeth-df7daf5667 |
+| 10 | `set_export_status` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 11 | `set_export_failed_unless_completed` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 12 | `set_export_pending_unless_completed` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 13 | `finalize_run` | RunLifecycleRepository | LEADER | `CoordinationToken` | leader epoch CAS | reads the reproducibility grade OUTSIDE its own fence, then delegates to `complete_run` |
+| 14 | `create_row` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE |
+| 15 | `create_row_with_token` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 16 | `insert_row_with_token_on` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 17 | `create_token` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 18 | `fork_token` | DataFlowRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 19 | `coalesce_tokens` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 20 | `finalize_coalesce_effect` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 21 | `expand_token` | DataFlowRepository | MEMBER | `WorkerMembershipToken` | membership | R7.1 BOTH → member-scoped |
+| 22a | `record_token_outcome` (item arm) | DataFlowRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS | R7.2 SPLIT — never an Optional |
+| 22b | `record_token_outcome` (finalize arm) | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.2 SPLIT — `run_lifecycle_repository.py:839`, `sink_effect_finalization.py:299` |
+| 23 | `register_node` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 24 | `register_edge` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 25 | `update_node_output_contract` | DataFlowRepository | MEMBER | `WorkerMembershipToken` | membership | R7.1 BOTH → member-scoped; no node-scoped fence is invented |
+| 26 | `record_validation_error` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.8 latent trap stated below |
+| 27 | `link_validation_error_to_row` | DataFlowRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE |
+| 28 | `record_transform_error` | DataFlowRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 29 | `begin_node_state` | ExecutionRepository | MEMBER | `WorkerMembershipToken` | membership | R7.1 BOTH → member-scoped |
+| 30 | `record_completed_node_state` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 31 | `record_completed_node_state_on` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 32 | `reconcile_source_completions_from_scheduler` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 33 | `begin_node_states_many` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 34 | `complete_node_state` | ExecutionRepository | MEMBER | `WorkerMembershipToken` | membership | R7.1 BOTH → member-scoped |
+| 35 | `complete_node_states_completed_many` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE (facade) |
+| 36 | `record_routing_event` | ExecutionRepository | MEMBER | `WorkerMembershipToken` | membership | R7.1 BOTH → member-scoped |
+| 37 | `record_routing_events` | ExecutionRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 38 | `allocate_call_index` | ExecutionRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 39 | `record_call` | ExecutionRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 40 | `begin_operation` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 41 | `complete_operation` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 42 | `allocate_operation_call_index` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 43 | `record_operation_call` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 44 | `create_batch` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 45 | `add_batch_member` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE (with `AggregationExecutor.buffer_row`) |
+| 46 | `update_batch_status` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 47 | `complete_batch` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 48 | `retry_batch` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 49 | `register_artifact` | ExecutionRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE (facade) |
+| 50 | `enqueue_ready` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership |  |
+| 51 | `enqueue_ready_claimed` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership |  |
+| 52 | `enqueue_ready_claimed_legacy_unfenced` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership | R7.6 DELETE |
+| 53 | `ingest_row_with_initial_claim` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 54 | `claim_ready` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership |  |
+| 55 | `claim_pending_sink` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.4 — the classification read it CLAIM from its verb KIND; the code says leader-only and the code wins. Follower contract quoted in A4 |
+| 56 | `recover_expired_leases` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 57 | `recover_expired_leases_legacy_unfenced` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE |
+| 58 | `heartbeat_lease` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership | OWNER-KEYED: the scheduler verb is CLAIM; `SinkEffectRepository.heartbeat_lease` is LEADER |
+| 59 | `mark_blocked` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 60 | `mark_terminal` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 61 | `mark_terminal_with_ready_children` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 62 | `mark_failed` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 63 | `mark_failed_with_ready_children` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 64 | `mark_pending_sink` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 65 | `mark_pending_sink_with_ready_children` | TokenSchedulerRepository | ITEM | `WorkerMembershipToken` | membership + item-lease CAS |  |
+| 66 | `mark_pending_sink_terminal` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 67 | `mark_pending_sink_terminal_many` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 68 | `terminalize_pending_sinks_with_terminal_outcomes` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 69 | `complete_barrier` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 70 | `mark_blocked_barrier_pending_sink_many` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | NO production caller at either layer. DELETE candidate — RAISED, not ruled |
+| 71 | `mark_blocked_barrier_terminal` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 72 | `adopt_blocked_barrier_item` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 73 | `reset_adoption_marker_to_pending` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.3 LIVE UNFENCED LEADER WRITE — elspeth-ee18e446ff (P1) |
+| 74 | `adopt_group_losses` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 75 | `reserve` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | no authority fence of any kind today (ordering CAS only) |
+| 76 | `claim_preparation` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 77 | `complete_plan` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | the ONLY sink-effect verb with the lease in SQL |
+| 78 | `acquire_lease` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | no rowcount check |
+| 79 | `heartbeat_lease` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | OWNER-KEYED: the scheduler verb is CLAIM; `SinkEffectRepository.heartbeat_lease` is LEADER |
+| 80 | `takeover_expired` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | no rowcount check |
+| 81 | `begin_attempt` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 82 | `record_attempt_result` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
+| 83 | `complete_member_result` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | accepts a lease it never puts in SQL |
+| 84 | `mark_response_lost` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | accepts a lease it never puts in SQL; omitted at 5 of 6 call sites |
+| 85 | `finalize` | SinkEffectRepository | LEADER | `CoordinationToken` | leader epoch CAS | compares `lease_owner` in Python only |
+| 86 | `create_checkpoint` | CheckpointManager | LEADER | `CoordinationToken` | leader epoch CAS | fence is OPTIONAL at the manager; `CheckpointCoordinator._require_fence` is what fails closed |
+| 87 | `delete_checkpoints` | CheckpointManager | LEADER | `CoordinationToken` | leader epoch CAS | same optional fence; same coordinator guard |
+| 88 | `register_candidate` | AuditExportSnapshotRepository | LEADER | `CoordinationToken` | leader epoch CAS | NO production caller; its own docstring deprecates it. DELETE candidate — RAISED, not ruled |
+| 89 | `register_verified_candidate` | AuditExportSnapshotRepository | LEADER | `CoordinationToken` | leader epoch CAS | writes with NO coordination fence; leader-only by caller chain alone |
+| 90 | `bind_winner` | AuditExportSnapshotRepository | LEADER | `CoordinationToken` | leader epoch CAS | performs NO DML — a verify-and-project read miscounted into the census |
+
+Three verbs beyond the 90 are fenced by this amendment's implementation and
+belong in the same picture: `release_seat` is **LEADER** (the seat is a
+run-scoped row, so vacating it is D4's first fence, not its second), and
+`depart_worker` and `worker_heartbeat` are **MEMBER**. All three reify their
+refusal rather than propagating it — each is called from a teardown or liveness
+arm where re-raising would mask the exception being unwound — so their evidence
+is the durable `fence_refusal` row plus zero mutation. The F-10 inventory records
+that distinction per verb.
+
+### A4. Classification rulings folded in (EMC3, 2026-09-07)
+
+**R7.1 — the four BOTH verbs are MEMBER-scoped, deliberately.** `begin_node_state`,
+`complete_node_state`, `record_routing_event` and `update_node_output_contract`
+are reachable by leader and follower alike. They are member-scoped because **the
+leader is also a member**: a membership fence on a write both roles make asserts
+exactly what the writer can prove, and nothing it cannot. This is recorded here
+so that a later reader does not "tighten" one of them to LEADER as an apparent
+improvement and thereby break every follower that makes the write. No node-scoped
+fence is invented for `update_node_output_contract`; there is no node seat.
+
+**R7.2 — `record_token_outcome` SPLITS into two verbs**, each with a required
+concrete type. The item-scoped arm serves the lease path; the leader-scoped arm
+serves the finalize-time callers `run_lifecycle_repository.py:839`
+(`_abandon_undecided_tokens_in`) and `sink_effect_finalization.py:299`. Neither
+takes the other's type and neither is Optional. One verb with an optional or
+union-typed authority would be exactly option (B) in miniature.
+
+**R7.3 — `reset_adoption_marker_to_pending` is a live unfenced leader write** on
+the release branch (`scheduler/barrier.py:1204-1211`, a bare `begin_write`; the
+caller `BarrierRecoveryCoordinator` binds the token at
+`barrier_coordination.py:1662` and calls at `:2465`/`:2497`). Filed as
+**elspeth-ee18e446ff, P1** — the priority follows the consequence, not the size of
+the fix: a deposed leader replaying an adoption reset unrefused is precisely what
+the epoch fence exists to prevent. The verb's docstring asserting it is
+deliberately fence-free is refuted in source (the two-takeover window).
+
+**R7.4 — `claim_pending_sink` is LEADER.** The evidence is the follower contract
+in `engine/orchestrator/follower.py`, quoted rather than asserted:
+
+> ``claim_ready`` only — never ``claim_pending_sink`` or pending-sink recovery
+> (sink work is leader-only).
+
+`processor.py` carries the same rule at `drain_follower_ready_work`, and
+`leader_drain.py` states the other half: the leader drains the PENDING_SINK rows
+that follower workers produced. (ADR-030 §B.1/§C.3.)
+
+**R7.5 — `enqueue_ready`.** `follower.py`'s module docstring describes a
+membership-fenced follower continuation path with no follower-reachable caller in
+the tree. Wave 2 (lane SCHED) resolves stale-prose versus missing-path **in
+source** and reports before it fences anything; if the prose is stale it is fixed
+in the same commit. A corroborating lie is worse than no comment.
+
+**R7.6 — nine dead facade verbs are marked DELETE**, not fenced, so wave 2 does
+not spend a fence on a verb nothing calls: `create_row`,
+`link_validation_error_to_row`, `add_batch_member` (with
+`AggregationExecutor.buffer_row`), the facade `complete_node_states_completed_many`
+and `register_artifact`, the `PluginContext.record_call` state arm,
+`recover_expired_leases_legacy_unfenced` and
+`enqueue_ready_claimed_legacy_unfenced`. **Hard precondition before deleting any
+test alongside a verb:** classify each test by its SUBJECT via AST, not by the
+file it lives in, and grep the behaviour's vocabulary tree-wide. Where the real
+subject is a live path — for example the sub-repository `SinkEffectFinalization`
+actually calls — MIGRATE the test onto that subject and mutation-test that it
+still fails when the live path breaks. Deleting a doomed test file has already
+deleted the only coverage of live code in this repository once.
+
+**R7.7 — the follower's readiness evidence does not exist.**
+`rag/transform.py:477 _record_readiness_check` guards on
+`ctx.coordination_token is not None` and silently returns on every follower
+`on_start`, because `cli.py` builds the follower's `PluginContext` without a
+token. Two comments in the same chain contradict each other:
+`contracts/plugin_context.py` says a context without a token "cannot write, and
+that is the intended failure mode — never a silently skipped audit row", while
+the RAG guard does exactly the silent skip. The remedy is the member token on
+`PluginContext` (lane EXEC-PLUMB). Filed as **elspeth-df7daf5667**.
+
+**R7.8 — `record_validation_error`'s LEADER classification rests on a
+convention, and that is stated here beside the classification rather than only
+in a ledger.** The convention is that only sources call it while the follower's
+context carries a live audit writer. Nothing structural enforces it. If a
+follower-reachable caller is ever added, the verb becomes a silent unfenced
+write, not a refusal. The trap closes when the member token reaches
+`PluginContext` (R7.7).
+
+**R7.9 — two structurally distinct kinds of direct construction.** A direct
+`CoordinationToken(...)` or `WorkerMembershipToken(...)` in a test that MOCKS the
+repository is a **mock-only construction**: there is no seat and no `run_workers`
+row to read back, so no helper could return one. That is legitimate and is not
+the same thing as a **fence-rejection subject**, where the token is the subject of
+the test and is deliberately built stale, foreign, or mismatched. §5's rule —
+read the seat back, never mint — governs every other case; the member-scoped
+helper is `tests/fixtures/landscape.py::member_token_for(engine, worker_id=...)`,
+which reads the `run_workers` row back and does **not** check its status, because a
+departed or evicted worker's token is exactly what a refusal test needs.
+
+### A5. The run-less writers
+
+ADR-048 never named these. Each gets an owned authority type **or** a named exact
+exception; every exception carries a pinned write set of exact table + exact DML
+verb — never a prefix, never a file, never a repository — and states **why no
+seat can exist**, not merely that none does today. An exception class that grows
+a second member later is how a fence becomes a formality, so the two writers
+whose "no run" is a design claim rather than a fact get their own reasoning.
+
+| writer | pinned write set (table: verb @ site) | disposition | why no seat CAN exist |
+|---|---|---|---|
+| `AuthAuditRepository.record_auth_event` / `record_login_success_and_token_issued` | `auth_events: INSERT` @ `auth_audit_repository.py:172`; `auth_events: INSERT` @ `:218` (one statement, two value rows) | named exact exception, **permanent** (`temporary=False`) | **Fact, not a claim.** `auth_events` has no `run_id` column and no FK to `runs` (`schema.py:2497-2542`). These rows are written at the HTTP auth boundary — login, token issuance, auth failure — before any pipeline run exists. There is no run to take a seat on, and adding one would mean inventing a run per login. |
+| `LandscapeWriteRepository.record_synthesised_run` | `runs: INSERT` @ `write_repository.py:125`; `run_attributions: INSERT` @ `:151`; `nodes: INSERT` @ `:161` (N executions); `rows: INSERT` @ `:194` (N executions) | **NO exception. Fence it or delete it** — see below | **The design claim FAILS.** This verb *creates* the run, so a seat could exist: it already owns the right transaction shape (one `write_connection()` at `:123`) and could call `register_run_leader_on(conn, …)` immediately after the `runs` INSERT and return the token, which is precisely the two-phase creation §6 describes for `begin_run`. It does not, and the consequence is concrete: a cache-replay run has a `runs` row and **no `run_coordination` seat**, so `acquire_export_leadership` and `acquire_run_leadership` both raise `AuditIntegrityError` reading "the audit DB is corrupt" on it. Measured: **zero production callers in `src/`** — every construction site is a test, and `LandscapeWriteRepositories.__slots__` does not expose it. A test-only surface is an argument for deleting or fencing it, never for exempting it. |
+| `reproducibility.update_grade_after_purge` | `runs: UPDATE` @ `reproducibility.py:332` (CAS-guarded: `reproducibility_grade = REPLAY_REPRODUCIBLE` → `ATTRIBUTABLE_ONLY`) | **NO exception on the normal branch — take the export seat.** One real hole remains; see below | **The design claim HOLDS, and then breaks on one branch.** `_EXPORT_SEAT_RUN_STATUSES` is all five terminal statuses, and finalisation vacates the seat, so on every run this verb can normally reach, `acquire_export_leadership` is admissible: §4's rule applies unchanged — take a seat or do not write. **But** the resume takeover flips FAILED/INTERRUPTED → RUNNING **without clearing `reproducibility_grade`**, and `update_run_status` does not clear it either. A resumed run therefore carries `REPLAY_REPRODUCIBLE` while RUNNING with a live seat, and the purge's run selection applies no status filter — so the UPDATE fires where the export seat is inadmissible on two independent grounds. That is a defect in the resume path (the grade should be cleared when the run leaves terminal), not a licence to exempt the writer. |
+| `LandscapeJournal._drain_committed_outbox` | `sidecar_journal_outbox: DELETE` @ `journal.py:401` (one statement, once per acknowledged sequence) — **and** `sidecar_journal_outbox: INSERT` @ `journal.py:298` in `_before_commit`, which §8's pin omits | named exact exception, `temporary=True`, **sunset at Task 8B** (§8, now RULED) | **Fact.** `sidecar_journal_outbox` has no `run_id` column and no FK to `runs` (`schema.py:382-391`); it is keyed by `journal_owner`, and one batch can span records from any number of runs. There is no single run whose seat would authorise the drain. Note the asymmetry: the INSERT rides the caller's SQLAlchemy `Connection` and is fenced exactly when that transaction was; the DELETE runs on a raw DBAPI connection in its own `BEGIN IMMEDIATE`, outside every fence, from two different origins (`recover_pending` and the dialect commit hook). |
+| `LandscapeDB._set_sqlite_schema_epoch` | `PRAGMA user_version = <int>` @ `database.py:1355` — **no table write at all** | named exact exception, permanent | **Fact.** It runs during schema management, before `metadata.create_all`; on a fresh database the `runs` table does not exist yet. The gate already classifies it by its own rule (`_SCHEMA_STAMP_PRAGMAS`) as a schema stamp rather than a row write, and it is a no-op on PostgreSQL. |
+| `_database_ops` relays | **none of its own** — `_database_ops.py` contains zero DML constructions; it executes a caller-supplied `Executable` at `:113` and `:148` | **D8.8's wording is WRONG for this module — correct it** | See below. |
+
+**D8.8's "admitted on the fenced `Connection`" is false as written for
+`_database_ops.py`.** All three write-capable members open their **own**
+transaction (`execute_insert` `:112`, `write_connection` `:132`, `execute_update`
+`:147`) and none accepts a `Connection`. They are caller-supplied *statement*
+relays on a *relay-owned* transaction; there is no fenced connection for them to
+be admitted on. The claim holds instead for the relays that do take
+`conn: Connection` and execute on it — `record_buffered_outcome_guarded` and
+`record_terminal_outcome_guarded` (`data_flow/outcomes.py`, both called inside the
+fenced barrier transaction), and `record_coordination_event`,
+`record_coordination_events` and `_insert_worker_row`
+(`run_coordination_repository.py`). One relay has both shapes and must be named
+as such: `TokenOutcomeRepository.record_token_outcome` takes
+`conn: Connection | None = None` and opens its own transaction when none is
+passed, so whether any one of its production call sites is fenced depends on
+whether that site passes `conn=`. Of the eleven `_database_ops` write callers,
+nine are run-scoped repositories that hold a token; **the only two with no run at
+all are the two `auth_audit_repository` sites**, so the relay's unfenced
+self-owned transaction is load-bearing for `auth_events` and for nothing else.
+
+### A5a. How the PluginContext admission survives ADR-032's ban on Protocols
+
+The gate admits a plugin's `ctx.<forwarder>()` call through two arms, and one of
+them is annotated with a Protocol. That looks, at first reading, like exactly the
+thing [ADR-032](032-validate-by-trust-domain.md) forbids — a structural type used
+as a security control. It is not, and the reason is worth stating in the
+architecture decision rather than leaving in a lane report:
+
+> **Arm (a) is a deferral, not a grant.** Admitting `ctx.<forwarder>()` on a
+> Protocol-annotated parameter does not certify anything — it moves the proof
+> obligation to whichever concrete class actually forwards to Landscape, and
+> that class's own call is scanned like any other. **Arm (b), which grants, is
+> keyed on a concrete owned class at an exact path.** A structural impostor
+> cannot launder an unfenced write through (a); it can only relocate where the
+> proof is demanded.
+
+So the Protocol never answers "is this writer authorised". It answers "is this
+call the end of the chain, or is there a further call still to prove?" — and the
+answer "there is a further call" is safe under structural typing, because an
+impostor that satisfies the Protocol still has to produce a concrete forwarder
+whose own Landscape call the scanner will demand a token from. ADR-032's rule is
+about the type that decides; this type decides nothing.
+
+### A6. A defect class: key on the RESOLVED OWNER, never the method name
+
+Two of the seven web false positives, and a wrong row in the coordinator's own
+cross-tab, had one cause: **method-name collisions across owned types.**
+
+| name | owners it collides across | what went wrong |
+|---|---|---|
+| `update_run_status` | `RunLifecycleRepository` (Landscape) vs `SessionService` (Sessions) | six Sessions writes read as Landscape reaches; corrected at §4 |
+| `begin_attempt` | `SinkEffectRepository` vs `_PlannerAttemptTrail` (`web/composer/pipeline_planner.py:1121`) | a planner attempt-trail call rowed as a Landscape mutation |
+| `heartbeat_lease` | `TokenSchedulerRepository` (work-item lease, CLAIM) vs `SinkEffectRepository` (sink-effect lease, LEADER) | the sink-effect facade was credited with the scheduler verb's classification and its membership fence; the sink-effect verb has neither |
+
+**Any inventory, gate rule, ledger row or classification that keys on a method
+name must key on the resolved owner instead.** This is not a scanner
+implementation note: two of the three above reached prose in this ADR and in a
+coordinator cross-tab, and each read as a finding about code that was fine while
+hiding the state of code that was not.
+
+The receiver-precision rule that follows from this admits a mutation-named call
+by naming the receiver's **resolved non-Landscape owner**. It must never admit a
+receiver on the grounds that the receiver resolves at all, and it must never
+require the receiver to resolve *into* an owned Landscape class. An unresolvable
+receiver stays a row.
+
+**The justification first circulated with this rule, and written into an earlier
+draft of this section, was wrong on the tree, and the correction matters more
+than the error.** That draft said the eight unknown-receiver rows in the LLM
+providers (`gateway.py` ×4, `openrouter.py` ×4) are UNRESOLVABLE, and that an
+owner-keyed rule was therefore needed to keep them rowing. Measured through the
+gate's own resolver, `audit_parent` is a parameter annotated `LLMAuditParent`
+(`providers/gateway.py:556`, `:702`, `:731`) and resolves cleanly and exactly to
+`elspeth.plugins.transforms.llm.provider.LLMAuditParent`, which at
+`provider.py:41` really does declare `allocate_call_index` (`:97`) and
+`record_call` (`:105`). The eight rows are not unresolved. They are fully
+resolved, and they row because their owner is **absent from the allowlist**.
+
+The conclusion survives the correction and is strengthened by it. Option (b),
+"admit whatever resolves", was rejected as failing closed on the rows worth
+catching. On the measured tree it is worse than that argument claimed: option
+(b) would have **admitted all eight and lost them**, silently, because they
+satisfy its admission criterion perfectly. The `LLMAuditParent` → `CallRecorder`
+indirection that D8.3 exists to thread would have been erased from the inventory
+by the very rule meant to sharpen it, and the escape counter would have fallen
+by fifteen instead of seven while the real finding disappeared inside the
+improvement.
+
+So the operative distinction is **not resolvable versus unresolvable — it is
+enumerated versus not enumerated.** Admission is a closed, pinned list of
+(owner, method) pairs re-derived from the tree, and everything else rows,
+whether or not it resolves. A receiver that resolves beautifully to a type
+nobody allowlisted must still row.
+
+### A7. What this amendment does not change
+
+The fence predicates (ADR-030), the clock authority (ADR-047), the transaction
+shape, and every *shape* rule in §1: required, keyword-only, exactly one concrete
+owned class per parameter, never a Protocol, never a union, never Optional, never
+an ambient carrier. The token still travels as a value in a parameter, and the
+absence of a parameter is still the absence of authority. What changes is only
+**which** owned class each verb requires, and that is now decided by the verb's
+scope rather than assumed to be the leader's.

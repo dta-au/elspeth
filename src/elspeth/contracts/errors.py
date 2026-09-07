@@ -1101,6 +1101,42 @@ class RunLeadershipLostError(Exception):
         )
 
 
+# This worker's run_workers row is no longer 'active' (departed, or evicted by
+# the leader's housekeeping sweep / a takeover), so its membership-fenced
+# transaction was refused by the membership verify-UPDATE and rolled back with
+# ZERO durable mutation (ADR-030 D4, second fence). The refusal is best-effort
+# attributed via a fence_refusal coordination event; the worker abandons
+# cleanly under the single-use identity doctrine. Sibling of
+# RunLeadershipLostError: same discipline, one fence down.
+# TIER-2: Legitimate multi-worker coordination — this worker's membership ended; the fenced write rolled back cleanly with zero mutation, not audit corruption.
+class RunMembershipLostError(Exception):
+    """Raised when the membership fence verify-UPDATE misses (ADR-030 D4).
+
+    The first statement of every membership-fenced transaction is a
+    conditional UPDATE on ``run_workers`` matching ``(run_id, worker_id,
+    status='active')``. When no active row matches, an existing registration
+    means this worker departed or was evicted. The entire transaction rolls
+    back before any payload write, and the worker must abandon this identity.
+    A missing registration raises ``AuditIntegrityError`` instead.
+
+    Attributes:
+        run_id: The run whose membership fence refused this worker.
+        worker_id: The identity whose ``run_workers`` row is no longer active.
+        verb: The fenced verb that was refused (forensic attribution; also
+            recorded in the best-effort ``fence_refusal`` coordination event).
+    """
+
+    def __init__(self, *, run_id: str, worker_id: str, verb: str) -> None:
+        self.run_id = run_id
+        self.worker_id = worker_id
+        self.verb = verb
+        super().__init__(
+            f"Run membership lost for run_id={run_id!r}: worker_id={worker_id!r} "
+            f"is no longer an active member (refused at verb {verb!r}). "
+            "The worker departed or was evicted; abandon work under this identity."
+        )
+
+
 # This worker's run_workers registry row left 'active' (evicted by the leader's
 # housekeeping sweep, or departed at finalize). Single-use identity doctrine
 # (ADR-030): the row never returns to 'active'; the drain loop abandons

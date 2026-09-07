@@ -53,8 +53,8 @@ from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
 from sqlalchemy.exc import OperationalError as SQLAOperationalError
 
 from elspeth.contracts.coordination import (
-    CoordinationToken,
     LeaderInfo,
+    WorkerMembershipToken,
 )
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, FollowerSeatDeadError, RunWorkerEvictedError
@@ -262,15 +262,15 @@ class _StubRunCoordRepo:
             seat_live=self._seat_live,
         )
 
-    def depart_worker(self, *, worker_id: str) -> None:
-        self.depart_calls.append({"worker_id": worker_id})
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        self.depart_calls.append({"worker_id": member_token.worker_id})
         if self._lifecycle_events is not None:
             self._lifecycle_events.append("worker_depart")
 
-    def worker_heartbeat(self, *, worker_id: str, window_seconds: float) -> Any:
+    def worker_heartbeat(self, *, member_token: WorkerMembershipToken, window_seconds: float) -> Any:
         from elspeth.contracts.coordination import CoordinationSnapshot
 
-        self.worker_heartbeat_calls.append({"worker_id": worker_id, "window_seconds": window_seconds})
+        self.worker_heartbeat_calls.append({"worker_id": member_token.worker_id, "window_seconds": window_seconds})
         return CoordinationSnapshot(
             leader_worker_id=f"worker:{RUN_ID}:leader",
             leader_epoch=1,
@@ -366,11 +366,11 @@ def _make_follower(
         # Also trip the terminal flag so the loop exits
         factory.run_lifecycle._running = False
 
-    token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+    member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
     follower = FollowerProcessor(
         processor=processor,
-        token=token,
+        member_token=member_token,
         run_coordination=coord_repo,  # type: ignore[arg-type]
         factory=factory,  # type: ignore[arg-type]
         wait_fn=_wait,
@@ -429,11 +429,11 @@ class TestFollowerTerminalRun:
             # Transition to terminal AFTER the first idle sleep
             factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_wait,
@@ -474,10 +474,10 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -502,10 +502,10 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -526,10 +526,10 @@ class TestFollowerSeatDead:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -565,10 +565,10 @@ class TestFollowerSeatDead:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -623,10 +623,10 @@ class TestFollowerSeatDead:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -679,10 +679,10 @@ class TestFollowerSeatDead:
         ]
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -715,10 +715,10 @@ class TestFollowerEvicted:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)  # check_and_raise() raises immediately
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -746,10 +746,10 @@ class TestFollowerEvicted:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -817,10 +817,10 @@ class TestFollowerEvictionFinalizeDepartureRace:
         run_result_completed = _RunStatusRecord(status=RunStatus.COMPLETED)
         factory.run_lifecycle.get_run_results = [run_result_running, run_result_completed]
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -861,10 +861,10 @@ class TestFollowerEvictionFinalizeDepartureRace:
         # Run stays RUNNING for ALL get_run calls → true eviction.
         factory = _StubFactory(running=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -901,11 +901,11 @@ class TestFollowerSIGINT:
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_raising_wait,
@@ -933,10 +933,10 @@ class TestFollowerSIGINT:
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -970,12 +970,12 @@ class TestFollowerIdleBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False  # exit after first idle
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         idle_seconds = 3.5
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_wait,
@@ -1009,11 +1009,11 @@ class TestFollowerIdleBehavior:
             if call_count >= 2:
                 factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_wait,
@@ -1052,11 +1052,11 @@ class TestFollowerDrainedBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False  # exit after first idle
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_wait,
@@ -1088,11 +1088,11 @@ class TestFollowerDrainedBehavior:
             waits.append(seconds)
             factory.run_lifecycle._running = False
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         heartbeat = _StubHeartbeat()
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_wait,
@@ -1134,10 +1134,10 @@ class TestFollowerDepartHygiene:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1156,14 +1156,14 @@ class TestFollowerDepartHygiene:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_raising_wait,
@@ -1184,15 +1184,15 @@ class TestFollowerDepartHygiene:
         factory = _StubFactory(running=False)
 
         class _ExplodingCoordRepo(_StubRunCoordRepo):
-            def depart_worker(self, *, worker_id: str) -> None:
+            def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
                 raise SQLAOperationalError("stmt", None, Exception("DB unavailable"))
 
         coord_repo = _ExplodingCoordRepo()
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1239,10 +1239,10 @@ class TestFollowerHeartbeatLifecycle:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat(evicted=True)
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1259,14 +1259,14 @@ class TestFollowerHeartbeatLifecycle:
         coord_repo = _StubRunCoordRepo()
         factory = _StubFactory(running=True)
         heartbeat = _StubHeartbeat()
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
 
         def _raising_wait(seconds: float) -> None:
             raise KeyboardInterrupt
 
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=_raising_wait,
@@ -1291,7 +1291,7 @@ class TestFollowerHeartbeatLifecycle:
 
         follower = FollowerProcessor(
             processor=_ExplodingDrain(),  # type: ignore[arg-type]
-            token=CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0),
+            member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID),
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=_StubFactory(running=True),  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1336,10 +1336,10 @@ class TestFollowerFinalizeFlipCleanExit:
         # Heartbeat latch is already set (simulates worker_active=False).
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1361,10 +1361,10 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1388,10 +1388,10 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1411,10 +1411,10 @@ class TestFollowerFinalizeFlipCleanExit:
         coord_repo = _StubRunCoordRepo()
         heartbeat = _StubHeartbeat(evicted=True)
 
-        token = CoordinationToken(run_id=RUN_ID, worker_id=WORKER_ID, leader_epoch=0)
+        member_token = WorkerMembershipToken(run_id=RUN_ID, worker_id=WORKER_ID)
         follower = FollowerProcessor(
             processor=processor,
-            token=token,
+            member_token=member_token,
             run_coordination=coord_repo,  # type: ignore[arg-type]
             factory=factory,  # type: ignore[arg-type]
             wait_fn=lambda _: None,
@@ -1671,8 +1671,8 @@ class _RaisingDepartRepo(_StubRunCoordRepo):
         super().__init__(**kwargs)
         self._depart_exc = exc
 
-    def depart_worker(self, *, worker_id: str) -> None:
-        self.depart_calls.append({"worker_id": worker_id})
+    def depart_worker(self, *, member_token: WorkerMembershipToken) -> None:
+        self.depart_calls.append({"worker_id": member_token.worker_id})
         raise self._depart_exc
 
 

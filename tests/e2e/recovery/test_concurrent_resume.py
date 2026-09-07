@@ -1305,11 +1305,12 @@ class TestTwoResumesSameRunId:
             patch("elspeth.engine.orchestrator.join_admission.stable_hash", return_value=db_config_hash),
         ):
             orch = Orchestrator(crashed.db, clock=crashed.clock)
-            follower_id = orch.join_run(
+            follower_token = orch.join_run(
                 run_id=crashed.run_id,
                 settings=fake_settings,
                 window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
             )
+            follower_id = follower_token.worker_id
 
         # join_run returns a valid worker_id (NOT a resume point — no epoch bump).
         assert follower_id.startswith(f"worker:{crashed.run_id}:")
@@ -1409,7 +1410,7 @@ class TestTwoResumesSameRunId:
 
         # Depart the follower first (simulating follower clean exit via depart_worker).
         crashed.factory.run_coordination.depart_worker(
-            worker_id=follower_id,
+            member_token=follower_token,
         )
         follower_row_departed = next(w for w in _run_workers(crashed.db, crashed.run_id) if w["worker_id"] == follower_id)
         assert follower_row_departed["status"] == "departed"
