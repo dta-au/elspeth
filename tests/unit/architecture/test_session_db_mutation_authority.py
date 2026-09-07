@@ -4234,54 +4234,33 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # there is no authority under which it could be fenced -- the only fence
     # available is the membership fence that just refused it.
     #
-    # What makes "reviewed" correct rather than convenient is a CONSUMER fact,
-    # not a property of the read: the snapshot's seat fields are unfenced and
-    # may be stale the instant they are read, and the deposed-latch in
-    # RunHeartbeatThread._beat_once would be a genuine fail-open if it acted on
-    # them. It cannot: worker_active=False latches coordination-lost and
-    # RETURNS before any seat field is examined. That is the whole argument,
-    # and it is conditional -- a future consumer that reads leader_worker_id or
-    # seat_live from a worker_active=False snapshot would invalidate this
-    # entry, not merely extend it.
+    # THE JUSTIFICATION ABOVE IS DOMAIN FACTS ONLY, AND DELIBERATELY SO.
+    # The method's own design is disputed -- the agent that wrote it argued the
+    # refusal path should not carry seat fields at all, and separately that its
+    # audit-integrity verdict now crosses a transaction boundary. That dispute
+    # and its measured, CONTINGENT verdict live on the method itself, and are
+    # tracked as elspeth-9c4f6c43a7. They are cited here as a POINTER and form
+    # no part of this entry's justification.
     #
-    # A SECOND objection, raised by the agent that wrote the method and NOT
-    # answered by the argument above, is recorded here because it is about the
-    # method rather than about this classification. The AuditIntegrityError for
-    # an absent role row is now reached from an unfenced read in a SECOND
-    # transaction, where the same check previously sat inside the single write
-    # transaction. That is a real structural change and it opens a window in
-    # which a row vanishing between the two would be reported as audit
-    # corruption rather than as a lost race.
-    #
-    # The window is currently UNREACHABLE, and that is measured rather than
-    # assumed. Enumerating every DML verb applied to run_workers across all of
-    # src/ -- enumerating, not searching for the spelling one expects, because
-    # finding no `delete(run_workers_table)` would only prove that string was
-    # absent -- the verb set is {insert, update}:
-    #
-    #   1 insert / 7 updates / 0 DELETES, on this tree. The SEVENTH update is
-    #   this lane's own membership fence, in its D7 verify-UPDATE form; the
-    #   pre-membership-fence tree reads 6, so the count is tree-dependent and
-    #   the ZERO is the figure the verdict actually rests on.
-    #
-    # No raw SQL names the table and no retention or purge path touches it.
-    # Single-use identity doctrine is why: departed and evicted rows keep their
-    # row and change status rather than being removed. So a row cannot vanish
-    # between the two reads, and an absent row still means a token for a
-    # registration that never happened -- the corruption the error names.
-    #
-    # If a DELETE on run_workers is ever introduced, that verdict stops being
-    # sound. This note is the condition, kept here rather than in a handover,
-    # because whoever adds that delete will be reading this repository.
+    # Keeping them apart is the point, because the two claims have different
+    # LIFETIMES. The domain claim is unconditional and permanent: this is a
+    # Landscape-engine SELECT. The method's contingent verdict rests on facts
+    # about run_workers that a future commit could change. Braided together, the
+    # commit that invalidated the contingent claim would silently age the
+    # permanent one, and the invalidating condition would end up attached to the
+    # wrong claim. An allowlist entry that also quietly means "and this method
+    # is well designed" is a second source of truth for something nobody wrote
+    # down -- and it fails in the accusing direction, exactly like the duplicated
+    # fence-name set this lane found in the fencing gate.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository._inactive_member_snapshot",
         "<non-session-write-connection>",
         "write_connection",
-        "cef7ee23193b44a9",
+        "008c2f94937aea42",
         1,
         None,
-        line=1132,
+        line=1167,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4292,7 +4271,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1427,
+        line=1462,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4303,7 +4282,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1452,
+        line=1487,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",

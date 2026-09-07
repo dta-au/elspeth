@@ -1128,6 +1128,41 @@ class RunCoordinationRepository:
         refusal event is written. A row that is absent altogether is
         corruption (a token exists for a registration that never happened or
         was deleted), not a departed member.
+
+        DISPUTED, AND THE VERDICT BELOW IS CONTINGENT (elspeth-9c4f6c43a7).
+        Two objections stand against this method, both raised by its own author:
+
+        1. The seat fields are decorative on this path. They are read for a
+           worker the fence has just proven holds no membership, and exist only
+           to fill a frozen dataclass. They are not consumed:
+           ``RunHeartbeatThread._beat_once`` latches on ``worker_active=False``
+           and RETURNS before the deposed-latch examines any seat field. That is
+           safety by consumer behaviour, not by construction, so it is
+           conditional on that consumer not being edited to read them.
+        2. The ``AuditIntegrityError`` for an absent role row is now reached
+           from an UNFENCED read in a SECOND transaction, where the same check
+           previously sat inside the single write transaction. That boundary is
+           new and this change created it. A row vanishing between the two would
+           be reported as audit corruption rather than as a lost race.
+
+        Objection 2's failure mode is UNREACHABLE TODAY, measured rather than
+        assumed. Every DML verb applied to ``run_workers`` across ``src/`` was
+        ENUMERATED -- not searched for by expected spelling, since finding no
+        ``delete(run_workers_table)`` would prove only that one string absent --
+        and the verb set is ``{insert, update}``: 1 insert, 7 updates, ZERO
+        deletes on this tree. The seventh update is the membership fence's own
+        verify-UPDATE, so that count is tree-dependent; the ZERO is what the
+        verdict rests on, and it holds on the pre-fence tree too. No raw SQL
+        names the table and no retention or purge path touches it. Single-use
+        identity is why: departed and evicted rows keep their row and change
+        status rather than being removed. So a row cannot vanish between the two
+        reads, and an absent row still means a registration that never happened.
+
+        **A DELETE on ``run_workers`` invalidates objection 2's verdict.** This
+        note is that condition, kept beside the code because whoever adds such a
+        delete will be reading this repository, not a ticket. The proposed
+        narrowing -- a refusal return carrying no seat fields, or carrying them
+        as unknown -- is endorsed and unimplemented.
         """
         with self._engine.connect() as conn:
             database_now = read_landscape_transaction_time(conn)
