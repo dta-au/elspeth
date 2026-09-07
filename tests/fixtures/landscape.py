@@ -372,6 +372,43 @@ def insert_crashed_leader_seat(conn: Any, *, run_id: str) -> None:
     )
 
 
+def reseat_crashed_leader(db: LandscapeDB, run_id: str) -> None:
+    """Turn a VACATED seat back into the lapsed image a crashed leader leaves.
+
+    A run the engine drove to completion released its seat on teardown
+    (``leader_worker_id`` NULL). A fixture that then rewrites that run as a
+    crashed mid-run image (deleting outcomes, writing a checkpoint, flipping
+    the status to FAILED) needs a dead incumbent again: checkpoint writes are
+    leader-fenced and read the seat back (ADR-048 §5), and the resume
+    takeover CAS requires a vacant-or-expired seat. This installs the same
+    image :func:`insert_crashed_leader_seat` writes for raw-SQL runs, on the
+    existing row; it refuses to depose a live or vacant-but-never-minted seat.
+    """
+    from sqlalchemy import select, update
+
+    from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+    from elspeth.core.landscape.schema import run_coordination_table
+
+    with db.engine.begin() as conn:
+        seat = conn.execute(
+            select(run_coordination_table.c.leader_worker_id).where(run_coordination_table.c.run_id == run_id)
+        ).one_or_none()
+        if seat is None:
+            raise AssertionError(f"run {run_id!r} has no run_coordination seat row to reseat; begin_run mints one")
+        if seat.leader_worker_id is not None:
+            raise AssertionError(f"run {run_id!r} seat is held by {seat.leader_worker_id!r}; reseat only a vacated seat")
+        lapsed = read_landscape_transaction_time(conn) - timedelta(seconds=1)
+        conn.execute(
+            update(run_coordination_table)
+            .where(run_coordination_table.c.run_id == run_id)
+            .values(
+                leader_worker_id=f"worker:{run_id}:crashed-leader",
+                leader_heartbeat_expires_at=lapsed,
+                updated_at=lapsed,
+            )
+        )
+
+
 def leader_token_for(db: LandscapeDB, run_id: str) -> CoordinationToken:
     """The run's OWN leader token, read back from its ``run_coordination`` seat.
 

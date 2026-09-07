@@ -912,6 +912,7 @@ class TestResumeFinalizesAsFailed:
                 recovery_manager=MagicMock(spec=RecoveryManager),
                 resume_checkpoint_id="checkpoint-blocked-work",
                 schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+                coordination_token=CoordinationToken(run_id="run-with-blocked-work", worker_id="worker:test", leader_epoch=1),
             )
 
         assert isinstance(exc_info.value.__cause__, OrchestrationInvariantError)
@@ -972,6 +973,7 @@ class TestResumeFinalizesAsFailed:
                 recovery_manager=MagicMock(spec=RecoveryManager),
                 resume_checkpoint_id="checkpoint-runtime-preflight-fails",
                 schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+                coordination_token=CoordinationToken(run_id="run-resume-runtime-preflight-fails", worker_id="worker:test", leader_epoch=1),
             )
 
         source.on_complete.assert_not_called()
@@ -1036,6 +1038,7 @@ class TestResumeFinalizesAsFailed:
                         recovery_manager=MagicMock(spec=RecoveryManager),
                         resume_checkpoint_id="checkpoint-clean-boundary",
                         schema_contracts_by_source={NodeID("source"): MagicMock(spec=SchemaContract)},
+                        coordination_token=CoordinationToken(run_id="run-resume-clean-boundary", worker_id="worker:test", leader_epoch=1),
                     )
 
         source.on_complete.assert_not_called()
@@ -2006,8 +2009,9 @@ class TestResumeFinalizesAsFailed:
         assert barrier_restore.resume_checkpoint_id == "cp-buffered-only"
         assert barrier_restore.barrier_scalars is scalars
         assert dict(barrier_restore.batch_id_remap) == {"batch-dead": "batch-retry"}
-        # Checkpoints are deleted only AFTER the processing path completed.
-        delete_checkpoints.assert_called_once_with(run_id)
+        # Checkpoints are deleted only AFTER the processing path completed,
+        # under the seat the takeover returned (ADR-048 §3).
+        delete_checkpoints.assert_called_once_with(coordination_token=coordination_token)
         assert result.status == RunStatus.EMPTY
 
     def test_all_rows_processed_resume_replays_structural_counters_from_audit(self) -> None:

@@ -67,7 +67,6 @@ _CLOCK_AUTHORITY_VERBS = frozenset(
 )
 
 _SENSITIVE_SYMBOLS = _CLOCK_AUTHORITY_VERBS | {
-    "CheckpointManager._fenced_or_plain_write",
     "CheckpointManager.delete_checkpoints",
     "FollowerProcessor._best_effort_depart",
     "FollowerProcessor._drain_loop",
@@ -133,7 +132,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fenced_leader_transaction, and every fence reads the Landscape clock to verify-and-
 # extend the seat — so fencing a verb makes it a clock boundary even when the verb's
 # own UPDATE writes no timestamp. Re-derived from the printed output.
-# SINKFX (elspeth-43ddb79074, ADR-048 D8.5): ba944a5b… → the value below, +4 identities:
+# SINKFX (elspeth-43ddb79074, ADR-048 D8.5): ba944a5b… → 81fd6c8f…, +4 identities:
 # begin_attempt, record_attempt_result, reserve and _reserve_export gained
 # fenced_leader_transaction, and the same rule applies — the fence's verify-and-extend
 # reads the Landscape clock, so fencing a verb makes it a clock boundary. The identity
@@ -141,6 +140,17 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # digest was re-derived by RUNNING the gate on the merged tree, because it hashes the
 # source tree's DISCOVERY ORDER rather than this literal, so it cannot be computed by
 # reasoning about rows and the literal's own row order is not load-bearing.
+# CKPT-SNAP (elspeth-43ddb79074, ADR-048 D8.5): 81fd6c8f… → the value below.
+# +2 identities: the audit-export registry's two public write verbs,
+# register_candidate and register_verified_candidate, each open their OWN
+# fenced_leader_transaction over one shared connection helper, so each reads the
+# Landscape clock to judge the seat it extends — boundaries purely because they fence,
+# since the snapshot and chunk rows they write carry no authority timestamp.
+# −1 identity: CheckpointManager._fenced_or_plain_write is DELETED with its method, so
+# its row goes with it. THIS LANE IS THE ONLY ONE CARRYING A MINUS TERM: a mechanical
+# union of the row sets resurrects a row whose definition no longer exists, and the
+# gate then reports it as stale rather than as a merge artefact. Row set is therefore
+# UNION MINUS DELETIONS: 90 (tip at landing) + 2 − 1 = 91.
 _CLOCK_BOUNDARY_DIGEST = "81fd6c8f20c2dcdc6300aa8281766d9ea78a33ea5fc1e58d9e409a86e3a2fba7"
 
 
@@ -202,7 +212,6 @@ class _FunctionRecord:
 # authority definition requires an explicit review of this gate.
 _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
     {
-        ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager._fenced_or_plain_write"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.create_checkpoint"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
@@ -305,7 +314,6 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
 # no direct SQL decision.
 _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
     {
-        ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager._fenced_or_plain_write"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.acquire_lease"),
@@ -4136,7 +4144,7 @@ class Harmless:
 def test_required_authority_boundary_injection_cannot_mask_a_deleted_definition() -> None:
     path = "src/elspeth/core/checkpoint/manager.py"
     missing = _missing_required_boundaries({path: "def unrelated(): pass"})
-    assert (path, "CheckpointManager._fenced_or_plain_write") in missing
+    assert (path, "CheckpointManager.delete_checkpoints") in missing
     assert not _discover_authority_boundaries({path: "def unrelated(): pass"})
 
 
@@ -5803,7 +5811,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
 
         monkeypatch.setattr(checkpoint_module, "datetime", SessionsDateTime)
         landscape_before = database_now()
-        CheckpointManager(db).delete_checkpoints(run_id, coordination_token=token)
+        CheckpointManager(db).delete_checkpoints(coordination_token=token)
         landscape_after = database_now()
         with db.engine.connect() as connection:
             checkpoint_fence_expiry = connection.execute(

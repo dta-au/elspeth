@@ -36,13 +36,13 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts import Checkpoint, Determinism, NodeType, RunStatus
-from elspeth.contracts.barrier_scalars import BarrierScalars
 from elspeth.core.canonical import stable_hash
 from elspeth.core.checkpoint import CheckpointCompatibilityValidator, CheckpointManager
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import nodes_table, rows_table, runs_table, tokens_table
-from tests.helpers.checkpoint import checkpoint_draft
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_token_for
+from tests.helpers.checkpoint import create_checkpoint
 from tests.strategies.json import json_primitives
 
 # =============================================================================
@@ -83,24 +83,6 @@ def create_test_graph(num_transforms: int = 2) -> ExecutionGraph:
     graph.add_edge(prev, "sink", label="continue")
 
     return graph
-
-
-def create_checkpoint(
-    manager: CheckpointManager,
-    *,
-    run_id: str,
-    sequence_number: int,
-    graph: ExecutionGraph,
-    barrier_scalars: BarrierScalars | None = None,
-) -> Checkpoint:
-    return manager.create_checkpoint(
-        draft=checkpoint_draft(
-            run_id=run_id,
-            sequence_number=sequence_number,
-            graph=graph,
-            barrier_scalars=barrier_scalars,
-        )
-    )
 
 
 def create_test_db() -> tuple[LandscapeDB, Path]:
@@ -146,6 +128,9 @@ def setup_checkpoint_prerequisites(
                 openrouter_catalog_source="bundled",
             )
         )
+        # A raw-SQL run has no seat; checkpoint writes read the run's seat
+        # back (ADR-048 §5), so leave the one a crashed leader would have left.
+        insert_crashed_leader_seat(conn, run_id=run_id)
 
         # 2. Create source node (needed for rows FK)
         conn.execute(
@@ -556,9 +541,16 @@ class TestCheckpointCreationProperties:
         db, _ = create_test_db()
         try:
             manager = CheckpointManager(db)
+            # A real seat, read back (ADR-048 §5) — never minted here. The draft
+            # type check raises before the token reaches the fence, so this
+            # proves the refusal is the DRAFT's, not a missing-seat accident.
+            setup_checkpoint_prerequisites(db, "test-run-draft")
 
             with pytest.raises(TypeError, match="draft must be CheckpointDraft"):
-                manager.create_checkpoint(draft=None)  # type: ignore[arg-type]
+                manager.create_checkpoint(
+                    draft=None,  # type: ignore[arg-type]
+                    coordination_token=leader_token_for(db, "test-run-draft"),
+                )
         finally:
             db.close()
 

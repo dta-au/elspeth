@@ -835,7 +835,7 @@ class ResumeCoordinator:
         # Delete checkpoints on successful completion. LEADER WORK: the
         # delete is epoch-fenced (ADR-030 §C.4 row 5) and must run BEFORE
         # the seat release vacates the fence's CAS target.
-        self._checkpoints.delete_checkpoints(run_id)
+        self._checkpoints.delete_checkpoints(coordination_token=coordination_token)
 
         # ADR-030 §A.3: stop the heartbeat thread BEFORE releasing the
         # seat — the thread must not beat the seat after it is vacated.
@@ -1017,9 +1017,8 @@ class ResumeCoordinator:
                 "reconstruct_resume_state — acquire_run_leadership must always return "
                 "a token or raise; a None result is an orchestration invariant violation."
             )
-        # Thread the token to the collaborators the slice-2 step-4 fences
-        # consume (checkpoint writes, finalize, ceremonies).
-        self._checkpoints.bind_coordination(coordination_token)
+        # The token reaches every fenced collaborator (checkpoint writes,
+        # finalize, ceremonies) as a parameter of the call, by value (ADR-048 §3).
         schema_contracts_by_source = state.schema_contracts_by_source
         unprocessed_rows = state.unprocessed_rows
         # F1 fix: pre-computed by _reconstruct_resume_state; forwarded to the loop.
@@ -1259,10 +1258,14 @@ class ResumeCoordinator:
         resume_checkpoint_id: str,
         schema_contracts_by_source: Mapping[NodeID, SchemaContract],
         shutdown_event: threading.Event | None = None,
-        coordination_token: CoordinationToken | None = None,
+        coordination_token: CoordinationToken,
         check_coordination_latch: Callable[[], None] | None = None,
     ) -> RunResult:
         """Process unprocessed rows during resume.
+
+        ``coordination_token`` is the seat the resume takeover CAS returned;
+        it reaches every checkpoint write as a parameter, by value
+        (ADR-048 §3) — resume is leader-only, so there is no tokenless arm.
 
         Mirrors _execute_run() structure but with resume-specific divergences
         documented in the accounting block below. Returns RunStatus.RUNNING —
@@ -1369,9 +1372,12 @@ class ResumeCoordinator:
                     artifacts.sink_id_map,
                     artifacts.edge_map,
                     interrupted,
-                    on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(run_id, run_ctx.processor),
+                    on_token_written_factory=self._checkpoints.make_checkpoint_after_sink_factory(
+                        run_ctx.processor, coordination_token=coordination_token
+                    ),
                     scheduler_terminalizer=run_ctx.processor,
                     check_coordination_latch=check_coordination_latch,
+                    coordination_token=coordination_token,
                 )
 
                 # ADR-019 Phase 4: resumed row processing reaches stable I1a/I1b

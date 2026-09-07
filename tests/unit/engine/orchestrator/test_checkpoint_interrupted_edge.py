@@ -44,7 +44,7 @@ class _ScalarProcessor:
         return self.barrier_scalars
 
 
-def _make_coordinator(run_id: str) -> CheckpointCoordinator:
+def _make_coordinator() -> CheckpointCoordinator:
     config = RuntimeCheckpointConfig(enabled=True, frequency=1, checkpoint_interval=None)
     coordinator = CheckpointCoordinator(
         checkpoint_manager=create_autospec(CheckpointManager, instance=True, spec_set=True),
@@ -53,10 +53,13 @@ def _make_coordinator(run_id: str) -> CheckpointCoordinator:
     graph = ExecutionGraph()
     graph.add_node("source", node_type=NodeType.SOURCE, plugin_name="test", config={})
     coordinator.set_active_graph(graph)
-    # Checkpoint writes fail closed without a leader token bound to the run
-    # being written (elspeth-fab455790d).
-    coordinator.bind_coordination(CoordinationToken(run_id=run_id, worker_id="test-leader", leader_epoch=1))
     return coordinator
+
+
+def _token(run_id: str) -> CoordinationToken:
+    # The manager is an autospec double, so there is no seat to read back;
+    # the coordinator forwards whatever token the drain hands it (ADR-048 §3).
+    return CoordinationToken(run_id=run_id, worker_id="test-leader", leader_epoch=1)
 
 
 def _loop_ctx(
@@ -89,13 +92,10 @@ class TestFlushEmptiedAggregationCheckpoints:
         nodes, so the checkpoint is still written with an empty BarrierScalars
         (``has_state`` False → the manager persists NULL).
         """
-        coordinator = _make_coordinator("run-counter-only")
+        coordinator = _make_coordinator()
         loop_ctx = _loop_ctx({})  # executor emitted nothing — no latched nodes
 
-        coordinator.checkpoint_interrupted_progress(
-            run_id="run-counter-only",
-            loop_ctx=loop_ctx,
-        )
+        coordinator.checkpoint_interrupted_progress(loop_ctx, coordination_token=_token("run-counter-only"))  # type: ignore[arg-type]
 
         coordinator._checkpoint_manager.create_checkpoint.assert_called_once()
         kwargs = coordinator._checkpoint_manager.create_checkpoint.call_args.kwargs
@@ -108,15 +108,12 @@ class TestFlushEmptiedAggregationCheckpoints:
         The executor's get_barrier_scalars() already filters to latched nodes;
         the projection must carry them through verbatim.
         """
-        coordinator = _make_coordinator("run-mixed-agg")
+        coordinator = _make_coordinator()
         loop_ctx = _loop_ctx(
             {NodeID("agg_latched"): AggregationNodeScalars(count_fire_offset=0.25, condition_fire_offset=None)},
         )
 
-        coordinator.checkpoint_interrupted_progress(
-            run_id="run-mixed-agg",
-            loop_ctx=loop_ctx,
-        )
+        coordinator.checkpoint_interrupted_progress(loop_ctx, coordination_token=_token("run-mixed-agg"))  # type: ignore[arg-type]
 
         coordinator._checkpoint_manager.create_checkpoint.assert_called_once()
         kwargs = coordinator._checkpoint_manager.create_checkpoint.call_args.kwargs
@@ -128,16 +125,16 @@ class TestFlushEmptiedAggregationCheckpoints:
 
     def test_no_buffered_tokens_anywhere_still_checkpoints(self) -> None:
         """No latched barriers and no pending sink tokens: the shutdown
-        checkpoint is still written (the former no-anchor skip arm is gone)."""
-        coordinator = _make_coordinator("run-no-anchor")
+        checkpoint is still written (the former no-anchor skip arm is gone),
+        addressed to the token's run (ADR-048 §2)."""
+        coordinator = _make_coordinator()
         loop_ctx = _loop_ctx({})
+        token = _token("run-no-anchor")
 
-        coordinator.checkpoint_interrupted_progress(
-            run_id="run-no-anchor",
-            loop_ctx=loop_ctx,
-        )
+        coordinator.checkpoint_interrupted_progress(loop_ctx, coordination_token=token)  # type: ignore[arg-type]
 
         coordinator._checkpoint_manager.create_checkpoint.assert_called_once()
         kwargs = coordinator._checkpoint_manager.create_checkpoint.call_args.kwargs
         assert kwargs["draft"].run_id == "run-no-anchor"
+        assert kwargs["coordination_token"] is token
         assert kwargs["draft"].barrier_scalars.has_state is False

@@ -88,7 +88,8 @@ def _build_open_effect_run(
         )
         if with_checkpoint:
             CheckpointManager(db).create_checkpoint(
-                draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH)
+                draft=CheckpointDraft(run_id=run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH),
+                coordination_token=leader_coordination_token(factory, run_id),
             )
         _row, token = factory.data_flow.create_row_with_token(
             run_id,

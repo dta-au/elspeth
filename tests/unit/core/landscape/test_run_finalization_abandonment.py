@@ -66,7 +66,8 @@ def _setup_run_with_tokens(
     )
     if with_checkpoint:
         CheckpointManager(setup.db).create_checkpoint(
-            draft=CheckpointDraft(run_id=setup.run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH)
+            draft=CheckpointDraft(run_id=setup.run_id, sequence_number=0, upstream_topology_hash=_TOPOLOGY_HASH),
+            coordination_token=setup.coordination_token,
         )
     token_ids: list[str] = []
     for index in range(token_count):

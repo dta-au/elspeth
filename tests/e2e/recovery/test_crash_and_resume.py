@@ -73,7 +73,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import leader_coordination_token, make_factory
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -1178,6 +1178,10 @@ class TestCheckpointRecovery:
                     openrouter_catalog_source="bundled",
                 )
             )
+            # A raw-SQL run has no seat; the checkpoint below is written under the
+            # lapsed seat its crashed leader left (ADR-048 §5 read-back), which is
+            # also what the resume takeover CAS requires.
+            insert_crashed_leader_seat(conn, run_id=run_id)
 
             conn.execute(
                 nodes_table.insert().values(
@@ -1316,6 +1320,10 @@ class TestCheckpointRecovery:
                     openrouter_catalog_source="bundled",
                 )
             )
+            # A raw-SQL run has no seat; the checkpoint below is written under the
+            # lapsed seat its crashed leader left (ADR-048 §5 read-back), which is
+            # also what the resume takeover CAS requires.
+            insert_crashed_leader_seat(conn, run_id=run_id)
 
             conn.execute(
                 nodes_table.insert().values(
