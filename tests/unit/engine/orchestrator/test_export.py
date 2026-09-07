@@ -28,6 +28,7 @@ from pydantic import ValidationError
 
 from elspeth.contracts import CallType, Determinism, NodeType
 from elspeth.contracts.audit_export import AuditExportContentStoreResolver
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.plugin_context import PluginContext
@@ -160,12 +161,28 @@ _TEST_AUDIT_CONTENT_STORE_RESOLVER = AuditExportContentStoreResolver()
 _TEST_AUDIT_CONTENT_STORE_RESOLVER.register(_TEST_AUDIT_CONTENT_STORE)
 
 
+def _export_seat_token(args: tuple[Any, ...], kwargs: dict[str, Any]) -> CoordinationToken:
+    """The export seat these scenarios act under (ADR-048 §4).
+
+    Constructed rather than read back from the seat, deliberately: this module
+    drives ``export_landscape`` against resource doubles with no Landscape
+    behind them — several scenarios pass ``object()`` as the database — so
+    there is no ``run_coordination`` row a read-back could return. The real
+    seat is covered where a real one exists, by
+    ``tests/integration/pipeline/test_audit_export_effect_recovery.py`` and the
+    e2e export suites.
+    """
+    run_id = kwargs["run_id"] if "run_id" in kwargs else args[1]
+    return CoordinationToken(run_id=run_id, worker_id=kwargs["worker_id"], leader_epoch=1)
+
+
 def export_landscape(*args: Any, **kwargs: Any) -> None:
     """Keep existing unit scenarios explicit without repeating resource doubles."""
     kwargs.setdefault("payload_store", _TEST_PAYLOAD_STORE)
     kwargs.setdefault("audit_export_content_store", _TEST_AUDIT_CONTENT_STORE)
     kwargs.setdefault("audit_export_content_store_resolver", _TEST_AUDIT_CONTENT_STORE_RESOLVER)
     kwargs.setdefault("worker_id", "runtime-worker")
+    kwargs.setdefault("coordination_token", _export_seat_token(args, kwargs))
     _production_export_landscape(*args, **kwargs)
 
 
@@ -371,6 +388,7 @@ class _LegacyExportLandscapeJSON:
                 audit_export_content_store=audit_content_store,
                 audit_export_content_store_resolver=audit_content_store_resolver,
                 worker_id="runtime-worker",
+                coordination_token=CoordinationToken(run_id="run-1", worker_id="runtime-worker", leader_epoch=1),
             )
 
         recorder_factory.assert_called_once_with(exporter.call_args.args[0], payload_store=payload_store)

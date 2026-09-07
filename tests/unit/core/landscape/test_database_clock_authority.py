@@ -28,6 +28,7 @@ from typing import Any
 
 import pytest
 
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.tree_gate import iter_gate_files
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -132,7 +133,15 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # fenced_leader_transaction, and every fence reads the Landscape clock to verify-and-
 # extend the seat — so fencing a verb makes it a clock boundary even when the verb's
 # own UPDATE writes no timestamp. Re-derived from the printed output.
-_CLOCK_BOUNDARY_DIGEST = "ba944a5b536c57c97165469b7d237ef72ccd0c3eb4b3bf24e665bbbcff137c74"
+# SINKFX (elspeth-43ddb79074, ADR-048 D8.5): ba944a5b… → the value below, +4 identities:
+# begin_attempt, record_attempt_result, reserve and _reserve_export gained
+# fenced_leader_transaction, and the same rule applies — the fence's verify-and-extend
+# reads the Landscape clock, so fencing a verb makes it a clock boundary. The identity
+# rows below are the UNION of both lanes' additions (86 at the tip + 4 = 90); this
+# digest was re-derived by RUNNING the gate on the merged tree, because it hashes the
+# source tree's DISCOVERY ORDER rather than this literal, so it cannot be computed by
+# reasoning about rows and the literal's own row order is not load-bearing.
+_CLOCK_BOUNDARY_DIGEST = "55c0ef02a6575deabd6ea9ed00ec156b5f0f210a3483392dce9a7caf8a1690dd"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -205,12 +214,16 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization._validate_effect_authority"),
         ("src/elspeth/core/landscape/execution/sink_effect_finalization.py", "SinkEffectFinalization.finalize"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.acquire_lease"),
+        ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.begin_attempt"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.claim_preparation"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.complete_member_result"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.complete_plan"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.heartbeat_lease"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.mark_response_lost"),
+        ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.record_attempt_result"),
         ("src/elspeth/core/landscape/execution/sink_effect_lifecycle.py", "SinkEffectLifecycle.takeover_expired"),
+        ("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "SinkEffectReservation._reserve_export"),
+        ("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "SinkEffectReservation.reserve"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.acquire_lease"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.claim_preparation"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.heartbeat_lease"),
@@ -5897,7 +5910,9 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             replacing_target=False,
             primary_effect_id=None,
         )
-        effect = factory.execution.sink_effects.reserve(reservation).new_effect
+        effect = factory.execution.sink_effects.reserve(
+            reservation, coordination_token=leader_coordination_token(factory, run_id)
+        ).new_effect
         assert effect is not None
         monkeypatch.setattr(effect_module, "now", lambda: observed_sessions_now)
         landscape_before = database_now()
@@ -5905,6 +5920,7 @@ def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(
             effect.effect_id,
             owner="effect-worker",
             ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, run_id),
         )
         landscape_after = database_now()
         with db.engine.connect() as connection:

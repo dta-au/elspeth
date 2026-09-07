@@ -40,7 +40,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event, insert, select, update
 
-from elspeth.contracts import CheckpointDraft, ExportStatus, NodeType, RunStatus
+from elspeth.contracts import CallType, CheckpointDraft, ExportStatus, NodeType, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import (
@@ -49,11 +49,25 @@ from elspeth.contracts.errors import (
     RunLeadershipLostError,
 )
 from elspeth.contracts.preflight import CommencementGateResult, PreflightResult
+from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.scheduler import BlockedPendingSinkHandoff, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+from elspeth.contracts.sink_effects import (
+    SINK_EFFECT_PROTOCOL_VERSION,
+    SinkEffectAttemptAction,
+    SinkEffectCommitResult,
+    SinkEffectDescriptorMode,
+    SinkEffectFinalizationMember,
+    SinkEffectFinalizeRequest,
+    SinkEffectInputKind,
+    SinkEffectInspectionMode,
+    SinkEffectLease,
+    SinkEffectPlan,
+)
 from elspeth.core.checkpoint.manager import CheckpointManager
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectAttemptRequest, SinkEffectAttemptResult
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -72,12 +86,18 @@ from elspeth.core.landscape.schema import (
     runs_table,
     scheduler_events_table,
     secret_resolutions_table,
+    sink_effect_attempts_table,
+    sink_effect_export_snapshots_table,
+    sink_effect_members_table,
+    sink_effect_streams_table,
+    sink_effects_table,
     token_outcomes_table,
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import expire_lease, make_landscape_db
+from tests.fixtures.landscape import expire_lease, leader_coordination_token, make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
+from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
 RUN_ID = "run-fence-1"
 OTHER_RUN_ID = "run-fence-2"
@@ -153,6 +173,117 @@ def _run_lifecycle_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ..
     snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
     with db.engine.connect() as conn:
         for table in (runs_table, run_sources_table, secret_resolutions_table, preflight_results_table):
+            snapshot[table.name] = tuple(tuple(row) for row in conn.execute(select(table).order_by(*table.primary_key.columns)).all())
+    return snapshot
+
+
+_STALE_EFFECT_ID = "a" * 64
+_STALE_ATTEMPT_ID = "b" * 64
+
+
+def _bump_epoch_for(db: LandscapeDB, run_id: str) -> None:
+    """Depose the leader of an arbitrary run (the RUN_ID-bound sibling of :func:`_bump_epoch`)."""
+    with db.engine.begin() as conn:
+        conn.execute(
+            update(run_coordination_table)
+            .where(run_coordination_table.c.run_id == run_id)
+            .values(leader_epoch=run_coordination_table.c.leader_epoch + 1)
+        )
+
+
+def _fence_refusals_for(db: LandscapeDB, run_id: str, verb: str) -> list[dict[str, object]]:
+    """:func:`_fence_refusals` for a run other than ``RUN_ID``."""
+    with db.engine.connect() as conn:
+        rows = (
+            conn.execute(
+                select(run_coordination_events_table)
+                .where(run_coordination_events_table.c.run_id == run_id)
+                .where(run_coordination_events_table.c.event_type == "fence_refusal")
+            )
+            .mappings()
+            .all()
+        )
+    return [dict(row) for row in rows if json.loads(str(row["context_json"]))["verb"] == verb]
+
+
+def _stale_plan() -> SinkEffectPlan:
+    return SinkEffectPlan(
+        effect_id=_STALE_EFFECT_ID,
+        protocol_version=SINK_EFFECT_PROTOCOL_VERSION,
+        input_kind=SinkEffectInputKind.PIPELINE_MEMBERS,
+        descriptor_mode=SinkEffectDescriptorMode.RESULT_DERIVED,
+        inspection_mode=SinkEffectInspectionMode.NO_INSPECTION_REQUIRED,
+        target="file:///tmp/stale.jsonl",
+        plan_hash="e" * 64,
+        payload_hash="f" * 64,
+        expected_descriptor=None,
+        safe_evidence={"inspection_reference": "no-inspection-required:v1"},
+    )
+
+
+def _stale_lease() -> SinkEffectLease:
+    return SinkEffectLease(effect_id=_STALE_EFFECT_ID, owner="worker-a", generation=1, expires_at=NOW)
+
+
+def _stale_descriptor() -> ArtifactDescriptor:
+    return ArtifactDescriptor(
+        artifact_type="file",
+        path_or_uri="file:///tmp/stale.jsonl",
+        content_hash="1" * 64,
+        size_bytes=7,
+    )
+
+
+def _stale_attempt_request() -> SinkEffectAttemptRequest:
+    return SinkEffectAttemptRequest(
+        effect_id=_STALE_EFFECT_ID,
+        member_ordinal=None,
+        generation=1,
+        action=SinkEffectAttemptAction.COMMIT,
+        call_kind=CallType.FILESYSTEM,
+        request_hash="2" * 64,
+    )
+
+
+def _stale_attempt_result() -> SinkEffectAttemptResult:
+    return SinkEffectAttemptResult(attempt_id=_STALE_ATTEMPT_ID, evidence={}, latency_ms=1.0)
+
+
+def _stale_commit_result() -> SinkEffectCommitResult:
+    return SinkEffectCommitResult(
+        descriptor=_stale_descriptor(),
+        evidence={},
+        accepted_ordinals=(),
+        diverted_ordinals=(),
+    )
+
+
+def _stale_finalize_request() -> SinkEffectFinalizeRequest:
+    return SinkEffectFinalizeRequest(
+        effect_id=_STALE_EFFECT_ID,
+        lease_owner="worker-a",
+        generation=1,
+        descriptor=_stale_descriptor(),
+        publication_performed=True,
+        publication_evidence_kind="returned",
+        accepted_ordinals=(),
+        diverted_ordinals=(),
+        evidence={},
+        members=(),
+    )
+
+
+def _sink_effect_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ...], ...]]:
+    """Every table a sink-effect writer can touch, as a complete image."""
+    snapshot: dict[str, tuple[tuple[object, ...], ...]] = {}
+    with db.engine.connect() as conn:
+        for table in (
+            sink_effects_table,
+            sink_effect_members_table,
+            sink_effect_attempts_table,
+            sink_effect_streams_table,
+            sink_effect_export_snapshots_table,
+        ):
             snapshot[table.name] = tuple(tuple(row) for row in conn.execute(select(table).order_by(*table.primary_key.columns)).all())
     return snapshot
 
@@ -943,6 +1074,152 @@ class TestStaleTokenFenceRefusals:
             rows = conn.execute(select(rows_table.c.row_id)).scalars().all()
         assert rows == []
         assert len(_fence_refusals(db, "create_row_with_token")) == 1
+
+    @pytest.mark.parametrize(
+        ("verb", "call"),
+        (
+            pytest.param(
+                "claim_preparation",
+                lambda effects, token: effects.claim_preparation(
+                    _STALE_EFFECT_ID, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="claim_preparation",
+            ),
+            pytest.param(
+                "complete_plan",
+                lambda effects, token: effects.complete_plan(
+                    _STALE_EFFECT_ID, _stale_plan(), claim=_stale_lease(), coordination_token=token
+                ),
+                id="complete_plan",
+            ),
+            pytest.param(
+                "acquire_lease",
+                lambda effects, token: effects.acquire_lease(
+                    _STALE_EFFECT_ID, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="acquire_lease",
+            ),
+            pytest.param(
+                "heartbeat_lease",
+                lambda effects, token: effects.heartbeat_lease(
+                    _STALE_EFFECT_ID, owner="worker-a", generation=1, ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="heartbeat_lease",
+            ),
+            pytest.param(
+                "takeover_expired",
+                lambda effects, token: effects.takeover_expired(
+                    _STALE_EFFECT_ID, owner="worker-b", ttl=timedelta(seconds=30), coordination_token=token
+                ),
+                id="takeover_expired",
+            ),
+            pytest.param(
+                "begin_attempt",
+                lambda effects, token: effects.begin_attempt(_stale_attempt_request(), coordination_token=token),
+                id="begin_attempt",
+            ),
+            pytest.param(
+                "record_attempt_result",
+                lambda effects, token: effects.record_attempt_result(_stale_attempt_result(), coordination_token=token),
+                id="record_attempt_result",
+            ),
+            pytest.param(
+                "complete_member_result",
+                lambda effects, token: effects.complete_member_result(
+                    _STALE_ATTEMPT_ID, _stale_commit_result(), lease=_stale_lease(), coordination_token=token
+                ),
+                id="complete_member_result",
+            ),
+            pytest.param(
+                "mark_response_lost",
+                lambda effects, token: effects.mark_response_lost(_STALE_ATTEMPT_ID, coordination_token=token),
+                id="mark_response_lost",
+            ),
+        ),
+    )
+    def test_sink_effect_verb_refused(self, db: LandscapeDB, token: CoordinationToken, verb: str, call: Any) -> None:
+        """ADR-048 D8.5: every SinkEffectRepository writer fences FIRST — a deposed leader writes nothing.
+
+        The arguments name rows that do not exist. That is the point: the
+        fence is the first statement of the verb's IMMEDIATE transaction, so
+        a deposed leader is refused BEFORE any effect lookup could report
+        "no such effect". A verb that reported the missing row instead would
+        prove the fence had moved off first position.
+        """
+        factory = RecorderFactory(db)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch(db)
+        with pytest.raises(RunLeadershipLostError) as raised:
+            call(factory.execution.sink_effects, token)
+        assert raised.value.verb == verb
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must leave every sink-effect table untouched"
+        assert len(_fence_refusals(db, verb)) == 1
+
+    def test_sink_effect_reserve_refused(self, db: LandscapeDB) -> None:
+        """``reserve`` fences before it writes the effect, its members or its stream.
+
+        Reserve validates a real member set before the fence, so this arm
+        builds one: the refusal has to come from the deposed epoch, not from
+        a request the constructor would have rejected anyway.
+        """
+        factory = RecorderFactory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        request = _pipeline_request(run_id, sink_id, members)
+        stale = leader_coordination_token(factory, run_id)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch_for(db, run_id)
+
+        with pytest.raises(RunLeadershipLostError) as raised:
+            factory.execution.sink_effects.reserve(request, coordination_token=stale)
+
+        assert raised.value.verb == "reserve"
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must reserve nothing"
+        assert len(_fence_refusals_for(db, run_id, "reserve")) == 1
+
+    def test_sink_effect_finalize_refused(self, db: LandscapeDB) -> None:
+        """``finalize`` fences before the artifact, the member outcomes and the terminal state.
+
+        The optimistic witness is a read-only pre-pass, so the effect must
+        exist for this arm to reach the fence at all; the fence is still the
+        first statement of the write transaction, which is what the refusal
+        proves.
+        """
+        factory = RecorderFactory(db)
+        run_id, sink_id, members = _pipeline_members(factory, 1)
+        valid = leader_coordination_token(factory, run_id)
+        effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members), coordination_token=valid).new_effect
+        assert effect is not None
+        request = SinkEffectFinalizeRequest(
+            effect_id=effect.effect_id,
+            lease_owner=None,
+            generation=effect.generation,
+            descriptor=_stale_descriptor(),
+            publication_performed=True,
+            publication_evidence_kind="returned",
+            accepted_ordinals=(0,),
+            diverted_ordinals=(),
+            evidence={},
+            members=(
+                SinkEffectFinalizationMember(
+                    ordinal=0,
+                    output_data={"ordinal": 0},
+                    duration_ms=1.0,
+                    outcome=TerminalOutcome.SUCCESS,
+                    path=TerminalPath.DEFAULT_FLOW,
+                    sink_name="sink",
+                ),
+            ),
+        )
+        stale = leader_coordination_token(factory, run_id)
+        before = _sink_effect_snapshot(db)
+        _bump_epoch_for(db, run_id)
+
+        with pytest.raises(RunLeadershipLostError) as raised:
+            factory.execution.sink_effects.finalize(request, coordination_token=stale)
+
+        assert raised.value.verb == "finalize"
+        assert _sink_effect_snapshot(db) == before, "a deposed leader must finalize nothing"
+        assert len(_fence_refusals_for(db, run_id, "finalize")) == 1
 
 
 class TestStrictPendingSinkOwnerCAS:

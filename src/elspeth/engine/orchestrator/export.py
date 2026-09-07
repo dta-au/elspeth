@@ -132,10 +132,15 @@ def export_landscape(
     audit_export_content_store: AuditExportContentStore,
     audit_export_content_store_resolver: AuditExportContentStoreResolver,
     worker_id: str,
+    coordination_token: CoordinationToken,
     prepared_binding: SinkEffectRuntimeBinding | None = None,
     sink_effect_admission: object | None = None,
 ) -> None:
     """Export audit trail to configured sink after run completion.
+
+    ``coordination_token`` is the seat the caller holds on ``run_id`` — the
+    run's leader token from the export phase, or the export seat a resume
+    takes (ADR-048 §4) — and every durable sink-effect write fences on it.
 
     For JSON format: writes all records to a single sink (records are
     heterogeneous but JSON handles that naturally).
@@ -282,6 +287,7 @@ def export_landscape(
             sink_node_id=sink.node_id,
             target_config=dict(settings.sinks[sink_name].options),
             worker_id=worker_id,
+            coordination_token=coordination_token,
         )
     finally:
         sink.close()
@@ -445,6 +451,7 @@ def _resume_audit_export_led(
             audit_export_content_store=audit_export_content_store,
             audit_export_content_store_resolver=audit_export_content_store_resolver,
             worker_id=coordination_token.worker_id,
+            coordination_token=coordination_token,
         )
     except Exception as export_error:
         from elspeth.engine.executors.sink_effects import SinkEffectLeaseHeld

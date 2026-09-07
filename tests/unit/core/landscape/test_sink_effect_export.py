@@ -11,7 +11,7 @@ from elspeth.contracts.sink_effects import SinkEffectAttemptAction, SinkEffectAt
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.unit.core.landscape.test_sink_effect_finalization import _prepared
 
 
@@ -37,7 +37,8 @@ def test_export_preserves_abandoned_intent_and_safe_effect_history(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="c" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
     records = list(LandscapeExporter(db)._iter_records(effect.run_id))
@@ -86,7 +87,8 @@ def test_attempt_export_uses_stable_per_effect_call_indexes(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="d" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     second = factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
@@ -96,7 +98,8 @@ def test_attempt_export_uses_stable_per_effect_call_indexes(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="e" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
     attempts = [record for record in LandscapeExporter(db)._iter_records(effect.run_id) if record["record_type"] == "sink_effect_attempt"]

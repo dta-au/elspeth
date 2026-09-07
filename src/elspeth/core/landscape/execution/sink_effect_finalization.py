@@ -14,6 +14,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from elspeth.contracts import NodeStateStatus
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
@@ -52,6 +53,7 @@ from elspeth.core.landscape.model_loaders import (
     SinkEffectLoader,
     TokenOutcomeLoader,
 )
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     artifacts_table,
     node_states_table,
@@ -131,15 +133,26 @@ class SinkEffectFinalization:
         )
         self._artifacts = ArtifactRepository(ops, artifact_loader=self._artifact_loader)
 
-    def finalize(self, request: SinkEffectFinalizeRequest) -> SinkEffectFinalizationResult:
+    def finalize(self, request: SinkEffectFinalizeRequest, *, coordination_token: CoordinationToken) -> SinkEffectFinalizationResult:
+        """Finalize one effect under the run's current leader token (ADR-048).
+
+        The fence is the transaction's first statement on every witness
+        restart, so a deposed leader cannot commit the artifact, the member
+        outcomes, or the effect's terminal state.
+        """
         if type(request) is not SinkEffectFinalizeRequest:
             raise TypeError("request must be exact SinkEffectFinalizeRequest")
         self._validate_outcome_shapes(request)
         for restart in range(_MAX_WITNESS_RESTARTS):
             optimistic = self._resolve_optimistic_witness(request)
             try:
-                with self._db.write_connection() as conn:
-                    result = self._finalize_on(conn, request, optimistic)
+                with fenced_leader_transaction(
+                    self._db.engine,
+                    token=coordination_token,
+                    window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                    verb="finalize",
+                ) as conn:
+                    result = self._finalize_on(conn, request, optimistic, coordination_token=coordination_token)
             except _WitnessChanged:
                 if restart + 1 == _MAX_WITNESS_RESTARTS:
                     raise LandscapeRecordError(
@@ -202,10 +215,18 @@ class SinkEffectFinalization:
         conn: Connection,
         request: SinkEffectFinalizeRequest,
         optimistic: _OptimisticWitness,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectFinalizationResult:
         optimistic_effect = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == request.effect_id)).fetchone()
         if optimistic_effect is None:
             raise LandscapeRecordError("sink effect disappeared before finalization")
+        if optimistic_effect.run_id != coordination_token.run_id:
+            # ADR-048 §2: the token proves leadership of ONE run; finalizing
+            # another run's effect is a cross-run write, refused before any lock.
+            raise LandscapeRecordError(
+                f"sink effect {request.effect_id!r} belongs to run {optimistic_effect.run_id!r}, not the coordination token's run"
+            )
         if optimistic_effect.state == SinkEffectState.FINALIZED.value:
             locked = self._lock_stream_and_effects(conn, optimistic_effect, optimistic.linked_effect_ids)
             effect = locked[request.effect_id]

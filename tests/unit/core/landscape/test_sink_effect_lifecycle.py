@@ -35,7 +35,7 @@ from elspeth.core.landscape.execution.sink_effect_lifecycle import (
 )
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table, operations_table, sink_effects_table
-from tests.fixtures.landscape import expire_sink_effect_lease, make_factory, make_landscape_db
+from tests.fixtures.landscape import expire_sink_effect_lease, leader_coordination_token, make_factory, make_landscape_db
 from tests.unit.core.landscape.test_sink_effect_finalization import _descriptor, _prepared
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
@@ -51,13 +51,20 @@ def db_factory() -> Iterator[tuple[LandscapeDB, RecorderFactory]]:
 
 def _reserved(factory: RecorderFactory):
     run_id, sink_id, members = _pipeline_members(factory, 1)
-    effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members)).new_effect
+    effect = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
     assert effect is not None
     return effect
 
 
-def _claim(factory: RecorderFactory, effect_id: str, *, owner: str = "worker-a"):
-    return factory.execution.sink_effects.claim_preparation(effect_id, owner=owner, ttl=timedelta(seconds=30))
+def _claim(factory: RecorderFactory, effect_id: str, *, run_id: str, owner: str = "worker-a"):
+    return factory.execution.sink_effects.claim_preparation(
+        effect_id,
+        owner=owner,
+        ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
 
 
 def _plan(effect_id: str, *, plan_hash: str = "a" * 64) -> SinkEffectPlan:
@@ -80,7 +87,12 @@ def test_reserved_effect_cannot_lease_before_complete_plan(db_factory: tuple[Lan
     effect = _reserved(factory)
 
     with pytest.raises(LandscapeRecordError, match="prepared"):
-        factory.execution.sink_effects.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+        factory.execution.sink_effects.acquire_lease(
+            effect.effect_id,
+            owner="worker-a",
+            ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
 
 @pytest.mark.parametrize(
@@ -132,8 +144,15 @@ def test_in_flight_effect_rejects_result_fields_before_finalization(
     db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.complete_plan(
+        effect.effect_id,
+        _plan(effect.effect_id),
+        claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
+    repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
 
     with pytest.raises(IntegrityError), db.engine.begin() as conn:
         conn.execute(
@@ -146,14 +165,23 @@ def test_concurrent_plan_cas_accepts_equal_and_rejects_divergent(db_factory: tup
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
 
-    claim = _claim(factory, effect.effect_id)
-    first = repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
-    second = repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
+    claim = _claim(factory, effect.effect_id, run_id=effect.run_id)
+    first = repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=claim, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
+    second = repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=claim, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
 
     assert first == second
     assert first.state is SinkEffectState.PREPARED
     with pytest.raises(AuditIntegrityError, match="divergent plan"):
-        repo.complete_plan(effect.effect_id, _plan(effect.effect_id, plan_hash="c" * 64), claim=claim)
+        repo.complete_plan(
+            effect.effect_id,
+            _plan(effect.effect_id, plan_hash="c" * 64),
+            claim=claim,
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
 
 def test_plan_diversion_requires_exact_durable_attribution(
@@ -173,7 +201,8 @@ def test_plan_diversion_requires_exact_durable_attribution(
         factory.execution.sink_effects.complete_plan(
             effect.effect_id,
             plan,
-            claim=_claim(factory, effect.effect_id),
+            claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
 
 
@@ -183,7 +212,12 @@ def test_inspected_plan_requires_returned_inspection_attempt(db_factory: tuple[L
     inspected = replace(_plan(effect.effect_id), inspection_mode=SinkEffectInspectionMode.INSPECTED)
 
     with pytest.raises(LandscapeRecordError, match="returned inspect"):
-        factory.execution.sink_effects.complete_plan(effect.effect_id, inspected, claim=_claim(factory, effect.effect_id))
+        factory.execution.sink_effects.complete_plan(
+            effect.effect_id,
+            inspected,
+            claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
 
 def test_preparation_claim_is_exclusive_and_fences_plan_bind(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
@@ -192,7 +226,9 @@ def test_preparation_claim_is_exclusive_and_fences_plan_bind(db_factory: tuple[L
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
 
-    claim = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    claim = repo.claim_preparation(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert claim.generation == 1
     claimed = repo.get_effect(effect.effect_id)
     assert claimed is not None
@@ -200,19 +236,33 @@ def test_preparation_claim_is_exclusive_and_fences_plan_bind(db_factory: tuple[L
     assert (claimed.lease_owner, claimed.generation) == ("worker-a", 1)
 
     with pytest.raises(LandscapeRecordError, match="live claim"):
-        repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+        repo.claim_preparation(
+            effect.effect_id,
+            owner="worker-b",
+            ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
     forged = SinkEffectLease(effect.effect_id, "worker-b", claim.generation, claim.expires_at)
     with pytest.raises(LandscapeRecordError, match="preparation claim"):
-        repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=forged)
+        repo.complete_plan(
+            effect.effect_id, _plan(effect.effect_id), claim=forged, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
-    prepared = repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
+    prepared = repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=claim, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert prepared.state is SinkEffectState.PREPARED
     assert prepared.generation == claim.generation
     assert prepared.lease_owner is None
 
     with pytest.raises(LandscapeRecordError, match="reserved effect"):
-        repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+        repo.claim_preparation(
+            effect.effect_id,
+            owner="worker-b",
+            ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
 
 def test_expired_preparation_claim_takeover_fences_stale_binder(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
@@ -221,18 +271,31 @@ def test_expired_preparation_claim_takeover_fences_stale_binder(db_factory: tupl
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
 
-    stale = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    stale = repo.claim_preparation(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     with pytest.raises(LandscapeRecordError, match="live claim"):
-        repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+        repo.claim_preparation(
+            effect.effect_id,
+            owner="worker-b",
+            ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
     # The claim lapses the way it does in production: its deadline passes on
     # the Landscape database clock (ADR-047), written into the past here.
     expire_sink_effect_lease(_db.engine, effect.effect_id)
-    takeover = repo.claim_preparation(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+    takeover = repo.claim_preparation(
+        effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert takeover.generation == stale.generation + 1
 
     with pytest.raises(LandscapeRecordError, match="preparation claim"):
-        repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=stale)
-    prepared = repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=takeover)
+        repo.complete_plan(
+            effect.effect_id, _plan(effect.effect_id), claim=stale, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
+    prepared = repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=takeover, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert prepared.state is SinkEffectState.PREPARED
     assert prepared.generation == takeover.generation
 
@@ -241,13 +304,16 @@ def test_preparation_claim_heartbeat_extends_reserved_claim(db_factory: tuple[La
     _db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    claim = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    claim = repo.claim_preparation(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
 
     renewed = repo.heartbeat_lease(
         effect.effect_id,
         owner=claim.owner,
         generation=claim.generation,
         ttl=timedelta(seconds=60),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
     assert renewed.owner == claim.owner
@@ -260,8 +326,15 @@ def test_lease_takeover_increments_generation_and_fences_stale_results(db_factor
     _db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    first = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.complete_plan(
+        effect.effect_id,
+        _plan(effect.effect_id),
+        claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
+    first = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     abandoned = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -270,17 +343,29 @@ def test_lease_takeover_increments_generation_and_fences_stale_results(db_factor
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="c" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     with pytest.raises(LandscapeRecordError, match="has not expired"):
-        repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+        repo.takeover_expired(
+            effect.effect_id,
+            owner="worker-b",
+            ttl=timedelta(seconds=30),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
     expire_sink_effect_lease(_db.engine, effect.effect_id)
-    second = repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30))
+    second = repo.takeover_expired(
+        effect.effect_id, owner="worker-b", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert second.generation == first.generation + 1
 
     with pytest.raises(LandscapeRecordError, match="stale lease authority"):
-        repo.mark_response_lost(abandoned.attempt_id, recovery_lease=first)
-    recovered = repo.mark_response_lost(abandoned.attempt_id, recovery_lease=second)
+        repo.mark_response_lost(
+            abandoned.attempt_id, recovery_lease=first, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
+    recovered = repo.mark_response_lost(
+        abandoned.attempt_id, recovery_lease=second, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert recovered.state is SinkEffectAttemptState.RESPONSE_LOST
 
     with pytest.raises(LandscapeRecordError, match="stale generation"):
@@ -292,7 +377,8 @@ def test_lease_takeover_increments_generation_and_fences_stale_results(db_factor
                 action=SinkEffectAttemptAction.COMMIT,
                 call_kind=CallType.FILESYSTEM,
                 request_hash="d" * 64,
-            )
+            ),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
         )
 
 
@@ -302,8 +388,15 @@ def test_abandoned_commit_intent_becomes_response_lost_with_stable_call_index(
     db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.complete_plan(
+        effect.effect_id,
+        _plan(effect.effect_id),
+        claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
+    lease = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     attempt = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -312,10 +405,11 @@ def test_abandoned_commit_intent_becomes_response_lost_with_stable_call_index(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="e" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
-    recovered = repo.mark_response_lost(attempt.attempt_id)
+    recovered = repo.mark_response_lost(attempt.attempt_id, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     assert recovered.state is SinkEffectAttemptState.RESPONSE_LOST
     with db.read_only_connection() as conn:
@@ -333,8 +427,15 @@ def test_attempt_return_records_one_success_call_and_is_idempotent(db_factory: t
     db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.complete_plan(
+        effect.effect_id,
+        _plan(effect.effect_id),
+        claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
+    lease = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     attempt = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -343,15 +444,16 @@ def test_attempt_return_records_one_success_call_and_is_idempotent(db_factory: t
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="f" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     envelope = encode_sink_effect_returned_result(
         SinkEffectCommitResult(descriptor=_descriptor(), evidence={"result": "exact"}, accepted_ordinals=(0,), diverted_ordinals=())
     )
     result = SinkEffectAttemptResult(attempt_id=attempt.attempt_id, evidence=envelope, latency_ms=2.5)
 
-    first = repo.record_attempt_result(result)
-    second = repo.record_attempt_result(result)
+    first = repo.record_attempt_result(result, coordination_token=leader_coordination_token(factory, effect.run_id))
+    second = repo.record_attempt_result(result, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     assert first == second
     assert first.state is SinkEffectAttemptState.RETURNED
@@ -364,8 +466,10 @@ def test_attempt_calls_record_adapter_declared_transport(db_factory: tuple[Lands
     db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    claim = _claim(factory, effect.effect_id)
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
+    claim = _claim(factory, effect.effect_id, run_id=effect.run_id)
+    repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=claim, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     inspect = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -374,11 +478,14 @@ def test_attempt_calls_record_adapter_declared_transport(db_factory: tuple[Lands
             action=SinkEffectAttemptAction.INSPECT,
             call_kind=CallType.FILESYSTEM,
             request_hash="c" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     assert inspect.call_kind == "filesystem"
-    repo.mark_response_lost(inspect.attempt_id)
-    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.mark_response_lost(inspect.attempt_id, coordination_token=leader_coordination_token(factory, effect.run_id))
+    lease = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     commit = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -387,12 +494,16 @@ def test_attempt_calls_record_adapter_declared_transport(db_factory: tuple[Lands
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.HTTP,
             request_hash="d" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     commit_envelope = encode_sink_effect_returned_result(
         SinkEffectCommitResult(descriptor=_descriptor(), evidence={"result": "exact"}, accepted_ordinals=(0,), diverted_ordinals=())
     )
-    repo.record_attempt_result(SinkEffectAttemptResult(attempt_id=commit.attempt_id, evidence=commit_envelope, latency_ms=1.0))
+    repo.record_attempt_result(
+        SinkEffectAttemptResult(attempt_id=commit.attempt_id, evidence=commit_envelope, latency_ms=1.0),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
 
     with db.read_only_connection() as conn:
         operation_id = conn.scalar(select(operations_table.c.operation_id).where(operations_table.c.sink_effect_id == effect.effect_id))
@@ -408,8 +519,15 @@ def test_attempt_result_refuses_non_envelope_evidence(db_factory: tuple[Landscap
     _db, factory = db_factory
     effect = _reserved(factory)
     repo = factory.execution.sink_effects
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=_claim(factory, effect.effect_id))
-    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30))
+    repo.complete_plan(
+        effect.effect_id,
+        _plan(effect.effect_id),
+        claim=_claim(factory, effect.effect_id, run_id=effect.run_id),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
+    lease = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     attempt = repo.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -418,11 +536,15 @@ def test_attempt_result_refuses_non_envelope_evidence(db_factory: tuple[Landscap
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="f" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
 
     with pytest.raises(LandscapeRecordError, match="exact evidence"):
-        repo.record_attempt_result(SinkEffectAttemptResult(attempt_id=attempt.attempt_id, evidence={"result": "raw"}, latency_ms=1.0))
+        repo.record_attempt_result(
+            SinkEffectAttemptResult(attempt_id=attempt.attempt_id, evidence={"result": "raw"}, latency_ms=1.0),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
     reloaded = next(item for item in repo.get_attempts(effect.effect_id) if item.attempt_id == attempt.attempt_id)
     assert reloaded.state is SinkEffectAttemptState.INTENT
@@ -446,14 +568,16 @@ def _returned_member_attempt(
             action=action,
             call_kind=CallType.FILESYSTEM,
             request_hash=request_hash,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     repo.record_attempt_result(
         SinkEffectAttemptResult(
             attempt_id=attempt.attempt_id,
             evidence=encode_sink_effect_returned_result(result),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     return attempt
 
@@ -464,15 +588,17 @@ def test_finalized_member_replay_rejects_divergent_evidence(db_factory: tuple[La
     repo = factory.execution.sink_effects
     winner = SinkEffectCommitResult(descriptor=_descriptor(), evidence={"marker": "winner"}, accepted_ordinals=(0,), diverted_ordinals=())
     first = _returned_member_attempt(factory, effect, lease, winner, action=SinkEffectAttemptAction.COMMIT, request_hash="c" * 64)
-    repo.complete_member_result(first.attempt_id, winner, lease=lease)
-    repo.complete_member_result(first.attempt_id, winner, lease=lease)
+    repo.complete_member_result(first.attempt_id, winner, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id))
+    repo.complete_member_result(first.attempt_id, winner, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     divergent = SinkEffectCommitResult(
         descriptor=_descriptor(), evidence={"marker": "divergent"}, accepted_ordinals=(0,), diverted_ordinals=()
     )
     second = _returned_member_attempt(factory, effect, lease, divergent, action=SinkEffectAttemptAction.COMMIT, request_hash="e" * 64)
     with pytest.raises(LandscapeRecordError, match="evidence is divergent"):
-        repo.complete_member_result(second.attempt_id, divergent, lease=lease)
+        repo.complete_member_result(
+            second.attempt_id, divergent, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
 
 def test_finalized_member_replay_rejects_divergent_descriptor(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
@@ -481,14 +607,16 @@ def test_finalized_member_replay_rejects_divergent_descriptor(db_factory: tuple[
     repo = factory.execution.sink_effects
     winner = SinkEffectCommitResult(descriptor=_descriptor(), evidence={"marker": "winner"}, accepted_ordinals=(0,), diverted_ordinals=())
     first = _returned_member_attempt(factory, effect, lease, winner, action=SinkEffectAttemptAction.COMMIT, request_hash="c" * 64)
-    repo.complete_member_result(first.attempt_id, winner, lease=lease)
+    repo.complete_member_result(first.attempt_id, winner, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     divergent = SinkEffectCommitResult(
         descriptor=_descriptor(content_hash="e" * 64), evidence={"marker": "winner"}, accepted_ordinals=(0,), diverted_ordinals=()
     )
     second = _returned_member_attempt(factory, effect, lease, divergent, action=SinkEffectAttemptAction.COMMIT, request_hash="e" * 64)
     with pytest.raises(LandscapeRecordError, match="descriptor is divergent"):
-        repo.complete_member_result(second.attempt_id, divergent, lease=lease)
+        repo.complete_member_result(
+            second.attempt_id, divergent, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
 
 def test_finalized_member_replay_fails_closed_without_descriptor(db_factory: tuple[LandscapeDB, RecorderFactory]) -> None:
@@ -497,14 +625,16 @@ def test_finalized_member_replay_fails_closed_without_descriptor(db_factory: tup
     repo = factory.execution.sink_effects
     winner = SinkEffectCommitResult(descriptor=_descriptor(), evidence={"marker": "winner"}, accepted_ordinals=(0,), diverted_ordinals=())
     first = _returned_member_attempt(factory, effect, lease, winner, action=SinkEffectAttemptAction.COMMIT, request_hash="c" * 64)
-    repo.complete_member_result(first.attempt_id, winner, lease=lease)
+    repo.complete_member_result(first.attempt_id, winner, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     not_applied = SinkEffectReconcileResult.not_applied(evidence={"probe": "target-absent"})
     reconcile = _returned_member_attempt(
         factory, effect, lease, not_applied, action=SinkEffectAttemptAction.RECONCILE, request_hash="f" * 64
     )
     with pytest.raises(LandscapeRecordError, match="descriptor"):
-        repo.complete_member_result(reconcile.attempt_id, not_applied, lease=lease)
+        repo.complete_member_result(
+            reconcile.attempt_id, not_applied, lease=lease, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
 
 def test_lease_decisions_ignore_the_process_clock_and_follow_database_time(
@@ -530,23 +660,41 @@ def test_lease_decisions_ignore_the_process_clock_and_follow_database_time(
     ttl = timedelta(seconds=30)
 
     monkeypatch.setattr(sink_effect_lifecycle, "now", lambda: datetime(2040, 1, 1, tzinfo=UTC))
-    claim = repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=ttl)
+    claim = repo.claim_preparation(
+        effect.effect_id, owner="worker-a", ttl=ttl, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert_deadline_within(claim.expires_at, landscape_database_now(db.engine) + ttl)
-    repo.complete_plan(effect.effect_id, _plan(effect.effect_id), claim=claim)
-    lease = repo.acquire_lease(effect.effect_id, owner="worker-a", ttl=ttl)
+    repo.complete_plan(
+        effect.effect_id, _plan(effect.effect_id), claim=claim, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
+    lease = repo.acquire_lease(
+        effect.effect_id, owner="worker-a", ttl=ttl, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert_deadline_within(lease.expires_at, landscape_database_now(db.engine) + ttl)
 
     monkeypatch.setattr(sink_effect_lifecycle, "now", lambda: datetime(2041, 1, 1, tzinfo=UTC))
     # The refusal is the typed one the executor's lease wait maps, and it is
     # still a LandscapeRecordError for every caller that catches that.
     with pytest.raises(SinkEffectLeaseLiveError, match="has not expired"):
-        repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=ttl)
+        repo.takeover_expired(
+            effect.effect_id, owner="worker-b", ttl=ttl, coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
     contended = _reserved(factory)
-    repo.claim_preparation(contended.effect_id, owner="worker-a", ttl=ttl)
+    repo.claim_preparation(
+        contended.effect_id, owner="worker-a", ttl=ttl, coordination_token=leader_coordination_token(factory, contended.run_id)
+    )
     with pytest.raises(SinkEffectLeaseLiveError, match="live claim"):
-        repo.claim_preparation(contended.effect_id, owner="worker-b", ttl=ttl)
+        repo.claim_preparation(
+            contended.effect_id, owner="worker-b", ttl=ttl, coordination_token=leader_coordination_token(factory, contended.run_id)
+        )
     assert issubclass(SinkEffectLeaseLiveError, LandscapeRecordError)
-    renewed = repo.heartbeat_lease(effect.effect_id, owner="worker-a", generation=lease.generation, ttl=ttl)
+    renewed = repo.heartbeat_lease(
+        effect.effect_id,
+        owner="worker-a",
+        generation=lease.generation,
+        ttl=ttl,
+        coordination_token=leader_coordination_token(factory, effect.run_id),
+    )
     assert_deadline_within(renewed.expires_at, landscape_database_now(db.engine) + ttl)
     assert repo.lease_validity_seconds(effect.effect_id) is not None
 
@@ -554,7 +702,9 @@ def test_lease_decisions_ignore_the_process_clock_and_follow_database_time(
     # takeover the 2041 process clock could not buy is granted.
     expire_sink_effect_lease(db.engine, effect.effect_id)
     assert repo.lease_validity_seconds(effect.effect_id) is None
-    taken = repo.takeover_expired(effect.effect_id, owner="worker-b", ttl=ttl)
+    taken = repo.takeover_expired(
+        effect.effect_id, owner="worker-b", ttl=ttl, coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     assert taken.generation == lease.generation + 1
     assert_deadline_within(taken.expires_at, landscape_database_now(db.engine) + ttl)
 
@@ -586,7 +736,9 @@ def test_a_sub_second_lease_is_live_for_its_whole_ttl_when_stamped_late_in_a_dat
 
     claim = late_in_a_database_second(
         db.engine,
-        lambda _database_now: repo.claim_preparation(effect.effect_id, owner="worker-a", ttl=ttl),
+        lambda _database_now: repo.claim_preparation(
+            effect.effect_id, owner="worker-a", ttl=ttl, coordination_token=leader_coordination_token(factory, effect.run_id)
+        ),
     )
     stamped_at = time.monotonic()
 

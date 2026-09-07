@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.audit import SinkEffect
 from elspeth.contracts.audit_export import C, H, final_manifest_identity_payload, hash_final_manifest_identity_payload
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.enums import NodeStateStatus, RunStatus
 from elspeth.contracts.freeze import freeze_fields
 from elspeth.contracts.hashing import canonical_json
@@ -28,9 +29,10 @@ from elspeth.contracts.sink_effects import (
     SinkEffectReservationRequest,
     SinkEffectState,
 )
-from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.model_loaders import SinkEffectLoader
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     audit_export_snapshots_table,
     node_states_table,
@@ -212,6 +214,67 @@ def _export_identity(request: SinkEffectReservationRequest, snapshot: Row[Any]) 
     )
 
 
+def _effect_row_values(
+    conn: Connection,
+    request: SinkEffectReservationRequest,
+    identity: _EffectIdentity,
+    *,
+    stream_id: str | None,
+    stream_sequence: int | None,
+    predecessor_effect_id: str | None,
+) -> dict[str, object]:
+    """Build the reserved effect's row, stamped from Landscape database time.
+
+    The clock read lives here rather than beside the INSERT: ADR-047 keeps
+    the authority decision at the boundary that makes it, and leaves the
+    writer with no clock of its own to get wrong.
+    """
+    timestamp = read_landscape_transaction_time(conn)
+    primary_effect_ids = {member.primary_effect_id for member in identity.members if member.primary_effect_id is not None}
+    common_primary_effect_id = next(iter(primary_effect_ids)) if len(primary_effect_ids) == 1 else None
+    return {
+        "effect_id": identity.effect_id,
+        "run_id": request.run_id,
+        "sink_node_id": request.sink_node_id,
+        "role": request.role.value,
+        "state": SinkEffectState.RESERVED.value,
+        "protocol_version": SINK_EFFECT_PROTOCOL_VERSION,
+        "input_kind": request.input_kind.value,
+        "required_member_ordinal": 0 if request.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS else None,
+        "required_snapshot_slot": 0 if request.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT else None,
+        "config_hash": request.config_hash,
+        "membership_or_manifest_hash": identity.membership_or_manifest_hash,
+        "group_payload_hash": identity.group_payload_hash,
+        "artifact_id": identity.artifact_id,
+        "artifact_idempotency_key": identity.artifact_idempotency_key,
+        "target_json": _EMPTY_TARGET_JSON,
+        "inspection_mode": None,
+        "inspection_attempt_id": None,
+        "plan_json": None,
+        "plan_hash": None,
+        "descriptor_mode": None,
+        "expected_descriptor_hash": None,
+        "precondition_hash": None,
+        "prepared_at": None,
+        "lease_owner": None,
+        "generation": 0,
+        "lease_expires_at": None,
+        "lease_heartbeat_at": None,
+        "reconcile_kind": None,
+        "reconcile_evidence_hash": None,
+        "result_descriptor_hash": None,
+        "publication_performed": None,
+        "publication_evidence_kind": None,
+        "primary_effect_id": common_primary_effect_id,
+        "stream_id": stream_id,
+        "stream_sequence": stream_sequence,
+        "predecessor_effect_id": predecessor_effect_id,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "finalized_at": None,
+    }
+
+
 def _unsupported_backend(conn: Connection) -> RuntimeError:
     return RuntimeError(f"unsupported Landscape backend {conn.dialect.name!r}")
 
@@ -223,16 +286,35 @@ class SinkEffectReservation:
         self._db = db
         self._effect_loader = effect_loader
 
-    def reserve(self, request: SinkEffectReservationRequest) -> SinkEffectReservationResult:
+    def reserve(
+        self,
+        request: SinkEffectReservationRequest,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectReservationResult:
+        """Reserve under the run's current leader token (ADR-048).
+
+        The request names the run its members belong to and the token proves
+        leadership of exactly one run; they must agree, and the fence is the
+        first statement of the reservation transaction so a deposed leader
+        reserves nothing.
+        """
         if type(request) is not SinkEffectReservationRequest:
             raise TypeError("request must be exact SinkEffectReservationRequest")
+        if request.run_id != coordination_token.run_id:
+            raise ValueError("sink effect reservation request names a different run than the coordination token")
         if request.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT:
-            return self._reserve_export(request)
+            return self._reserve_export(request, coordination_token=coordination_token)
 
         witness = self._resolve_pipeline_witness(request)
-        with self._db.write_connection() as conn:
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="reserve",
+        ) as conn:
             self._lock_and_validate_pipeline_witness(conn, request, witness)
-            return self._reserve_pipeline_locked(conn, request)
+            return self._reserve_pipeline_locked(conn, request, coordination_token=coordination_token)
 
     def _resolve_pipeline_witness(self, request: SinkEffectReservationRequest) -> _PipelineWitness:
         token_ids = tuple(member.token_id for member in request.members)
@@ -395,6 +477,8 @@ class SinkEffectReservation:
         self,
         conn: Connection,
         request: SinkEffectReservationRequest,
+        *,
+        coordination_token: CoordinationToken,
     ) -> SinkEffectReservationResult:
         token_ids = tuple(member.token_id for member in request.members)
         bindings = self._member_bindings(conn, request, token_ids)
@@ -438,6 +522,7 @@ class SinkEffectReservation:
             stream_id=expected_stream_id if request.replacing_target else None,
             stream_sequence=sequence,
             predecessor_effect_id=predecessor,
+            coordination_token=coordination_token,
         )
         if not inserted:
             # Token locks make this reachable only after an independently
@@ -466,8 +551,8 @@ class SinkEffectReservation:
                 raise ValueError("sink effect stream tail changed during reservation")
         return SinkEffectReservationResult(finalized, opened, effect)
 
-    def _reserve_export(self, request: SinkEffectReservationRequest) -> SinkEffectReservationResult:
-        assert request.audit_export_snapshot_id is not None
+    def _optimistic_export_snapshot(self, request: SinkEffectReservationRequest) -> Row[Any]:
+        """Read and validate the snapshot registry winner before the fenced transaction opens."""
         with self._db.read_only_connection() as conn:
             optimistic = conn.execute(
                 select(audit_export_snapshots_table).where(audit_export_snapshots_table.c.snapshot_id == request.audit_export_snapshot_id)
@@ -475,9 +560,23 @@ class SinkEffectReservation:
         if optimistic is None:
             raise ValueError("audit export snapshot does not exist")
         self._validate_export_snapshot(request, optimistic)
-        optimistic_values = dict(optimistic._mapping)
+        return optimistic
 
-        with self._db.write_connection() as conn:
+    def _reserve_export(
+        self,
+        request: SinkEffectReservationRequest,
+        *,
+        coordination_token: CoordinationToken,
+    ) -> SinkEffectReservationResult:
+        assert request.audit_export_snapshot_id is not None
+        optimistic_values = dict(self._optimistic_export_snapshot(request)._mapping)
+
+        with fenced_leader_transaction(
+            self._db.engine,
+            token=coordination_token,
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="reserve",
+        ) as conn:
             locked_run = conn.execute(
                 select(runs_table.c.run_id).where(runs_table.c.run_id == request.run_id).with_for_update(of=runs_table)
             ).fetchone()
@@ -513,6 +612,7 @@ class SinkEffectReservation:
                 stream_id=identity.stream_id if request.replacing_target else None,
                 stream_sequence=sequence,
                 predecessor_effect_id=predecessor,
+                coordination_token=coordination_token,
             )
             self._insert_or_compare_export_association(conn, effect.effect_id, request.audit_export_snapshot_id)
             self._insert_or_compare_operation(conn, request, effect)
@@ -686,51 +786,21 @@ class SinkEffectReservation:
         stream_id: str | None,
         stream_sequence: int | None,
         predecessor_effect_id: str | None,
+        coordination_token: CoordinationToken,
     ) -> tuple[bool, SinkEffect]:
-        timestamp = now()
-        primary_effect_ids = {member.primary_effect_id for member in identity.members if member.primary_effect_id is not None}
-        common_primary_effect_id = next(iter(primary_effect_ids)) if len(primary_effect_ids) == 1 else None
-        values: dict[str, object] = {
-            "effect_id": identity.effect_id,
-            "run_id": request.run_id,
-            "sink_node_id": request.sink_node_id,
-            "role": request.role.value,
-            "state": SinkEffectState.RESERVED.value,
-            "protocol_version": SINK_EFFECT_PROTOCOL_VERSION,
-            "input_kind": request.input_kind.value,
-            "required_member_ordinal": 0 if request.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS else None,
-            "required_snapshot_slot": 0 if request.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT else None,
-            "config_hash": request.config_hash,
-            "membership_or_manifest_hash": identity.membership_or_manifest_hash,
-            "group_payload_hash": identity.group_payload_hash,
-            "artifact_id": identity.artifact_id,
-            "artifact_idempotency_key": identity.artifact_idempotency_key,
-            "target_json": _EMPTY_TARGET_JSON,
-            "inspection_mode": None,
-            "inspection_attempt_id": None,
-            "plan_json": None,
-            "plan_hash": None,
-            "descriptor_mode": None,
-            "expected_descriptor_hash": None,
-            "precondition_hash": None,
-            "prepared_at": None,
-            "lease_owner": None,
-            "generation": 0,
-            "lease_expires_at": None,
-            "lease_heartbeat_at": None,
-            "reconcile_kind": None,
-            "reconcile_evidence_hash": None,
-            "result_descriptor_hash": None,
-            "publication_performed": None,
-            "publication_evidence_kind": None,
-            "primary_effect_id": common_primary_effect_id,
-            "stream_id": stream_id,
-            "stream_sequence": stream_sequence,
-            "predecessor_effect_id": predecessor_effect_id,
-            "created_at": timestamp,
-            "updated_at": timestamp,
-            "finalized_at": None,
-        }
+        if request.run_id != coordination_token.run_id:
+            # ADR-048 §2: the token proves leadership of ONE run; reserving an
+            # effect for another run is a cross-run write, refused before the
+            # INSERT rather than after it.
+            raise ValueError(f"sink effect reservation names run {request.run_id!r}, not the coordination token's run")
+        values = _effect_row_values(
+            conn,
+            request,
+            identity,
+            stream_id=stream_id,
+            stream_sequence=stream_sequence,
+            predecessor_effect_id=predecessor_effect_id,
+        )
         if conn.dialect.name == "sqlite":
             inserted = (
                 conn.execute(
@@ -771,10 +841,10 @@ class SinkEffectReservation:
             (row.group_payload_hash, identity.group_payload_hash),
             (row.artifact_id, identity.artifact_id),
             (row.artifact_idempotency_key, identity.artifact_idempotency_key),
-            (row.primary_effect_id, common_primary_effect_id),
-            (row.stream_id, stream_id),
-            (row.stream_sequence, stream_sequence),
-            (row.predecessor_effect_id, predecessor_effect_id),
+            (row.primary_effect_id, values["primary_effect_id"]),
+            (row.stream_id, values["stream_id"]),
+            (row.stream_sequence, values["stream_sequence"]),
+            (row.predecessor_effect_id, values["predecessor_effect_id"]),
         )
         if any(observed != expected for observed, expected in immutable_fields):
             raise ValueError("sink effect identity winner is divergent")

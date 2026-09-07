@@ -46,7 +46,7 @@ from elspeth.core.landscape.schema import (
     sink_effects_table,
     token_outcomes_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_members, _pipeline_request
 
 
@@ -77,7 +77,8 @@ def _prepared(
 ) -> tuple[object, tuple[object, ...], object]:
     run_id, sink_id, members = _pipeline_members(factory, count)
     effect = factory.execution.sink_effects.reserve(
-        _pipeline_request(run_id, sink_id, members, replacing_target=replacing_target)
+        _pipeline_request(run_id, sink_id, members, replacing_target=replacing_target),
+        coordination_token=leader_coordination_token(factory, run_id),
     ).new_effect
     assert effect is not None
     descriptor = _descriptor()
@@ -85,6 +86,7 @@ def _prepared(
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     factory.execution.sink_effects.complete_plan(
         effect.effect_id,
@@ -101,11 +103,13 @@ def _prepared(
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=claim,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     lease = factory.execution.sink_effects.acquire_lease(
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     return effect, members, lease
 
@@ -128,7 +132,8 @@ def _request(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     recorded_evidence = (
         encode_sink_effect_returned_result(
@@ -143,7 +148,8 @@ def _request(
         else attempt_evidence
     )
     factory.execution.sink_effects.record_attempt_result(
-        SinkEffectAttemptResult(attempt_id=attempt.attempt_id, evidence=recorded_evidence, latency_ms=1.0)
+        SinkEffectAttemptResult(attempt_id=attempt.attempt_id, evidence=recorded_evidence, latency_ms=1.0),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     return SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -177,8 +183,8 @@ def test_finalization_is_one_transaction_and_retry_returns_winner(
     effect, members, lease = _prepared(factory)
     request = _request(factory, effect, members, lease)
 
-    first = factory.execution.sink_effects.finalize(request)
-    second = factory.execution.sink_effects.finalize(request)
+    first = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
+    second = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     assert first == second
     assert first.effect.state is SinkEffectState.FINALIZED
@@ -213,7 +219,9 @@ def test_new_attempt_state_witness_is_resolved_not_part_of_identity(
         attempt=1,
     )
 
-    result = factory.execution.sink_effects.finalize(_request(factory, effect, members, lease))
+    result = factory.execution.sink_effects.finalize(
+        _request(factory, effect, members, lease), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
 
     assert result.effect.effect_id == effect.effect_id
     assert result.artifact.sink_effect_id == effect.effect_id
@@ -238,7 +246,7 @@ def test_finalization_refuses_stale_or_divergent_authority(
     request = replace(_request(factory, effect, members, lease), **{field: value})
 
     with pytest.raises(LandscapeRecordError, match=message):
-        factory.execution.sink_effects.finalize(request)
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
 
 def test_stream_head_cas_advances_exact_predecessor(
@@ -247,7 +255,9 @@ def test_stream_head_cas_advances_exact_predecessor(
     _db, factory = db_factory
     effect, members, lease = _prepared(factory, count=1, replacing_target=True)
 
-    result = factory.execution.sink_effects.finalize(_request(factory, effect, members, lease))
+    result = factory.execution.sink_effects.finalize(
+        _request(factory, effect, members, lease), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     stream = factory.execution.sink_effects.get_stream(effect.stream_id)
 
     assert result.effect.state is SinkEffectState.FINALIZED
@@ -276,9 +286,12 @@ def test_finalization_response_loss_retry_observes_committed_winner(
 
     monkeypatch.setattr(finalizer, "_after_commit", lose_once)
     with pytest.raises(ConnectionError):
-        factory.execution.sink_effects.finalize(request)
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
-    assert factory.execution.sink_effects.finalize(request).effect.state is SinkEffectState.FINALIZED
+    assert (
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id)).effect.state
+        is SinkEffectState.FINALIZED
+    )
 
 
 def test_failed_finalization_rolls_back_every_audit_write(
@@ -289,7 +302,7 @@ def test_failed_finalization_rolls_back_every_audit_write(
     divergent = replace(_request(factory, effect, members, lease), descriptor=_descriptor(content_hash="f" * 64))
 
     with pytest.raises(LandscapeRecordError):
-        factory.execution.sink_effects.finalize(divergent)
+        factory.execution.sink_effects.finalize(divergent, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     with db.read_only_connection() as conn:
         assert (
@@ -317,7 +330,7 @@ def test_result_derived_descriptor_requires_exact_authoritative_evidence(
     }
     request = _request(factory, effect, members, lease, evidence=exact_evidence)
 
-    result = factory.execution.sink_effects.finalize(request)
+    result = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     assert result.artifact.content_hash == request.descriptor.content_hash
 
@@ -329,7 +342,9 @@ def test_result_derived_descriptor_refuses_non_authoritative_evidence(
     effect, members, lease = _prepared(factory, count=1, descriptor_mode=SinkEffectDescriptorMode.RESULT_DERIVED)
 
     with pytest.raises(LandscapeRecordError, match="result-derived evidence"):
-        factory.execution.sink_effects.finalize(_request(factory, effect, members, lease))
+        factory.execution.sink_effects.finalize(
+            _request(factory, effect, members, lease), coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
 
 def test_result_derived_diversion_requires_exact_durable_attribution(
@@ -358,7 +373,7 @@ def test_result_derived_diversion_requires_exact_durable_attribution(
     )
 
     with pytest.raises(LandscapeRecordError, match="requires diversion attribution"):
-        factory.execution.sink_effects.finalize(request)
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
 
 def test_result_derived_reconciled_retry_preserves_ordinals_and_returns_winner(
@@ -402,14 +417,16 @@ def test_result_derived_reconciled_retry_preserves_ordinals_and_returns_winner(
             action=SinkEffectAttemptAction.RECONCILE,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
             attempt_id=attempt.attempt_id,
             evidence=encode_sink_effect_returned_result(reconciliation),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     request = SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -435,8 +452,8 @@ def test_result_derived_reconciled_retry_preserves_ordinals_and_returns_winner(
         reconcile_kind=SinkEffectReconcileKind.APPLIED_WITH_EXACT_DESCRIPTOR,
     )
 
-    first = factory.execution.sink_effects.finalize(request)
-    second = factory.execution.sink_effects.finalize(request)
+    first = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
+    second = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     assert first.effect.state is SinkEffectState.FINALIZED
     assert second.effect == first.effect
@@ -450,7 +467,9 @@ def test_no_publication_finalization_registers_virtual_artifact_without_lease(
 ) -> None:
     db, factory = db_factory
     run_id, sink_id, members = _pipeline_members(factory, 1)
-    effect = factory.execution.sink_effects.reserve(_pipeline_request(run_id, sink_id, members)).new_effect
+    effect = factory.execution.sink_effects.reserve(
+        _pipeline_request(run_id, sink_id, members), coordination_token=leader_coordination_token(factory, run_id)
+    ).new_effect
     assert effect is not None
     descriptor = ArtifactDescriptor(
         artifact_type="file",
@@ -521,7 +540,7 @@ def test_no_publication_finalization_registers_virtual_artifact_without_lease(
         members=(),
     )
 
-    result = factory.execution.sink_effects.finalize(request)
+    result = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, run_id))
 
     assert result.artifact.publication_performed is False
     assert result.artifact.publication_evidence_kind == "virtual"
@@ -536,7 +555,9 @@ def test_missing_current_state_witness_refuses_before_artifact_or_outcome(
         conn.execute(delete(node_states_table).where(node_states_table.c.token_id == members[0].token_id))
 
     with pytest.raises(LandscapeRecordError, match="current open state witness"):
-        factory.execution.sink_effects.finalize(_request(factory, effect, members, lease))
+        factory.execution.sink_effects.finalize(
+            _request(factory, effect, members, lease), coordination_token=leader_coordination_token(factory, effect.run_id)
+        )
 
     with db.read_only_connection() as conn:
         assert (
@@ -550,10 +571,13 @@ def test_finalized_retry_refuses_a_divergent_descriptor(
     _db, factory = db_factory
     effect, members, lease = _prepared(factory, count=1)
     request = _request(factory, effect, members, lease)
-    factory.execution.sink_effects.finalize(request)
+    factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
     with pytest.raises(LandscapeRecordError, match="descriptor"):
-        factory.execution.sink_effects.finalize(replace(request, descriptor=_descriptor(content_hash="f" * 64)))
+        factory.execution.sink_effects.finalize(
+            replace(request, descriptor=_descriptor(content_hash="f" * 64)),
+            coordination_token=leader_coordination_token(factory, effect.run_id),
+        )
 
 
 def test_finalization_refuses_raw_evidence_attempt_encoding(
@@ -575,7 +599,7 @@ def test_finalization_refuses_raw_evidence_attempt_encoding(
     )
     request = _request(factory, effect, members, lease, attempt_evidence=divergent_envelope)
     with pytest.raises(LandscapeRecordError, match="finalization evidence differs"):
-        factory.execution.sink_effects.finalize(request)
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
 
 def test_finalized_retry_refuses_raw_evidence_attempt_encoding(
@@ -584,7 +608,7 @@ def test_finalized_retry_refuses_raw_evidence_attempt_encoding(
     db, factory = db_factory
     effect, members, lease = _prepared(factory, count=1)
     request = _request(factory, effect, members, lease)
-    factory.execution.sink_effects.finalize(request)
+    factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
     with db.engine.begin() as conn:
         conn.execute(
             update(sink_effect_attempts_table)
@@ -593,7 +617,7 @@ def test_finalized_retry_refuses_raw_evidence_attempt_encoding(
         )
 
     with pytest.raises(LandscapeRecordError, match="finalized retry attempt/evidence differs"):
-        factory.execution.sink_effects.finalize(request)
+        factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, effect.run_id))
 
 
 @pytest.mark.parametrize("primary_member_corruption", [None, "accepted", "not_finalized"])
@@ -611,7 +635,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
     factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -625,7 +650,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
     factory.execution.sink_effects.finalize(
         SinkEffectFinalizeRequest(
@@ -640,7 +666,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
             evidence={"result": "primary-exact"},
             members=(),
             attempt_id=primary_attempt.attempt_id,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
     if primary_member_corruption is not None:
         column_values = (
@@ -687,7 +714,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
             config_hash=identity.config_hash,
             replacing_target=False,
             primary_effect_id=primary.effect_id,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     ).new_effect
     assert failsink is not None
     descriptor = ArtifactDescriptor(
@@ -700,6 +728,7 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
         failsink.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
     factory.execution.sink_effects.complete_plan(
         failsink.effect_id,
@@ -716,8 +745,14 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=failsink_claim,
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
-    lease = factory.execution.sink_effects.acquire_lease(failsink.effect_id, owner="worker-f", ttl=timedelta(seconds=30))
+    lease = factory.execution.sink_effects.acquire_lease(
+        failsink.effect_id,
+        owner="worker-f",
+        ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
+    )
     attempt = factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=failsink.effect_id,
@@ -726,7 +761,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="1" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
     factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -740,7 +776,8 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, primary.run_id),
     )
 
     request = SinkEffectFinalizeRequest(
@@ -769,10 +806,10 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
 
     if primary_member_corruption is not None:
         with pytest.raises(LandscapeRecordError, match="diverted finalized primary member"):
-            factory.execution.sink_effects.finalize(request)
+            factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, primary.run_id))
         return
 
-    result = factory.execution.sink_effects.finalize(request)
+    result = factory.execution.sink_effects.finalize(request, coordination_token=leader_coordination_token(factory, primary.run_id))
 
     assert result.effect.primary_effect_id == primary.effect_id
     assert result.artifact.sink_effect_id == failsink.effect_id

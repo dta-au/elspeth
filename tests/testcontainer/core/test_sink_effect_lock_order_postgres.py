@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import Connection
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
@@ -129,9 +129,15 @@ def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_eff
     second_factory = make_factory(db)
     monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", pause)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(factory.execution.sink_effects.reserve, request)
+        first = pool.submit(
+            factory.execution.sink_effects.reserve, request, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         assert first_locked.wait(timeout=5)
-        second = pool.submit(second_factory.execution.sink_effects.reserve, reverse_request)
+        second = pool.submit(
+            second_factory.execution.sink_effects.reserve,
+            reverse_request,
+            coordination_token=leader_coordination_token(second_factory, run.run_id),
+        )
         release_first.set()
         results = (first.result(timeout=10), second.result(timeout=10))
 
@@ -190,7 +196,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             config_hash=identity.config_hash,
             replacing_target=False,
             primary_effect_id=None,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, run.run_id),
     ).new_effect
     assert effect is not None
     descriptor = ArtifactDescriptor(
@@ -203,6 +210,7 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     finalizer_factory.execution.sink_effects.complete_plan(
         effect.effect_id,
@@ -219,11 +227,13 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=claim,
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     lease = finalizer_factory.execution.sink_effects.acquire_lease(
         effect.effect_id,
         owner="worker-a",
         ttl=timedelta(seconds=30),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     attempt = finalizer_factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
@@ -233,7 +243,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     finalizer_factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -247,7 +258,8 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
     )
     request = SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -301,7 +313,11 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
         )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        finalization = pool.submit(finalizer_factory.execution.sink_effects.finalize, request)
+        finalization = pool.submit(
+            finalizer_factory.execution.sink_effects.finalize,
+            request,
+            coordination_token=leader_coordination_token(finalizer_factory, effect.run_id),
+        )
         assert finalizer_holds_token.wait(timeout=5)
         outcome = pool.submit(competing_outcome)
         assert outcome_approached_token.wait(timeout=5)
@@ -403,8 +419,16 @@ def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
     monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", await_both_witnesses)
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = (
-            pool.submit(first_factory.execution.sink_effects.reserve, requests[0]),
-            pool.submit(second_factory.execution.sink_effects.reserve, requests[1]),
+            pool.submit(
+                first_factory.execution.sink_effects.reserve,
+                requests[0],
+                coordination_token=leader_coordination_token(first_factory, run.run_id),
+            ),
+            pool.submit(
+                second_factory.execution.sink_effects.reserve,
+                requests[1],
+                coordination_token=leader_coordination_token(second_factory, run.run_id),
+            ),
         )
         effects = tuple(future.result(timeout=10).new_effect for future in futures)
 
@@ -507,7 +531,11 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
 
     first_token_id = min(member.token_id for member in members)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        reservation_future = pool.submit(reservation_factory.execution.sink_effects.reserve, request)
+        reservation_future = pool.submit(
+            reservation_factory.execution.sink_effects.reserve,
+            request,
+            coordination_token=leader_coordination_token(reservation_factory, run.run_id),
+        )
         assert first_token_locked.wait(timeout=5)
         outcome_future = pool.submit(
             outcome_factory.data_flow.record_token_outcome,
@@ -613,7 +641,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             config_hash=identity.config_hash,
             replacing_target=False,
             primary_effect_id=None,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, run.run_id),
     ).new_effect
     assert effect is not None
     descriptor = ArtifactDescriptor(
@@ -622,7 +651,9 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
         content_hash="d" * 64,
         size_bytes=12,
     )
-    claim = factory.execution.sink_effects.claim_preparation(effect.effect_id, owner=owner, ttl=timedelta(seconds=30))
+    claim = factory.execution.sink_effects.claim_preparation(
+        effect.effect_id, owner=owner, ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     factory.execution.sink_effects.complete_plan(
         effect.effect_id,
         SinkEffectPlan(
@@ -638,8 +669,11 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             safe_evidence={"inspection_reference": "no-inspection-required:v1"},
         ),
         claim=claim,
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
-    lease = factory.execution.sink_effects.acquire_lease(effect.effect_id, owner=owner, ttl=timedelta(seconds=30))
+    lease = factory.execution.sink_effects.acquire_lease(
+        effect.effect_id, owner=owner, ttl=timedelta(seconds=30), coordination_token=leader_coordination_token(factory, effect.run_id)
+    )
     attempt = factory.execution.sink_effects.begin_attempt(
         SinkEffectAttemptRequest(
             effect_id=effect.effect_id,
@@ -648,7 +682,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
             action=SinkEffectAttemptAction.COMMIT,
             call_kind=CallType.FILESYSTEM,
             request_hash="a" * 64,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     factory.execution.sink_effects.record_attempt_result(
         SinkEffectAttemptResult(
@@ -662,7 +697,8 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
                 )
             ),
             latency_ms=1.0,
-        )
+        ),
+        coordination_token=leader_coordination_token(factory, effect.run_id),
     )
     request = SinkEffectFinalizeRequest(
         effect_id=effect.effect_id,
@@ -797,7 +833,9 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
         lease_owner=new_lease.owner,
         generation=new_lease.generation,
     )
-    winner = takeover_factory.execution.sink_effects.finalize(winner_request)
+    winner = takeover_factory.execution.sink_effects.finalize(
+        winner_request, coordination_token=leader_coordination_token(takeover_factory, built.run_id)
+    )
     assert winner.effect.effect_id == built.effect_id
     assert winner.effect.generation == new_lease.generation
     assert winner.artifact.path_or_uri == built.request.descriptor.path_or_uri
@@ -931,7 +969,9 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
     db = postgres_db
     setup_factory = make_factory(db)
     built = _build_in_flight_effect(setup_factory, name_prefix="retry-converge")
-    first = setup_factory.execution.sink_effects.finalize(built.request)
+    first = setup_factory.execution.sink_effects.finalize(
+        built.request, coordination_token=leader_coordination_token(setup_factory, built.run_id)
+    )
     assert first.effect.state.value == "finalized"
 
     retry_a_factory = make_factory(db)
