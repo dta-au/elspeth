@@ -802,7 +802,7 @@ cross-tab, had one cause: **method-name collisions across owned types.**
 | name | owners it collides across | what went wrong |
 |---|---|---|
 | `update_run_status` | `RunLifecycleRepository` (Landscape) vs `SessionService` (Sessions) | six Sessions writes read as Landscape reaches; corrected at §4 |
-| `begin_attempt` | `SinkEffectRepository` vs `_PlannerAttemptTrail` (`web/composer/pipeline_planner.py:1165`) | a planner attempt-trail call rowed as a Landscape mutation |
+| `begin_attempt` | `SinkEffectRepository` vs `_PlannerAttemptTrail` (`web/composer/pipeline_planner.py:1121`) | a planner attempt-trail call rowed as a Landscape mutation |
 | `heartbeat_lease` | `TokenSchedulerRepository` (work-item lease, CLAIM) vs `SinkEffectRepository` (sink-effect lease, LEADER) | the sink-effect facade was credited with the scheduler verb's classification and its membership fence; the sink-effect verb has neither |
 
 **Any inventory, gate rule, ledger row or classification that keys on a method
@@ -811,11 +811,39 @@ implementation note: two of the three above reached prose in this ADR and in a
 coordinator cross-tab, and each read as a finding about code that was fine while
 hiding the state of code that was not.
 
-The receiver-precision rule that follows from this admits **only** a receiver
-that resolves to a nameable owned NON-Landscape type. An **unresolvable** receiver
-stays a row. Making "cannot resolve" a reason to stop rowing would be fail-open,
-and would also erase the real `LLMAuditParent` → `CallRecorder` rows that D8.3
-still has to thread.
+The receiver-precision rule that follows from this admits a mutation-named call
+by naming the receiver's **resolved non-Landscape owner**. It must never admit a
+receiver on the grounds that the receiver resolves at all, and it must never
+require the receiver to resolve *into* an owned Landscape class. An unresolvable
+receiver stays a row.
+
+**The justification first circulated with this rule, and written into an earlier
+draft of this section, was wrong on the tree, and the correction matters more
+than the error.** That draft said the eight unknown-receiver rows in the LLM
+providers (`gateway.py` ×4, `openrouter.py` ×4) are UNRESOLVABLE, and that an
+owner-keyed rule was therefore needed to keep them rowing. Measured through the
+gate's own resolver, `audit_parent` is a parameter annotated `LLMAuditParent`
+(`providers/gateway.py:556`, `:702`, `:731`) and resolves cleanly and exactly to
+`elspeth.plugins.transforms.llm.provider.LLMAuditParent`, which at
+`provider.py:41` really does declare `allocate_call_index` (`:97`) and
+`record_call` (`:105`). The eight rows are not unresolved. They are fully
+resolved, and they row because their owner is **absent from the allowlist**.
+
+The conclusion survives the correction and is strengthened by it. Option (b),
+"admit whatever resolves", was rejected as failing closed on the rows worth
+catching. On the measured tree it is worse than that argument claimed: option
+(b) would have **admitted all eight and lost them**, silently, because they
+satisfy its admission criterion perfectly. The `LLMAuditParent` → `CallRecorder`
+indirection that D8.3 exists to thread would have been erased from the inventory
+by the very rule meant to sharpen it, and the escape counter would have fallen
+by fifteen instead of seven while the real finding disappeared inside the
+improvement.
+
+So the operative distinction is **not resolvable versus unresolvable — it is
+enumerated versus not enumerated.** Admission is a closed, pinned list of
+(owner, method) pairs re-derived from the tree, and everything else rows,
+whether or not it resolves. A receiver that resolves beautifully to a type
+nobody allowlisted must still row.
 
 ### A7. What this amendment does not change
 
