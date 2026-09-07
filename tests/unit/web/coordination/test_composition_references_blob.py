@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.state import CompositionState, NodeSpec, PipelineMetadata
+from elspeth.web.composer.yaml_generator import generate_pipeline_dict
 from elspeth.web.coordination.repository import _composition_references_blob
 
 _BLOB_ID = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
@@ -92,3 +94,36 @@ def test_corrupt_options_still_crash_rather_than_read_as_unreferenced() -> None:
     state = {"sources": {"primary": {"plugin": "csv", "options": ["not", "a", "dict"]}}}
     with pytest.raises(AuditIntegrityError):
         _composition_references_blob(state, _BLOB_ID, "/unused")
+
+
+def test_missing_canonical_source_options_crashes() -> None:
+    state = {"sources": {"primary": {"plugin": "csv"}}}
+    with pytest.raises(KeyError, match="options"):
+        _composition_references_blob(state, _BLOB_ID, "/unused")
+
+
+@pytest.mark.parametrize("reference", [{"blob_ref": _BLOB_ID}, {"blob_id": _UPPER}, {"path": "/blob/collector.txt"}])
+def test_lowered_collector_options_retain_blob_identity(reference: dict[str, str]) -> None:
+    collector = NodeSpec(
+        id="collect_pages",
+        node_type="collector",
+        plugin="batch_stats",
+        input="pages",
+        on_success="main",
+        on_error=None,
+        options={"reference": reference},
+        condition=None,
+        routes=None,
+        fork_to=None,
+        branches=None,
+        policy=None,
+        merge=None,
+        scope_name="document_pages",
+        scope_opener="explode_pages",
+        scope_policy="require_all",
+    )
+    state = CompositionState(source=None, nodes=(collector,), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
+    pipeline = generate_pipeline_dict(state)
+
+    assert _composition_references_blob(pipeline, _BLOB_ID, "/blob/collector.txt")
+    assert not _composition_references_blob(pipeline, "00000000-0000-0000-0000-000000000000", "/unrelated")

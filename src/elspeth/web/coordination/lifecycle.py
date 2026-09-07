@@ -15,6 +15,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
@@ -785,10 +786,22 @@ class SessionOperationLease:
                 ) from None
             if reconciliation is ArchiveDeleteReconciliation.CONSUMED:
                 self._disposition = SessionOperationLeaseDisposition.CONSUMED
-                await self._run_archive_lifecycle_callback(
-                    finalize_consumed,
-                    task_name="session-operation-archive-finalize-consumed",
-                )
+                # Confirmed deletion resolves commit uncertainty, not an
+                # integrity failure. Finish consumed-resource cleanup, then
+                # preserve the invariant violation as an operation failure.
+                retain_primary_error = isinstance(primary_error, contract_errors.TIER_1_ERRORS)
+                try:
+                    await self._run_archive_lifecycle_callback(
+                        finalize_consumed,
+                        task_name="session-operation-archive-finalize-consumed",
+                    )
+                except BaseException as finalization_error:
+                    if not retain_primary_error:
+                        raise
+                    primary_error.add_note(f"Consumed archive finalization also failed with {type(finalization_error).__name__}.")
+                    raise primary_error from None
+                if retain_primary_error:
+                    raise primary_error
                 return
 
             await self._restore_archive_current(

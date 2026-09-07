@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.web.coordination.contracts import (
     ArchiveDeleteReconciliation,
     FenceLossReason,
@@ -1136,6 +1137,40 @@ async def test_archive_consume_unprovable_outcome_is_unknown_and_never_released(
     assert "OSError" in "\n".join(raised.value.__notes__)
     assert authority.release_calls == []
     assert lease.disposition is SessionOperationLeaseDisposition.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [AuditIntegrityError, OrchestrationInvariantError])
+@pytest.mark.parametrize("finalization_fails", [False, True])
+async def test_consumed_archive_retains_tier_one_failure_after_finalization(
+    failure_type: type[Exception], finalization_fails: bool
+) -> None:
+    authority = _FakeAuthority()
+    primary = failure_type("archive invariant failed")
+    authority.archive_delete_error = primary
+    authority.reconcile_archive_delete_result = ArchiveDeleteReconciliation.CONSUMED
+    lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
+    callbacks: list[str] = []
+
+    async def restore_current() -> None:
+        callbacks.append("restore")
+
+    async def finalize_consumed() -> None:
+        callbacks.append("finalize")
+        if finalization_fails:
+            raise OSError("private-finalization-path")
+
+    with pytest.raises(failure_type, match="archive invariant failed") as caught:
+        await lease.consume_archive(restore_current=restore_current, finalize_consumed=finalize_consumed)
+
+    assert caught.value is primary
+    if finalization_fails:
+        assert primary.__notes__ == ["Consumed archive finalization also failed with OSError."]
+        assert "private-finalization-path" not in "".join(traceback.format_exception(primary))
+    assert callbacks == ["finalize"]
+    assert lease.disposition is SessionOperationLeaseDisposition.CONSUMED
+    assert lease.closed
+    assert authority.release_attempts == []
 
 
 @pytest.mark.asyncio

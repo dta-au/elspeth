@@ -396,10 +396,10 @@ def _composition_references_blob(composition_state: Any, blob_id: str, storage_p
         for source_name, source in sources.items():
             if type(source) is not dict:
                 raise AuditIntegrityError(f"Tier 1: composition_states.sources[{source_name!r}] is {type(source).__name__}, expected dict")
-            if _options_reference_blob(source.get("options"), blob_id, storage_path, f"sources[{source_name!r}]"):
+            if _options_reference_blob(source["options"], blob_id, storage_path, f"sources[{source_name!r}]"):
                 return True
 
-    for collection_key in ("transforms", "gates", "aggregations", "coalesce"):
+    for collection_key in ("transforms", "gates", "aggregations", "coalesce", "collectors"):
         nodes = composition_state.get(collection_key)
         if nodes is None:
             continue
