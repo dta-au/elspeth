@@ -1364,6 +1364,14 @@ class RepositoryIdentityAuthority:
             # cannot otherwise reach. It stays because it makes the predicate
             # SAY what R5 means, rather than be accidentally right via a
             # Literal enforced three layers away.
+            #
+            # WHAT ARMS IT, so nobody deletes a load-bearing term because a
+            # comment said it did nothing: any change that lets a login
+            # resolve to a ``kind='service'`` row. Adding a provider value
+            # that service identities can also carry does it, and so does
+            # minting service identities under a browser provider. On that
+            # day this term is the only thing standing between a recycled
+            # service subject and R5 protection it must never have.
             r5_protected = False
             target_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": bound.identity_id}).all(), now)
             if existing.kind == "human" and _holds_deployment_admin(target_grants):
