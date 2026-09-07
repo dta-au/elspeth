@@ -3210,8 +3210,10 @@ async def maybe_resolve_step_1_source_chat(
                             retain_failures.append((retain_call, exc))
                     if retain_failures:
                         if type(deferred_repair_state) is _DeferredResolutionOpen:
-                            status = ComposerLLMCallStatus.SUCCESS
-                            return _withhold_open_resolution(deferred_repair_state)
+                            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                            error_class = type(retain_failures[0][1]).__name__
+                            error_message = "malformed_response"
+                            return _withhold_open_resolution(deferred_repair_state, error_class="PairedResolutionShapeRejected")
                         # Bounded self-repair (mirrors the step-2 config-invalid
                         # resolve_sink threading): thread the value-free shape
                         # rejections back and let the model correct itself once
@@ -4232,8 +4234,10 @@ async def maybe_resolve_step_2_sink_chat(
                             retain_failures.append((retain_call, exc))
                     if retain_failures:
                         if type(deferred_repair_state) is _DeferredResolutionOpen:
-                            status = ComposerLLMCallStatus.SUCCESS
-                            return _withhold_open_resolution(deferred_repair_state)
+                            status = ComposerLLMCallStatus.MALFORMED_RESPONSE
+                            error_class = type(retain_failures[0][1]).__name__
+                            error_message = "malformed_response"
+                            return _withhold_open_resolution(deferred_repair_state, error_class="PairedResolutionShapeRejected")
                         # Bounded self-repair (mirrors the config-invalid
                         # resolve_sink threading below): thread the value-free
                         # shape rejections back and let the model correct itself

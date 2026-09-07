@@ -2878,6 +2878,39 @@ async def _run_failure_state_solver(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
+async def test_resolution_open_malformed_retain_preserves_failure_and_settled_actions(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    """A failed retain replay remains malformed in both audit and caller outcome."""
+    calls_seen = 0
+
+    async def malformed_retain_replay(**_kwargs: Any) -> _FakeLLMResponse:
+        nonlocal calls_seen
+        calls_seen += 1
+        calls = (
+            _resolution_open_first_reply(stage)
+            if calls_seen == 1
+            else _resolution_replay_calls(stage, (_VALID_DEFERRED_ARGUMENTS, {"target_stage": "topology"}))
+        )
+        return _FakeLLMResponse(choices=[_FakeChoice(message=_FakeMessage(content=None, tool_calls=calls))])
+
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", malformed_retain_replay)
+    recorder = BufferingRecorder()
+    outcome = await _run_failure_state_solver(stage, recorder=recorder)
+
+    assert type(outcome) is chat_solver.GuidedChatDeferredIntentWithheldResolutionOutcome
+    assert outcome.actions == (_EXPECTED_DEFERRED_ACTION, _EXPECTED_DEFERRED_ACTION)
+    assert outcome.resolution_error_class == "PairedResolutionShapeRejected"
+    assert calls_seen == 2
+    assert len(recorder.llm_calls) == 2
+    assert recorder.llm_calls[-1].status is ComposerLLMCallStatus.MALFORMED_RESPONSE
+    assert recorder.llm_calls[-1].error_class == "DeferredIntentActionShapeError"
+    assert recorder.llm_calls[-1].error_message == "malformed_response"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["source", "sink"])
 @pytest.mark.parametrize("open_state", ["retain", "resolution"])
 @pytest.mark.parametrize(
     ("failure_kind", "expected_status"),
