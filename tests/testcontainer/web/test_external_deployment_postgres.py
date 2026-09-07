@@ -16,11 +16,12 @@ import importlib
 import json
 import os
 import re
+import time
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psycopg
 import pytest
@@ -28,12 +29,13 @@ from click.testing import Result
 from fastapi.testclient import TestClient
 from psycopg import sql
 from pydantic import SecretBytes
-from sqlalchemy import create_engine, inspect, update
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy import create_engine, event, inspect, update
+from sqlalchemy.engine import URL, Engine, make_url
 from sqlalchemy.exc import ProgrammingError
 from typer.testing import CliRunner
 
 from elspeth.cli import app as cli_app
+from elspeth.web import readiness
 from elspeth.web.app import create_app
 from elspeth.web.config import WebSettings
 from elspeth.web.external_state_startup import ExternalStateSchemaNotReadyError
@@ -376,12 +378,34 @@ def _assert_ddl_denied(url: str) -> None:
 
 
 @pytest.mark.usefixtures("aws_rds_trust_test_override")
-@pytest.mark.parametrize("target", _RUNTIME_CONTRACT_TARGETS)
+@pytest.mark.parametrize(
+    ("target", "query_delay"),
+    [pytest.param(target, 0.0, id=target) for target in _RUNTIME_CONTRACT_TARGETS]
+    + [pytest.param("kubernetes", 0.006, id="kubernetes-network-latency")],
+)
 def test_external_target_doctor_initializes_then_runtime_stays_validate_only(
     tmp_path: Path,
     database_pair: _DatabasePair,
     target: str,
+    query_delay: float,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    original_probe = readiness._probe_database_engine
+
+    def latency(*_args: object) -> None:
+        time.sleep(query_delay)
+
+    def delayed_probe(engine: Engine, *, kind: Literal["session", "landscape"]) -> tuple[readiness.ReadinessCheck, ...]:
+        event.listen(engine, "before_cursor_execute", latency)
+        try:
+            return original_probe(engine, kind=kind)
+        finally:
+            event.remove(engine, "before_cursor_execute", latency)
+
+    if query_delay:
+        # A modest per-query roundtrip cost must fit the unchanged readiness
+        # deadline; this fails when every table is reflected independently.
+        monkeypatch.setattr(readiness, "_probe_database_engine", delayed_probe)
     environment = _doctor_environment(
         tmp_path,
         target=target,
