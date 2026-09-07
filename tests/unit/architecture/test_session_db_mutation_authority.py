@@ -2166,7 +2166,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "9d42ab43e8714140",
         1,
         "WebInstanceMembershipAuthority",
-        line=251,
+        line=225,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2176,7 +2176,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "9d42ab43e8714140",
         1,
         "WebInstanceMembershipAuthority",
-        line=257,
+        line=231,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2186,7 +2186,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "fd9264070f18566f",
         1,
         "WebInstanceMembershipAuthority",
-        line=277,
+        line=251,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2196,7 +2196,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "16ca50d5443ff62b",
         1,
         "WebInstanceMembershipAuthority",
-        line=299,
+        line=273,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2206,7 +2206,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "46a0b81f64e195f0",
         1,
         "WebInstanceMembershipAuthority",
-        line=321,
+        line=295,
     ),
     # ── identity substrate (P4-D6 elspeth-e483fe7f85): RepositoryIdentityAuthority,
     # method-exact; every acquisition stays inside its method ─────────────
@@ -2642,7 +2642,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "98fd14f12508e73a",
         1,
         "WebInstanceMembershipAuthority",
-        line=296,
+        line=270,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2652,7 +2652,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "71b4334a0f438add",
         1,
         "WebInstanceMembershipAuthority",
-        line=274,
+        line=248,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2662,7 +2662,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "4152160f19e026da",
         1,
         "WebInstanceMembershipAuthority",
-        line=229,
+        line=203,
     ),
     WriterIdentity(
         "src/elspeth/web/coordination/membership_authority.py",
@@ -2672,7 +2672,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "476bbd10507b185c",
         1,
         "WebInstanceMembershipAuthority",
-        line=318,
+        line=292,
     ),
     # src/elspeth/web/coordination/repository.py :: SessionBlobMutationAuthority
     WriterIdentity(
@@ -10321,7 +10321,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "4152160f19e026da",
             1,
             "WebInstanceMembershipAuthority",
-            line=229,
+            line=203,
         ),
         WriterIdentity(
             authority_relpath,
@@ -10331,7 +10331,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "71b4334a0f438add",
             1,
             "WebInstanceMembershipAuthority",
-            line=274,
+            line=248,
         ),
         WriterIdentity(
             authority_relpath,
@@ -10341,7 +10341,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "98fd14f12508e73a",
             1,
             "WebInstanceMembershipAuthority",
-            line=296,
+            line=270,
         ),
         WriterIdentity(
             authority_relpath,
@@ -10351,7 +10351,7 @@ def test_web_instance_membership_writer_is_exact_contained_and_operation_exact()
             "476bbd10507b185c",
             1,
             "WebInstanceMembershipAuthority",
-            line=318,
+            line=292,
         ),
     ]
     assert connection_authority_violations(authority_live) == []

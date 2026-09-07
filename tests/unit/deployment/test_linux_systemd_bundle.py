@@ -63,6 +63,9 @@ def test_portable_service_retains_restart_and_hardening_contract() -> None:
     lines = _active_service_lines()
 
     assert "Restart=on-failure" in lines
+    # ProcessRecovery asks Uvicorn to drain through SIGTERM. Systemd otherwise
+    # considers that signal clean and on-failure would leave the service down.
+    assert "RestartForceExitStatus=SIGTERM" in lines
     expected_hardening = {
         "NoNewPrivileges=yes",
         "PrivateTmp=yes",

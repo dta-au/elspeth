@@ -50,6 +50,7 @@ from typing import Final, Literal
 
 from sqlalchemy import Engine
 
+from elspeth import __version__
 from elspeth.web import aws_ecs_startup, external_state_startup
 from elspeth.web.config import DeploymentTarget, WebSettings
 from elspeth.web.deployment_contract import ResolvedDeploymentStateMode
@@ -75,6 +76,17 @@ StartupContractFamily = Literal["aws-ecs", "external-state"]
 verification and ECS-worded diagnostics; every other target boots through
 the provider-neutral ``external_state_startup`` module directly.
 """
+
+MembershipIdentitySource = Literal["package", "task-definition", "platform-revision"]
+
+
+@dataclass(frozen=True)
+class DeploymentMembershipIdentity:
+    """Deployment facts carried into the membership row."""
+
+    generation: str
+    image_identity: str
+    revision: str
 
 
 class PlatformIdentityError(RuntimeError):
@@ -117,6 +129,35 @@ class DeploymentStartupProfile:
     """Platform variable naming this replica, or ``None`` when the platform sets none."""
     revision_env_var: str | None
     """Platform variable naming the deployed revision, or ``None``."""
+    membership_identity_source: MembershipIdentitySource = "package"
+
+    def membership_identity(self, settings: WebSettings) -> DeploymentMembershipIdentity:
+        """Resolve the deployment facts this profile requires; never default missing facts."""
+
+        def required(value: str | None, name: str) -> str:
+            if value is None or not value.strip():
+                raise ValueError(f"{self.target} membership identity requires the deployment contract to carry {name}")
+            return value
+
+        match self.membership_identity_source:
+            case "task-definition":
+                return DeploymentMembershipIdentity(
+                    generation=required(settings.operator_telemetry_task_definition_family, "operator_telemetry_task_definition_family"),
+                    image_identity=required(settings.operator_telemetry_release, "operator_telemetry_release"),
+                    revision=required(settings.operator_telemetry_task_definition_revision, "operator_telemetry_task_definition_revision"),
+                )
+            case "platform-revision":
+                revision = required(read_platform_identity(self).revision, "platform revision")
+                return DeploymentMembershipIdentity(
+                    generation=revision,
+                    image_identity=required(settings.operator_telemetry_release, "operator_telemetry_release"),
+                    revision=revision,
+                )
+            case "package":
+                package_identity = f"elspeth-{__version__}"
+                return DeploymentMembershipIdentity(package_identity, package_identity, package_identity)
+            case _:
+                raise ValueError(f"Unknown membership identity source: {self.membership_identity_source}")
 
     def enforce_contract(self, settings: WebSettings, *, resolved_state_mode: ResolvedDeploymentStateMode) -> None:
         """Reject incomplete deployment policy before any provider is installed."""
@@ -172,6 +213,7 @@ DEPLOYMENT_STARTUP_PROFILES: Final[Mapping[DeploymentTarget, DeploymentStartupPr
             # the environment; the acceptance harness reads it there.
             replica_identity_env_var=None,
             revision_env_var=None,
+            membership_identity_source="task-definition",
         ),
         "azure-container-apps": DeploymentStartupProfile(
             target="azure-container-apps",
@@ -181,6 +223,7 @@ DEPLOYMENT_STARTUP_PROFILES: Final[Mapping[DeploymentTarget, DeploymentStartupPr
             # Set by Container Apps on every replica of every revision.
             replica_identity_env_var="CONTAINER_APP_REPLICA_NAME",
             revision_env_var="CONTAINER_APP_REVISION",
+            membership_identity_source="platform-revision",
         ),
         "kubernetes": _external_state_profile("kubernetes"),
     }

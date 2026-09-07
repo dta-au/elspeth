@@ -203,6 +203,16 @@ without printing the environment file:
 sudo journalctl -u elspeth-web.service --since=-10m --no-pager
 ```
 
+Fatal membership heartbeat or orphan-sweeper failure marks the instance as
+draining and sends SIGTERM to Uvicorn. The host stops accepting requests,
+drains execution, records membership stopped, flushes telemetry and closes
+workers and database resources before exiting. The portable unit includes
+`RestartForceExitStatus=SIGTERM` so this exit triggers replacement even though
+`Restart=on-failure` normally treats SIGTERM as clean. Use
+`sudo systemctl stop elspeth-web.service` for an intentional stop: an explicit
+systemd stop suppresses automatic restart. These restart semantics are
+defined by [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#RestartForceExitStatus=).
+
 ## Stop-before-start upgrade
 
 Every upgrade has a deliberate availability interruption. Do not start the

@@ -2078,7 +2078,7 @@ class TestLifespanShutdown:
         assert fake_operator_telemetry.shutdown_calls == 1
 
     @pytest.mark.asyncio
-    async def test_fatal_periodic_cleanup_failure_stops_lifespan_and_preserves_shutdown(
+    async def test_fatal_periodic_cleanup_requests_recovery_and_preserves_shutdown(
         self,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path,
@@ -2099,23 +2099,17 @@ class TestLifespanShutdown:
 
         monkeypatch.setattr(app_module, "_periodic_orphan_cleanup", fatal_cleanup)
         monkeypatch.setattr("elspeth.web.async_workers.shutdown_async_workers", shutdown_workers)
-
-        async def serve_until_stopped() -> None:
+        recovery_requested = asyncio.Event()
+        monkeypatch.setattr("elspeth.web.process_recovery.os.kill", lambda _pid, _signal: recovery_requested.set())
+        with (
+            patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service),
+            pytest.raises(OSError, match="orphan cleanup storage unavailable"),
+        ):
             async with lifespan(app):
-                await asyncio.Event().wait()
-
-        with patch("elspeth.web.app.ExecutionServiceImpl", return_value=fake_execution_service):
-            lifespan_task = asyncio.create_task(serve_until_stopped())
-            await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
-            done, _pending = await asyncio.wait({lifespan_task}, timeout=0.2)
-            if lifespan_task not in done:
-                lifespan_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, OSError):
-                    await lifespan_task
-
-        assert lifespan_task in done, "fatal orphan cleanup left the service lifespan running"
-        with pytest.raises(OSError, match="orphan cleanup storage unavailable"):
-            await lifespan_task
+                await asyncio.wait_for(cleanup_failed.wait(), timeout=5.0)
+                await asyncio.wait_for(recovery_requested.wait(), timeout=5.0)
+                assert app.state.instance_draining.is_set()
+                assert fake_execution_service.shutdown_calls == 0
         assert fake_execution_service.shutdown_calls == 1
         assert fake_operator_telemetry.shutdown_calls == 1
 

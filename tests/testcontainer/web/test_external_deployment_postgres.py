@@ -238,6 +238,10 @@ def _clear_inherited_web_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in tuple(os.environ):
         if key.startswith("ELSPETH_WEB__"):
             monkeypatch.delenv(key, raising=False)
+    # Model the identity Container Apps injects, including the revision used
+    # by its PostgreSQL membership row. Other startup profiles ignore it.
+    monkeypatch.setenv("CONTAINER_APP_REVISION", "elspeth--postgres-contract")
+    monkeypatch.setenv("CONTAINER_APP_REPLICA_NAME", "elspeth--postgres-contract-replica")
 
 
 def _prepare_directories(tmp_path: Path) -> tuple[Path, Path]:
@@ -270,6 +274,8 @@ def _settings(
 ) -> WebSettings:
     data_dir, payload_dir = _prepare_directories(tmp_path)
     target_settings = _aws_settings() if target == "aws-ecs" else {}
+    if target == "azure-container-apps":
+        target_settings["operator_telemetry_release"] = "a" * 40
     return WebSettings(
         deployment_target=target,  # type: ignore[arg-type]
         deployment_state_mode="external-postgresql",

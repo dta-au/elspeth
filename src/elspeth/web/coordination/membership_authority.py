@@ -27,7 +27,6 @@ from typing import Any, final
 
 from sqlalchemy import Engine, insert, select, update
 
-from elspeth import __version__
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH
 from elspeth.web.config import WebSettings
 from elspeth.web.coordination.contracts import (
@@ -35,7 +34,7 @@ from elspeth.web.coordination.contracts import (
     CompatibilityKey,
     InstanceState,
 )
-from elspeth.web.deployment_contract import DEPLOYMENT_TARGET_AWS_ECS
+from elspeth.web.deployment_profiles import deployment_startup_profile
 from elspeth.web.sessions.models import SESSION_SCHEMA_EPOCH, web_instances_table
 from elspeth.web.sessions.protocol import WebInstanceRecord
 
@@ -130,50 +129,25 @@ def current_compatibility_key() -> CompatibilityKey:
     )
 
 
-def _require_contract_identity(value: str | None, setting_name: str) -> str:
-    if value is None or not value.strip():
-        raise ValueError(f"aws-ecs membership identity requires the deployment contract to carry {setting_name}")
-    return value
-
-
 def web_instance_identity_from_settings(settings: WebSettings, *, instance_id: str) -> WebInstanceIdentity:
     """Derive the membership identity from what the deployment contract proves.
 
-    ``aws-ecs`` carries a task-definition family (the rollout generation), a
-    task-definition revision and the release SHA the image pull was gated on;
-    the ECS contract already requires all three, and their absence here is a
-    contract breach, not a default. Every other target registers the package
-    version as its generation and image identity: that is the only build fact
-    a process can prove about itself without platform-injected identity. A
-    platform startup profile that carries more (Azure Container Apps names
-    its revision and replica) supplies its own arm here.
+    The closed startup profile owns deployment-specific identity policy.
+    AWS carries its task family/revision and Azure its platform revision;
+    both carry the release identity of the digest-pinned image. Profiles
+    without injected deployment identity use their package version.
     """
     if type(settings) is not WebSettings:
         raise TypeError("settings must be a WebSettings")
     compatibility_key = current_compatibility_key()
-    if settings.deployment_target == DEPLOYMENT_TARGET_AWS_ECS:
-        return WebInstanceIdentity(
-            instance_id=instance_id,
-            deployment_target=settings.deployment_target,
-            deployment_generation=_require_contract_identity(
-                settings.operator_telemetry_task_definition_family,
-                "operator_telemetry_task_definition_family",
-            ),
-            compatibility_key=compatibility_key,
-            image_digest=_require_contract_identity(settings.operator_telemetry_release, "operator_telemetry_release"),
-            revision_label=_require_contract_identity(
-                settings.operator_telemetry_task_definition_revision,
-                "operator_telemetry_task_definition_revision",
-            ),
-        )
-    package_identity = f"elspeth-{__version__}"
+    deployment_identity = deployment_startup_profile(settings.deployment_target).membership_identity(settings)
     return WebInstanceIdentity(
         instance_id=instance_id,
         deployment_target=settings.deployment_target,
-        deployment_generation=package_identity,
+        deployment_generation=deployment_identity.generation,
         compatibility_key=compatibility_key,
-        image_digest=package_identity,
-        revision_label=package_identity,
+        image_digest=deployment_identity.image_identity,
+        revision_label=deployment_identity.revision,
     )
 
 

@@ -120,6 +120,7 @@ from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
 from elspeth.web.preferences.routes import create_preferences_router
 from elspeth.web.preferences.service import CorruptPreferencesError, PreferencesService
+from elspeth.web.process_recovery import ProcessRecovery
 from elspeth.web.readiness import (
     ReadinessCache,
     ReadinessProbeRunner,
@@ -755,26 +756,25 @@ async def _service_lifespan(app: FastAPI) -> AsyncIterator[None]:
             create_tables=create_landscape_tables,
         )
     )
-    lifespan_owner = asyncio.current_task()
-    if lifespan_owner is None:
-        raise RuntimeError("service lifespan must run inside an asyncio task")
 
-    def _stop_lifespan_on_orphan_failure(completed: asyncio.Task[None]) -> None:
+    def _recover_process_on_orphan_failure(completed: asyncio.Task[None]) -> None:
         if not completed.cancelled() and completed.exception() is not None:
-            lifespan_owner.cancel()
+            app.state.instance_draining.set()
+            app.state.process_recovery.request_shutdown()
 
-    orphan_task.add_done_callback(_stop_lifespan_on_orphan_failure)
+    orphan_task.add_done_callback(_recover_process_on_orphan_failure)
 
     try:
         yield
     finally:
+        app.state.process_recovery.begin_shutdown()
         # Drain first: readiness fails at once and the membership row says
         # ``draining`` while the executor's work drains, so the platform stops
         # routing new work here before anything is torn down. The row write's
         # outcome is returned, never raised — shutdown proceeds regardless.
         await app.state.web_instance_membership.begin_drain()
         # Cancel periodic cleanup before shutting down the executor. A fatal
-        # sweeper failure cancels this owning task via the done callback above;
+        # sweeper failure requests host shutdown via the done callback above;
         # awaiting the completed task then restores that original failure.
         # Teardown stays in the nested finally so the failure cannot skip the
         # executor, telemetry, or shared-worker shutdown sequence.
@@ -1619,11 +1619,14 @@ def _create_app(
     # readiness gate reads identically on both modes. Registration and the
     # heartbeat start in the lifespan, after the startup sweeps.
     web_instance_membership: WebInstanceMembership
+    process_recovery = ProcessRecovery()
+    app.state.process_recovery = process_recovery
     if session_engine.dialect.name == "postgresql":
         web_instance_membership = RegisteredWebInstanceMembership(
             RepositoryWebInstanceMembershipAuthority(session_engine),
             web_instance_identity_from_settings(settings, instance_id=session_service.session_operation_owner_instance_id),
             lease_seconds=session_service.session_operation_lease_seconds,
+            process_recovery=process_recovery,
         )
     else:
         web_instance_membership = SingleProcessWebInstanceMembership()
