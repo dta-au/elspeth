@@ -102,6 +102,7 @@ class _ControllableLease:
         self.loss_signalled = asyncio.Event()
         self.close_calls = 0
         self.close_cancelled = False
+        self.close_error: BaseException | None = None
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -112,6 +113,8 @@ class _ControllableLease:
             self.close_cancelled = True
             raise
         self.close_finished.set()
+        if self.close_error is not None:
+            raise self.close_error
 
     async def wait_until_lost(self) -> None:
         await self.loss_signalled.wait()
@@ -531,6 +534,79 @@ async def test_cancelled_execute_request_before_transfer_cannot_interrupt_lease_
     assert lease.close_calls == 1
     assert not lease.close_cancelled
     assert lease.close_finished.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cleanup_error_type", "logger_error_type"),
+    [
+        (OSError, None),
+        (OSError, OSError),
+        (OSError, AuditIntegrityError),
+        (OSError, FrameworkBugError),
+        (AuditIntegrityError, None),
+        (FrameworkBugError, None),
+    ],
+)
+@pytest.mark.parametrize("repeat_cancellation", [False, True])
+async def test_cancelled_http_execute_observes_cleanup_failure_without_losing_primary(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_error_type: type[Exception],
+    logger_error_type: type[Exception] | None,
+    repeat_cancellation: bool,
+) -> None:
+    session_id = uuid4()
+    lease = _ControllableLease(_context(session_id))
+    cleanup_error = cleanup_error_type("private lease failure detail")
+    lease.close_error = cleanup_error
+    _install_acquire(monkeypatch, lease)
+    session_service = _RouteSessionService(session_id)
+    execution_service = _RouteExecutionService(uuid4())
+    app = _http_route_app(session_service=session_service, execution_service=execution_service)
+    logger_error = None if logger_error_type is None else logger_error_type("private logger failure detail")
+    expected_integrity_error = (
+        cleanup_error
+        if cleanup_error_type in (AuditIntegrityError, FrameworkBugError)
+        else logger_error
+        if logger_error_type in (AuditIntegrityError, FrameworkBugError)
+        else None
+    )
+
+    with patch("elspeth.web.execution.routes.slog.error", side_effect=logger_error) as log_error:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            request_task = asyncio.create_task(client.post(f"/api/sessions/{session_id}/execute"))
+            await asyncio.wait_for(execution_service.started.wait(), timeout=2)
+            request_task.cancel("initial request cancellation")
+            await asyncio.wait_for(lease.close_started.wait(), timeout=2)
+            if repeat_cancellation:
+                request_task.cancel("repeated request cancellation")
+                await asyncio.sleep(0)
+            assert not request_task.done()
+            lease.close_allowed.set()
+            if expected_integrity_error is not None:
+                with pytest.raises(type(expected_integrity_error)) as raised_integrity:
+                    await asyncio.wait_for(request_task, timeout=2)
+                assert raised_integrity.value is expected_integrity_error
+            else:
+                with pytest.raises(asyncio.CancelledError) as raised_cancellation:
+                    await asyncio.wait_for(request_task, timeout=2)
+                assert raised_cancellation.value.args == ("initial request cancellation",)
+
+    assert lease.close_calls == 1
+    assert lease.close_finished.is_set()
+    assert not lease.close_cancelled
+    if cleanup_error_type is OSError:
+        log_error.assert_called_once_with(
+            "execution_pretransfer_lease_close_failed",
+            session_id=str(session_id),
+            operation_id=lease.context.fence.operation_id,
+            operation_epoch=lease.context.fence.operation_epoch,
+            error_type="OSError",
+            primary_error_type="CancelledError",
+        )
+        assert "private" not in repr(log_error.call_args)
+    else:
+        log_error.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -31,6 +31,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 from starlette.types import Receive, Scope, Send
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
@@ -128,26 +129,46 @@ def _get_websocket_ticket_store(app: Any) -> WebSocketTicketStore:
     return cast(WebSocketTicketStore, app.state.websocket_ticket_store)
 
 
-async def _close_execute_lease_before_transfer(lease: SessionOperationLease) -> None:
+async def _close_execute_lease_before_transfer(
+    lease: SessionOperationLease,
+    *,
+    cancellation: asyncio.CancelledError | None = None,
+) -> None:
     """Join exact lease cleanup even when request cancellation repeats."""
     close_task = asyncio.create_task(
         lease.close(),
         name="execution-pretransfer-lease-close",
     )
-    cancellation: asyncio.CancelledError | None = None
     while not close_task.done():
         try:
-            await asyncio.shield(close_task)
+            # wait observes completion without propagating the close error or
+            # cancelling the close task when this request is cancelled.
+            await asyncio.wait({close_task})
         except asyncio.CancelledError as error:
             if cancellation is None:
                 cancellation = error
             continue
     try:
         close_task.result()
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except BaseException as close_error:
         if cancellation is None:
             raise
         cancellation.add_note(f"Execution pre-transfer lease close also failed with {type(close_error).__name__}.")
+        try:
+            slog.error(
+                "execution_pretransfer_lease_close_failed",
+                session_id=lease.context.fence.session_id,
+                operation_id=lease.context.fence.operation_id,
+                operation_epoch=lease.context.fence.operation_epoch,
+                error_type=type(close_error).__name__,
+                primary_error_type=type(cancellation).__name__,
+            )
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_error:
+            cancellation.add_note(f"Execution pre-transfer cleanup diagnostic also failed with {type(logging_error).__name__}.")
     if cancellation is not None:
         raise cancellation from None
 
@@ -984,6 +1005,7 @@ def create_execution_router() -> APIRouter:
             lease_seconds=session_service.session_operation_lease_seconds,
         )
         transferred = False
+        request_cancellation: asyncio.CancelledError | None = None
         try:
             run_id = await service.execute(
                 session_id,
@@ -995,6 +1017,9 @@ def create_execution_router() -> APIRouter:
                 secret_ack_token=secret_ack_token,
             )
             transferred = True
+        except asyncio.CancelledError as error:
+            request_cancellation = error
+            raise
         except StateAccessError:
             # IDOR contract: the "state does not exist" and
             # "state belongs to another session" branches in the
@@ -1210,7 +1235,7 @@ def create_execution_router() -> APIRouter:
             raise HTTPException(status_code=404, detail=str(exc)) from None
         finally:
             if not transferred:
-                await _close_execute_lease_before_transfer(lease)
+                await _close_execute_lease_before_transfer(lease, cancellation=request_cancellation)
         return {"run_id": str(run_id)}
 
     # ── Run-scoped endpoints (status, cancel, results) ────────────────
