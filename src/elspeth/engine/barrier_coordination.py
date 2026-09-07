@@ -2459,11 +2459,13 @@ class BarrierRecoveryCoordinator:
             # them afresh and runs the full accept + trigger path (merge, failure,
             # late-arrival), which the restore phase cannot safely produce (accept()
             # may fire a merge whose RowResult the __init__ path cannot commit to the
-            # journal).  The reset is leader-fenced on this coordinator's seat: our
-            # own takeover CAS committed before this restore began and gates nothing
-            # now, so a SECOND takeover that deposed us mid-restore is refused here
-            # (RunLeadershipLostError) rather than resetting a live successor's
-            # markers — see reset_adoption_marker_to_pending's docstring.
+            # journal).  The reset is leader-fenced on this coordinator's seat.
+            # It is NOT made safe by any takeover CAS: that CAS guards adoption,
+            # a different verb, and our own committed long before this restore.
+            # A single takeover that deposed us mid-restore is enough to make
+            # this write land under a live successor, so the fence refuses it
+            # here (RunLeadershipLostError) with zero mutation of the markers —
+            # see reset_adoption_marker_to_pending's docstring.
             if coalesce_holdless_items:
                 reset_count = self._scheduler.reset_adoption_marker_to_pending(
                     work_item_ids=[item.work_item_id for item in coalesce_holdless_items],

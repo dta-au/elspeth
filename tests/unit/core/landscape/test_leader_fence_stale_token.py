@@ -1073,32 +1073,83 @@ class TestValidTokenFenceSemantics:
         assert after.replace(tzinfo=UTC) > before, "every fenced verb doubles as the seat heartbeat (verify-AND-EXTEND)"
         assert _fence_refusals(db, "create_checkpoint") == []
 
-    def test_reset_adoption_marker_to_pending_clears_the_marker(self, db: LandscapeDB, token: CoordinationToken) -> None:
-        """The live-token arm: an undeposed leader's §E.3 reset still does its job."""
-        repo = TokenSchedulerRepository(db.engine)
-        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=0, owner=WORKER)
-        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key="b1", expected_lease_owner=WORKER)
-        repo.adopt_blocked_barrier_item(
+    def _adopt_blocked_row(
+        self, db: LandscapeDB, repo: TokenSchedulerRepository, *, sequence: int, token: CoordinationToken
+    ) -> tuple[str, str]:
+        """BLOCKED barrier hold adopted through the real fenced verb; returns (token_id, work_item_id)."""
+        token_id, _row_id, work_item_id = _enqueue_and_claim(db, repo, sequence=sequence, owner=WORKER)
+        repo.mark_blocked(work_item_id=work_item_id, queue_key=None, barrier_key=f"b{sequence}", expected_lease_owner=WORKER)
+        adoption = repo.adopt_blocked_barrier_item(
             run_id=RUN_ID,
             work_item_id=work_item_id,
             token_id=token_id,
-            barrier_key="b1",
+            barrier_key=f"b{sequence}",
             membership=None,
             buffered_outcome=None,
             coordination_token=token,
         )
-        assert _work_item_row(db, token_id)["barrier_adopted_epoch"] == token.leader_epoch
-        reset = repo.reset_adoption_marker_to_pending(work_item_ids=[work_item_id], coordination_token=token)
-        assert reset == 1
-        assert _work_item_row(db, token_id)["barrier_adopted_epoch"] is None, "the row is intake-pending again"
+        assert adoption.barrier_adopted_epoch == token.leader_epoch
+        return token_id, work_item_id
+
+    def test_reset_adoption_marker_to_pending_resets_only_blocked_rows(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """Behaviour preservation: adding the fence must not change WHICH rows the verb resets.
+
+        A fence that also changes the write is two changes wearing one commit,
+        so the live-token arm pins the selection, not merely that something
+        happened. Three adopted rows, all three ids passed, ONLY the two still
+        BLOCKED are reset; the terminal row keeps its marker (§E.4 treats
+        adopted-at-any-epoch rows as restorable members).
+        """
+        repo = TokenSchedulerRepository(db.engine)
+        blocked: list[tuple[str, str]] = []
+        for sequence in (0, 1):
+            token_id, work_item_id = self._adopt_blocked_row(db, repo, sequence=sequence, token=token)
+            blocked.append((token_id, work_item_id))
+        terminal_token_id, terminal_work_item_id = self._adopt_blocked_row(db, repo, sequence=2, token=token)
+        with db.engine.begin() as conn:
+            conn.execute(
+                update(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == terminal_work_item_id)
+                .values(status=TokenWorkStatus.TERMINAL.value)
+            )
+        adopted_epoch = token.leader_epoch
+        assert _work_item_row(db, terminal_token_id)["barrier_adopted_epoch"] == adopted_epoch
+
+        reset = repo.reset_adoption_marker_to_pending(
+            work_item_ids=[work_item_id for _token_id, work_item_id in blocked] + [terminal_work_item_id],
+            coordination_token=token,
+        )
+
+        assert reset == 2, "only the BLOCKED rows are reset, even though three ids were passed"
+        for token_id, _work_item_id in blocked:
+            assert _work_item_row(db, token_id)["barrier_adopted_epoch"] is None, "the BLOCKED row is intake-pending again"
+        assert _work_item_row(db, terminal_token_id)["barrier_adopted_epoch"] == adopted_epoch, (
+            "a non-BLOCKED row keeps its adoption marker: the fence must not widen the write set"
+        )
         assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
 
-    def test_reset_adoption_marker_to_pending_empty_ids_never_reaches_the_fence(self, db: LandscapeDB, token: CoordinationToken) -> None:
-        """No ids means no database effect, so a deposed leader is not refused — there is nothing to refuse."""
+    def test_reset_adoption_marker_to_pending_empty_ids_opens_no_transaction(self, db: LandscapeDB, token: CoordinationToken) -> None:
+        """No ids means no database effect, so the early return precedes the fence entirely.
+
+        Even a deposed leader is not refused here: there is nothing to refuse.
+        """
         repo = TokenSchedulerRepository(db.engine)
         _bump_epoch(db)
-        assert repo.reset_adoption_marker_to_pending(work_item_ids=[], coordination_token=token) == 0
+        before = _barrier_mutation_snapshot(db)
+        transactions: list[object] = []
+
+        def record_begin(conn: object) -> None:
+            transactions.append(conn)
+
+        event.listen(db.engine, "begin", record_begin)
+        try:
+            assert repo.reset_adoption_marker_to_pending(work_item_ids=[], coordination_token=token) == 0
+        finally:
+            event.remove(db.engine, "begin", record_begin)
+
+        assert transactions == [], "an empty reset must return before opening a transaction"
         assert _fence_refusals(db, "reset_adoption_marker_to_pending") == []
+        assert _barrier_mutation_snapshot(db) == before
 
     def test_complete_run_quiescence_predicate_refuses_residual_work(self, db: LandscapeDB, token: CoordinationToken) -> None:
         """§D: a SUCCESS finalize over residual scheduler work is refused in-statement."""

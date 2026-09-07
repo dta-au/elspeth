@@ -1195,21 +1195,36 @@ class BarrierJournalRepository:
         holdless non-completed rows, before any executor state is touched.
 
         Leader-fenced (ADR-030 §D4, ADR-048). This verb previously ran on a bare
-        ``begin_write`` and its docstring argued the fence was unnecessary
-        because "the takeover CAS has already committed, so the new leader is
-        the only actor with write access at this point". That is true of ONE
-        takeover and false of two. Leader A takes the seat at epoch N, enters
-        ``restore_from_journal``, and stalls; A's lease lapses, B takes over at
-        epoch N+1 and begins adopting rows; A's in-flight restore then resumes
-        and resets the markers B has just set — under a live successor, with no
-        refusal and no ``fence_refusal`` event. A's own takeover CAS committed
-        long ago and gates nothing now. The epoch fence is what turns "the only
-        actor with write access" from an assumption into a statement the write
-        itself verifies, which is exactly the write this fence exists to refuse.
+        ``begin_write``, and its docstring argued confidently that it was
+        "epoch-fence-free" because "any concurrent old-leader adoption attempt
+        would fail the CAS, and the new leader is the only actor with write
+        access at this point". That justification was a category error, and the
+        confidence is why it survived review:
+
+        * It pointed at the **adoption CAS**, which guards a DIFFERENT verb.
+          :meth:`adopt_blocked_barrier_item` is fenced and CASes
+          ``barrier_adopted_epoch NULL -> epoch``. THIS verb has no CAS at all,
+          so nothing it does is protected by the sentence that excused it.
+        * **ONE takeover is sufficient** to break it. A leader still inside
+          ``restore_from_journal`` whose lease has lapsed, and whose seat a
+          successor has taken, reaches this write with nothing to refuse it: it
+          clears markers under a live successor, with no ``fence_refusal``
+          event. The second, worse instance is a further takeover: leader A
+          holds epoch N, enters restore and stalls; B takes over at N+1 and
+          begins adopting; A's in-flight restore then resets the markers B has
+          just set. A's own takeover CAS committed long ago and gates nothing.
+        * "The new leader is the only actor with write access at this point"
+          was an assumption about TIMING stated as a property, with no code
+          enforcing it — a fail-open guard written in prose.
+
+        What enforces it now: ``fenced_leader_transaction`` is the FIRST
+        database effect after the empty-ids early return, so a stale epoch is
+        refused (``RunLeadershipLostError``) with ZERO mutation of the marker,
+        and the refusal is recorded as a ``fence_refusal`` event.
 
         An empty ``work_item_ids`` returns before the fence: there is no
-        database effect to fence, so a caller with nothing to reset is not
-        charged a seat verification (and does not have its seat extended).
+        database effect to fence, so a caller with nothing to reset opens no
+        transaction, is not charged a seat verification, and is not refused.
         """
         if not work_item_ids:
             return 0
