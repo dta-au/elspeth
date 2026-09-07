@@ -48,25 +48,42 @@ PDF_DIR="${ELSPETH_CONTROL_PACK_PDF_DIR:-$SOURCE_DIR}"
 METADATA_DIR="$SCRIPT_DIR/control-pack"
 
 # ─────────────────────────────────────────────────────────────
-# Document manifest:  key | source markdown | metadata file
+# Document manifest:  key | source stem | metadata file
 #
 # Each entry becomes one self-contained PDF.  To add a document,
 # add a line here and a matching metadata YAML under control-pack/.
+#
+# The stem carries no date.  Every document in the control set is filed
+# under a YYYY-MM-DD- prefix, and the folder README defines the current
+# version of a document as the file with the LATEST date prefix, so the
+# builder resolves the stem against the directory rather than pinning a
+# date here — otherwise every reissue of the pack needs an edit to this
+# tracked script before it can be rendered.
 # ─────────────────────────────────────────────────────────────
 DOCUMENTS=(
-    "program|2026-09-05-work-packages.md|program.yaml"
-    "raid-register|2026-09-05-implementation-raid-register.md|raid-register.yaml"
-    "prd|2026-09-05-elspeth-prd.md|prd.yaml"
+    "program|work-packages.md|program.yaml"
+    "raid-register|implementation-raid-register.md|raid-register.yaml"
+    "prd|elspeth-prd.md|prd.yaml"
 )
 
 doc_key()      { echo "${1%%|*}"; }
-doc_source()   { local r="${1#*|}"; echo "${r%%|*}"; }
+doc_stem()     { local r="${1#*|}"; echo "${r%%|*}"; }
 doc_metadata() { echo "${1##*|}"; }
+
+# Newest dated file for a stem, as a bare filename.  Empty if none exists.
+doc_source() {
+    local stem="$1" newest=""
+    for candidate in "$SOURCE_DIR"/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-"$stem"; do
+        [[ -f "$candidate" ]] || continue
+        newest="$candidate"
+    done
+    [[ -n "$newest" ]] && basename "$newest"
+}
 
 if [[ "${1:-}" == "--list" ]]; then
     echo "Document keys:"
     for entry in "${DOCUMENTS[@]}"; do
-        printf '  %-16s %s\n' "$(doc_key "$entry")" "$(doc_source "$entry")"
+        printf '  %-16s %s\n' "$(doc_key "$entry")" "$(doc_source "$(doc_stem "$entry")")"
     done
     exit 0
 fi
@@ -94,8 +111,12 @@ echo "PDFs:   $PDF_DIR"
 build_document() {
     local key="$1" source_file="$2" metadata_file="$3"
 
-    local src="$SOURCE_DIR/$source_file"
     local metadata="$METADATA_DIR/$metadata_file"
+    if [[ -z "$source_file" ]]; then
+        echo "  [error] no dated source in $SOURCE_DIR for document: $key" >&2
+        exit 1
+    fi
+    local src="$SOURCE_DIR/$source_file"
     if [[ ! -f "$src" ]]; then
         echo "  [error] missing source: $src" >&2
         exit 1
@@ -152,7 +173,7 @@ for entry in "${DOCUMENTS[@]}"; do
     if [[ ${#SELECTED[@]} -gt 0 ]] && [[ ! " ${SELECTED[*]} " == *" $key "* ]]; then
         continue
     fi
-    build_document "$key" "$(doc_source "$entry")" "$(doc_metadata "$entry")"
+    build_document "$key" "$(doc_source "$(doc_stem "$entry")")" "$(doc_metadata "$entry")"
     BUILT=$(( BUILT + 1 ))
 done
 
