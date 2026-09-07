@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
-from elspeth_lints.core.judge import AgentToolScope
+from elspeth_lints.core.judge import AgentToolScope, build_readonly_tool_scope
 from elspeth_lints.mcp.codex_judge_tools import (
     _glob_files,
     _grep_files,
@@ -80,3 +81,60 @@ def test_read_and_grep_see_scrubbed_source_not_raw_bytes(scope: AgentToolScope) 
 def test_glob_rejects_parent_escape(scope: AgentToolScope) -> None:
     with pytest.raises(ValueError, match="may not contain"):
         _glob_files(scope, {"pattern": "../*"})
+
+
+def test_whole_checkout_search_reaches_evidence_without_searching_artifacts(tmp_path: Path) -> None:
+    source = tmp_path / "src" / "elspeth"
+    source.mkdir(parents=True)
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=tmp_path / "config")
+    evidence = (
+        "src/elspeth/helper.py",
+        "tests/unit/test_helper.py",
+        "docs/control.md",
+        "scripts/verify.py",
+        "config/control.yaml",
+        ".github/workflows/ci.yaml",
+        ".agents/skills/review/SKILL.md",
+        "README.md",
+    )
+    artifacts = (
+        ".git/config",
+        ".venv/vendor.py",
+        "node_modules/pkg/index.js",
+        ".claude/worktrees/old/tests/test_old.py",
+        ".elspeth/staged-reviews/old.json",
+        "config/.sign-bundle-transactions/old/candidate.yaml",
+    )
+    for name in (*evidence, *artifacts):
+        target = tmp_path / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("control_evidence\n", encoding="utf-8")
+    expected = sorted(str(tmp_path / name) for name in evidence)
+    result = json.loads(_grep_files(scope, {"pattern": "control_evidence", "output_mode": "files_with_matches"}))
+    assert result["files"] == expected
+    assert result["scanned_files"] == len(evidence)
+    assert result["truncated"] is False
+    assert json.loads(_glob_files(scope, {"pattern": "**/*"}))["files"] == expected
+    assert json.loads(_glob_files(scope, {"pattern": "tests/**/*.py"}))["files"] == [str(tmp_path / "tests/unit/test_helper.py")]
+    assert json.loads(_glob_files(scope, {"pattern": "*.md"}))["files"] == [str(tmp_path / "README.md")]
+    assert json.loads(_glob_files(scope, {"pattern": "**/helper.py"}))["files"] == [str(source / "helper.py")]
+    assert json.loads(_glob_files(scope, {"pattern": "*.py", "path": "src/elspeth"}))["files"] == [str(source / "helper.py")]
+    assert json.loads(_glob_files(scope, {"pattern": "**/*.py", "path": "src/elspeth"}))["files"] == [str(source / "helper.py")]
+    for name in evidence:
+        assert _read_file(scope, {"file_path": name}) == "1: control_evidence"
+
+
+def test_whole_checkout_reader_keeps_secret_and_escape_guards(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    source = repo / "src" / "elspeth"
+    source.mkdir(parents=True)
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=repo / "config")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside_evidence\n")
+    (repo / "escape.txt").symlink_to(outside)
+    (repo / "linked_directory").symlink_to(tmp_path, target_is_directory=True)
+    for path in ("escape.txt", "linked_directory/outside.txt", "../outside.txt", ".env", ".env.local", ".git/config"):
+        with pytest.raises(ValueError):
+            _read_file(scope, {"file_path": path})
+    assert json.loads(_grep_files(scope, {"pattern": "outside_evidence", "output_mode": "count"}))["count"] == 0
+    assert json.loads(_glob_files(scope, {"pattern": "**/*"}))["files"] == []

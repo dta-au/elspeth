@@ -47,7 +47,16 @@ authenticates from the installed CLI account, but receives a minimal environment
 that excludes the operator HMAC key, override tokens, provider API keys, and
 cloud credentials. Shell, web, apps, hooks, goals, memories, remote plugins, and
 subagents are disabled. Read/Grep/Glob context comes only from the sealed
-path-confined MCP reader.
+path-confined MCP reader. Its scope is the entire checkout, including tests,
+docs, scripts, configuration, and hidden tracked code, plus any external
+allowlist directory. The judge is a peer reviewer: give it real symbols and
+test nodeids and let it inspect their evidence. Tool paths start at the
+checkout root; finding keys remain relative to the scanner source root
+(normally `src/elspeth`). Searches skip dependency/cache trees, nested
+worktrees, and private signing scratch; explicit permitted reads still work.
+Git administration and `.env` files remain excluded and returned content
+remains secret-scrubbed. Whole-codebase access does not grant write or key
+custody.
 
 The judge inspects the source tree before ruling because the excerpt-blinded
 judge misjudged boundary code it could not see and forced bulk operator

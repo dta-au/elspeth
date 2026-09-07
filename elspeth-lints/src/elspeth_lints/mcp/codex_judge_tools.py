@@ -14,7 +14,10 @@ import argparse
 import asyncio
 import json
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
+from functools import cache
 from pathlib import Path, PurePath
 from typing import Any
 
@@ -25,6 +28,23 @@ _MAX_READ_LINES = 400
 _MAX_RESULT_CHARS = 50_000
 _MAX_FILE_RESULTS = 500
 _MAX_SCANNED_FILES = 20_000
+# Search the current codebase, not dependency installations, previous checkouts,
+# caches, or private signing scratch. Explicit in-scope reads remain available.
+_SEARCH_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".venv",
+        "venv",
+        "node_modules",
+        "__pycache__",
+        ".elspeth",
+        ".sign-bundle-transactions",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".hypothesis",
+    }
+)
 _SENSITIVE_ENV_NAMES = frozenset(
     {
         "ELSPETH_JUDGE_METADATA_HMAC_KEY",
@@ -128,7 +148,7 @@ def _glob_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
     _guard(scope, "Glob", {"path": raw_base, "pattern": pattern})
     base = _resolve(scope, raw_base)
     matches: list[str] = []
-    for candidate in base.glob(pattern):
+    for candidate in _iter_files(base, pattern):
         resolved = Path(os.path.realpath(candidate))
         allowed, _reason = _tool_scope_decision(
             scope,
@@ -143,11 +163,35 @@ def _glob_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:
     return json.dumps({"files": sorted(matches), "truncated": len(matches) >= _MAX_FILE_RESULTS})
 
 
-def _iter_files(base: Path, file_glob: str) -> Any:
+def _iter_files(base: Path, file_glob: str) -> Iterator[Path]:
     if base.is_file():
         yield base
         return
-    yield from base.glob(file_glob)
+    # Path.walk does not follow directory symlinks. Prune before traversal so
+    # discarded artifacts cannot consume the scan budget ahead of real tests.
+    for directory, dirnames, filenames in base.walk():
+        dirnames[:] = sorted(
+            name for name in dirnames if name not in _SEARCH_EXCLUDED_DIRS and not (directory.name == ".claude" and name == "worktrees")
+        )
+        for filename in sorted(filenames):
+            candidate = directory / filename
+            relative = candidate.relative_to(base)
+            if _matches_glob(relative.parts, PurePath(file_glob).parts):
+                yield candidate
+
+
+def _matches_glob(path: tuple[str, ...], pattern: tuple[str, ...]) -> bool:
+    """Match from the search root, with recursive ** semantics on Python 3.12."""
+
+    @cache
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern):
+            return path_index == len(path)
+        if pattern[pattern_index] == "**":
+            return match(path_index, pattern_index + 1) or (path_index < len(path) and match(path_index + 1, pattern_index))
+        return path_index < len(path) and fnmatchcase(path[path_index], pattern[pattern_index]) and match(path_index + 1, pattern_index + 1)
+
+    return match(0, 0)
 
 
 def _grep_files(scope: AgentToolScope, arguments: dict[str, Any]) -> str:

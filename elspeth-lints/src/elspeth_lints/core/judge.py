@@ -1273,25 +1273,29 @@ _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS: int = 24
 
 # Basenames that must never be read even if they somehow sit inside an allowed
 # root — defense in depth. The HMAC signing key lived in a repo ``.env`` once
-# (the O1 breach); the roots already exclude the repo root, but a belt-and-
-# braces basename denylist costs nothing.
+# (the O1 breach); whole-checkout evidence access must not expose it.
 _TOOL_SCOPE_FORBIDDEN_BASENAMES: frozenset[str] = frozenset({".env"})
 
 # Appended to the system prompt ONLY in tool mode, OUTSIDE ``_STATIC_POLICY_BLOCK``
 # so ``JUDGE_POLICY_HASH`` (sha256 of the static block) is unchanged. That is
 # acceptable because the addendum is investigation MECHANICS (read tools, cite
 # what you read), not tier-model verdict CRITERIA — those live in the hashed
-# static block. Signing paths reject tool mode, so this addendum cannot enter a
-# signed allowlist entry's policy hash.
+# static block. Changing investigation scope does not change verdict criteria.
 _TOOL_MODE_ADDENDUM: str = """
 TOOL-AUGMENTED INVESTIGATION MODE (read-only)
 
-You may use the Read, Grep, and Glob tools to investigate the source tree when
+You may use the Read, Grep, and Glob tools to investigate the whole codebase when
 the excerpt alone does not let you decide. This exists so you can resolve a
 would-be "block pending more context" by going and looking — e.g. read the
 callers of the function, the definition of a type, or the call site that
-establishes an invariant. You can only read within the project source; writes,
-shell, and network are unavailable.
+establishes an invariant. The working directory is the checkout root: tests,
+documentation, scripts, configuration, and source are all available, including
+pinning tests named in a rationale. An external allowlist directory is also
+readable. Writes, shell, and network are unavailable.
+Finding paths are relative to the scanner's source root, normally src/elspeth,
+whereas tool paths are relative to the checkout. For example, locate a finding
+at web/blobs/service.py with Glob **/web/blobs/service.py, then read the returned
+path. Test nodeids already start with the repository-relative tests/ path.
 
 Security limits: Read may be denied for files that match the project's source
 secret scrubber, and Grep is available only with explicit non-content
@@ -1352,19 +1356,29 @@ def build_readonly_tool_scope(
     allowlist_dir: Path,
     max_turns: int = _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS,
 ) -> AgentToolScope:
-    """Build the canonical read-only scope: the source tree + the allowlist dir.
+    """Build read-only evidence access to the whole checkout and the allowlist.
 
     Both roots are realpath-resolved so symlink/``..`` escapes are caught by the
-    prefix test in ``_tool_scope_decision``. ``cwd`` is the source ``root`` so a
-    pathless Grep/Glob defaults to scanning the source tree, never the repo root.
+    prefix test in ``_tool_scope_decision``. Canonical source trees use the
+    repository-root convention of boundary test references, without widening
+    into an enclosing checkout. Other layouts use the nearest Git marker,
+    including worktree markers, or keep the source root when none exists.
     """
     src_root = Path(os.path.realpath(root))
+    from elspeth_lints.rules.trust_boundary.shared import repository_root
+
+    repo_root = repository_root(src_root)
+    if repo_root == src_root:
+        repo_root = next(
+            (candidate for candidate in (src_root, *src_root.parents) if (candidate / ".git").exists()),
+            src_root,
+        )
     allow_root = Path(os.path.realpath(allowlist_dir))
     # De-dup while preserving order (root first, so it is a valid cwd).
-    roots: list[Path] = [src_root]
-    if allow_root != src_root:
+    roots: list[Path] = [repo_root]
+    if allow_root != repo_root:
         roots.append(allow_root)
-    return AgentToolScope(allowed_roots=tuple(roots), cwd=src_root, max_turns=max_turns)
+    return AgentToolScope(allowed_roots=tuple(roots), cwd=repo_root, max_turns=max_turns)
 
 
 def _tool_scope_candidate_paths(tool_name: str, tool_input: dict[str, Any], cwd: Path) -> list[Path]:
@@ -1454,8 +1468,10 @@ def _tool_scope_decision(
     except Exception as exc:  # fail closed on any extraction failure
         return False, f"could not establish an in-scope target for {tool_name} (denied fail-closed): {exc}"
     for cand in candidates:
-        if cand.name in _TOOL_SCOPE_FORBIDDEN_BASENAMES:
+        if cand.name in _TOOL_SCOPE_FORBIDDEN_BASENAMES or cand.name.startswith(".env."):
             return False, f"{cand} is a forbidden file (basename denylist)"
+        if any(cand.is_relative_to(r) and ".git" in cand.relative_to(r).parts for r in scope.allowed_roots):
+            return False, f"{cand} is Git administration data, not codebase evidence"
         if not any(cand == r or cand.is_relative_to(r) for r in scope.allowed_roots):
             return False, (f"{cand} is outside the permitted roots {[str(r) for r in scope.allowed_roots]} (read-only judge-tools scope)")
         if tool_name == "Read" and not scrubbed_reads:

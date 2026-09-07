@@ -37,8 +37,16 @@ not a grant.
 
 All judging — including the **final signature verdict** — runs via the agentic
 harness (`--judge-transport codex-cli`) with read-only tool access
-(`--judge-tools readonly`). The judge may Read/Grep/Glob within the source tree
-and allowlist dir through a sealed, fail-closed MCP reader before ruling.
+(`--judge-tools readonly`). The judge may Read/Grep/Glob throughout the entire
+checkout, including tests, docs, scripts, configuration, and hidden tracked
+code such as `.github` and `.agents`, through a read-only MCP reader before
+ruling. Its working directory is the checkout root, so repository-relative
+test nodeids and pathless searches work. An externally located allowlist
+directory remains readable too. Codex searches skip dependency installations,
+Git metadata, caches, nested worktrees, and private signing scratch so those
+artifacts cannot exhaust the scan budget ahead of current evidence. Explicit
+in-scope reads remain available, except for Git administrative data and `.env`
+files (including `.env.*`); content is still secret-scrubbed.
 
 The Codex subprocess authenticates from the installed CLI account state, not
 from a provider key passed by the signing shell. Its environment is reduced to

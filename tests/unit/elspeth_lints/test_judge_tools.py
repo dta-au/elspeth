@@ -74,7 +74,7 @@ def scope(tmp_path: Path) -> AgentToolScope:
     allow = tmp_path / "config" / "cicd" / "enforce_tier_model"
     src.mkdir(parents=True)
     allow.mkdir(parents=True)
-    return build_readonly_tool_scope(root=src, allowlist_dir=allow)
+    return AgentToolScope(allowed_roots=(src.resolve(), allow.resolve()), cwd=src.resolve(), max_turns=24)
 
 
 # --------------------------------------------------------------------------
@@ -88,11 +88,47 @@ def test_build_readonly_tool_scope_roots_and_cwd(tmp_path: Path) -> None:
     src.mkdir(parents=True)
     allow.mkdir()
     s = build_readonly_tool_scope(root=src, allowlist_dir=allow)
-    # roots are realpath-resolved; cwd is the source root (a valid allowed root).
-    assert s.cwd == Path(os.path.realpath(src))
+    # The canonical source layout admits repository-relative test evidence.
+    assert s.cwd == tmp_path.resolve()
     assert s.cwd in s.allowed_roots
     assert Path(os.path.realpath(allow)) in s.allowed_roots
     assert s.max_turns > 0
+
+
+def test_canonical_source_scope_does_not_widen_to_enclosing_checkout(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    checkout = tmp_path / "nested-project"
+    source = checkout / "src" / "elspeth"
+    source.mkdir(parents=True)
+    scope = build_readonly_tool_scope(root=source, allowlist_dir=checkout / "config")
+    assert scope.cwd == checkout
+    assert not _tool_scope_decision(scope, "Read", {"file_path": "../unrelated.txt"})[0]
+
+
+@pytest.mark.parametrize("git_marker_is_file", [False, True])
+def test_scope_discovers_checkout_from_noncanonical_source_root(tmp_path: Path, git_marker_is_file: bool) -> None:
+    repo = tmp_path / "checkout"
+    src = repo / "packages" / "application"
+    src.mkdir(parents=True)
+    marker = repo / ".git"
+    if git_marker_is_file:
+        marker.write_text("gitdir: /unread/admin/path\n")
+    else:
+        marker.mkdir()
+    external = tmp_path / "external-allowlists"
+    external.mkdir()
+    scope = build_readonly_tool_scope(root=src, allowlist_dir=external)
+    assert scope.cwd == repo
+    assert scope.allowed_roots == (repo, external)
+    for name in ("tests/proof.py", "docs/contract.md", "scripts/check.py", "config/policy.yaml", ".github/workflows/ci.yaml"):
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("evidence\n")
+        assert _tool_scope_decision(scope, "Read", {"file_path": name})[0]
+    assert _tool_scope_decision(scope, "Read", {"file_path": str(external / "rules.yaml")})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": "../outside.py"})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": ".git"})[0]
+    assert not _tool_scope_decision(scope, "Read", {"file_path": ".env.local"})[0]
 
 
 def test_agent_tool_scope_rejects_empty_roots() -> None:
