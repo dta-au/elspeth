@@ -518,9 +518,17 @@ ITEM keeps the item-lease CAS as D4's third fence *in addition to* the membershi
 fence; the membership fence proves who the worker is, the lease CAS proves the
 work item is still theirs.
 
-Totals: **LEADER 67, ITEM 13, CLAIM 6, MEMBER 5.** The source is the coordinator's
+Totals: **LEADER 68, ITEM 13, CLAIM 5, MEMBER 5** (91 rows for 90 APIs, because
+`record_token_outcome` splits per R7.2). The source is the coordinator's
 `verb-scope-classification.md`, corrected where the code disagreed — every
-correction is named in the notes column or in A5 below.
+correction is named in the notes column or in A4/A5 below.
+
+One axis note, because it caused a real disagreement while this table was
+built: **the scope column means REACHABILITY, not verb kind.** CLAIM is the one
+class whose name suggests a kind, and reading it that way puts
+`claim_pending_sink` and the four sink-effect lease verbs in it. They are
+leader-only by caller chain, so they are LEADER here. A verb's name is not its
+scope, for the same reason its method name is not its owner (A6).
 
 | # | verb | facade | scope | authority type | fence | notes |
 |---|---|---|---|---|---|---|
@@ -579,7 +587,7 @@ correction is named in the notes column or in A5 below.
 | 52 | `enqueue_ready_claimed_legacy_unfenced` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership | R7.6 DELETE |
 | 53 | `ingest_row_with_initial_claim` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
 | 54 | `claim_ready` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership |  |
-| 55 | `claim_pending_sink` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership | R7.4 LEADER; follower contract quoted below |
+| 55 | `claim_pending_sink` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.4 — the classification read it CLAIM from its verb KIND; the code says leader-only and the code wins. Follower contract quoted in A4 |
 | 56 | `recover_expired_leases` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS |  |
 | 57 | `recover_expired_leases_legacy_unfenced` | TokenSchedulerRepository | LEADER | `CoordinationToken` | leader epoch CAS | R7.6 DELETE |
 | 58 | `heartbeat_lease` | TokenSchedulerRepository | CLAIM | `WorkerMembershipToken` | membership | OWNER-KEYED: the scheduler verb is CLAIM; `SinkEffectRepository.heartbeat_lease` is LEADER |
