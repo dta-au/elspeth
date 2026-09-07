@@ -566,32 +566,62 @@ def _drift_repair_ast_path_fixture(tmp_path: Path) -> tuple[Path, Path, str]:
     return root, allowlist_dir, key
 
 
-def test_sign_bundle_drift_repair_rejudges(tmp_path: Path) -> None:
+@pytest.mark.parametrize("revised_rationale", [None, "Widget.lookup validates the externally supplied payload name."])
+def test_sign_bundle_drift_repair_rejudges(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revised_rationale: str | None) -> None:
+    import yaml
+
+    from elspeth_lints.mcp import server as judge_server
+
     root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    original_yaml = (allowlist_dir / "plugins.yaml").read_bytes()
+    original_reason = next(entry["reason"] for entry in yaml.safe_load(original_yaml)["allow_hits"] if entry["key"] == key)
     # Sanity: the tree genuinely reports the claimed status.
     assert any(i.status == "AST_PATH_BINDING_DRIFT" for i in _diagnose(root, allowlist_dir).items)
     bundle = _bundle(
         root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT"),)
     )
     bundle_path = _write_bundle_file(tmp_path, bundle)
+    if revised_rationale is not None:
+        ctx = judge_server._ServerContext(root=root, allowlist_dir=allowlist_dir, staged_dir=bundle_path.parent)
+        with monkeypatch.context() as keyless:
+            keyless.delenv("ELSPETH_JUDGE_METADATA_HMAC_KEY")
+            outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle.bundle_id, "rationales": {key: revised_rationale}})
+        assert not outcome.is_error, outcome.text
+        assert (allowlist_dir / "plugins.yaml").read_bytes() == original_yaml
 
-    with _patch_judge(_accept_all) as calls:
+    requests: list[Any] = []
+    with _patch_judge(_accept_all, request_log=requests) as calls:
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc == 0
     assert calls == ["plugins/widget.py"]  # the real judge WAS re-run
+    assert requests[0].rationale == (original_reason if revised_rationale is None else revised_rationale)
     post = _diagnose(root, allowlist_dir)
     assert not any(i.status == "AST_PATH_BINDING_DRIFT" for i in post.items)
     assert any(i.status == "OK_AUTHORITATIVE" for i in post.items)
     repaired_key = next(i.key for i in post.items if i.status == "OK_AUTHORITATIVE")
-    import yaml
-
     written = yaml.safe_load((allowlist_dir / "plugins.yaml").read_text(encoding="utf-8"))
+    repaired_entry = next(entry for entry in written["allow_hits"] if entry["key"] == repaired_key)
+    assert requests[0].rationale in repaired_entry["reason"]
     assert [entry["key"] for entry in written["allow_hits"]] == [
         _SPARE_PRE_JUDGE_KEY,
         repaired_key,
         _TRAILING_SPARE_PRE_JUDGE_KEY,
     ]
+
+
+def test_sign_bundle_blank_drift_rationale_refuses_before_judging(tmp_path: Path) -> None:
+    root, allowlist_dir, key = _drift_repair_ast_path_fixture(tmp_path)
+    before = (allowlist_dir / "plugins.yaml").read_bytes()
+    action = BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="AST_PATH_BINDING_DRIFT", draft_rationale=" \n")
+    bundle_path = _write_bundle_file(tmp_path, _bundle(root, allowlist_dir, (action,)))
+
+    with _patch_judge(_accept_all) as calls:
+        rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
+
+    assert rc == 2
+    assert calls == []
+    assert (allowlist_dir / "plugins.yaml").read_bytes() == before
 
 
 def test_sign_bundle_stale_drift_repair_claim_offers_no_resume_recovery(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -635,7 +665,8 @@ def test_sign_bundle_stale_drift_repair_claim_offers_no_resume_recovery(tmp_path
     assert _RECOVERY_GUIDANCE not in err
 
 
-def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:
+@pytest.mark.parametrize("draft_rationale", [None, "Widget.lookup rejects malformed external names."])
+def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path, draft_rationale: str | None) -> None:
     """§5.5/§7: an honest SCOPE drift that the judge BLOCKs is not laundered.
 
     The reused ceremony pops the stale row before judging and re-appends it on
@@ -651,15 +682,24 @@ def test_sign_bundle_drift_repair_block_not_laundered(tmp_path: Path) -> None:
     before = yaml_path.read_text(encoding="utf-8")
     assert any(i.status == "SCOPE_BINDING_DRIFT" for i in _diagnose(root, allowlist_dir).items)
     bundle = _bundle(
-        root, allowlist_dir, (BundleAction(lane="resign", kind="drift_repair", key=key, diagnosis_status="SCOPE_BINDING_DRIFT"),)
+        root,
+        allowlist_dir,
+        (
+            BundleAction(
+                lane="resign", kind="drift_repair", key=key, diagnosis_status="SCOPE_BINDING_DRIFT", draft_rationale=draft_rationale
+            ),
+        ),
     )
     bundle_path = _write_bundle_file(tmp_path, bundle)
 
-    with _patch_judge(_block_all) as calls:
+    requests: list[Any] = []
+    with _patch_judge(_block_all, request_log=requests) as calls:
         rc = main(_argv(bundle_path, root, allowlist_dir, extra=("--yes",)))
 
     assert rc != 0
     assert calls == ["plugins/widget.py"]  # judge ran and BLOCKed
+    if draft_rationale is not None:
+        assert requests[0].rationale == draft_rationale
     assert yaml_path.read_text(encoding="utf-8") == before  # restored intact -- NOT deleted, NOT re-signed
     assert "b" * 64 in before  # the original drifted scope binding is still on disk
 

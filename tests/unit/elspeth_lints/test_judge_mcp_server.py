@@ -1155,8 +1155,45 @@ def test_stage_annotate_rejects_unknown_key_without_writing(tmp_path: Path) -> N
     outcome = judge_server._run_tool(ctx, "stage_annotate", {"bundle_id": bundle_id, "rationales": {"no-such-key": "text"}})
 
     assert outcome.is_error is True
-    assert "does not name a staged justify action" in outcome.text
+    assert "does not name a staged judge-gated action" in outcome.text
     assert bundle_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_stage_annotate_drift_rationale_preserves_signed_bytes(tmp_path: Path, stale: bool) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    source = _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", fallback="guest")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "drift-annotation")
+    bundle_path = ctx.staged_dir / f"{bundle.bundle_id}.json"
+    before_bundle = bundle_path.read_bytes()
+    before_signed = (allowlist_dir / "widget.yaml").read_bytes()
+    if stale:
+        source.write_text(source.read_text(encoding="utf-8") + "# changed after staging\n", encoding="utf-8")
+
+    outcome = judge_server._run_tool(
+        ctx, "stage_annotate", {"bundle_id": bundle.bundle_id, "rationales": {key: "Widget.lookup extracts an external name."}}
+    )
+
+    assert (allowlist_dir / "widget.yaml").read_bytes() == before_signed
+    if stale:
+        assert outcome.is_error, outcome.text
+        assert "source snapshot" in outcome.text
+        assert bundle_path.read_bytes() == before_bundle
+    else:
+        assert not outcome.is_error, outcome.text
+        action = next(action for action in read_bundle(bundle_path).actions if action.key == key)
+        assert action.kind == "drift_repair"
+        assert action.diagnosis_status == "IDENTITY_PREFIX_REPLACEMENT"
+        assert action.draft_rationale == "Widget.lookup extracts an external name."
+        with patch("elspeth_lints.core.judge.call_judge", side_effect=AssertionError("drift preview is not supported")):
+            preview = judge_server._run_tool(ctx, "stage_preview", {"bundle_id": bundle.bundle_id})
+        assert not preview.is_error, preview.text
+        assert next(action for action in read_bundle(bundle_path).actions if action.key == key).preview is None
 
 
 def test_stage_annotate_rejects_empty_rationale_without_writing(tmp_path: Path) -> None:
@@ -1169,6 +1206,30 @@ def test_stage_annotate_rejects_empty_rationale_without_writing(tmp_path: Path) 
 
     assert outcome.is_error is True
     assert "non-empty rationale" in outcome.text
+    assert bundle_path.read_bytes() == before
+
+
+def test_stage_annotate_rejects_mixed_mechanical_request_without_writing(tmp_path: Path) -> None:
+    root = _build_root(tmp_path)
+    allowlist_dir = _build_allowlist_dir(tmp_path)
+    _write_source(root, "plugins/widget.py", "widget")
+    finding = _live_finding(root, "plugins/widget.py")
+    stale_key = _write_signed_v2_entry(allowlist_dir, "widget.yaml", finding=finding)
+    _write_source(root, "plugins/widget.py", "widget", active=False)
+    _write_source(root, "plugins/fresh.py", "fresh")
+    ctx = _context(root, allowlist_dir, tmp_path / "staged")
+    bundle = _scan_and_read(ctx, "mixed-annotation")
+    assert next(action for action in bundle.actions if action.key == stale_key).kind == "stale_delete"
+    justify_key = next(action.key for action in bundle.actions if action.kind == "justify")
+    bundle_path = ctx.staged_dir / f"{bundle.bundle_id}.json"
+    before = bundle_path.read_bytes()
+
+    outcome = judge_server._run_tool(
+        ctx, "stage_annotate", {"bundle_id": bundle.bundle_id, "rationales": {justify_key: "External name extraction", stale_key: "Orphan"}}
+    )
+
+    assert outcome.is_error, outcome.text
+    assert "does not name a staged judge-gated action" in outcome.text
     assert bundle_path.read_bytes() == before
 
 

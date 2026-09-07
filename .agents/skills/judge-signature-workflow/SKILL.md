@@ -77,13 +77,20 @@ bundles must be re-staged.
    gated keys only), `stale_delete` (orphan), `new_judgment` (uncovered finding).
    Optional `bundle_id`, `staged_by`.
 3. **`stage_annotate`** — attach your site-specific written rationale to each
-   staged `justify` action (`rationales`: map of action key → text). The judge
-   policy requires a rationale that speaks to the flagged pattern, so skipping
-   this leaves the preview judging an empty string and the operator fire
-   storing a generic fallback. Annotating an action clears any existing
+   staged `justify` or `drift_repair` action (`rationales`: map of action key →
+   text). The judge policy requires a rationale that speaks to the flagged
+   pattern. An unannotated `justify` action leaves the preview judging an empty
+   string and the operator fire storing a generic fallback. Annotating clears any existing
    preview on it (a verdict for a different rationale is stale evidence).
    Refuses stale bundles, unknown keys, and empty rationales. Args:
    `bundle_id`, `rationales`.
+   Drift annotations replace the existing reason only when the operator runs
+   the fresh authoritative judgment; unannotated drift actions reuse it.
+   `stage_preview` still covers only `justify` actions. For a previously blocked
+   drift rationale, stage and annotate a fresh bundle, then start a new
+   transaction. Do not edit signed YAML or transaction journals; a recorded
+   BLOCK is not re-judged on resume, and annotation changes the bundle bytes
+   to which an existing transaction is bound.
    **Authoring rule (judge policy, 2026-08-28):** when a rationale locates
    the real control somewhere other than the flagged site ("the in-
    transaction check in `X` raises; `test_y` pins it"), name that control

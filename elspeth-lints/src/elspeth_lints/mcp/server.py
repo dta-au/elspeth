@@ -638,15 +638,17 @@ def _tool_stage_scan(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
 
 
 def _tool_stage_annotate(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
-    """Attach agent-authored draft rationales to staged ``justify`` actions.
+    """Attach agent-authored draft rationales to staged judge-gated actions.
 
     The key-free rationale-custody surface (elspeth-0502deb48c): ``stage_scan``
     builds justify actions with ``draft_rationale=None`` and hand-editing the
     bundle JSON is not an official mutator, so without this tool the preview
     judge always rules on an empty rationale and the operator fire always
     stores the generic fallback. Annotating binds the site-specific rationale
-    to the action; ``stage_preview`` then judges it and the operator
-    ``sign-bundle`` carries it into the authoritative judge call.
+    to the action; the operator ``sign-bundle`` carries it into the
+    authoritative judge call. ``drift_repair`` annotations replace the old
+    reason only for that fresh judgment; the signed entry stays untouched.
+    ``stage_preview`` continues to judge only ``justify`` actions.
 
     Setting a rationale CLEARS any existing preview on that action — a preview
     verdict rendered for a different rationale is stale evidence.
@@ -666,18 +668,18 @@ def _tool_stage_annotate(ctx: _ServerContext, arguments: dict[str, Any]) -> str:
     rationales_arg = arguments.get("rationales")
     if not isinstance(rationales_arg, dict) or not rationales_arg:
         raise ValueError("stage_annotate requires a non-empty 'rationales' object mapping action key -> rationale text")
-    justify_keys = {action.key for action in bundle.actions if action.kind == "justify"}
+    judge_gated_keys = {action.key for action in bundle.actions if action.kind in {"justify", "drift_repair"}}
     rationales: dict[str, str] = {}
     for key, text in rationales_arg.items():
         if not isinstance(key, str) or not isinstance(text, str) or not text.strip():
             raise ValueError("stage_annotate rationales must map string action keys to non-empty rationale strings")
-        if key not in justify_keys:
-            raise ValueError(f"stage_annotate key does not name a staged justify action: {key!r}")
+        if key not in judge_gated_keys:
+            raise ValueError(f"stage_annotate key does not name a staged judge-gated action (justify or drift_repair): {key!r}")
         rationales[key] = text
 
     new_actions: list[Any] = []
     for action in bundle.actions:
-        text = rationales.get(action.key) if action.kind == "justify" else None
+        text = rationales.get(action.key) if action.kind in {"justify", "drift_repair"} else None
         if text is None:
             new_actions.append(action)
             continue
@@ -965,9 +967,9 @@ _TOOLS.update(
         ),
         "stage_annotate": _ToolSpec(
             description=(
-                "Attach agent-authored draft rationales to staged justify actions (the key-free "
-                "rationale-custody surface: stage_preview judges them and the operator sign-bundle "
-                "carries them into the authoritative judge call). Clears any existing preview on "
+                "Attach agent-authored draft rationales to staged justify or drift_repair actions. "
+                "The operator sign-bundle carries them into the authoritative judge call; "
+                "stage_preview judges only justify actions. Clears any existing preview on "
                 "annotated actions; refuses stale bundles, unknown keys, and empty rationales."
             ),
             input_schema={
@@ -976,7 +978,7 @@ _TOOLS.update(
                     "bundle_id": {"type": "string", "description": "Bundle id (file is <staged-dir>/<id>.json)"},
                     "rationales": {
                         "type": "object",
-                        "description": "Map of staged justify action key -> site-specific rationale text",
+                        "description": "Map of staged justify or drift_repair action key -> site-specific rationale text",
                         "additionalProperties": {"type": "string"},
                     },
                 },

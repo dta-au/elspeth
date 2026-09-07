@@ -115,7 +115,7 @@ present in the environment.
 | `verify_signatures` | yes | no | Read-only, **always shape-only** signature diagnosis of the tier_model allowlist. The authoritative HMAC recompute is the operator CLI `diagnose`, not this tool. |
 | `stage_scan` | yes | no | Survey source tree + allowlist into an authority-free worklist bundle across four lanes — `drift_repair` / `rotation` / `stale_delete` / `new_judgment` — and report the raw empty-allowlist target census split into exact-covered, per-file-covered, and uncovered targets. Roots are recorded as absolute paths, and ambiguous non-judge target groups fail staging. Args: optional `bundle_id`, `staged_by`. |
 | `stage_status` | yes | no | Verify the exact source binding, refuse stale bundles, then summarise a staged bundle (including source identity, per-lane/kind counts, preview outcomes, and which `justify` actions still lack a draft rationale) and emit the paste-ready operator command plus the `sign_bundle_plan` that prices it. Arg: `bundle_id` (required). |
-| `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` actions (`draft_rationale`); the preview judge and the operator fire-time judge both receive this text. Clears any existing preview on annotated actions — a verdict rendered for a different rationale is stale evidence. Refuses stale bundles, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
+| `stage_annotate` | yes | no | Attach agent-authored site-specific rationales to staged `justify` or `drift_repair` actions (`draft_rationale`). The operator fire-time judge receives this text; `stage_preview` judges only `justify` actions. An unannotated drift repair reuses the existing reason. Clears any existing preview on annotated actions. Refuses stale bundles, non-judge actions, unknown keys, and empty rationales. Args: `bundle_id`, `rationales` (map of action key → text, both required). |
 | `stage_preview` | yes | yes (read-only Codex CLI judge) | Fully verify the sign bundle before any judge call, run the sealed read-only Codex judge over each `new_judgment` action, reverify before overwrite, and record a **non-authoritative** preview verdict (`authoritative=False`). The previewed `JudgeRequest` carries the fire-time record: the annotated rationale, the rule's own definition, and duplicate-rationale evidence from the live allowlist. Stale bundles are never judged or rewritten. Arg: `bundle_id` (required). Needs installed/authenticated Codex CLI plus `[mcp]`. |
 | `stage_rekey` | yes | no | Enumerate currently-valid judge-gated entries and flag broken ones into a rekey bundle, recording env-var **names** only — never key bytes. Args: `old_key_env`, `new_key_env` (required), optional `bundle_id`, `staged_by`. |
 
@@ -183,7 +183,7 @@ stale entry before judging and therefore always runs one at a time, as do
 `rotation` and `stale_delete`. A `resign`-only fire gains nothing from the flag.
 
 `--lanes` scopes the transaction to a subset of the bundle's lanes: `resign`
-(`drift_repair` + `rotation` + `stale_delete`, needing no new rationale) and/or
+(`drift_repair` + `rotation` + `stale_delete`, with an optional revised drift rationale) and/or
 `new_judgment` (`justify`, which judges the staged rationale). Unselected
 actions are never attempted, never judged, and stay exactly as they are in the
 allowlist; the coherent publish covers the selected lanes only. The selection is
@@ -260,6 +260,12 @@ Per lane:
   carrying a stale verdict forward over changed content (that would be the [O1]
   forgery). A contradicting BLOCK is surfaced and **not** signed; on BLOCK the
   popped stale entry is restored intact.
+- To revise a previously blocked drift explanation, stage a fresh bundle and
+  annotate its `drift_repair` action before starting a new transaction. The
+  annotation changes only the proposed rationale; fresh diagnosis still chooses
+  the finding and stale entry. Never edit signed YAML or an existing transaction
+  journal: a recorded BLOCK is not re-judged on resume, and changing bundle bytes
+  invalidates that transaction's resume binding.
 - `rotation` re-binds non-judge-gated keys with no judge.
 - `stale_delete` removes an orphaned entry, surgically.
 

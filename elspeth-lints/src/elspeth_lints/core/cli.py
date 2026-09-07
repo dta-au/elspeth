@@ -11,7 +11,7 @@ import secrets
 import shlex
 import sys
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -895,8 +895,8 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="LANE[,LANE]",
         help=(
             "Scope the transaction to a comma-separated subset of bundle lanes: "
-            "'resign' (drift_repair + rotation + stale_delete — no new rationale "
-            "needed) and/or 'new_judgment' (justify — judges the staged "
+            "'resign' (drift_repair + rotation + stale_delete — new rationale optional) "
+            "and/or 'new_judgment' (justify — judges the staged "
             "rationale). Unselected actions are never attempted, never judged, "
             "and stay exactly as they are in the allowlist (fail-closed); the "
             "coherent publish covers the selected lanes only. The selection is "
@@ -4676,6 +4676,16 @@ def _execute_drift_repair_action(
             f"sign-bundle: drift_repair {action.key!r} has no signing spec in the fresh diagnosis (stale claim); re-run stage_scan.\n"
         )
         return 2
+
+    if action.draft_rationale is not None:
+        try:
+            rationale = _bounded_rationale_string(action.draft_rationale)
+        except argparse.ArgumentTypeError as exc:
+            sys.stderr.write(f"sign-bundle: drift_repair rationale error: {exc}\n")
+            return 2
+        # Only the proposed explanation changes. Identity, binding and stale-row
+        # ownership remain the fresh diagnosis's authority; signing still judges.
+        spec = replace(spec, rationale=rationale)
 
     removed_stale_entry: _RemovedAllowHitsEntry | None = None
     stale_yaml: Path | None = None
