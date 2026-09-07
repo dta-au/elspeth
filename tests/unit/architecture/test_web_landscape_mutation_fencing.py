@@ -394,7 +394,7 @@ _ALL_MUTATION_METHOD_NAMES = _MUTATION_METHOD_NAMES | _COORDINATION_MUTATION_MET
 # (49a7bb16c), _recover_expired_leases (55a8a94f4) and
 # SinkEffectLifecycle.complete_plan (826d5e6ca). Every added identity carries
 # its typed authority.
-_EXPECTED_DML_COUNT = 144
+_EXPECTED_DML_COUNT = 151
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -429,7 +429,25 @@ _EXPECTED_DML_COUNT = 144
 # statement change and not the fencing. Path, symbol, table, operation, ordinal
 # and authority are all unchanged. Attributed by scanning base f83011bb7 and the
 # merged tree with this same scanner: one site differs, no other.
-_EXPECTED_DML_INVENTORY_SHA256 = "a76a88f5d2d5445abc01c6cf59380087f68d55ee3ce65c036a52ba152a1de381"
+# Then 144 -> 151 (a76a88f5… → b9ef22af…, P4-D8 SINKFX elspeth-43ddb79074), and the
+# write set gains four shapes: sink_effects, sink_effect_members,
+# sink_effect_streams and sink_effect_export_snapshots insert. NONE OF THESE IS A
+# NEW DATABASE WRITE. Every one of them already ran; the generic
+# ``_conflict_safe_insert(conn, table, values, index_elements)`` took its table as a
+# caller-supplied parameter, so the scanner could not bind a table to the statement
+# and counted the family as two "insert on caller-supplied table" ESCAPES instead of
+# as classified DML. Each owner now issues its own dialect-specific conflict-safe
+# INSERT against a named table, so the writes MOVED from the escape counter into this
+# inventory — an unmasking, not an addition, which is why escapes fall by two across
+# the same delta. Of the eleven added rows, nine are in the newly classified
+# sink_effect_reservation.py; the other two are one-for-two consolidations in
+# _finalize_on and complete_plan, where a per-ordinal member UPDATE loop became one
+# executemany UPDATE (four rows removed, two added, and sink_effect_members/update
+# keeps surviving rows, so NO shape is removed). Re-derived by the merge writer on the
+# MERGED tree, not carried from the branch. The lane declared four added SHAPES and
+# none removed; this scan measured eleven added and four removed ROWS: the same fact
+# at two granularities, reconciled row by row before pinning.
+_EXPECTED_DML_INVENTORY_SHA256 = "b9ef22affdff788e2868cb27aca56d07083bc4813d5d9ad6024e0698b038975e"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -479,8 +497,12 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
         ("sidecar_journal_outbox", "insert"),
         ("sink_effect_attempts", "insert"),
         ("sink_effect_attempts", "update"),
+        ("sink_effect_export_snapshots", "insert"),
+        ("sink_effect_members", "insert"),
         ("sink_effect_members", "update"),
+        ("sink_effect_streams", "insert"),
         ("sink_effect_streams", "update"),
+        ("sink_effects", "insert"),
         ("sink_effects", "update"),
         ("token_lineage_frames", "insert"),
         ("token_outcomes", "insert"),
