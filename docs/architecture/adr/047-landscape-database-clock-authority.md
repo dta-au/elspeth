@@ -396,6 +396,11 @@ Estimate: 60–90 h as planned (C6.2 and C6.3 carry most of the test surface).
 C6 starts only after C1 → C2 → C4 land (lane C's critical path) and after
 the hub replies to this design; the ADR moves to **Accepted** on C6.5.
 
+**C6.5 closed at the 0.8.0 release (2026-09-07): C6.0–C6.4 landed, the gate's
+four ids are green at `-n 0`, and the programme ticket elspeth-0ff11aa42e
+closed 2026-09-06. This ADR is Accepted; the plan above is retained as the
+implementation record.**
+
 Rulings (2026-09-05, hub comment 9425 on elspeth-0ff11aa42e; no merge-writer
 veto):
 
