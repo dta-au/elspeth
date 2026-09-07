@@ -859,7 +859,10 @@ def bundle_check(store_dir: Path, *, candidate_sha: str, scenario_id: str) -> Bu
             probe = PROBE_KINDS[row["kind"]]
             if details["outcome"] != "pass":
                 failed_probes.append(probe)
-            if row["kind"] == "replica-progress" and cast(Mapping[str, object], details["owner_affine"])["outcome"] != "cannot_pass":
+            if (
+                row["kind"] in {"replica-progress", "single-revision-progress"}
+                and cast(Mapping[str, object], details["owner_affine"])["outcome"] != "cannot_pass"
+            ):
                 failed_probes.append("P4b")
     verdict = testcontainer_run_gate(
         rows,

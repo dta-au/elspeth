@@ -83,6 +83,8 @@ RUNBOOK_CHECK_KINDS = (
     "replica-run-start",
     "replica-lease-takeover",
     "replica-progress",
+    "single-revision-fence-conflict",
+    "single-revision-progress",
     "resource-graph-cleanup",
     "testcontainer-run",
 )
@@ -140,7 +142,7 @@ def _probe(probe: str, *, outcome: str = "pass", mechanism: str | None = None, r
     }
 
 
-@pytest.mark.parametrize("kind", ["replica-fence-conflict", "replica-run-start"])
+@pytest.mark.parametrize("kind", ["replica-fence-conflict", "replica-run-start", "single-revision-fence-conflict"])
 @pytest.mark.parametrize("trials", [None, 0, -1, 1, 19, True, 20.0, "20"])
 def test_external_passing_receipts_cannot_claim_weak_contention(kind: str, trials: object) -> None:
     details = VALID[kind]()
@@ -180,6 +182,21 @@ def test_external_p3_receipt_replays_before_expiry_identity_and_physical_effects
 
 def _job(name: str) -> dict[str, object]:
     return {"mechanism": "container_apps_job", "job_name": name, "execution_name": f"{name}-iwpi4il", "execution_status": "Succeeded"}
+
+
+def _single_topology() -> dict[str, object]:
+    peer = ReplicaBinding(APP_ID, REVISION, f"{REVISION}-86c8c4b497-peer1")
+    return {
+        "active_revisions_mode": "Single",
+        "session_affinity": "sticky",
+        "min_replicas": 2,
+        "max_replicas": 2,
+        "revision": REVISION,
+        "replicas": [
+            {"instance_id": "instance-a", "replica": REPLICA, "replica_binding_sha256": BINDING.sha256},
+            {"instance_id": "instance-b", "replica": peer.replica, "replica_binding_sha256": peer.sha256},
+        ],
+    }
 
 
 VALID: dict[str, Callable[[], dict[str, object]]] = {
@@ -236,6 +253,8 @@ VALID: dict[str, Callable[[], dict[str, object]]] = {
         "deployment_target": "azure-container-apps",
     },
     "replica-fence-conflict": lambda: _probe("P1"),
+    "single-revision-fence-conflict": lambda: {**_probe("P1"), "topology": _single_topology()},
+    "single-revision-progress": lambda: {**VALID["replica-progress"](), "topology": _single_topology()},
     "replica-run-start": lambda: _probe("P2"),
     "replica-lease-takeover": lambda: _probe("P3"),
     "replica-progress": lambda: {
@@ -273,6 +292,50 @@ def _envelope(check: str, details: object, **overrides: object) -> dict[str, obj
     return payload
 
 
+@pytest.mark.parametrize(
+    "kind,labelled", [("single-revision-fence-conflict", "replica-fence-conflict"), ("single-revision-progress", "replica-progress")]
+)
+def test_single_proofs_cannot_substitute_labelled_details(kind: str, labelled: str) -> None:
+    with pytest.raises(AcceptanceCheckError, match="exec_receipt_schema"):
+        _validate(kind, VALID[labelled]())
+
+
+@pytest.mark.parametrize(
+    "fault", ["mode", "affinity", "count", "same_replica", "same_instance", "revision", "owner_hash", "peer_hash", "progress_identity"]
+)
+def test_single_proof_topology_and_binding_cannot_be_replaced(fault: str) -> None:
+    details = VALID["single-revision-progress"]()
+    topology = details["topology"]
+    if fault == "mode":
+        topology["active_revisions_mode"] = "Multiple"
+    elif fault == "affinity":
+        topology["session_affinity"] = "none"
+    elif fault == "count":
+        topology["min_replicas"] = True
+    elif fault == "same_replica":
+        topology["replicas"][1]["replica"] = topology["replicas"][0]["replica"]
+    elif fault == "same_instance":
+        topology["replicas"][1]["instance_id"] = topology["replicas"][0]["instance_id"]
+    elif fault == "revision":
+        topology["revision"] = "elspeth-web--another"
+    elif fault == "owner_hash":
+        topology["replicas"][0]["replica_binding_sha256"] = "0" * 64
+    elif fault == "peer_hash":
+        topology["replicas"][1]["replica_binding_sha256"] = "0" * 64
+    else:
+        topology["replicas"][0]["instance_id"] = "third-instance"
+    with pytest.raises(AcceptanceCheckError):
+        encode_exec_receipt("single-revision-progress", details, candidate_sha=CANDIDATE, binding=BINDING, scenario_id="A")
+
+
+def test_single_stored_receipt_cannot_move_topology_to_another_envelope_binding() -> None:
+    document = _envelope("single-revision-progress", VALID["single-revision-progress"](), replica_binding_sha256="0" * 64)
+    with pytest.raises(AcceptanceCheckError, match="replica_binding"):
+        validate_stored_receipt(
+            document, kind="single-revision-progress", scenario_id="A", subject_sha256="0" * 64, candidate_sha=CANDIDATE
+        )
+
+
 def _validate(check: str, details: object) -> None:
     EXEC_RECEIPT_DESCRIPTOR.detail_validators[check](cast(dict[str, object], details))
 
@@ -281,8 +344,8 @@ def _validate(check: str, details: object) -> None:
 
 
 class TestVocabularies:
-    def test_the_twelve_kinds_plus_testcontainer_run_are_exactly_the_runbooks(self) -> None:
-        assert len(CHECK_KINDS) == 12
+    def test_the_required_kinds_plus_testcontainer_run_are_exactly_the_runbooks(self) -> None:
+        assert len(CHECK_KINDS) == 14
         assert frozenset(RUNBOOK_CHECK_KINDS) == STORED_RECEIPT_KINDS
         assert EXEC_RECEIPT_DESCRIPTOR.check_kinds == CHECK_KINDS
         assert set(VALID) == CHECK_KINDS

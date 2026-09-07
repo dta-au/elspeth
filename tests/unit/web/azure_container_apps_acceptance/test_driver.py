@@ -82,7 +82,8 @@ elif name == "python":
         (directory / "binding.json").write_text(json.dumps({
             "container_app_id": app_id, "revision": actual_revision, "replica": actual_revision + "-replica2",
         }))
-        emit({"probe": option("--probe")})
+        kind = "single-revision-fence-conflict" if option("--probe") == "P1" else "single-revision-progress"
+        emit({"check": kind, "probe": option("--probe")})
         sys.exit(1 if option("--probe") == os.environ.get("FAIL_SINGLE_PROBE") else 0)
     elif module == "elspeth.web._acceptance_common.testcontainer_run":
         emit({"junit_sha256": "d" * 64})
@@ -344,6 +345,13 @@ def test_complete_driver_orders_jobs_probes_receipts_and_cleanup(driver: DriverR
         command for command in commands if "receipt-store" in command and str(driver.evidence / "single-p1.receipt.json") in command
     )
     assert single_store[single_store.index("--subject-id") + 1].endswith(f"r{SHA[:12]}-single-replica2")
+    assert single_store[single_store.index("--kind") + 1] == "single-revision-fence-conflict"
+    progress_store = next(
+        command for command in commands if "receipt-store" in command and str(driver.evidence / "single-p4.receipt.json") in command
+    )
+    assert progress_store[progress_store.index("--kind") + 1] == "single-revision-progress"
+    assert json.loads((driver.evidence / "single-p1.stream").read_text())["check"] == "single-revision-fence-conflict"
+    assert json.loads((driver.evidence / "single-p4.stream").read_text())["check"] == "single-revision-progress"
     single_preparation = [command for command in commands if command[0] == "curl" and "/prepared-single-" in " ".join(command)]
     assert single_preparation and all(command[-1].startswith("https://app.example.test/") for command in single_preparation)
     storage = next(command for command in commands if "--owner-uid" in command)

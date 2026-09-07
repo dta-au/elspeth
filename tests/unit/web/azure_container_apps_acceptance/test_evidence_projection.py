@@ -495,6 +495,14 @@ def test_live_aca_bundle_rejects_local_docker_postgresql_proof(tmp_path: Path) -
     assert verdict.testcontainer_reason == "testcontainer_run_failed"
 
 
+@pytest.mark.parametrize("missing", ["single-revision-fence-conflict", "single-revision-progress"])
+def test_labelled_bundle_cannot_omit_required_single_revision_proof(tmp_path: Path, missing: str) -> None:
+    _fill_store(tmp_path / "store", kinds=CHECK_KINDS - {missing})
+    verdict = bundle_check(tmp_path / "store", candidate_sha=CANDIDATE, scenario_id="A")
+    assert not verdict.passed
+    assert verdict.missing_kinds == (missing,)
+
+
 def test_receipt_store_persists_canonical_bytes_under_their_hash_and_indexes_them(tmp_path: Path) -> None:
     store = tmp_path / "receipts"
     stored = receipt_store(

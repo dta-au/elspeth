@@ -602,9 +602,9 @@ stage_single_revision() {
   local session
   session=$(prepare_session single-p4 "$PROBE_YAML")
   api_post "/api/sessions/${session}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-single-p4-message.json"
-  single_revision_receipt P1 replica-fence-conflict single-p1 \
+  single_revision_receipt P1 single-revision-fence-conflict single-p1 \
     --trial-requests "$EVIDENCE_DIR/single-p1-trial-requests.json" --trials "${PROBE_TRIALS:-20}"
-  single_revision_receipt P4a replica-progress single-p4 --session-id "$session"
+  single_revision_receipt P4a single-revision-progress single-p4 --session-id "$session"
   unset PREPARATION_ORIGIN
   PROBE_WINDOW_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   printf '%s\n' "$PROBE_WINDOW_END" >"$EVIDENCE_DIR/probe-window-end.txt"

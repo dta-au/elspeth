@@ -11,6 +11,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
+import elspeth.web.azure_container_apps_single_revision as single_revision
 from elspeth.web._acceptance_common.errors import AcceptanceCheckError, AcceptanceInputError
 from elspeth.web._acceptance_common.http_client import AcceptanceCredentials
 from elspeth.web._acceptance_common.replica_probes import SESSION_OPERATION_CONFLICT_DETAIL, EvidenceObserver, MembershipRow
@@ -231,21 +232,27 @@ def test_process_ids_must_join_distinct_current_platform_replicas(fault: str) ->
         pytest.fail("distinct process UUIDs do not replace platform binding")
 
 
-def test_p4_cli_emits_bound_receipt_after_real_cookie_requests(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("probe", ["P1", "P4a"])
+def test_cli_emits_distinct_single_receipt_and_topology_after_real_cookie_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], probe: str
 ) -> None:
     routing = Routing()
     monkeypatch.setattr(AffinityClient, "from_env", lambda env: routing.factory())
+    monkeypatch.setattr(single_revision, "_observer", lambda env: routing.observer)
     app = tmp_path / "app.json"
     app.write_text(json.dumps(app_document()))
     app.chmod(0o600)
     replicas = tmp_path / "replicas.json"
     replicas.write_text(json.dumps([{"name": name} for name in REPLICAS]))
     evidence = tmp_path / "evidence"
+    requests = tmp_path / "requests.json"
+    requests.write_text(
+        json.dumps([{"session_id": str(uuid4()), "body": {"operation_id": str(uuid4()), "winner": REPLICAS[i % 2]}} for i in range(20)])
+    )
     exit_code = main(
         [
             "--probe",
-            "P4a",
+            probe,
             "--app-json",
             str(app),
             "--replicas-json",
@@ -256,6 +263,8 @@ def test_p4_cli_emits_bound_receipt_after_real_cookie_requests(
             "a" * 40,
             "--session-id",
             str(uuid4()),
+            "--trial-requests",
+            str(requests),
             "--evidence-dir",
             str(evidence),
         ]
@@ -267,11 +276,30 @@ def test_p4_cli_emits_bound_receipt_after_real_cookie_requests(
         expected_candidate_sha="a" * 40,
         expected_binding=ReplicaBinding(APP_ID, REVISION, REPLICAS[0]),
         expected_scenario_id="A",
-        expected_check="replica-progress",
+        expected_check="single-revision-progress" if probe == "P4a" else "single-revision-fence-conflict",
     )
     document = json.loads(receipt.canonical_json)
     assert document["details"]["outcome"] == "pass"
-    assert document["details"]["owner_affine"]["outcome"] == "cannot_pass"
+    assert document["details"]["topology"] == {
+        "active_revisions_mode": "Single",
+        "session_affinity": "sticky",
+        "min_replicas": 2,
+        "max_replicas": 2,
+        "revision": REVISION,
+        "replicas": [
+            {
+                "instance_id": INSTANCES[0],
+                "replica": REPLICAS[0],
+                "replica_binding_sha256": ReplicaBinding(APP_ID, REVISION, REPLICAS[0]).sha256,
+            },
+            {
+                "instance_id": INSTANCES[1],
+                "replica": REPLICAS[1],
+                "replica_binding_sha256": ReplicaBinding(APP_ID, REVISION, REPLICAS[1]).sha256,
+            },
+        ],
+    }
+    assert "topology" not in document["details"]["evidence"]
     assert json.loads((evidence / "binding.json").read_text()) == {
         "container_app_id": APP_ID,
         "revision": REVISION,
@@ -279,10 +307,14 @@ def test_p4_cli_emits_bound_receipt_after_real_cookie_requests(
     }
     assert (evidence / "binding.json").stat().st_mode & 0o777 == 0o600
     assert routing.created == 2
-    assert routing.uploaded and routing.message_content
-    for replica in REPLICAS:
-        assert any(actual == replica and path.endswith("/content") for actual, path in routing.paths)
-        assert any(actual == replica and path.endswith("/outputs") for actual, path in routing.paths)
+    if probe == "P4a":
+        assert document["details"]["owner_affine"]["outcome"] == "cannot_pass"
+        assert routing.uploaded and routing.message_content
+        for replica in REPLICAS:
+            assert any(actual == replica and path.endswith("/content") for actual, path in routing.paths)
+            assert any(actual == replica and path.endswith("/outputs") for actual, path in routing.paths)
+    else:
+        assert len([path for _, path in routing.paths if path.endswith("/guided/respond")]) == 40
 
 
 def test_invalid_candidate_refused_before_discovery(monkeypatch: pytest.MonkeyPatch) -> None:

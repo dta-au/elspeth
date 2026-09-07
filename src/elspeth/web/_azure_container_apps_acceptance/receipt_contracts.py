@@ -98,8 +98,16 @@ MECHANISMS: Final[frozenset[str]] = PROBE_MECHANISM_SET | PLATFORM_MECHANISMS
 """Every mechanism any Container Apps receipt may name; probe kinds are further narrowed per probe."""
 
 PROBE_KINDS: Final[Mapping[str, Probe]] = MappingProxyType(
-    {"replica-fence-conflict": "P1", "replica-run-start": "P2", "replica-lease-takeover": "P3", "replica-progress": "P4a"}
+    {
+        "replica-fence-conflict": "P1",
+        "replica-run-start": "P2",
+        "replica-lease-takeover": "P3",
+        "replica-progress": "P4a",
+        "single-revision-fence-conflict": "P1",
+        "single-revision-progress": "P4a",
+    }
 )
+SINGLE_REVISION_KINDS: Final = frozenset({"single-revision-fence-conflict", "single-revision-progress"})
 KIND_MECHANISMS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
     {
         "verify-doctor-job": frozenset({"container_apps_job"}),
@@ -113,14 +121,16 @@ KIND_MECHANISMS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
         "replica-run-start": PROBE_MECHANISMS["P2"],
         "replica-lease-takeover": PROBE_MECHANISMS["P3"],
         "replica-progress": PROBE_MECHANISMS["P4a"],
+        "single-revision-fence-conflict": PROBE_MECHANISMS["P1"],
+        "single-revision-progress": PROBE_MECHANISMS["P4a"],
         "resource-graph-cleanup": frozenset({"resource_graph_query"}),
     }
 )
-"""The twelve check kinds and the mechanisms each may claim."""
+"""The required check kinds and the mechanisms each may claim."""
 
 CHECK_KINDS: Final[frozenset[str]] = frozenset(KIND_MECHANISMS)
 STORED_RECEIPT_KINDS: Final[frozenset[str]] = CHECK_KINDS | {TESTCONTAINER_RUN_RECEIPT_KIND}
-"""What the receipt store admits: the twelve exec kinds plus the shared ``testcontainer-run``."""
+"""What the receipt store admits: the exec kinds plus the shared ``testcontainer-run``."""
 
 DOCTOR_JOB_NAMES: Final[frozenset[str]] = frozenset({"doctor-schema-init", "doctor-runtime-a", "doctor-runtime-b"})
 DOCTOR_REQUIRED_CHECKS: Final[frozenset[str]] = frozenset(
@@ -271,6 +281,29 @@ class ReplicaProgressDetails(ProbeReceiptDetails):
     owner_affine: ProbeReceiptDetails
 
 
+class SingleRevisionReplicaDetails(TypedDict):
+    instance_id: str
+    replica: str
+    replica_binding_sha256: str
+
+
+class SingleRevisionTopologyDetails(TypedDict):
+    active_revisions_mode: str
+    session_affinity: str
+    min_replicas: int
+    max_replicas: int
+    revision: str
+    replicas: list[SingleRevisionReplicaDetails]
+
+
+class SingleRevisionFenceDetails(ProbeReceiptDetails):
+    topology: SingleRevisionTopologyDetails
+
+
+class SingleRevisionProgressDetails(ReplicaProgressDetails):
+    topology: SingleRevisionTopologyDetails
+
+
 class ResourceGraphCleanupDetails(TypedDict):
     """``resource-graph-cleanup``: the group is gone from Resource Graph; the vault was purged or tombstoned."""
 
@@ -292,6 +325,8 @@ CheckDetails = (
     | RevisionRolloutDetails
     | ProbeReceiptDetails
     | ReplicaProgressDetails
+    | SingleRevisionFenceDetails
+    | SingleRevisionProgressDetails
     | ResourceGraphCleanupDetails
 )
 
@@ -353,6 +388,8 @@ _KIND_FIELDS: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
         "replica-run-start": _PROBE_FIELDS,
         "replica-lease-takeover": _PROBE_FIELDS,
         "replica-progress": _PROGRESS_FIELDS,
+        "single-revision-fence-conflict": frozenset(SingleRevisionFenceDetails.__required_keys__),
+        "single-revision-progress": frozenset(SingleRevisionProgressDetails.__required_keys__),
         "resource-graph-cleanup": _CLEANUP_FIELDS,
     }
 )
@@ -389,6 +426,44 @@ def _exact(value: object, expected: object) -> None:
     # ``==`` alone would let ``True`` stand in for ``1``: the type must agree too.
     if type(value) is not type(expected) or value != expected:
         raise _schema_violation()
+
+
+def _single_topology(raw: object) -> SingleRevisionTopologyDetails:
+    try:
+        topology = TypeAdapter(SingleRevisionTopologyDetails).validate_json(json.dumps(raw, allow_nan=False), strict=True, extra="forbid")
+    except (ValidationError, TypeError, ValueError):
+        raise _schema_violation() from None
+    _exact(topology["active_revisions_mode"], "Single")
+    _exact(topology["session_affinity"], "sticky")
+    _exact(topology["min_replicas"], 2)
+    _exact(topology["max_replicas"], 2)
+    revision = _text(topology["revision"], _REVISION_PATTERN)
+    replicas = topology["replicas"]
+    if len(replicas) != 2:
+        raise _schema_violation()
+    for replica in replicas:
+        _text(replica["instance_id"])
+        if not _text(replica["replica"]).startswith(f"{revision}-"):
+            raise _schema_violation()
+        _sha256_text(replica["replica_binding_sha256"])
+    for values in (
+        (replicas[0]["instance_id"], replicas[1]["instance_id"]),
+        (replicas[0]["replica"], replicas[1]["replica"]),
+        (replicas[0]["replica_binding_sha256"], replicas[1]["replica_binding_sha256"]),
+    ):
+        if values[0] == values[1]:
+            raise _schema_violation()
+    return topology
+
+
+def _single_expected_binding(raw: object, binding: ReplicaBinding) -> None:
+    topology = _single_topology(raw)
+    if topology["revision"] != binding.revision or topology["replicas"][0]["replica"] != binding.replica:
+        raise AcceptanceCheckError("replica_binding")
+    for replica in topology["replicas"]:
+        observed = ReplicaBinding(binding.container_app_id, binding.revision, replica["replica"])
+        if observed.sha256 != replica["replica_binding_sha256"]:
+            raise AcceptanceCheckError("replica_binding")
 
 
 def _job_execution(*, kind: str, job_name: object, execution_name: object, execution_status: object, job_names: frozenset[str]) -> str:
@@ -518,7 +593,7 @@ def validate_check_details(kind: str, details: Mapping[str, object]) -> None:
         # about a dead owner was proven and the receipt cannot record a pass.
         if kind == "replica-lease-takeover" and result.mechanism == "graceful_stop" and result.outcome == "pass":
             raise _schema_violation()
-        if kind == "replica-progress":
+        if kind in {"replica-progress", "single-revision-progress"}:
             owner_affine = details["owner_affine"]
             if type(owner_affine) is not dict or set(owner_affine) != _PROBE_FIELDS:
                 raise _schema_violation()
@@ -530,6 +605,18 @@ def validate_check_details(kind: str, details: Mapping[str, object]) -> None:
                 reasons=owner_affine["reasons"],
                 evidence=owner_affine["evidence"],
             )
+        if kind in SINGLE_REVISION_KINDS:
+            topology = _single_topology(details["topology"])
+            if result.outcome == "pass" and result.probe == "P1":
+                _exact(result.evidence["distinct_winners"], 2)
+            if result.outcome == "pass" and result.probe == "P4a":
+                observation = TypeAdapter(CrossReplicaProgressObservation).validate_json(
+                    json.dumps(cast(dict[str, object], details["evidence"])["observation"]), strict=True, extra="forbid"
+                )
+                if (observation.owner_instance_id, observation.reader_instance_id) != tuple(
+                    replica["instance_id"] for replica in topology["replicas"]
+                ):
+                    raise _schema_violation()
         return
     if kind == "verify-doctor-job":
         job_name = _job_execution(
@@ -644,6 +731,11 @@ def _admit_exec_receipt(payload: object) -> StoredReceipt:
         raise AcceptanceCheckError("exec_receipt_schema")
     document = _validate_bounded_receipt_document(payload)
     receipt = validate_exec_receipt_schema(document, descriptor=EXEC_RECEIPT_DESCRIPTOR)
+    if receipt["check"] in SINGLE_REVISION_KINDS:
+        details = cast(dict[str, object], receipt["details"])
+        topology = _single_topology(details["topology"])
+        if receipt["replica_binding_sha256"] != topology["replicas"][0]["replica_binding_sha256"]:
+            raise AcceptanceCheckError("replica_binding")
     return StoredReceipt(
         kind=cast(str, receipt["check"]),
         scenario_id=cast(str, receipt["scenario_id"]),
@@ -658,6 +750,9 @@ def encode_exec_receipt(check: str, details: CheckDetails, *, candidate_sha: str
 
     if _GIT_SHA_PATTERN.fullmatch(candidate_sha) is None or _SCENARIO_ID_PATTERN.fullmatch(scenario_id) is None:
         raise AcceptanceCheckError("exec_receipt_binding")
+    if check in SINGLE_REVISION_KINDS:
+        validate_check_details(check, cast(dict[str, object], details))
+        _single_expected_binding(cast(SingleRevisionFenceDetails | SingleRevisionProgressDetails, details)["topology"], binding)
     receipt = _admit_exec_receipt(
         {
             "version": 1,
@@ -722,6 +817,9 @@ def extract_exec_receipt(
         raise AcceptanceCheckError("scenario_binding")
     if receipt.kind != expected_check:
         raise AcceptanceCheckError("check_binding")
+    if receipt.kind in SINGLE_REVISION_KINDS:
+        document = json.loads(receipt.canonical_json)
+        _single_expected_binding(document["details"]["topology"], expected_binding)
     return receipt
 
 

@@ -44,7 +44,9 @@ from elspeth.web._azure_container_apps_acceptance.evidence import project_replic
 from elspeth.web._azure_container_apps_acceptance.receipt_contracts import (
     CheckDetails,
     ReplicaBinding,
-    ReplicaProgressDetails,
+    SingleRevisionFenceDetails,
+    SingleRevisionProgressDetails,
+    SingleRevisionTopologyDetails,
     encode_exec_receipt,
 )
 from elspeth.web.azure_container_apps_acceptance import (
@@ -304,22 +306,36 @@ def main(argv: list[str] | None = None) -> int:
         details: CheckDetails
         with discover_pair(topology, factory, attempts=args.discovery_attempts) as clients:
             owner, reader = clients
-            if owner.replica_name is None:
+            if owner.replica_name is None or reader.replica_name is None or owner.instance_id is None or reader.instance_id is None:
                 raise AcceptanceCheckError("single_revision_instances_unbound")
             binding = ReplicaBinding(topology.container_app_id, topology.revision, owner.replica_name)
+            reader_binding = ReplicaBinding(topology.container_app_id, topology.revision, reader.replica_name)
+            topology_details: SingleRevisionTopologyDetails = {
+                "active_revisions_mode": "Single",
+                "session_affinity": "sticky",
+                "min_replicas": 2,
+                "max_replicas": 2,
+                "revision": topology.revision,
+                "replicas": [
+                    {"instance_id": owner.instance_id, "replica": owner.replica_name, "replica_binding_sha256": binding.sha256},
+                    {"instance_id": reader.instance_id, "replica": reader.replica_name, "replica_binding_sha256": reader_binding.sha256},
+                ],
+            }
             if args.probe == "P1":
                 result = run_fence_trials(clients, _observer(env), requests)
-                check = "replica-fence-conflict"
-                details = result.to_receipt_details()
+                check = "single-revision-fence-conflict"
+                fence: SingleRevisionFenceDetails = {**result.to_receipt_details(), "topology": topology_details}
+                details = fence
             else:
                 observation = collect_progress(owner=owner, reader=reader, session_id=args.session_id, capture=capture, polling=Polling())
                 capture.write("progress", observation_document(observation))
                 result = decide_cross_replica_progress(observation)
-                progress: ReplicaProgressDetails = {
+                progress: SingleRevisionProgressDetails = {
                     **result.to_receipt_details(),
                     "owner_affine": record_owner_affine_progress(mitigation="single_revision_sticky_sessions").to_receipt_details(),
+                    "topology": topology_details,
                 }
-                check = "replica-progress"
+                check = "single-revision-progress"
                 details = progress
             capture.write("result", details)
             receipt = encode_exec_receipt(check, details, candidate_sha=args.candidate_sha, binding=binding, scenario_id=args.scenario_id)
