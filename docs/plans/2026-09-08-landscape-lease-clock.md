@@ -73,6 +73,7 @@ The guard owns no lease-renewal callback and retries no body. Registration is ti
 - Modify `src/elspeth/core/landscape/database_clock.py`, `database.py`, `journal.py`.
 - Create `src/elspeth/core/landscape/lease_deadlines.py`.
 - Create `tests/unit/core/landscape/test_lease_deadline_guard.py` and `tests/testcontainer/core/test_lease_deadline_guard_postgres.py`.
+- Update interface doubles in `tests/unit/core/landscape/test_database_compatibility_guards.py` and `test_journal.py` to model real Engine/Connection behavior used by listener installation and invalidation cleanup.
 
 1. Add failing tests for fresh versus transaction time, aware UTC, dialect/result rejection, reserve equality, replacement/cancellation, savepoint refusal, bare engines, pool reuse and journal-delay rollback.
 2. Run the new tests and record the actual failures before implementation.
@@ -88,6 +89,7 @@ The guard owns no lease-renewal callback and retries no body. Registration is ti
 
 - Modify `src/elspeth/core/landscape/run_coordination_repository.py` and `run_lifecycle_repository.py`.
 - Modify `src/elspeth/engine/orchestrator/heartbeat.py` and `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py`.
+- Update equality fixtures in `tests/unit/core/landscape/test_run_coordination_repository.py` and `tests/testcontainer/core/test_run_coordination_release_postgres.py`, preserving strict equality refusal and unchanged-state assertions with database-derived decision instants.
 - Create `tests/unit/core/landscape/test_coordination_deadline_finalization.py` and `tests/testcontainer/core/test_coordination_deadline_finalization_postgres.py`.
 
 1. Add real server-observed seat-lock waits for takeover, export acquisition and heartbeat; a long leader body; the outer `begin_run` mint body; and follower admission crossing expiry while waiting.
@@ -106,6 +108,8 @@ The guard owns no lease-renewal callback and retries no body. Registration is ti
 - Modify `src/elspeth/core/landscape/scheduler/leases.py` and `queue.py`.
 - Modify `src/elspeth/engine/scheduler_drain.py` and create `tests/unit/engine/test_scheduler_deadline_refusal.py`.
 - Modify `tests/testcontainer/core/test_scheduler_lease_eviction_postgres.py` only to recognize the new earlier item-lock boundary while preserving refusal assertions.
+- Update `tests/testcontainer/core/test_item_generation_fence_postgres.py` for recovery's earlier membership-row blocker; retain stale-generation refusal and full state assertions, and rerun its actual weakened-CAS mutation.
+- Update equality/tied-event fixtures in `tests/unit/core/landscape/test_scheduler_lease_recovery_races.py` and `test_scheduler_events.py`; retain non-reap equality and tied-event sequence assertions.
 - Create `tests/unit/core/landscape/test_scheduler_deadline_completion.py` and `tests/testcontainer/core/test_scheduler_decision_clock_postgres.py`.
 
 1. Add failing READY, PENDING_SINK and heartbeat tests with server-observed item blockers, expiry crossing during recovery, and outer enqueue/ingest tails consuming a claim's reserve.
@@ -122,6 +126,7 @@ The guard owns no lease-renewal callback and retries no body. Registration is ti
 
 - Modify `src/elspeth/core/landscape/execution/sink_effect_lifecycle.py` and `sink_effect_finalization.py`.
 - Create `tests/unit/core/landscape/test_sink_effect_deadline_completion.py` and `tests/testcontainer/core/test_sink_effect_decision_clock_postgres.py`.
+- Create `tests/unit/engine/test_sink_effect_deadline_propagation.py` and update the precision-dependent assertion in `tests/unit/engine/test_sink_effect_lease_wait.py` while preserving lease-wait and ownership checks.
 
 1. Add failing target-lock delay and expiry-crossing tests for preparation, acquisition, heartbeat, takeover and finalization.
 2. Verify the failures expose stale timing while owner/generation controls remain intact.

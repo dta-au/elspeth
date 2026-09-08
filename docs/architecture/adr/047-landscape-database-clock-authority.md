@@ -10,7 +10,7 @@
 
 Landscape remains the sole database clock authority for Landscape custody,
 liveness and expiry. For a lease decision, acquire the required authority and
-target-row locks before obtaining a fresh, aware-UTC Landscape database sample.
+lease-subject locks before obtaining a fresh, aware-UTC Landscape database sample.
 Reuse that sample for the decision's eligibility predicates, CAS conditions,
 deadline writes and associated timestamps. No process or Sessions clock enters
 the decision, and no public caller can supply its time.
@@ -33,8 +33,13 @@ with a direct full-token conditional UPDATE and immediate cardinality-one
 refusal. An identity-preserving UPDATE establishes the lock before the fresh
 deadline renewal. The lock remains held through commit or rollback. Expiry is
 not added to this admission predicate. A pure membership fence checks active
-worker identity and does not issue or renew a heartbeat. Item and sink-effect
+worker identity and does not issue or renew a heartbeat. Item fencing retains
+its active-member, owner and attempt predicates: expiry makes an item eligible
+for recovery, but recovery's generation change revokes its owner. Sink-effect
 operations retain their owner, generation, status and strict-expiry rules.
+An effect's strict expiry check admits the operation while the effect and
+authority locks remain held; later audit-body work does not acquire a new
+expiry-through-completion guarantee.
 
 The transaction owner must finalize only the continuing deadlines that its
 transaction explicitly issues or renews, after its body and while the required
@@ -63,6 +68,11 @@ commit. Family renewal DML occurs before journal serialization. The guard does
 not discover leases, rewrite deadlines or retry work. State is scoped to the
 outer transaction and cleared on every exit, including rollback and failed
 commit, so pooled connections cannot retain another transaction's obligations.
+
+A LandscapeDB engine installs this guard during setup. Externally supplied
+engines should install it before concurrent use; lazy registration alone does
+not establish safe first installation alongside an already-running custom
+commit listener.
 
 For effective nominal duration `W` (the duration actually added after any
 dialect or TTL alignment), the implementation requires a remaining reserve of
