@@ -1957,3 +1957,30 @@ def test_manifest_rejects_structural_payload_schema_impostor(
 
     with pytest.raises(FrameworkBugError, match="TypedDict"):
         build_runtime_val_manifest()
+
+
+@pytest.mark.parametrize(("base", "raw"), [(str, "x"), (int, 3), (float, 1.5)], ids=["str", "int", "float"])
+def test_primitive_subclass_constant_normalizes_distinct_from_its_base(base: type, raw: object) -> None:
+    """A str/int/float subclass constant must not hash identically to its bare base value.
+
+    The broad primitive pass-through used to precede the ``primitive_subclass``
+    arms, so those arms were unreachable and a subclass carrier change was
+    invisible to the resume-trust manifest.
+    """
+    from elspeth.contracts.runtime_val_manifest import _try_normalize_code_constant
+
+    subclass = type("ManifestProbeSubclass", (base,), {})
+    plain = _try_normalize_code_constant(raw)
+    normalized = _try_normalize_code_constant(subclass(raw))
+
+    assert plain == raw
+    assert normalized != plain
+    assert normalized["primitive_subclass"]["value"] == raw
+    assert "ManifestProbeSubclass" in normalized["primitive_subclass"]["type"]
+
+
+def test_plain_primitive_and_bool_constants_pass_through_unchanged() -> None:
+    from elspeth.contracts.runtime_val_manifest import _try_normalize_code_constant
+
+    for value in ("x", 3, 1.5, True, False, None):
+        assert _try_normalize_code_constant(value) is value

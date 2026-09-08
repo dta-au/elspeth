@@ -286,7 +286,10 @@ def _try_normalize_code_constant(value: object, *, seen: frozenset[int] = frozen
         if any(bound is _UNSUPPORTED_MANIFEST_VALUE for bound in normalized_bounds.values()):
             return _UNSUPPORTED_MANIFEST_VALUE
         return {"slice": normalized_bounds}
-    if isinstance(value, (str, int, float, bool)) or value is None:
+    # Exact-type pass-through only: a str/int/float SUBCLASS must fall through
+    # to the primitive_subclass arms below so its carrier identity reaches the
+    # manifest instead of hashing identically to the bare base value.
+    if value is None or type(value) in (str, int, float, bool):
         return value
     if isinstance(value, str):
         return {"primitive_subclass": {"type": _type_identity(type(value)), "value": str.__str__(value)}}

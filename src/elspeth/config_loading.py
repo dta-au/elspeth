@@ -210,6 +210,21 @@ def _reject_sensitive_plugin_env_placeholders_before_expansion(raw_config: Mappi
                 )
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "operator pipeline YAML on disk at config_path — loaded through Dynaconf and re-read with "
+        "yaml.safe_load so that only keys originating from the file are validated"
+    ),
+    source_param="config_path",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the YAML document is anything but a mapping (only an empty document is the "
+        "empty mapping) or carries unknown top-level keys; never coerces a non-mapping document"
+    ),
+    test_ref="tests/unit/core/test_config.py::TestLoadSettingsYamlDocumentShape::test_falsy_non_mapping_yaml_file_rejected",
+    test_fingerprint="6630775a55fe8121574e8df12084ed45b8e357b21888df810f9e50599584bac4",
+)
 def load_settings(config_path: Path) -> ElspethSettings:
     """Load settings from YAML file with environment variable overrides.
 
