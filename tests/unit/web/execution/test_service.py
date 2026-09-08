@@ -3005,13 +3005,31 @@ class TestExecutionFanoutGuard:
         # line_explode now correctly fails the independent UNKNOWN semantic
         # contract gate, so keep that sibling gate stubbed on the accepted
         # retry just as it is on the initial guard-producing call above.
-        with patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())):
-            await _execute(
-                service,
-                session_id=session_id,
-                fanout_ack_token=raised.value.guard.ack_token,
-                secret_ack_token=secret_raised.value.guard.ack_token,
-            )
+        authority = RecordingSessionOperationAuthority()
+        with (
+            patch.object(service, "_run_pipeline") as run_pipeline,
+            patch.object(service, "_loop", asyncio.get_running_loop()),
+            patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
+        ):
+            try:
+                await _execute(
+                    service,
+                    session_id=session_id,
+                    authority=authority,
+                    fanout_ack_token=raised.value.guard.ack_token,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
+            finally:
+                # The real executor and its lease-completion callback must
+                # finish before the fixture closes the worker's bridge loop.
+                await service.shutdown()
+
+        run_pipeline.assert_called_once()
+        acquired = [context for name, context in authority.calls if name == "acquire"]
+        released = [context for name, context in authority.calls if name == "release"]
+        assert len(acquired) == 1
+        assert released == acquired
+        assert not service._lease_completion_futures
 
         create_call = mock_session_service.create_run.await_args_list[-1]
         persisted_yaml = create_call.kwargs["pipeline_yaml"]
@@ -3062,21 +3080,32 @@ class TestExecutionFanoutGuard:
             ],
         )
 
+        authority = RecordingSessionOperationAuthority()
         with (
             patch.object(service, "_run_pipeline"),
+            patch.object(service, "_loop", asyncio.get_running_loop()),
             patch("elspeth.web.execution.service.validate_semantic_contracts", return_value=((), (), ())),
         ):
-            # The wired secret still requires its own out-of-band approval
-            # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
-            with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
-                await _execute(service, session_id=session_id)
-            run_id = await _execute(
-                service,
-                session_id=session_id,
-                secret_ack_token=secret_raised.value.guard.ack_token,
-            )
+            try:
+                # The wired secret still requires its own out-of-band approval
+                # (elspeth-f3c1aafd25); low cardinality only removes the FANOUT ack.
+                with pytest.raises(ExecutionSecretApprovalRequired) as secret_raised:
+                    await _execute(service, session_id=session_id)
+                run_id = await _execute(
+                    service,
+                    session_id=session_id,
+                    authority=authority,
+                    secret_ack_token=secret_raised.value.guard.ack_token,
+                )
+            finally:
+                await service.shutdown()
 
         assert isinstance(run_id, UUID)
+        acquired = [context for name, context in authority.calls if name == "acquire"]
+        released = [context for name, context in authority.calls if name == "release"]
+        assert len(acquired) == 1
+        assert released == acquired
+        assert not service._lease_completion_futures
         persisted_yaml = mock_session_service.create_run.await_args.kwargs["pipeline_yaml"]
         assert "elspeth_execution_fanout_guard" not in persisted_yaml
         assert "elspeth_execution_secret_approval" in persisted_yaml
