@@ -1,14 +1,24 @@
-"""Bounded operational telemetry for composer advisor checkpoints."""
+"""Bounded operational telemetry for composer advisor checkpoints.
+
+Every event here is the real-time MIRROR of an audit row that
+``web/composer/advisor_audit.py`` has already committed through the sessions
+service (or that a sessionless compose has no store to hold). Under the
+logging policy the audit row is the record; these emits are telemetry, so
+an exporter failure must neither displace the composer outcome the row
+already fixes nor pass silently: it is acknowledged on the last-resort
+channel (``composer.advisor_telemetry_failed``) the way the tutorial and
+preferences telemetry acknowledge theirs, and registered Tier-1 integrity
+failures still escape.
+"""
 
 from __future__ import annotations
 
-from contextlib import suppress
 from typing import Literal
 
 import structlog
 from opentelemetry import metrics
 
-from elspeth.contracts.hashing import stable_hash
+from elspeth.contracts import errors as contract_errors
 
 AdvisorCheckpointPhase = Literal["early", "end"]
 AdvisorCheckpointTelemetryVerdict = Literal["clean", "flagged", "unavailable", "malformed"]
@@ -30,26 +40,40 @@ _ADVISOR_CHECKPOINT_PASSES_COUNTER = metrics.get_meter(__name__).create_counter(
 slog = structlog.get_logger()
 
 
+def _acknowledge_telemetry_failure(*, operation: str, error_type: str) -> None:
+    """Acknowledge an exporter failure through the last available channel.
+
+    Only the exception CLASS name is projected, never its text.
+    """
+    try:
+        slog.error("composer.advisor_telemetry_failed", operation=operation, error_type=error_type)
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception:
+        # Ordinary failure of the last-resort logger cannot replace an audit
+        # row that has already committed.
+        return
+
+
 def record_advisor_checkpoint_pass(
     *,
     session_id: str | None,
     phase: AdvisorCheckpointPhase,
     pass_index: int,
     verdict: AdvisorCheckpointTelemetryVerdict,
-    findings_text: str,
     source: AdvisorCheckpointVerdictSource,
+    findings_hash: str,
 ) -> None:
-    """Best-effort event and metric increment for a logical checkpoint call."""
-    # The checkpoint verdict is already complete. Optional telemetry must
-    # neither replace it nor recursively log raw advisor findings.
-    #
-    # ``stable_hash`` is ELSPETH-owned and runs ABOVE the suppression on
-    # purpose: a canonicalization refusal is a programmer error about our own
-    # payload, not an exporter outage, so it must propagate rather than be
-    # swallowed with the emit. Same guard ordering the signed
-    # ``telemetry_phase8`` exemption relies on.
-    findings_hash = stable_hash({"advisor_findings": findings_text})
-    with suppress(Exception):
+    """Event and metric increment mirroring one persisted checkpoint pass.
+
+    Called by ``advisor_audit.persist_advisor_checkpoint_pass`` AFTER the
+    ``advisor_checkpoint_pass_audit`` row is durable. ``findings_hash`` is
+    the record's already-computed canonical hash: no findings text enters
+    this event. The event and the metric are guarded separately so a broken
+    meter provider cannot cost the event and a broken event sink cannot cost
+    the count.
+    """
+    try:
         slog.info(
             "composer.advisor_checkpoint_pass",
             session_id=session_id,
@@ -59,10 +83,16 @@ def record_advisor_checkpoint_pass(
             source=source,
             findings_hash=findings_hash,
         )
-    # Keep the metric independent from the event sink and off the correctness
-    # path, matching the composer's telemetry policy.
-    with suppress(Exception):
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as exc:
+        _acknowledge_telemetry_failure(operation="checkpoint_pass_event", error_type=type(exc).__name__)
+    try:
         _ADVISOR_CHECKPOINT_PASSES_COUNTER.add(1, {"phase": phase, "verdict": verdict, "source": source})
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as exc:
+        _acknowledge_telemetry_failure(operation="checkpoint_pass_counter", error_type=type(exc).__name__)
 
 
 AdvisorTerminalPublicationBranch = Literal[
@@ -91,24 +121,21 @@ def record_advisor_terminal_publication(
     preflight_shape: AdvisorPreflightShape,
     findings_backend_authored: bool,
 ) -> None:
-    """Best-effort attribution event for one advisor-cohort terminal publication.
+    """Event and metric increment mirroring one persisted terminal publication.
 
     elspeth-fa18d54eef: a live turn published the pending-handoff "did not
     clear" notice under a journal trail (advisor pass CLEAN, no withheld
     disclosure row) that the deployed tree could not produce, and which
     branch published the message was unrecoverable after the fact. Every
-    publication site now names its branch here, so a recurrence is
-    attributable from one journal read. Fields are all backend-derived
-    (closed vocabularies plus the session id) — no advisor findings text and
-    no model prose enter this event.
-
-    ``findings_backend_authored`` (elspeth-25f7b757e7 A2): True iff the
-    published wording embeds the backend-authored deterministic pre-scan
-    finding. Only the blocked terminal can carry True — it is the one
-    publication whose wording rides the verdict; every repair-cohort branch
-    publishes fixed copy with no finding at all and passes False.
+    publication site now mints an ``AdvisorTerminalPublication`` that
+    ``advisor_audit.persist_advisor_terminal_publication`` writes as an
+    ``advisor_terminal_publication_audit`` row before calling here, so a
+    recurrence is attributable from the session's own audit trail and this
+    event is only its real-time view. Fields are all backend-derived (closed
+    vocabularies plus the session id) — no advisor findings text and no model
+    prose enter this event.
     """
-    with suppress(Exception):
+    try:
         slog.info(
             "composer.advisor_terminal_publication",
             session_id=session_id,
@@ -117,10 +144,16 @@ def record_advisor_terminal_publication(
             preflight_shape=preflight_shape,
             findings_backend_authored=findings_backend_authored,
         )
-    # Keep the metric independent from the event sink and off the correctness
-    # path, matching the composer's telemetry policy.
-    with suppress(Exception):
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as exc:
+        _acknowledge_telemetry_failure(operation="terminal_publication_event", error_type=type(exc).__name__)
+    try:
         _ADVISOR_TERMINAL_PUBLICATIONS_COUNTER.add(
             1,
             {"branch": branch, "preflight_shape": preflight_shape, "findings_backend_authored": findings_backend_authored},
         )
+    except contract_errors.TIER_1_ERRORS:
+        raise
+    except Exception as exc:
+        _acknowledge_telemetry_failure(operation="terminal_publication_counter", error_type=type(exc).__name__)

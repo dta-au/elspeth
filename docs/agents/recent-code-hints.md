@@ -1234,7 +1234,8 @@ the same commit; the rules live there, the history lives here.
   `advisor_checkpoint_telemetry.record_advisor_checkpoint_pass` the owned `stable_hash` was computed inside
   `with suppress(Exception)` around the `slog.info` emit, so a canonicalization `ValueError`/`TypeError` about
   an owned payload was indistinguishable from an exporter outage; binding `findings_hash` above the `suppress`
-  fixes that for one line. Use the same test to decide whether a swallow needs a `TIER_1_ERRORS` re-raise arm at
+  fixed that for one line (since 2026-09-09 the hash is computed in `advisor_audit.AdvisorCheckpointPassRecord.from_findings`,
+  before any row is written or event emitted, and the emit itself no longer swallows — see the 2026-09-09 item). Use the same test to decide whether a swallow needs a `TIER_1_ERRORS` re-raise arm at
   all: if the protected body contains no owned call (a bare `counter.add`, a third-party registry lookup), no
   Tier-1 error can originate there and the arm would be dead code — say so in the rationale instead of writing
   it.
@@ -2078,8 +2079,38 @@ the same commit; the rules live there, the history lives here.
   `execution/validation.py::_skipped_checks` emits every check DOWNSTREAM of a halted stage as `passed=False` with `outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` — `advisor_signoff` included — so every pending-handoff strict preflight carries a "failing" advisor check that means NEVER EVALUATED. Reading it as a failure published the "advisory review did not clear" notice over a CLEAN advisor verdict (elspeth-fa18d54eef; live in three sessions before the telemetry caught it). Dispatch through `execution/completion_gates.advisor_signoff_check_failed` (skipped-aware), or for a new check name discriminate on `outcome_code` directly. The companion trap is FIXTURE DIVERGENCE: `_handoff_result()`-style hand-built ValidationResults with `checks=[]` pin a shape `validate_pipeline` never emits (the real producer appends the skipped tail), which is why seven scripted reproductions missed a bug three live sessions hit. When a consumer dispatches on checks, give the fixture the producer's skipped rows — `_producer_honest_handoff_result` in `tests/unit/web/composer/test_advisor_terminal_publication.py` is the worked example.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
+- **2026-09-09 — Advisor checkpoint verdicts and terminal-publication branches are AUDIT ROWS first; the structlog events are their mirror, and a `suppress(Exception)` around the event was a policy violation, not a signing problem**
+  The trust-tier judge blocked `web/composer/advisor_checkpoint_telemetry.py:R7:record_advisor_terminal_publication`
+  on the 0.8.0 tail: the suppressed `slog.info` was the PRIMARY record of which branch published a turn's fixed copy
+  (no audit row carried `branch`), which inverts the logging policy (audit first, synchronously, must-fire; telemetry
+  second; logs last resort). elspeth-fa18d54eef itself had been diagnosed from the journal — both
+  `composer.advisor_checkpoint_pass` and `composer.advisor_terminal_publication` were the evidence, so both are
+  probative and both belong in the session's audit trail. Now: `web/composer/advisor_audit.py` holds the records
+  (`AdvisorCheckpointPassRecord`, `AdvisorTerminalPublication`, closed vocabularies only), their `_kind` envelopes
+  (`advisor_checkpoint_pass_audit`, `advisor_terminal_publication_audit`), and `persist_advisor_checkpoint_pass` /
+  `persist_advisor_terminal_publication`, which write one `role="audit"` `chat_messages` row through
+  `SessionServiceProtocol.add_message` under the turn's `session_operation_context` and only then call the
+  `record_*` emitters. Publication sites mint the record onto `ComposerResult.advisor_terminal_publication`
+  (`advisor_terminal_published` is now derived: branch == `terminal_block`); the site holding the fence persists it
+  (`_qualified_advisor_repair_public_result`, and the END gate right after the withheld-disclosure row). Checkpoint
+  passes persist inside `_run_advisor_checkpoint.completed`, so `session_operation_context` is threaded into
+  `_run_advisor_checkpoint`, `_maybe_run_early_checkpoint` and `run_signoff_checkpoint`. Two rules fall out. (1) A
+  session id without its operation context is REFUSED (`TypeError`), never written unfenced and never downgraded to
+  telemetry-only — the withheld-disclosure row set that precedent; a test that drives a checkpoint or publication
+  WITH a session must supply the fence and a sessions service (`_fenced_session` in `test_advisor_checkpoint.py`,
+  UUID-shaped id). `session_id is None` (eval harnesses, direct unit calls) is the only telemetry-only path. (2) The
+  emitters use the accepted `tutorial_telemetry.py` shape — `except TIER_1_ERRORS: raise`, then acknowledge on
+  `composer.advisor_telemetry_failed` with the exception class only — so the four R7 findings became five R4
+  findings in the prescribed form and the two signed counter entries went stale; do not reintroduce
+  `suppress(Exception)` around an emit whose fact is not yet in an audit row, and do not "fix" a blocked R7 by
+  removing the suppress so a log line becomes must-fire (that entrenches the log as the record — reverted 2026-09-08).
+  Read-side: the new kinds are excluded from conversation and prompt history by the `role="audit"` rule in
+  `_is_composer_audit_tool_message`, are not LLM-audit kinds, and are never replayed as control messages.
+  Tests: `tests/unit/web/composer/test_advisor_audit.py` (ordering, refusals, real-SQLite row shape).
+  See [CONTRIBUTING: Whole-tree gates](../../CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit).
+
 - **2026-08-29 — Advisor-cohort terminal copy carries a SHARED withheld-prose disclosure, and every publication site is attributed** (elspeth-fa18d54eef)
-  `no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE` is appended to all six advisor-cohort terminal messages (`_ADVISOR_SIGNOFF_PENDING_NOTICE`, `_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE`, `ADVISOR_REPAIR_SUCCESS`/`REVIEW`/`REVIEW_WITH_FINDINGS`/`UNVERIFIED_PUBLIC_MESSAGE`). Edit the disclosure ONCE there, never fork per-message copies, and keep it OUT of `compose_preflight_failure_message`, whose chrome is shared with non-cohort turns where prose is not withheld. The finalize suffixes and the `visible_message_segments` recognizer derive from the same constants, so extending a notice keeps trusted chrome minting by construction; a hand-copied suffix string anywhere else breaks `test_advisor_terminal_publication.py`. Separately, every advisor-cohort terminal publication emits `composer.advisor_terminal_publication` (`record_advisor_terminal_publication`, closed branch + preflight-shape vocabularies, best-effort per the signed telemetry_phase8 posture, elspeth-fa18d54eef): adding a publication branch to `_replace_advisor_repair_public_result` or a new blocked terminal means adding its branch literal and emit, since an unattributed publication site re-opens the forensic hole this closed.
+  `no_tool_policy.ADVISOR_PROSE_WITHHELD_PUBLIC_DISCLOSURE` is appended to all six advisor-cohort terminal messages (`_ADVISOR_SIGNOFF_PENDING_NOTICE`, `_ADVISOR_SIGNOFF_PENDING_HANDOFF_NOTICE`, `ADVISOR_REPAIR_SUCCESS`/`REVIEW`/`REVIEW_WITH_FINDINGS`/`UNVERIFIED_PUBLIC_MESSAGE`). Edit the disclosure ONCE there, never fork per-message copies, and keep it OUT of `compose_preflight_failure_message`, whose chrome is shared with non-cohort turns where prose is not withheld. The finalize suffixes and the `visible_message_segments` recognizer derive from the same constants, so extending a notice keeps trusted chrome minting by construction; a hand-copied suffix string anywhere else breaks `test_advisor_terminal_publication.py`. Separately, every advisor-cohort terminal publication names its branch (elspeth-fa18d54eef; since 2026-09-09 as an `AdvisorTerminalPublication` record on the result that becomes an `advisor_terminal_publication_audit` row, with `composer.advisor_terminal_publication` as the telemetry mirror — see the 2026-09-09 item above): adding a publication branch to `_replace_advisor_repair_public_result` or a new blocked terminal means adding its branch literal to `advisor_audit.py` and minting the record, since an unattributed publication site re-opens the forensic hole this closed.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
 - **2026-08-29 — A `@trust_boundary` whose `source_param` is a `Path` DOES suppress the reads of the document that function opens itself, and the try-join rule is about where the READ sits, not whether the handler raises**

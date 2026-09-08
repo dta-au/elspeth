@@ -89,11 +89,14 @@ from elspeth.web.composer._compose_loop_carriers import (
     _ToolBatchCancellationRequested,
     _ToolOutcome,
 )
-from elspeth.web.composer.advisor_checkpoint_telemetry import (
-    AdvisorCheckpointVerdictSource,
-    record_advisor_checkpoint_pass,
-    record_advisor_terminal_publication,
+from elspeth.web.composer.advisor_audit import (
+    AdvisorCheckpointPassRecord,
+    AdvisorTerminalBlockReason,
+    AdvisorTerminalPublication,
+    persist_advisor_checkpoint_pass,
+    persist_advisor_terminal_publication,
 )
+from elspeth.web.composer.advisor_checkpoint_telemetry import AdvisorCheckpointVerdictSource
 from elspeth.web.composer.anti_anchor import AntiAnchorTracker
 from elspeth.web.composer.audit import (
     BufferingRecorder,
@@ -1302,7 +1305,6 @@ def _replace_advisor_repair_public_result(
     result: ComposerResult,
     *,
     outstanding_findings: ValidationResult | None = None,
-    session_id: str | None = None,
 ) -> ComposerResult:
     """Publish fixed prose after hidden advisor repair context was introduced.
 
@@ -1311,6 +1313,12 @@ def _replace_advisor_repair_public_result(
     is replaced: it was generated after the model received an internal advisor
     finding, so it is not safe as a human or persisted transcript surface even
     when the next checkpoint returns CLEAN.
+
+    Pure: every branch mints its ``AdvisorTerminalPublication`` onto the
+    returned result and writes nothing. The caller that holds the turn's
+    session write context (``_qualified_advisor_repair_public_result``)
+    persists the record as an audit row before its telemetry mirror fires —
+    the branch that spoke is a fact of the legal record, not of the journal.
 
     elspeth-88592f5be7: ``runtime_preflight is None`` means the preflight was
     NOT COMPUTED this turn (``_turn_runtime_preflight`` returns the initial
@@ -1338,22 +1346,22 @@ def _replace_advisor_repair_public_result(
     runtime_result = result.runtime_preflight
     preflight_shape = _advisor_preflight_shape(runtime_result)
     if runtime_result is None:
-        record_advisor_terminal_publication(
-            session_id=session_id, branch="repair_unverified", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
-        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_UNVERIFIED_PUBLIC_MESSAGE,
             raw_assistant_content=None,
+            advisor_terminal_publication=AdvisorTerminalPublication(
+                branch="repair_unverified", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+            ),
         )
     if runtime_result.is_valid and runtime_result.readiness.completion_ready:
-        record_advisor_terminal_publication(
-            session_id=session_id, branch="repair_success", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
-        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_SUCCESS_PUBLIC_MESSAGE,
             raw_assistant_content=None,
+            advisor_terminal_publication=AdvisorTerminalPublication(
+                branch="repair_success", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+            ),
         )
     if _is_pending_interpretation_handoff(runtime_result):
         if advisor_signoff_check_failed(runtime_result.checks):
@@ -1367,13 +1375,6 @@ def _replace_advisor_repair_public_result(
             # failures (elspeth-ac85b0ab0e, battery round 7 g03 terminated
             # exactly here on the bare notice), the qualified shape names the
             # validator's objection alongside the handoff.
-            record_advisor_terminal_publication(
-                session_id=session_id,
-                branch="repair_handoff_signoff_failed",
-                reason=None,
-                preflight_shape=preflight_shape,
-                findings_backend_authored=False,
-            )
             return replace(
                 result,
                 message=_compose_advisor_pending_handoff_message(
@@ -1381,6 +1382,9 @@ def _replace_advisor_repair_public_result(
                     outstanding_findings_detail=_outstanding_findings_detail(outstanding_findings),
                 ),
                 raw_assistant_content="",
+                advisor_terminal_publication=AdvisorTerminalPublication(
+                    branch="repair_handoff_signoff_failed", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+                ),
             )
         if outstanding_findings is not None:
             # elspeth-5a372d3267: the strict ledger stopped at
@@ -1388,50 +1392,38 @@ def _replace_advisor_repair_public_result(
             # unverified — the masked re-validation found failures in the
             # stages that never ran. Name them instead of claiming ready.
             detail = _outstanding_findings_detail(outstanding_findings)
-            record_advisor_terminal_publication(
-                session_id=session_id,
-                branch="repair_review_with_findings",
-                reason=None,
-                preflight_shape=preflight_shape,
-                findings_backend_authored=False,
-            )
             return replace(
                 result,
                 message=_ADVISOR_REPAIR_REVIEW_WITH_FINDINGS_PUBLIC_MESSAGE.format(detail=detail),
                 raw_assistant_content=None,
+                advisor_terminal_publication=AdvisorTerminalPublication(
+                    branch="repair_review_with_findings", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+                ),
             )
-        record_advisor_terminal_publication(
-            session_id=session_id, branch="repair_review", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
-        )
         return replace(
             result,
             message=_ADVISOR_REPAIR_REVIEW_PUBLIC_MESSAGE,
             raw_assistant_content=None,
+            advisor_terminal_publication=AdvisorTerminalPublication(
+                branch="repair_review", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+            ),
         )
     if not runtime_result.is_valid:
-        record_advisor_terminal_publication(
-            session_id=session_id,
-            branch="repair_preflight_failure",
-            reason=None,
-            preflight_shape=preflight_shape,
-            findings_backend_authored=False,
-        )
         return replace(
             result,
             message=_compose_preflight_failure_message("", runtime_result=runtime_result),
             raw_assistant_content="",
+            advisor_terminal_publication=AdvisorTerminalPublication(
+                branch="repair_preflight_failure", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+            ),
         )
-    record_advisor_terminal_publication(
-        session_id=session_id,
-        branch="repair_signoff_pending",
-        reason=None,
-        preflight_shape=preflight_shape,
-        findings_backend_authored=False,
-    )
     return replace(
         result,
         message=_compose_advisor_signoff_pending_message(""),
         raw_assistant_content="",
+        advisor_terminal_publication=AdvisorTerminalPublication(
+            branch="repair_signoff_pending", reason=None, preflight_shape=preflight_shape, findings_backend_authored=False
+        ),
     )
 
 
@@ -3091,12 +3083,37 @@ class ComposerServiceImpl:
             return None
         return tolerant
 
+    async def _persist_advisor_terminal_publication(
+        self,
+        result: ComposerResult,
+        *,
+        session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
+    ) -> None:
+        """Persist the branch that published ``result``, then mirror it to telemetry.
+
+        The publication site mints the record; this is the seam that holds
+        the turn's session write context. A result reaching here without a
+        record is a producer defect (a publication site that forgot to name
+        its branch), not a sessionless compose.
+        """
+        publication = result.advisor_terminal_publication
+        if publication is None:
+            raise InvariantError("advisor-cohort terminal result carries no AdvisorTerminalPublication")
+        await persist_advisor_terminal_publication(
+            sessions=self._sessions_service,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+            publication=publication,
+        )
+
     async def _qualified_advisor_repair_public_result(
         self,
         result: ComposerResult,
         *,
         user_id: str | None,
         session_id: str | None,
+        session_operation_context: SessionOperationContext | None,
         cache: _RuntimePreflightCache,
         initial_version: int,
         session_scope: str,
@@ -3107,16 +3124,19 @@ class ComposerServiceImpl:
         Wraps ``_replace_advisor_repair_public_result``: when the turn ends in
         the pending-review handoff shape, run the masked re-validation first
         so the published message never claims "ready for the required review"
-        over stages the strict ledger skipped (elspeth-5a372d3267).
+        over stages the strict ledger skipped (elspeth-5a372d3267). The branch
+        the replacer chose is then persisted as an audit row and mirrored to
+        telemetry, in that order.
         """
         outstanding_findings: ValidationResult | None = None
         runtime_result = result.runtime_preflight
         # elspeth-2ae50afcd1: an already-published END blocked terminal passes
         # through the replacer untouched, so verifying its handoff claim here
         # would spend an engine dry-run on findings the replacer discards —
-        # the gate already ran this verification before building the result.
+        # the gate already ran this verification before building the result,
+        # and already persisted its ``terminal_block`` publication.
         if result.advisor_terminal_published:
-            return _replace_advisor_repair_public_result(result, outstanding_findings=None, session_id=session_id)
+            return _replace_advisor_repair_public_result(result, outstanding_findings=None)
         if runtime_result is not None and _is_pending_interpretation_handoff(runtime_result):
             outstanding_findings = await self._pending_handoff_outstanding_findings(
                 result.state,
@@ -3128,7 +3148,13 @@ class ComposerServiceImpl:
                 llm_calls=result.llm_calls,
                 plugin_snapshot=plugin_snapshot,
             )
-        return _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings, session_id=session_id)
+        published = _replace_advisor_repair_public_result(result, outstanding_findings=outstanding_findings)
+        await self._persist_advisor_terminal_publication(
+            published,
+            session_id=session_id,
+            session_operation_context=session_operation_context,
+        )
+        return published
 
     async def _attempt_empty_state_uploaded_blob_repair(
         self,
@@ -6244,6 +6270,7 @@ class ComposerServiceImpl:
                 pass_index=pass_index,
                 advisor_review_state=review_state,
                 deadline=deadline,
+                session_operation_context=session_operation_context,
             )
             passes_delta += 1
             review_state = _advance_advisor_review_state(
@@ -6351,32 +6378,36 @@ class ComposerServiceImpl:
             # the ``"none"`` default, and any unrecognised value fall through
             # to the fail-closed malformed wording (same asymmetry as the
             # classification comment in ``_run_advisor_checkpoint``).
+            blocked = self._advisor_blocked_result(
+                reason=(
+                    "flagged_unrepairable"
+                    if verdict.ok and verdict.repair_unactionable
+                    else "flagged_final_pass"
+                    if verdict.ok and is_last_pass
+                    else ("flagged_no_repair" if verdict.ok else ("unavailable" if verdict.failure_class == "unavailable" else "malformed"))
+                ),
+                verdict=verdict,
+                state=state,
+                assistant_message=assistant_message,
+                recorder=recorder,
+                repair_turns_used=repair_turns_used,
+                persisted_assistant_message_id=persisted_assistant_message_id,
+                persisted_assistant_content=persisted_assistant_content,
+                persisted_tool_call_turn=persisted_tool_call_turn,
+                runtime_preflight=runtime_preflight,
+                outstanding_findings=outstanding_findings,
+            )
+            # Audit row for the branch that spoke, after the disclosure row
+            # above and before the telemetry mirror — the replacer will pass
+            # this result through without publishing it a second time.
+            await self._persist_advisor_terminal_publication(
+                blocked,
+                session_id=session_id,
+                session_operation_context=session_operation_context,
+            )
             return _TerminalNoToolAdvisorGateOutcome(
                 action="return",
-                result=self._advisor_blocked_result(
-                    session_id=session_id,
-                    reason=(
-                        "flagged_unrepairable"
-                        if verdict.ok and verdict.repair_unactionable
-                        else "flagged_final_pass"
-                        if verdict.ok and is_last_pass
-                        else (
-                            "flagged_no_repair"
-                            if verdict.ok
-                            else ("unavailable" if verdict.failure_class == "unavailable" else "malformed")
-                        )
-                    ),
-                    verdict=verdict,
-                    state=state,
-                    assistant_message=assistant_message,
-                    recorder=recorder,
-                    repair_turns_used=repair_turns_used,
-                    persisted_assistant_message_id=persisted_assistant_message_id,
-                    persisted_assistant_content=persisted_assistant_content,
-                    persisted_tool_call_turn=persisted_tool_call_turn,
-                    runtime_preflight=runtime_preflight,
-                    outstanding_findings=outstanding_findings,
-                ),
+                result=blocked,
                 advisor_passes_delta=passes_delta,
                 advisor_review_state=review_state,
             )
@@ -6659,6 +6690,7 @@ class ComposerServiceImpl:
                             terminate.result,
                             user_id=user_id,
                             session_id=session_id,
+                            session_operation_context=session_operation_context,
                             cache=runtime_preflight_cache,
                             initial_version=initial_version,
                             session_scope=session_scope,
@@ -6740,6 +6772,7 @@ class ComposerServiceImpl:
                                 recorder=recorder,
                                 progress=progress,
                                 deadline=deadline,
+                                session_operation_context=session_operation_context,
                             )
                         except _AdvisorCheckpointComposeDeadlineExpired:
                             # The driver converts this signal after persistence
@@ -6985,6 +7018,7 @@ class ComposerServiceImpl:
                         classify.result,
                         user_id=user_id,
                         session_id=session_id,
+                        session_operation_context=session_operation_context,
                         cache=runtime_preflight_cache,
                         initial_version=initial_version,
                         session_scope=session_scope,
@@ -7958,7 +7992,7 @@ class ComposerServiceImpl:
     def _advisor_blocked_result(
         self,
         *,
-        reason: str,
+        reason: AdvisorTerminalBlockReason,
         verdict: AdvisorCheckpointVerdict,
         state: CompositionState,
         assistant_message: _AdmittedAssistantMessage,
@@ -7974,7 +8008,6 @@ class ComposerServiceImpl:
         persisted_tool_call_turn: bool,
         runtime_preflight: ValidationResult | None,
         outstanding_findings: ValidationResult | None,
-        session_id: str | None = None,
     ) -> ComposerResult:
         """Build the end-gate ``ComposerResult`` for a sign-off that did not pass.
 
@@ -8025,8 +8058,9 @@ class ComposerServiceImpl:
         (elspeth-cd9af8e61d).
         """
         del assistant_message
-        record_advisor_terminal_publication(
-            session_id=session_id,
+        # Minted here, persisted by the gate that calls this builder: the
+        # record is the result's own proof of which branch published it.
+        publication = AdvisorTerminalPublication(
             branch="terminal_block",
             reason=reason,
             preflight_shape=_advisor_preflight_shape(runtime_preflight),
@@ -8117,7 +8151,7 @@ class ComposerServiceImpl:
                 raw_assistant_content=raw_content,
                 tool_invocations=recorder.invocations,
                 llm_calls=recorder.llm_calls,
-                advisor_terminal_published=True,
+                advisor_terminal_publication=publication,
             ),
             repair_turns_used=repair_turns_used,
             persisted_assistant_message_id=persisted_assistant_message_id,
@@ -8133,6 +8167,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder | None,
         progress: ComposerProgressSink | None = None,
         user_message: str | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Public END evidence-scoped completion advisory checkpoint (P5).
 
@@ -8157,6 +8192,7 @@ class ComposerServiceImpl:
             recorder=recorder,
             progress=progress,
             user_message=user_message,
+            session_operation_context=session_operation_context,
         )
 
     async def _run_advisor_checkpoint(
@@ -8171,6 +8207,7 @@ class ComposerServiceImpl:
         pass_index: int = 1,
         advisor_review_state: _AdvisorReviewState | None = None,
         deadline: float | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> AdvisorCheckpointVerdict:
         """Backend-initiated deterministic advisor checkpoint (early|end).
 
@@ -8193,21 +8230,33 @@ class ComposerServiceImpl:
         ``user_message`` (R2-F8a, elspeth-583c2a0792) is forwarded to
         :meth:`_build_checkpoint_arguments`, which only uses it for
         ``phase="end"``.
+
+        ``session_operation_context`` is the fenced session write the
+        completed pass is recorded under: every completion persists an
+        ``advisor_checkpoint_pass_audit`` row through the sessions service
+        before its telemetry mirror fires (audit primacy). A sessionless
+        compose (``session_id is None``) has no store and emits telemetry
+        only; a session without its context is refused, never written
+        unfenced.
         """
 
-        def completed(verdict: AdvisorCheckpointVerdict, *, source: AdvisorCheckpointVerdictSource) -> AdvisorCheckpointVerdict:
-            telemetry_verdict: Literal["clean", "flagged", "unavailable", "malformed"]
+        async def completed(verdict: AdvisorCheckpointVerdict, *, source: AdvisorCheckpointVerdictSource) -> AdvisorCheckpointVerdict:
+            audit_verdict: Literal["clean", "flagged", "unavailable", "malformed"]
             if verdict.ok:
-                telemetry_verdict = "flagged" if verdict.blocking else "clean"
+                audit_verdict = "flagged" if verdict.blocking else "clean"
             else:
-                telemetry_verdict = "unavailable" if verdict.failure_class == "unavailable" else "malformed"
-            record_advisor_checkpoint_pass(
+                audit_verdict = "unavailable" if verdict.failure_class == "unavailable" else "malformed"
+            await persist_advisor_checkpoint_pass(
+                sessions=self._sessions_service,
                 session_id=session_id,
-                phase=cast(Literal["early", "end"], phase),
-                pass_index=pass_index,
-                verdict=telemetry_verdict,
-                findings_text=verdict.findings_text,
-                source=source,
+                session_operation_context=session_operation_context,
+                record=AdvisorCheckpointPassRecord.from_findings(
+                    phase=cast(Literal["early", "end"], phase),
+                    pass_index=pass_index,
+                    verdict=audit_verdict,
+                    source=source,
+                    findings_text=verdict.findings_text,
+                ),
             )
             return verdict
 
@@ -8215,7 +8264,7 @@ class ComposerServiceImpl:
         if phase == "end":
             prompt_injection_finding = _advisor_prompt_template_injection_finding(state, user_message=user_message)
             if prompt_injection_finding is not None:
-                return completed(
+                return await completed(
                     AdvisorCheckpointVerdict(
                         ok=True,
                         blocking=True,
@@ -8274,7 +8323,7 @@ class ComposerServiceImpl:
                 continue
             verdict = _parse_advisor_checkpoint_guidance(guidance)
             if verdict.ok:
-                return completed(verdict, source="model")
+                return await completed(verdict, source="model")
             # R2-F14 (elspeth-5403f346c0): a transport-SUCCESSFUL reply that
             # simply did not state a verdict used to be terminal here — the
             # bounded retry covered exceptions only, so one formatting slip by
@@ -8289,7 +8338,7 @@ class ComposerServiceImpl:
             # The advisor was REACHABLE on the final attempt and still returned
             # no verdict. That is MALFORMED, not unavailable — the distinction
             # the END gate reads to pick honest user-facing wording.
-            return completed(
+            return await completed(
                 AdvisorCheckpointVerdict(
                     ok=False,
                     blocking=False,
@@ -8343,7 +8392,7 @@ class ComposerServiceImpl:
             # bounded-retry loop) fail closed as MALFORMED.
             failure_class = "malformed"
         findings_text = _ADVISOR_UNAVAILABLE_USER_DETAIL if failure_class == "unavailable" else _ADVISOR_MALFORMED_USER_DETAIL
-        return completed(
+        return await completed(
             AdvisorCheckpointVerdict(
                 ok=False,
                 blocking=False,
@@ -8363,6 +8412,7 @@ class ComposerServiceImpl:
         recorder: BufferingRecorder,
         progress: ComposerProgressSink | None = None,
         deadline: float | None = None,
+        session_operation_context: SessionOperationContext | None = None,
     ) -> bool:
         """Run the EARLY advisory checkpoint on the empty->non-empty pipeline
         TRANSITION (structurally <= once per session). Advisory only: inject the
@@ -8379,6 +8429,7 @@ class ComposerServiceImpl:
             recorder=recorder,
             progress=progress,
             deadline=deadline,
+            session_operation_context=session_operation_context,
         )
         if verdict.ok and verdict.blocking:
             # ok and blocking => free advisor text (or the backend pre-scan

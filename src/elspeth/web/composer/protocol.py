@@ -37,6 +37,7 @@ from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
 from elspeth.contracts.errors import FailedTurnMetadata, FrameworkBugError
+from elspeth.web.composer.advisor_audit import AdvisorTerminalPublication
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
@@ -264,17 +265,15 @@ class ComposerResult:
     # model turn whose prose ``raw_assistant_content`` carries. False is
     # deliberately inconclusive: distinct turns may produce identical bytes.
     persisted_assistant_matches_terminal_model_turn: bool = False
-    # Positive proof, set only by the END advisor gate's blocked-terminal
-    # builder, that this result was already published: its message is fixed
-    # backend copy and its ``composer.advisor_terminal_publication`` event was
-    # already emitted. The repair-cohort replacer passes such a result through
-    # untouched instead of re-deriving telemetry from ``runtime_preflight`` —
-    # which for this result is the SYNTHESIZED advisor-signoff validation, not
-    # a real turn preflight (elspeth-2ae50afcd1). False is inconclusive and
-    # keeps the replacement path: the marker, not the preflight shape, is the
-    # discriminator, so a raw-prose result whose preflight merely looks
-    # advisor-blocked still gets its prose replaced.
-    advisor_terminal_published: bool = False
+    # Which advisor-cohort branch published this result's fixed backend copy,
+    # minted by the publication site itself (``_advisor_blocked_result`` for
+    # ``terminal_block``; ``_replace_advisor_repair_public_result`` for the
+    # repair branches). The site that holds the turn's session write context
+    # persists it as an ``advisor_terminal_publication_audit`` row BEFORE its
+    # telemetry mirror fires (``advisor_audit.persist_advisor_terminal_publication``);
+    # the row, not the journal, is the record of which branch spoke. None
+    # means no advisor-cohort publication site touched this result.
+    advisor_terminal_publication: AdvisorTerminalPublication | None = None
     # Exact durable composition-state head after the final persisted tool turn.
     # Routes use this as the final response-settlement CAS; re-reading latest
     # would bless an out-of-band writer that raced the compose loop.
@@ -290,6 +289,22 @@ class ComposerResult:
     # ``composer_meta.repair_turns_used`` for the convergence-suite eval
     # scorer.
     repair_turns_used: int = 0
+
+    @property
+    def advisor_terminal_published(self) -> bool:
+        """Positive proof that the END advisor gate already published this result.
+
+        True only for the gate's blocked-terminal builder: its message is
+        fixed backend copy and its ``terminal_block`` publication is already
+        recorded. The repair-cohort replacer passes such a result through
+        untouched instead of re-deriving the branch from ``runtime_preflight``
+        — which for this result is the SYNTHESIZED advisor-signoff validation,
+        not a real turn preflight (elspeth-2ae50afcd1). False is inconclusive
+        and keeps the replacement path: the producer's own record, not the
+        preflight shape, is the discriminator, so a raw-prose result whose
+        preflight merely looks advisor-blocked still gets its prose replaced.
+        """
+        return self.advisor_terminal_publication is not None and self.advisor_terminal_publication.branch == "terminal_block"
 
     def __post_init__(self) -> None:
         # Two directions of the field-pairing invariant. Both matter:
@@ -345,6 +360,8 @@ class ComposerResult:
             )
         if self.final_persisted_state_id is not None and type(self.final_persisted_state_id) is not UUID:
             raise TypeError("final_persisted_state_id must be an exact UUID or None")
+        if self.advisor_terminal_publication is not None and type(self.advisor_terminal_publication) is not AdvisorTerminalPublication:
+            raise TypeError("advisor_terminal_publication must be an exact AdvisorTerminalPublication or None")
         # Cap-assert on repair_turns_used. The loop enforces the bound
         # informally via ``_MAX_REPAIR_TURNS`` (web/composer/service.py),
         # but the field flows into the audit trail via

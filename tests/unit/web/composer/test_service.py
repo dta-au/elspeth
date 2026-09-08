@@ -30,7 +30,6 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
-from elspeth.web.composer.advisor_checkpoint_telemetry import record_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
@@ -3424,7 +3423,6 @@ class TestDiscoveryCache:
     @pytest.mark.asyncio
     async def test_one_compose_call_threads_one_snapshot_object(self) -> None:
         """Prompt and every tool dispatch share one principal snapshot."""
-        from unittest.mock import MagicMock
 
         from elspeth.web.composer import service as service_module
         from elspeth.web.composer import tool_batch as tool_batch_module
@@ -3689,8 +3687,8 @@ class TestComposeTimeout:
         )
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         progress_events: list[ComposerProgressEvent] = []
-        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+        checkpoint_persist = AsyncMock()
+        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
 
         async def terminal_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
             await asyncio.sleep(0.01)
@@ -3708,7 +3706,7 @@ class TestComposeTimeout:
             await service.compose("Review this pipeline", [], state, progress=record_progress)
 
         assert advisor_call.await_count == 0
-        checkpoint_telemetry.assert_not_called()
+        checkpoint_persist.assert_not_awaited()
         assert exc_info.value.budget_exhausted == "timeout"
         assert exc_info.value.reason == "convergence_wall_clock_timeout"
         assert exc_info.value.llm_calls == ()
@@ -3732,8 +3730,8 @@ class TestComposeTimeout:
             settings=_make_settings(composer_timeout_seconds=0.005),
         )
         service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
-        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+        checkpoint_persist = AsyncMock()
+        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",
             "on_success": "rows",
@@ -3778,7 +3776,7 @@ class TestComposeTimeout:
             await service.compose("Build a CSV pipeline", [], _empty_state())
 
         assert advisor_call.await_count == 0
-        checkpoint_telemetry.assert_not_called()
+        checkpoint_persist.assert_not_awaited()
         assert exc_info.value.budget_exhausted == "timeout"
         assert exc_info.value.llm_calls == ()
         assert len(exc_info.value.tool_invocations) == 1
@@ -3797,8 +3795,8 @@ class TestComposeTimeout:
         await sessions.update_composer_preferences(UUID(session_id), trust_mode="auto_commit", density_default="high", actor="user:test")
         monkeypatch.setattr(service, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl))
         failure = error_type("advisor internal failure")
-        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
-        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+        checkpoint_persist = AsyncMock()
+        monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",
             "on_success": "rows",
@@ -3829,7 +3827,7 @@ class TestComposeTimeout:
 
         assert raised.value is failure
         assert advisor.await_count == 1
-        checkpoint_telemetry.assert_not_called()
+        checkpoint_persist.assert_not_awaited()
         engine = service._session_engine
         assert engine is not None
         with engine.connect() as conn:
