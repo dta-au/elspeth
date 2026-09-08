@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.exc import IntegrityError
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import token_parents_table, validation_errors_table
+from elspeth.core.landscape.schema import rows_table, token_parents_table, tokens_table, validation_errors_table
 
 pytestmark = pytest.mark.testcontainer
 
@@ -55,15 +54,14 @@ def test_postgres_rejects_cross_run_token_parent(postgres_db: LandscapeDB) -> No
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
-    child_row = factory.data_flow.create_row(
-        run_id=child_run.run_id,
+    _child_row, child = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, child_run.run_id),
         source_node_id=child_source,
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"side": "child"},
     )
-    child = factory.data_flow.create_token(child_row.row_id)
 
     parent_run = factory.run_lifecycle.begin_run(
         config={},
@@ -79,23 +77,21 @@ def test_postgres_rejects_cross_run_token_parent(postgres_db: LandscapeDB) -> No
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
-    parent_row = factory.data_flow.create_row(
-        run_id=parent_run.run_id,
+    _parent_row, parent = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, parent_run.run_id),
         source_node_id=parent_source,
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"side": "parent"},
     )
-    parent = factory.data_flow.create_token(parent_row.row_id)
 
     values: dict[str, object] = {
         "token_id": child.token_id,
         "parent_token_id": parent.token_id,
         "ordinal": 0,
+        "run_id": child_run.run_id,
     }
-    if "run_id" in token_parents_table.c:
-        values["run_id"] = child_run.run_id
 
     with pytest.raises(IntegrityError), postgres_db.write_connection() as conn:
         conn.execute(token_parents_table.insert().values(**values))
@@ -126,8 +122,8 @@ def _seed_cross_run_validation_row(factory: RecorderFactory, *, suffix: str) -> 
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
-    row_b = factory.data_flow.create_row(
-        run_id=run_b,
+    row_b, _token_b = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_b),
         source_node_id=node_b,
         row_index=0,
         source_row_index=0,
@@ -173,7 +169,7 @@ def test_postgres_public_writer_rejects_cross_run_validation_error_row_link(post
 
     with pytest.raises(AuditIntegrityError, match="cross-run contamination"):
         factory.data_flow.record_validation_error(
-            run_id=run_a,
+            coordination_token=leader_coordination_token(factory, run_a),
             node_id=node_a,
             row_id=row_b,
             row_data={"invalid": True},
@@ -190,7 +186,6 @@ def test_postgres_public_writer_rejects_cross_run_validation_error_row_link(post
 def test_postgres_validation_error_link_is_compare_and_set(
     postgres_db: LandscapeDB,
     postgres_url: str,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Concurrent same-run linkers cannot silently overwrite row lineage."""
     first_factory = make_factory(postgres_db)
@@ -209,19 +204,9 @@ def test_postgres_validation_error_link_is_compare_and_set(
         node_type=NodeType.SOURCE,
         plugin_name="source",
     )
-    rows = [
-        first_factory.data_flow.create_row(
-            run_id=run_id,
-            source_node_id=node_id,
-            row_index=index,
-            source_row_index=index,
-            ingest_sequence=index,
-            data={"candidate": index},
-        )
-        for index in range(2)
-    ]
+    coordination_token = leader_coordination_token(first_factory, run_id)
     error_id = first_factory.data_flow.record_validation_error(
-        run_id=run_id,
+        coordination_token=coordination_token,
         node_id=node_id,
         row_data={"invalid": True},
         error="invalid row",
@@ -231,41 +216,93 @@ def test_postgres_validation_error_link_is_compare_and_set(
 
     second_db = LandscapeDB.from_url(postgres_url)
     second_factory = make_factory(second_db)
-    old_read_barrier = threading.Barrier(2)
+    winner_holds_seat = threading.Event()
+    loser_reached_seat = threading.Event()
+    release_winner = threading.Event()
+    backends: dict[str, int] = {}
+    outcomes: dict[str, str | BaseException] = {}
+    lock = threading.Lock()
 
-    # Deterministically reproduces the old split read/update implementation:
-    # both workers observe validation_errors.row_id=NULL before either writes.
-    for factory in (first_factory, second_factory):
-        ops = factory.data_flow.errors._ops
-        original_fetchone = ops.execute_fetchone
+    def before_execute(conn: Any, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
+        if not statement.upper().startswith("UPDATE RUN_COORDINATION SET"):
+            return
+        name = threading.current_thread().name
+        with lock:
+            backends[name] = int(conn.connection.driver_connection.info.backend_pid)
+        if name == "validation-link-second":
+            loser_reached_seat.set()
 
-        def synchronized_fetchone(query: Any, *, _original: Any = original_fetchone) -> Any:
-            result = _original(query)
-            selected = tuple(query.selected_columns.keys())
-            if selected == ("run_id", "row_id"):
-                old_read_barrier.wait(timeout=5)
-            return result
+    def after_execute(_conn: Any, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
+        if statement.upper().startswith("UPDATE RUN_COORDINATION SET") and threading.current_thread().name == "validation-link-first":
+            winner_holds_seat.set()
+            if not release_winner.wait(timeout=30):
+                raise TimeoutError("test did not release validation-link leader seat")
 
-        monkeypatch.setattr(ops, "execute_fetchone", synchronized_fetchone)
-
-    def link(candidate: tuple[RecorderFactory, str]) -> str:
-        factory, row_id = candidate
+    def link(factory: RecorderFactory, index: int) -> None:
         try:
-            factory.data_flow.link_validation_error_to_row(run_id=run_id, error_id=error_id, row_id=row_id)
-        except AuditIntegrityError as exc:
-            assert "already linked to row" in str(exc)
-            return "rejected"
-        return "committed"
+            row, _token = factory.data_flow.create_quarantine_row_with_token(
+                source_node_id=node_id,
+                row_index=index,
+                source_row_index=index,
+                ingest_sequence=index,
+                data={"candidate": index},
+                validation_error_id=error_id,
+                coordination_token=coordination_token,
+            )
+            result: str | BaseException = row.row_id
+        except BaseException as exc:
+            result = exc
+        with lock:
+            outcomes[threading.current_thread().name] = result
 
+    threads = [
+        threading.Thread(target=link, name="validation-link-first", args=(first_factory, 0)),
+        threading.Thread(target=link, name="validation-link-second", args=(second_factory, 1)),
+    ]
+    for db in (postgres_db, second_db):
+        event.listen(db.engine, "before_cursor_execute", before_execute)
+        event.listen(db.engine, "after_cursor_execute", after_execute)
     try:
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(link, ((first_factory, rows[0].row_id), (second_factory, rows[1].row_id))))
-    finally:
-        second_db.close()
+        threads[0].start()
+        assert winner_holds_seat.wait(timeout=10)
+        threads[1].start()
+        assert loser_reached_seat.wait(timeout=10)
+        winner_pid = backends["validation-link-first"]
+        loser_pid = backends["validation-link-second"]
+        assert winner_pid != loser_pid
+        with postgres_db.read_only_connection() as conn:
+            for _ in range(200):
+                blocked = conn.exec_driver_sql("SELECT %s = ANY(pg_blocking_pids(%s))", (winner_pid, loser_pid)).scalar_one()
+                if blocked:
+                    break
+                threading.Event().wait(0.01)
+        assert blocked, "PostgreSQL did not report the contender waiting on the incumbent seat lock"
+        assert "validation-link-second" not in outcomes
+        release_winner.set()
+        for thread in threads:
+            thread.join(timeout=30)
+            assert not thread.is_alive()
 
-    assert sorted(results) == ["committed", "rejected"]
-    with postgres_db.read_only_connection() as conn:
-        linked_row_id = conn.execute(
-            select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
-        ).scalar_one()
-    assert linked_row_id in {rows[0].row_id, rows[1].row_id}
+        winner = outcomes["validation-link-first"]
+        loser = outcomes["validation-link-second"]
+        assert isinstance(winner, str)
+        assert isinstance(loser, AuditIntegrityError)
+        assert "already linked to row" in str(loser)
+        with postgres_db.read_only_connection() as conn:
+            linked_row_id = conn.execute(
+                select(validation_errors_table.c.row_id).where(validation_errors_table.c.error_id == error_id)
+            ).scalar_one()
+            durable_rows = conn.execute(select(rows_table.c.row_id).where(rows_table.c.run_id == run_id)).scalars().all()
+            durable_tokens = conn.execute(select(tokens_table.c.row_id).where(tokens_table.c.run_id == run_id)).scalars().all()
+        assert linked_row_id == winner
+        assert durable_rows == [winner]
+        assert durable_tokens == [winner]
+    finally:
+        release_winner.set()
+        for thread in threads:
+            if thread.ident is not None:
+                thread.join(timeout=30)
+        for db in (postgres_db, second_db):
+            event.remove(db.engine, "before_cursor_execute", before_execute)
+            event.remove(db.engine, "after_cursor_execute", after_execute)
+        second_db.close()

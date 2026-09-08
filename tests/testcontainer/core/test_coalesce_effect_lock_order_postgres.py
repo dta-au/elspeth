@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Iterator, Sequence
+from pathlib import Path
+from typing import Any
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.engine import Connection
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import leader_coordination_token, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType
@@ -30,19 +33,31 @@ def postgres_url() -> Iterator[str]:
         yield postgres_url
 
 
+def _wait_for_blocker(db: LandscapeDB, *, waiter: int, blocker: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with db.engine.connect() as conn:
+            blocked = conn.exec_driver_sql("SELECT %s = ANY(pg_blocking_pids(%s))", (blocker, waiter)).scalar_one()
+        if blocked:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"PostgreSQL did not report pid {waiter} waiting for {blocker}")
+
+
 @pytest.mark.timeout(120)
 def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
     postgres_url: str,
-    tmp_path,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The loser blocks on parent authority, then reads the winner's receipt."""
+    """The loser blocks on the first leader fence, then reuses the winner's receipt."""
     first_db = LandscapeDB.from_url(postgres_url)
     second_db = LandscapeDB.from_url(postgres_url)
     payload_root = tmp_path / "payloads"
     first = RecorderFactory(first_db, payload_store=FilesystemPayloadStore(payload_root))
     second = RecorderFactory(second_db, payload_store=FilesystemPayloadStore(payload_root))
     run = first.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    leader = leader_coordination_token(first, run.run_id)
     source_id = register_test_node(first.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
     coalesce_id = register_test_node(
         first.data_flow,
@@ -51,8 +66,8 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         node_type=NodeType.COALESCE,
         plugin_name="coalesce",
     )
-    row = first.data_flow.create_row(
-        run_id=run.run_id,
+    row, root = first.data_flow.create_row_with_token(
+        coordination_token=leader,
         source_node_id=source_id,
         row_index=0,
         source_row_index=0,
@@ -63,19 +78,31 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
     # closes exactly its own fork frame (spec rulings 24/28; the META-38 guard
     # in coalesce_tokens refuses frame-less parents before any effect write),
     # so mint them through the real fork path rather than as bare tokens.
-    root = first.data_flow.create_token(row.row_id)
+    claimed_root = first.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=root.token_id,
+        row_id=row.row_id,
+        node_id=None,
+        step_index=3,
+        ingest_sequence=0,
+        row_payload_json="{}",
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
     parents, _fork_group_id = first.data_flow.fork_token(
         TokenRef(token_id=root.token_id, run_id=run.run_id),
         row.row_id,
         ["left", "right"],
         step_in_pipeline=3,
+        member_token=leader.membership,
+        work_item=claimed_root,
     )
     refs = tuple(TokenRef(token_id=token.token_id, run_id=run.run_id) for token in parents)
     state_ids = tuple(
         first.execution.begin_node_state(
             token_id=ref.token_id,
             node_id=coalesce_id,
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=4,
             input_data={"ordinal": ordinal},
         ).state_id
@@ -93,9 +120,9 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
     def pause_winner(
         conn: Connection,
         *,
-        parent_refs,
-        parent_state_ids,
-        coalesce_node_id,
+        parent_refs: Sequence[TokenRef],
+        parent_state_ids: Sequence[str] | None,
+        coalesce_node_id: str | None,
     ) -> None:
         original_first_lock(
             conn,
@@ -110,12 +137,10 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
     def observe_loser(
         conn: Connection,
         *,
-        parent_refs,
-        parent_state_ids,
-        coalesce_node_id,
+        parent_refs: Sequence[TokenRef],
+        parent_state_ids: Sequence[str] | None,
+        coalesce_node_id: str | None,
     ) -> None:
-        backend_pids["loser"] = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
-        loser_attempting_authority.set()
         original_second_lock(
             conn,
             parent_refs=parent_refs,
@@ -124,6 +149,12 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         )
         loser_has_authority.set()
 
+    def observe_loser_fence(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
+        if threading.current_thread().name == "coalesce-loser" and statement.lstrip().upper().startswith("UPDATE RUN_COORDINATION"):
+            backend_pids["loser"] = int(conn.connection.driver_connection.info.backend_pid)
+            loser_attempting_authority.set()
+
+    event.listen(second_db.engine, "before_cursor_execute", observe_loser_fence)
     monkeypatch.setattr(first.data_flow.tokens, "_lock_coalesce_dependencies", pause_winner)
     monkeypatch.setattr(second.data_flow.tokens, "_lock_coalesce_dependencies", observe_loser)
     results: dict[str, Token | BaseException] = {}
@@ -138,6 +169,7 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
                 merged_payload={"merged": True},
                 merged_contract=_CONTRACT,
                 step_in_pipeline=4,
+                coordination_token=leader,
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             results[name] = exc
@@ -151,7 +183,8 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         assert winner_has_authority.wait(timeout=10)
         threads[1].start()
         assert loser_attempting_authority.wait(timeout=10)
-        assert not loser_has_authority.wait(timeout=0.25)
+        _wait_for_blocker(first_db, waiter=backend_pids["loser"], blocker=backend_pids["winner"])
+        assert not loser_has_authority.is_set()
         release_winner.set()
         for thread in threads:
             thread.join(timeout=30)
@@ -189,5 +222,6 @@ def test_identical_coalesce_writers_serialize_on_parents_and_reuse_one_effect(
         for thread in threads:
             if thread.ident is not None:
                 thread.join(timeout=30)
+        event.remove(second_db.engine, "before_cursor_execute", observe_loser_fence)
         first_db.close()
         second_db.close()

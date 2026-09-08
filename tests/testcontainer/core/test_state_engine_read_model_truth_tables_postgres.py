@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy import func, insert, update
 from sqlalchemy.exc import IntegrityError
-from tests.fixtures.landscape import make_factory, register_test_node, stamp_inside_next_transaction
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node, stamp_inside_next_transaction
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
@@ -69,7 +69,7 @@ def _begin_run(factory: RecorderFactory, run_id: str, leader: str) -> None:
         openrouter_catalog_source="bundled",
     )
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -82,7 +82,7 @@ def _begin_run(factory: RecorderFactory, run_id: str, leader: str) -> None:
 
 def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) -> str:
     row, token = factory.data_flow.create_row_with_token(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         source_node_id=f"source-{run_id}",
         row_index=sequence,
         data={"name": name},
@@ -92,7 +92,7 @@ def _enqueue(factory: RecorderFactory, run_id: str, name: str, sequence: int) ->
         token_id=f"token-{name}",
     )
     item = factory.scheduler.enqueue_ready(
-        run_id=run_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -380,7 +380,7 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
     for index, run_id in enumerate(run_ids):
         _begin_run(factory, run_id, f"worker:{run_id}:leader")
         factory.data_flow.create_row_with_token(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             source_node_id=f"source-{run_id}",
             row_index=index,
             data={"run": run_id},
@@ -391,7 +391,8 @@ def test_postgresql_rm14_accounting_census_and_abandoned_resume_refusal(
         )
 
     for run_id in (run_ids[0], run_ids[3]):
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(factory, run_id),
             ref=TokenRef(token_id=f"token-{run_id}", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,

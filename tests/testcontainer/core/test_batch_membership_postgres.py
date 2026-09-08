@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Iterator
 from typing import Any
 
 import pytest
 from sqlalchemy import event
+from sqlalchemy.engine import Connection
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import BatchStatus, NodeType
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 pytestmark = pytest.mark.testcontainer
 
@@ -27,10 +33,11 @@ def postgres_url() -> Iterator[str]:
         yield postgres_url
 
 
-def _seed(factory: RecorderFactory, *, suffix: str) -> tuple[str, str]:
+def _seed(factory: RecorderFactory, *, suffix: str) -> tuple[CoordinationToken, str, str]:
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=f"run-{suffix}")
+    leader = leader_coordination_token(factory, run.run_id)
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader,
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -39,7 +46,7 @@ def _seed(factory: RecorderFactory, *, suffix: str) -> tuple[str, str]:
         schema_config=_DYNAMIC_SCHEMA,
     )
     aggregation = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader,
         plugin_name="aggregation",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
@@ -47,18 +54,36 @@ def _seed(factory: RecorderFactory, *, suffix: str) -> tuple[str, str]:
         node_id=f"agg-{suffix}",
         schema_config=_DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run.run_id,
-        source.node_id,
-        0,
-        {"value": 1},
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader,
+        source_node_id=source.node_id,
+        row_index=0,
+        data={"value": 1},
         row_id=f"row-{suffix}",
+        token_id=f"token-{suffix}",
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id, token_id=f"token-{suffix}")
-    batch = factory.execution.create_batch(run.run_id, aggregation.node_id, batch_id=f"batch-{suffix}")
-    return batch.batch_id, token.token_id
+    batch = factory.execution.create_batch(coordination_token=leader, aggregation_node_id=aggregation.node_id, batch_id=f"batch-{suffix}")
+    return leader, batch.batch_id, token.token_id
+
+
+def _add_member(factory: RecorderFactory, leader: CoordinationToken, batch_id: str, token_id: str) -> None:
+    with fenced_leader_transaction(
+        factory._db.engine, token=leader, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="test_batch_membership"
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=0, expected_run_id=leader.run_id)
+
+
+def _wait_for_blocker(db: LandscapeDB, *, waiter: int, blocker: int) -> None:
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with db.engine.connect() as conn:
+            blocked = conn.exec_driver_sql("SELECT %s = ANY(pg_blocking_pids(%s))", (blocker, waiter)).scalar_one()
+        if blocked:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"PostgreSQL did not report pid {waiter} waiting for {blocker}")
 
 
 def _physical_postgres_connection(conn: Any) -> tuple[int, int]:
@@ -79,27 +104,27 @@ def test_postgres_transition_lock_orders_racing_membership(
     """Every membership-closing transition orders before a racing add."""
     db = LandscapeDB.from_url(postgres_url)
     factory = RecorderFactory(db)
-    batch_id, token_id = _seed(factory, suffix=target_status.value)
+    leader, batch_id, token_id = _seed(factory, suffix=target_status.value)
 
     transition_holds_lock = threading.Event()
     release_transition = threading.Event()
-    member_reached_batch_read = threading.Event()
+    member_reached_leader_fence = threading.Event()
     outcomes: dict[str, str] = {}
     physical_connections: dict[str, tuple[int, int]] = {}
     outcomes_lock = threading.Lock()
 
-    def pause_after_transition(conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
+    def pause_after_transition(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
         if statement.lstrip().upper().startswith("UPDATE BATCHES"):
             physical_connections["transition"] = _physical_postgres_connection(conn)
             transition_holds_lock.set()
             if not release_transition.wait(timeout=30):
                 raise TimeoutError("test did not release PostgreSQL batch transition")
 
-    def observe_member_read(conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
+    def observe_member_read(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
         normalized = " ".join(statement.upper().split())
-        if threading.current_thread().name == "batch-member" and normalized.startswith("SELECT") and "FROM BATCHES" in normalized:
+        if threading.current_thread().name == "batch-member" and normalized.startswith("UPDATE RUN_COORDINATION"):
             physical_connections.setdefault("member", _physical_postgres_connection(conn))
-            member_reached_batch_read.set()
+            member_reached_leader_fence.set()
 
     event.listen(db.engine, "after_cursor_execute", pause_after_transition)
     event.listen(db.engine, "before_cursor_execute", observe_member_read)
@@ -107,9 +132,9 @@ def test_postgres_transition_lock_orders_racing_membership(
     def transition() -> None:
         try:
             if target_status is BatchStatus.EXECUTING:
-                factory.execution.update_batch_status(batch_id, target_status)
+                factory.execution.update_batch_status(batch_id, target_status, coordination_token=leader)
             else:
-                factory.execution.complete_batch(batch_id, target_status)
+                factory.execution.complete_batch(batch_id, target_status, coordination_token=leader)
         except BaseException as exc:  # pragma: no cover - asserted below
             result = f"{type(exc).__name__}: {exc}"
         else:
@@ -119,7 +144,7 @@ def test_postgres_transition_lock_orders_racing_membership(
 
     def add_member() -> None:
         try:
-            factory.execution.add_batch_member(batch_id, token_id, ordinal=0)
+            _add_member(factory, leader, batch_id, token_id)
         except AuditIntegrityError as exc:
             result = f"refused: {exc}"
         except BaseException as exc:  # pragma: no cover - asserted below
@@ -135,7 +160,8 @@ def test_postgres_transition_lock_orders_racing_membership(
         transition_thread.start()
         assert transition_holds_lock.wait(timeout=30), "transition never reached its locked UPDATE"
         member_thread.start()
-        assert member_reached_batch_read.wait(timeout=30), "member never reached its batch predicate read"
+        assert member_reached_leader_fence.wait(timeout=30), "member never reached its first leader fence"
+        _wait_for_blocker(db, waiter=physical_connections["member"][1], blocker=physical_connections["transition"][1])
         release_transition.set()
         transition_thread.join(timeout=30)
         member_thread.join(timeout=30)
@@ -175,34 +201,37 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
     the fix, membership locked ``batches`` FOR UPDATE first and its INSERT then
     waited on the token FK lock — the two paths deadlocked and PostgreSQL
     aborted one audit write.  This drives the exact interleaving: membership
-    pauses holding its (token-first) lock, the racing outcome write blocks on
-    that token lock, and both must commit once membership is released.
+    pauses holding its token-first parent lock, the racing outcome write now
+    blocks at the preceding leader fence, and both must commit once membership
+    is released. The captured SQL still proves token-before-batch parent order.
     """
-    from sqlalchemy.engine import Connection
-
     from elspeth.contracts.audit import TokenRef
     from elspeth.contracts.enums import TerminalPath
     from elspeth.core.landscape.schema import token_outcomes_table
 
     db = LandscapeDB.from_url(postgres_url)
     factory = RecorderFactory(db)
-    batch_id, token_id = _seed(factory, suffix="outcome-race")
+    leader, batch_id, token_id = _seed(factory, suffix="outcome-race")
 
     member_statements: list[str] = []
     member_holds_token_lock = threading.Event()
     release_member = threading.Event()
-    outcome_entered_token_lock = threading.Event()
+    outcome_entered_leader_fence = threading.Event()
     outcomes: dict[str, str] = {}
     backend_pids: dict[str, int] = {}
     outcomes_lock = threading.Lock()
 
-    def record_member_statements(conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
+    def record_member_statements(
+        conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool
+    ) -> None:
         if threading.current_thread().name != "batch-member":
             return
         normalized = " ".join(statement.upper().split())
         member_statements.append(normalized)
 
-    def pause_member_after_token_lock(conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
+    def pause_member_after_token_lock(
+        conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool
+    ) -> None:
         if threading.current_thread().name != "batch-member":
             return
         normalized = " ".join(statement.upper().split())
@@ -215,16 +244,15 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
     event.listen(db.engine, "before_cursor_execute", record_member_statements)
     event.listen(db.engine, "after_cursor_execute", pause_member_after_token_lock)
 
-    original_lock = factory.data_flow.outcomes.lock_token_outcome_dependencies
-
-    def entering_token_lock(refs, *, conn: Connection) -> None:  # type: ignore[no-untyped-def]
-        backend_pids["outcome"] = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
-        outcome_entered_token_lock.set()
-        original_lock(refs, conn=conn)
+    def entering_leader_fence(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
+        normalized = " ".join(statement.upper().split())
+        if threading.current_thread().name == "token-outcome" and normalized.startswith("UPDATE RUN_COORDINATION"):
+            backend_pids["outcome"] = _physical_postgres_connection(conn)[1]
+            outcome_entered_leader_fence.set()
 
     def add_member() -> None:
         try:
-            factory.execution.add_batch_member(batch_id, token_id, ordinal=0)
+            _add_member(factory, leader, batch_id, token_id)
         except BaseException as exc:  # pragma: no cover - asserted below
             result = f"{type(exc).__name__}: {exc}"
         else:
@@ -234,11 +262,12 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
 
     def record_outcome() -> None:
         try:
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 TokenRef(token_id=token_id, run_id="run-outcome-race"),
                 None,
                 TerminalPath.BUFFERED,
                 batch_id=batch_id,
+                coordination_token=leader,
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             result = f"{type(exc).__name__}: {exc}"
@@ -249,7 +278,7 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
 
     member_thread = threading.Thread(target=add_member, name="batch-member")
     outcome_thread = threading.Thread(target=record_outcome, name="token-outcome")
-    factory.data_flow.outcomes.lock_token_outcome_dependencies = entering_token_lock  # type: ignore[method-assign]
+    event.listen(db.engine, "before_cursor_execute", entering_leader_fence)
     try:
         member_thread.start()
         assert member_holds_token_lock.wait(timeout=30), (
@@ -258,7 +287,8 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
             f"member statements so far: {member_statements}"
         )
         outcome_thread.start()
-        assert outcome_entered_token_lock.wait(timeout=30), "outcome write never reached its token lock"
+        assert outcome_entered_leader_fence.wait(timeout=30), "outcome write never reached its first leader fence"
+        _wait_for_blocker(db, waiter=backend_pids["outcome"], blocker=backend_pids["member"])
         release_member.set()
         member_thread.join(timeout=60)
         outcome_thread.join(timeout=60)
@@ -287,11 +317,11 @@ def test_postgres_membership_takes_token_lock_first_and_survives_racing_outcome(
         assert outcome_rows[0].path == TerminalPath.BUFFERED.value
     finally:
         release_member.set()
-        factory.data_flow.outcomes.lock_token_outcome_dependencies = original_lock  # type: ignore[method-assign]
         if member_thread.ident is not None:
             member_thread.join(timeout=30)
         if outcome_thread.ident is not None:
             outcome_thread.join(timeout=30)
+        event.remove(db.engine, "before_cursor_execute", entering_leader_fence)
         event.remove(db.engine, "after_cursor_execute", pause_member_after_token_lock)
         event.remove(db.engine, "before_cursor_execute", record_member_statements)
         db.close()

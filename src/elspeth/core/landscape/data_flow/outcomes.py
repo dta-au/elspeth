@@ -718,10 +718,10 @@ class TokenOutcomeRepository:
             if item.outcome is not None:
                 completed.add(ref.token_id)
         try:
-            result = conn.execute(token_outcomes_table.insert(), values)
+            result = conn.execute(token_outcomes_table.insert().returning(token_outcomes_table.c.outcome_id), values)
         except SQLAlchemyError as exc:
             raise LandscapeRecordError(f"record_token_outcomes_on failed — database rejected audit write: {type(exc).__name__}") from exc
-        if result.rowcount != len(values):
+        if len(result.fetchall()) != len(values):
             raise LandscapeRecordError("record_token_outcomes_on: zero rows or incomplete batch — audit write failed")
         return outcome_ids
 
@@ -977,11 +977,11 @@ def record_terminal_outcomes_guarded(
     if not values:
         return []
     try:
-        result = conn.execute(token_outcomes_table.insert(), values)
+        result = conn.execute(token_outcomes_table.insert().returning(token_outcomes_table.c.outcome_id), values)
     except SQLAlchemyError as exc:
         raise LandscapeRecordError(
             f"record_terminal_outcomes_guarded failed — database rejected audit write: {type(exc).__name__}"
         ) from exc
-    if result.rowcount != len(values):
+    if len(result.fetchall()) != len(values):
         raise LandscapeRecordError("record_terminal_outcomes_guarded: incomplete batch — audit write failed")
     return outcome_ids

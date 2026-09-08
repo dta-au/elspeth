@@ -23,6 +23,7 @@ from elspeth.contracts import NodeType
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import SchemaCompatibilityError
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler.group_losses import record_group_loss
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -290,6 +291,12 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
                     openrouter_catalog_source="bundled",
                 )
             )
+            leader = RunCoordinationRepository(landscape.engine).register_run_leader_on(
+                conn,
+                run_id="scheduler-postgres-run",
+                worker_id="scheduler-postgres-leader",
+                window_seconds=300,
+            )
             conn.execute(
                 insert(nodes_table),
                 [
@@ -340,7 +347,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
 
         scheduler = TokenSchedulerRepository(landscape.engine)
         item = scheduler.enqueue_ready(
-            run_id="scheduler-postgres-run",
+            member_token=leader.membership,
             token_id="token-1",
             row_id="row-1",
             node_id="transform",
@@ -349,7 +356,7 @@ def test_postgres_scheduler_enqueue_and_accounting_projection_are_dialect_safe(
             row_payload_json=payload,
         )
         duplicate = scheduler.enqueue_ready(
-            run_id="scheduler-postgres-run",
+            member_token=leader.membership,
             token_id="token-1",
             row_id="row-1",
             node_id="transform",

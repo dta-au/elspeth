@@ -513,17 +513,19 @@ class RunLifecycleRepository:
         1. the verify-and-extend leader epoch fence (FIRST statement) — a
            deposed leader's finalize is refused with
            ``RunLeadershipLostError`` and a ``fence_refusal`` event;
-        2. the terminal conditional UPDATE — for SUCCESS statuses
+        2. lock the active follower roster before run or token writes, in the
+           same membership-before-token order used by follower audit writes;
+        3. the terminal conditional UPDATE — for SUCCESS statuses
            (COMPLETED / COMPLETED_WITH_FAILURES / EMPTY) it carries the
            in-statement quiescence arm ``NOT EXISTS (READY/LEASED/BLOCKED/
            PENDING_SINK token_work_items)`` so a run can never be stamped
            successful over residual scheduler work; FAILED/INTERRUPTED check
            only fence + immutability (the journal is left intact for resume);
-        3. ADR-038 abandonment of undecided tokens when the run is
+        4. ADR-038 abandonment of undecided tokens when the run is
            non-resumable, plus fail-open of effect-linked operations;
-        4. follower departure hygiene (no-op at N=1) + ``worker_depart``
+        5. follower departure hygiene (no-op at N=1) + ``worker_depart``
            events;
-        5. the ``finalize`` run_coordination event.
+        6. the ``finalize`` run_coordination event.
 
         The run is ``coordination_token.run_id``: there is no second run id
         to disagree with the authority (ADR-048 §2).
@@ -643,6 +645,22 @@ class RunLifecycleRepository:
         coordination_token: CoordinationToken,
     ) -> None:
         """The fenced transaction body of :meth:`complete_run`, on the caller's fenced connection."""
+        # Follower audit writes hold membership before token rows. Acquire the
+        # departure roster in that order too, before abandonment can hold a
+        # token needed by an in-flight follower. Admission also locks the seat,
+        # so no new follower can enter after this roster has been locked.
+        follower_ids = (
+            conn.execute(
+                select(run_workers_table.c.worker_id)
+                .where(run_workers_table.c.run_id == run_id)
+                .where(run_workers_table.c.status == "active")
+                .where(run_workers_table.c.role == "follower")
+                .order_by(run_workers_table.c.worker_id)
+                .with_for_update()
+            )
+            .scalars()
+            .all()
+        )
         # The SUCCESS quiescence arm rides in the SAME statement as the stamp;
         # ``where()`` with no clauses is a no-op for the FAILED/INTERRUPTED arm.
         quiescence_clauses = [~residual_work_exists] if is_success_status else []
@@ -702,17 +720,6 @@ class RunLifecycleRepository:
                 )
 
         # §D follower-departure hygiene (no-op at N=1, evented).
-        follower_ids = (
-            conn.execute(
-                select(run_workers_table.c.worker_id)
-                .where(run_workers_table.c.run_id == run_id)
-                .where(run_workers_table.c.status == "active")
-                .where(run_workers_table.c.role == "follower")
-                .order_by(run_workers_table.c.registered_at)
-            )
-            .scalars()
-            .all()
-        )
         if follower_ids:
             conn.execute(
                 run_workers_table.update()

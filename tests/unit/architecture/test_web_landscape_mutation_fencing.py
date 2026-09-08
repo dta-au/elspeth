@@ -643,7 +643,9 @@ _EXPECTED_DML_COUNT = 146
 # Member-fence integration adds verify_membership_fence and changes the three
 # heartbeat/departure DML fingerprints to use the membership token's subjects.
 # The existing write-shape set is unchanged. Re-derived with scan_dml_identities.
-_EXPECTED_DML_INVENTORY_SHA256 = "693e76502d4ece372ef2ecf0b6a17a29ed5bf1d5035a28c572f02ae62062093a"
+# Actual INSERT RETURNING cardinality checks and the finalizer's locked follower
+# roster change function fingerprints; the DML count and write-shape set stay unchanged.
+_EXPECTED_DML_INVENTORY_SHA256 = "1049f1f915f9f3bc58fff2efb57df266048dac1dda89842c448109e47c1d5093"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),

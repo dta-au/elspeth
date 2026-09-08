@@ -18,6 +18,7 @@ from sqlalchemy import Connection, Engine, create_engine, event, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, OperationalError, SQLAlchemyError
 from sqlalchemy.pool import NullPool
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.core.test_schema_shape import _static_check_issues
 
@@ -28,6 +29,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import _REQUIRED_TRIGGERS, LandscapeDB, SchemaCompatibilityError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction, fenced_member_transaction
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, audit_export_snapshot_chunks_table
 from elspeth.core.landscape.schema import schema_identity_table as landscape_schema_identity_table
 from elspeth.core.schema_identity import SCHEMA_IDENTITY_APPLICATION_ID
@@ -1202,9 +1204,10 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",
         )
+        leader = leader_coordination_token(factory, run.run_id)
         schema = SchemaConfig.from_dict({"mode": "observed"})
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -1213,7 +1216,7 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             schema_config=schema,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -1221,20 +1224,20 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             node_id="postgres-artifact-sink",
             schema_config=schema,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id="postgres-artifact-source",
             row_index=0,
             data={"value": 1},
             row_id="postgres-artifact-row",
+            token_id="postgres-artifact-token",
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="postgres-artifact-token")
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="postgres-artifact-sink",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"value": 1},
             state_id="postgres-artifact-state",
@@ -1250,15 +1253,22 @@ def test_artifact_idempotency_index_and_behavior(postgres_engine: Engine) -> Non
             "idempotency_key": "postgres-artifact-row:csv_sink",
         }
 
-        first = factory.execution.register_artifact(**values, artifact_id="postgres-artifact-first")
-        retried = factory.execution.register_artifact(**values, artifact_id="postgres-artifact-retry")
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            first = factory.execution.artifacts.register_artifact(**values, artifact_id="postgres-artifact-first", conn=conn)
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            retried = factory.execution.artifacts.register_artifact(**values, artifact_id="postgres-artifact-retry", conn=conn)
         assert retried == first
 
-        with pytest.raises(AuditIntegrityError, match="content_hash"):
-            factory.execution.register_artifact(**(values | {"content_hash": "sha256:divergent"}))
+        with (
+            pytest.raises(AuditIntegrityError, match="content_hash"),
+            fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn,
+        ):
+            factory.execution.artifacts.register_artifact(**(values | {"content_hash": "sha256:divergent"}), conn=conn)
 
-        null_first = factory.execution.register_artifact(**(values | {"idempotency_key": None}))
-        null_second = factory.execution.register_artifact(**(values | {"idempotency_key": None}))
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            null_first = factory.execution.artifacts.register_artifact(**(values | {"idempotency_key": None}), conn=conn)
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="test_artifact") as conn:
+            null_second = factory.execution.artifacts.register_artifact(**(values | {"idempotency_key": None}), conn=conn)
         assert null_first.artifact_id != null_second.artifact_id
         assert len(factory.execution.get_artifacts(run.run_id)) == 3
     finally:
@@ -1282,9 +1292,10 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",
         )
+        leader = leader_coordination_token(factory, run.run_id)
         schema = SchemaConfig.from_dict({"mode": "observed"})
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -1293,7 +1304,7 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             schema_config=schema,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -1301,20 +1312,20 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             node_id="postgres-artifact-contention-sink",
             schema_config=schema,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader,
             source_node_id="postgres-artifact-contention-source",
             row_index=0,
             data={"value": 1},
             row_id="postgres-artifact-contention-row",
+            token_id="postgres-artifact-contention-token",
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="postgres-artifact-contention-token")
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="postgres-artifact-contention-sink",
-            run_id=run.run_id,
+            member_token=leader.membership,
             step_index=0,
             input_data={"value": 1},
             state_id="postgres-artifact-contention-state",
@@ -1328,6 +1339,17 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
             "size_bytes": 128,
             "idempotency_key": "postgres-artifact-contention-row:csv_sink",
         }
+        # Separate registered memberships retain concurrent artifact writes:
+        # one shared leader fence would serialize before the unique-index race.
+        members = [
+            factory.run_coordination.admit_follower(
+                run_id=run.run_id,
+                worker_id=f"postgres-artifact-contender-{ordinal}",
+                config_hash=run.config_hash,
+                window_seconds=300,
+            )
+            for ordinal in range(2)
+        ]
 
         transaction_barrier = threading.Barrier(2)
         physical_connections: set[int] = set()
@@ -1348,11 +1370,13 @@ def test_artifact_idempotency_contenders_use_independent_postgres_connections(
                 content_hash = "sha256:postgres-divergent"
             contender = RecorderFactory(db)
             try:
-                return contender.execution.register_artifact(
-                    **values,
-                    content_hash=content_hash,
-                    artifact_id=f"postgres-artifact-proposal-{ordinal}",
-                )
+                with fenced_member_transaction(db.engine, member_token=members[ordinal], verb="test_artifact") as conn:
+                    return contender.execution.artifacts.register_artifact(
+                        **values,
+                        content_hash=content_hash,
+                        artifact_id=f"postgres-artifact-proposal-{ordinal}",
+                        conn=conn,
+                    )
             except AuditIntegrityError as exc:
                 return exc
 

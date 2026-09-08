@@ -5,17 +5,20 @@ from __future__ import annotations
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from time import monotonic, sleep
 
 import pytest
-from sqlalchemy import func, select, update
+from sqlalchemy import event, func, select, update
 from sqlalchemy.engine import Connection
 from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import CallType, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import DISCARD_SINK_NAME, TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.results import ArtifactDescriptor
 from elspeth.contracts.sink_effects import (
     SINK_EFFECT_PROTOCOL_VERSION,
@@ -38,6 +41,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import compute_pipeli
 from elspeth.core.landscape.execution.sink_effect_lifecycle import SinkEffectAttemptRequest, SinkEffectAttemptResult
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservationRequest
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     artifacts_table,
     node_states_table,
@@ -65,8 +69,55 @@ def postgres_db(postgres_url: str) -> Iterator[LandscapeDB]:
         db.close()
 
 
+@pytest.fixture
+def peer_db(postgres_url: str) -> Iterator[LandscapeDB]:
+    """A separate connection pool makes competing backend identities stable."""
+    db = LandscapeDB(postgres_url)
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def _observe_fence_attempt(db: LandscapeDB) -> Iterator[tuple[threading.Event, dict[str, int]]]:
+    attempted = threading.Event()
+    backend: dict[str, int] = {}
+
+    def before_cursor_execute(
+        conn: Connection,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: bool,
+    ) -> None:
+        normalized = statement.upper()
+        if attempted.is_set() or not normalized.startswith("UPDATE RUN_COORDINATION "):
+            return
+        backend["pid"] = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
+        attempted.set()
+
+    event.listen(db.engine, "before_cursor_execute", before_cursor_execute)
+    try:
+        yield attempted, backend
+    finally:
+        event.remove(db.engine, "before_cursor_execute", before_cursor_execute)
+
+
+def _assert_backend_blocked_by(db: LandscapeDB, *, waiter: int, blocker: int) -> None:
+    deadline = monotonic() + 5
+    while monotonic() < deadline:
+        with db.read_only_connection() as conn:
+            blocked = conn.exec_driver_sql("SELECT %s = ANY(pg_blocking_pids(%s))", (blocker, waiter)).scalar_one()
+        if blocked:
+            return
+        sleep(0.01)
+    pytest.fail(f"PostgreSQL backend {waiter} never waited on backend {blocker}")
+
+
 def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_effect(
-    postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = postgres_db
     factory = make_factory(db)
@@ -76,19 +127,18 @@ def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_eff
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal in range(2):
         payload = {"ordinal": ordinal}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = factory.data_flow.create_token(row.row_id)
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data=payload,
         )
@@ -126,7 +176,7 @@ def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_eff
             assert release_first.wait(timeout=5)
 
     monkeypatch.setattr(factory.execution.sink_effects._reservation, "_after_witness_locks", pause)
-    second_factory = make_factory(db)
+    second_factory = make_factory(peer_db)
     monkeypatch.setattr(second_factory.execution.sink_effects._reservation, "_after_witness_locks", pause)
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(
@@ -150,28 +200,28 @@ def test_concurrent_reservation_reverse_arrival_uses_ascending_locks_and_one_eff
 
 def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first_order(
     postgres_db: LandscapeDB,
+    peer_db: LandscapeDB,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db = postgres_db
     finalizer_factory = make_factory(db)
-    outcome_factory = make_factory(db)
+    outcome_factory = make_factory(peer_db)
     run = finalizer_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = register_test_node(finalizer_factory.data_flow, run.run_id, "finalize-source", node_type=NodeType.SOURCE, plugin_name="source")
     sink = register_test_node(finalizer_factory.data_flow, run.run_id, "finalize-sink", node_type=NodeType.SINK, plugin_name="sink")
     payload = {"ordinal": 0}
-    row = finalizer_factory.data_flow.create_row(
-        run_id=run.run_id,
+    _row, token = finalizer_factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(finalizer_factory, run.run_id),
         source_node_id=source,
         row_index=0,
         data=payload,
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = finalizer_factory.data_flow.create_token(row.row_id)
     finalizer_factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=sink,
-        run_id=run.run_id,
+        member_token=leader_coordination_token(finalizer_factory, run.run_id).membership,
         step_index=0,
         input_data=payload,
     )
@@ -285,7 +335,6 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
     )
     finalizer_holds_token = threading.Event()
     release_finalizer = threading.Event()
-    outcome_approached_token = threading.Event()
     backend_pids: dict[str, int] = {}
 
     def after_token_locks(pid: int, token_ids: tuple[str, ...]) -> None:
@@ -298,21 +347,23 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
 
     def outcome_lock(refs: tuple[TokenRef, ...], *, conn: Connection) -> None:
         backend_pids["outcome"] = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
-        outcome_approached_token.set()
         original_outcome_lock(refs, conn=conn)
 
     monkeypatch.setattr(finalizer_factory.execution.sink_effects._finalization, "_after_token_locks", after_token_locks)
     monkeypatch.setattr(outcome_factory.data_flow.outcomes, "lock_token_outcome_dependencies", outcome_lock)
 
     def competing_outcome() -> str:
-        return outcome_factory.data_flow.record_token_outcome(
+        return outcome_factory.data_flow.record_token_outcome_leader(
             TokenRef(token_id=token.token_id, run_id=run.run_id),
             TerminalOutcome.SUCCESS,
             TerminalPath.DEFAULT_FLOW,
             sink_name="sink",
+            coordination_token=leader_coordination_token(outcome_factory, run.run_id),
         )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    # Observe the competing leader before its seat lock. It cannot approach
+    # token locks until the first writer commits its entire fenced payload.
+    with _observe_fence_attempt(peer_db) as (outcome_attempted, outcome_backend), ThreadPoolExecutor(max_workers=2) as pool:
         finalization = pool.submit(
             finalizer_factory.execution.sink_effects.finalize,
             request,
@@ -320,8 +371,11 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
         )
         assert finalizer_holds_token.wait(timeout=5)
         outcome = pool.submit(competing_outcome)
-        assert outcome_approached_token.wait(timeout=5)
-        release_finalizer.set()
+        try:
+            assert outcome_attempted.wait(timeout=5)
+            _assert_backend_blocked_by(db, waiter=outcome_backend["pid"], blocker=backend_pids["finalizer"])
+        finally:
+            release_finalizer.set()
         winner = finalization.result(timeout=10)
         with pytest.raises(LandscapeRecordError):
             outcome.result(timeout=10)
@@ -336,11 +390,11 @@ def test_finalization_vs_outcome_mutation_uses_distinct_backends_and_token_first
 
 
 def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
-    postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     db = postgres_db
     first_factory = make_factory(db)
-    second_factory = make_factory(db)
+    second_factory = make_factory(peer_db)
     run = first_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = register_test_node(
         first_factory.data_flow,
@@ -359,19 +413,18 @@ def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal in range(2):
         payload = {"ordinal": ordinal}
-        row = first_factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = first_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(first_factory, run.run_id),
             source_node_id=source,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = first_factory.data_flow.create_token(row.row_id)
         first_factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(first_factory, run.run_id).membership,
             step_index=0,
             input_data=payload,
         )
@@ -458,10 +511,12 @@ def test_concurrent_disjoint_reservations_form_one_stream_predecessor_chain(
     assert ordered[1].predecessor_effect_id == ordered[0].effect_id
 
 
-def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
     db = postgres_db
     reservation_factory = make_factory(db)
-    outcome_factory = make_factory(db)
+    outcome_factory = make_factory(peer_db)
     run = reservation_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = register_test_node(
         reservation_factory.data_flow,
@@ -480,19 +535,18 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal in range(2):
         payload = {"ordinal": ordinal}
-        row = reservation_factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = reservation_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(reservation_factory, run.run_id),
             source_node_id=source,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = reservation_factory.data_flow.create_token(row.row_id)
         reservation_factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(reservation_factory, run.run_id).membership,
             step_index=0,
             input_data=payload,
         )
@@ -520,7 +574,7 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
     )
 
     first_token_locked = threading.Event()
-    outcome_entered = threading.Event()
+    release_reservation = threading.Event()
     reservation_pid: list[int] = []
     outcome_pid: list[int] = []
     complete_witnesses: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
@@ -529,7 +583,7 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
         if len(token_ids) == 1 and not first_token_locked.is_set():
             reservation_pid.append(pid)
             first_token_locked.set()
-            assert outcome_entered.wait(timeout=5)
+            assert release_reservation.wait(timeout=5)
 
     def capture_complete_witnesses(pid: int, token_ids: tuple[str, ...], state_ids: tuple[str, ...]) -> None:
         if not reservation_pid:
@@ -540,7 +594,6 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
 
     def enter_outcome_lock(refs: tuple[TokenRef, ...], *, conn: Connection) -> None:
         outcome_pid.append(int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one()))
-        outcome_entered.set()
         original_outcome_locks(refs, conn=conn)
 
     monkeypatch.setattr(reservation_factory.execution.sink_effects._reservation, "_after_token_lock", pause_after_first_token)
@@ -548,7 +601,7 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
     monkeypatch.setattr(outcome_factory.data_flow.outcomes, "lock_token_outcome_dependencies", enter_outcome_lock)
 
     first_token_id = min(member.token_id for member in members)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with _observe_fence_attempt(peer_db) as (outcome_attempted, outcome_backend), ThreadPoolExecutor(max_workers=2) as pool:
         reservation_future = pool.submit(
             reservation_factory.execution.sink_effects.reserve,
             request,
@@ -556,13 +609,19 @@ def test_reservation_vs_outcome_uses_token_first_order_without_deadlock(postgres
         )
         assert first_token_locked.wait(timeout=5)
         outcome_future = pool.submit(
-            outcome_factory.data_flow.record_token_outcome,
+            outcome_factory.data_flow.record_token_outcome_leader,
             TokenRef(token_id=first_token_id, run_id=run.run_id),
             TerminalOutcome.FAILURE,
             TerminalPath.SINK_DISCARDED,
             sink_name=DISCARD_SINK_NAME,
             error_hash="outcome-race",
+            coordination_token=leader_coordination_token(outcome_factory, run.run_id),
         )
+        try:
+            assert outcome_attempted.wait(timeout=5)
+            _assert_backend_blocked_by(db, waiter=outcome_backend["pid"], blocker=reservation_pid[0])
+        finally:
+            release_reservation.set()
         reservation = reservation_future.result(timeout=10)
         outcome_future.result(timeout=10)
 
@@ -622,19 +681,18 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
     source = register_test_node(factory.data_flow, run.run_id, f"{name_prefix}-source", node_type=NodeType.SOURCE, plugin_name="source")
     sink = register_test_node(factory.data_flow, run.run_id, f"{name_prefix}-sink", node_type=NodeType.SINK, plugin_name="sink")
     payload = {"ordinal": 0}
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id=source,
         row_index=0,
         data=payload,
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id)
     factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=sink,
-        run_id=run.run_id,
+        member_token=leader_coordination_token(factory, run.run_id).membership,
         step_index=0,
         input_data=payload,
     )
@@ -757,7 +815,9 @@ def _build_in_flight_effect(factory: RecorderFactory, *, name_prefix: str, owner
     )
 
 
-def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_takeover_vs_finalization_generation_fences_stale_finalizer(
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Takeover paused after its effect lock beats a stale finalizer approaching
     through sorted token/state locks: the generation fence rejects the stale
     finalization, both transactions complete bounded, and no artifact or
@@ -765,7 +825,7 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
     finalization/head CAS)."""
     db = postgres_db
     finalizer_factory = make_factory(db)
-    takeover_factory = make_factory(db)
+    takeover_factory = make_factory(peer_db)
     built = _build_in_flight_effect(finalizer_factory, name_prefix="takeover-fence")
 
     # Expire the lease directly so takeover is legal while the original owner
@@ -844,24 +904,10 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
 
     assert new_lease.owner == "worker-b"
     assert new_lease.generation == built.generation + 1
-    # NO DISTINCT-BACKEND ASSERTION HERE, DELIBERATELY. It was
-    # `backend_pids["takeover"] != backend_pids["finalizer"]`, and it is no
-    # longer DECIDABLE in this test. Both factories draw from this module's one
-    # LandscapeDB pool, so two distinct PostgreSQL backends require the two
-    # verbs to genuinely OVERLAP. The seat fence serialises them, and the only
-    # way to force overlap would be to hold the takeover open inside its fenced
-    # transaction — the very interleaving the fence makes unreachable. Measured
-    # rather than assumed: keeping it and merely submitting the finalizer while
-    # the takeover was in flight passed 1 run in 8, because whether the
-    # finalizer opens its connection before the takeover returns its own to the
-    # pool is timing this test cannot control. An assertion that flakes is not
-    # evidence, so it is omitted and the reason recorded, per ADR-048's
-    # decidable-properties rule.
-    #
-    # Both backend ids are still CAPTURED above, and the per-call ascending
-    # token and state lock order is still asserted in the hooks, which is what
-    # this proof needs and what needs no overlap.
+    # Separate pools guarantee distinct server sessions even when the seat
+    # admits the payloads sequentially.
     assert backend_pids.keys() == {"takeover", "finalizer"}
+    assert backend_pids["takeover"] != backend_pids["finalizer"]
     with db.read_only_connection() as conn:
         effect_row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == built.effect_id)).one()
         operation_rows = conn.execute(select(operations_table).where(operations_table.c.sink_effect_id == built.effect_id)).fetchall()
@@ -933,14 +979,16 @@ def test_takeover_vs_finalization_generation_fences_stale_finalizer(postgres_db:
         assert statuses == [NodeStateStatus.COMPLETED.value]
 
 
-def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_takeover_blocked_by_finalization_observes_finalized_effect(
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The other legal winner: a finalizer paused holding its effect locks
     commits first, and the concurrent takeover — blocked on the same effect
     row — must observe FINALIZED and be rejected instead of stealing the
     lease of a completed effect."""
     db = postgres_db
     finalizer_factory = make_factory(db)
-    takeover_factory = make_factory(db)
+    takeover_factory = make_factory(peer_db)
     built = _build_in_flight_effect(finalizer_factory, name_prefix="takeover-loses")
 
     # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause.
@@ -1024,7 +1072,7 @@ def test_takeover_blocked_by_finalization_observes_finalized_effect(postgres_db:
 
 
 def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
-    postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Effect-linked artifact path: two crash-recovery retries of an already
     finalized effect serialize on the effect row and only then take the
@@ -1039,7 +1087,7 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
     assert first.effect.state.value == "finalized"
 
     retry_a_factory = make_factory(db)
-    retry_b_factory = make_factory(db)
+    retry_b_factory = make_factory(peer_db)
 
     # WHAT CANNOT HAPPEN HERE, AND WHY (ADR-048). Do not reintroduce the pause
     # or the `assert not retry_b.done()`.
@@ -1091,14 +1139,16 @@ def test_concurrent_finalization_retries_converge_on_winner_under_effect_lock(
         )
 
 
-def test_legacy_state_linked_artifact_outcome_contention_single_winner(postgres_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_state_linked_artifact_outcome_contention_single_winner(
+    postgres_db: LandscapeDB, peer_db: LandscapeDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Legacy state-linked artifact path: two composed outcome writers for the
     same token follow token, state, artifact lock order; they serialize at the
     token class, exactly one outcome wins, the loser is rejected without
     deadlock, and the artifact witness row survives untouched."""
     db = postgres_db
     winner_factory = make_factory(db)
-    loser_factory = make_factory(db)
+    loser_factory = make_factory(peer_db)
     run = winner_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = register_test_node(
         winner_factory.data_flow, run.run_id, "legacy-artifact-source", node_type=NodeType.SOURCE, plugin_name="source"
@@ -1107,41 +1157,47 @@ def test_legacy_state_linked_artifact_outcome_contention_single_winner(postgres_
         winner_factory.data_flow, run.run_id, "legacy-artifact-failsink", node_type=NodeType.SINK, plugin_name="failsink"
     )
     payload = {"value": 1}
-    row = winner_factory.data_flow.create_row(
-        run_id=run.run_id,
+    _row, token = winner_factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(winner_factory, run.run_id),
         source_node_id=source,
         row_index=0,
         data=payload,
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = winner_factory.data_flow.create_token(row.row_id)
     state = winner_factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=failsink,
-        run_id=run.run_id,
+        member_token=leader_coordination_token(winner_factory, run.run_id).membership,
         step_index=0,
         input_data=payload,
     )
     winner_factory.execution.complete_node_state(
+        member_token=leader_coordination_token(winner_factory, run.run_id).membership,
         state_id=state.state_id,
         status=NodeStateStatus.COMPLETED,
         output_data={"written": True},
         duration_ms=1.0,
     )
-    artifact = winner_factory.execution.register_artifact(
-        run_id=run.run_id,
-        state_id=state.state_id,
-        sink_node_id=failsink,
-        artifact_type="test",
-        path="memory://legacy/fallback-artifact",
-        content_hash="ab" * 32,
-        size_bytes=0,
-    )
+    with fenced_leader_transaction(
+        db.engine,
+        token=leader_coordination_token(winner_factory, run.run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="test_legacy_sink_artifact",
+    ) as conn:
+        artifact = winner_factory.execution.artifacts.register_artifact(
+            conn=conn,
+            run_id=run.run_id,
+            state_id=state.state_id,
+            sink_node_id=failsink,
+            artifact_type="test",
+            path="memory://legacy/fallback-artifact",
+            content_hash="ab" * 32,
+            size_bytes=0,
+        )
 
     winner_locked = threading.Event()
     release_winner = threading.Event()
-    loser_approached = threading.Event()
     backend_pids: dict[str, int] = {}
 
     original_winner_lock = winner_factory.data_flow.outcomes.lock_token_outcome_dependencies
@@ -1156,14 +1212,13 @@ def test_legacy_state_linked_artifact_outcome_contention_single_winner(postgres_
 
     def loser_lock(refs: tuple[TokenRef, ...], *, conn: Connection) -> None:
         backend_pids["loser"] = int(conn.exec_driver_sql("SELECT pg_backend_pid()").scalar_one())
-        loser_approached.set()
         original_loser_lock(refs, conn=conn)
 
     monkeypatch.setattr(winner_factory.data_flow.outcomes, "lock_token_outcome_dependencies", winner_lock)
     monkeypatch.setattr(loser_factory.data_flow.outcomes, "lock_token_outcome_dependencies", loser_lock)
 
     def record_fallback(factory: RecorderFactory) -> str:
-        return factory.data_flow.record_token_outcome(
+        return factory.data_flow.record_token_outcome_leader(
             TokenRef(token_id=token.token_id, run_id=run.run_id),
             TerminalOutcome.TRANSIENT,
             TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -1171,14 +1226,18 @@ def test_legacy_state_linked_artifact_outcome_contention_single_winner(postgres_
             sink_node_id=failsink,
             artifact_id=artifact.artifact_id,
             error_hash="fallback-error",
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with _observe_fence_attempt(peer_db) as (loser_attempted, loser_backend), ThreadPoolExecutor(max_workers=2) as pool:
         winner = pool.submit(record_fallback, winner_factory)
         assert winner_locked.wait(timeout=5)
         loser = pool.submit(record_fallback, loser_factory)
-        assert loser_approached.wait(timeout=5)
-        release_winner.set()
+        try:
+            assert loser_attempted.wait(timeout=5)
+            _assert_backend_blocked_by(db, waiter=loser_backend["pid"], blocker=backend_pids["winner"])
+        finally:
+            release_winner.set()
         outcome_id = winner.result(timeout=10)
         with pytest.raises(LandscapeRecordError, match="database rejected audit write"):
             loser.result(timeout=10)

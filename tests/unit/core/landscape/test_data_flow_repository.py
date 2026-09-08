@@ -1340,16 +1340,16 @@ class TestExpandTokenAtomicity:
 class TestForkTokenRowcountValidation:
     """fork_token must validate rowcount on every insert — phantom tokens are audit corruption."""
 
-    def test_fork_raises_on_zero_rowcount_token_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_fork_raises_on_zero_rowcount_token_insert(self) -> None:
         db, repo, _fac, row_id, tok_id = _make_repo_with_token()
         ref = TokenRef(token_id=tok_id, run_id="run-1")
         leader = _test_leader(repo, "run-1")
         item = _test_claim(repo, ref)
         before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
-        intercepted = _intercept_insert(monkeypatch, "tokens", zero_rowcount=True)
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TRIGGER omit_child_tokens BEFORE INSERT ON tokens BEGIN SELECT RAISE(IGNORE); END")
         with pytest.raises(AuditIntegrityError, match="zero rows"):
             repo.fork_token(ref, row_id, ["a", "b"], member_token=leader.membership, work_item=item)
-        assert intercepted == ["tokens"]
         assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 
@@ -1374,17 +1374,17 @@ class TestCoalesceTokensRowcountValidation:
 class TestExpandTokenRowcountValidation:
     """expand_token must validate rowcount on every insert."""
 
-    def test_expand_raises_on_zero_rowcount_token_insert(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_expand_raises_on_zero_rowcount_token_insert(self) -> None:
         db, repo, _fac, row_id, tok_id = _make_repo_with_token()
         ref = TokenRef(token_id=tok_id, run_id="run-1")
         leader = _test_leader(repo, "run-1")
         before = (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db))
-        intercepted = _intercept_insert(monkeypatch, "tokens", zero_rowcount=True)
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql("CREATE TRIGGER omit_child_tokens BEFORE INSERT ON tokens BEGIN SELECT RAISE(IGNORE); END")
         with pytest.raises(AuditIntegrityError, match="zero rows"):
             repo.expand_token(
                 ref, row_id, [{"item": i} for i in range(3)], output_contract=_MINIMAL_CONTRACT, member_token=leader.membership
             )
-        assert intercepted == ["tokens"]
         assert (_count_tokens(db), _count_token_outcomes(db), _count_token_parents(db)) == before
 
 

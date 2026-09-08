@@ -235,8 +235,8 @@ class RowTokenRepository:
             for depth, frame in enumerate(frames)
         ]
         if values:
-            result = conn.execute(token_lineage_frames_table.insert(), values)
-            if result.rowcount != len(values):
+            result = conn.execute(token_lineage_frames_table.insert().returning(token_lineage_frames_table.c.token_id), values)
+            if len(result.fetchall()) != len(values):
                 raise AuditIntegrityError("lineage frame INSERT affected zero rows or an incomplete batch")
 
     @staticmethod
@@ -245,7 +245,7 @@ class RowTokenRepository:
         if not children:
             return
         result = conn.execute(
-            tokens_table.insert(),
+            tokens_table.insert().returning(tokens_table.c.token_id),
             [
                 {
                     "token_id": child.token_id,
@@ -258,16 +258,16 @@ class RowTokenRepository:
                 for child in children
             ],
         )
-        if result.rowcount != len(children):
+        if len(result.fetchall()) != len(children):
             raise AuditIntegrityError(f"{verb}: child token INSERT affected zero rows or an incomplete batch")
         result = conn.execute(
-            token_parents_table.insert(),
+            token_parents_table.insert().returning(token_parents_table.c.token_id),
             [
                 {"token_id": child.token_id, "parent_token_id": parent_token_id, "run_id": run_id, "ordinal": ordinal}
                 for ordinal, child in enumerate(children)
             ],
         )
-        if result.rowcount != len(children):
+        if len(result.fetchall()) != len(children):
             raise AuditIntegrityError(f"{verb}: token_parent INSERT affected zero rows or an incomplete batch")
         RowTokenRepository._insert_lineage_frames_many(
             conn, run_id=run_id, paths={child.token_id: child.lineage_path for child in children}
@@ -1024,10 +1024,12 @@ class RowTokenRepository:
 
             # Record the whole ordered parent roster on the same connection.
             result = conn.execute(
-                token_parents_table.insert().values(run_id=coordination_token.run_id, token_id=token_id),
+                token_parents_table.insert()
+                .values(run_id=coordination_token.run_id, token_id=token_id)
+                .returning(token_parents_table.c.parent_token_id),
                 [{"parent_token_id": ref.token_id, "ordinal": ordinal} for ordinal, ref in enumerate(parent_refs)],
             )
-            if result.rowcount != len(parent_refs):
+            if len(result.fetchall()) != len(parent_refs):
                 raise AuditIntegrityError(
                     f"coalesce_tokens: token_parent INSERT affected zero rows or an incomplete batch (child={token_id})"
                 )
@@ -1058,7 +1060,9 @@ class RowTokenRepository:
             if result.rowcount == 0:
                 raise AuditIntegrityError(f"coalesce_tokens: effect INSERT affected zero rows (effect_id={effect_id})")
             result = conn.execute(
-                coalesce_effect_members_table.insert().values(effect_id=effect_id, run_id=coordination_token.run_id),
+                coalesce_effect_members_table.insert()
+                .values(effect_id=effect_id, run_id=coordination_token.run_id)
+                .returning(coalesce_effect_members_table.c.parent_token_id),
                 [
                     {
                         "ordinal": ordinal,
@@ -1068,7 +1072,7 @@ class RowTokenRepository:
                     for ordinal, ref in enumerate(parent_refs)
                 ],
             )
-            if result.rowcount != len(parent_refs):
+            if len(result.fetchall()) != len(parent_refs):
                 raise AuditIntegrityError(
                     f"coalesce_tokens: normalized effect member INSERT affected zero rows or an incomplete batch (effect_id={effect_id})"
                 )

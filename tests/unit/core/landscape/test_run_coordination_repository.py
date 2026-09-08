@@ -175,7 +175,7 @@ def test_worker_heartbeat_missing_seat_refuses_without_liveness_write(
         conn.execute(delete(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID))
         conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == worker_id).values(heartbeat_expires_at=NOW))
     before = _coordination_image(engine)
-    with pytest.raises(AuditIntegrityError, match="no run_coordination seat"):
+    with pytest.raises(AuditIntegrityError, match="registered membership but no coordination seat"):
         repo.worker_heartbeat(member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=worker_id), window_seconds=WINDOW)
     assert _coordination_image(engine) == before
 

@@ -9,21 +9,34 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, select
+from tests.fixtures.base_classes import create_observed_contract
+from tests.fixtures.landscape import leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 
-from elspeth.contracts import NodeType, RoutingEvent, RoutingMode, RoutingSpec
+from elspeth.contracts import NodeType, PipelineRow, RoutingEvent, RoutingMode, RoutingSpec
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import canonical_json, stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import routing_events_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 
 pytestmark = pytest.mark.testcontainer
 
 _SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
+
+
+def _admit_peer(db: LandscapeDB, *, run_id: str) -> WorkerMembershipToken:
+    return RunCoordinationRepository(db.engine).admit_follower(
+        run_id=run_id,
+        worker_id=f"{run_id}-peer",
+        config_hash=stable_hash({}),
+        window_seconds=60,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -39,8 +52,9 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
     sink_id = f"sink-{suffix}"
     state_id = f"state-{suffix}"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination_token = leader_coordination_token(factory, run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination_token,
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -49,7 +63,7 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
         schema_config=_SCHEMA,
     )
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination_token,
         plugin_name="gate",
         node_type=NodeType.GATE,
         plugin_version="1.0",
@@ -58,7 +72,7 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
         schema_config=_SCHEMA,
     )
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination_token,
         plugin_name="sink",
         node_type=NodeType.SINK,
         plugin_version="1.0",
@@ -70,7 +84,7 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
     for label in ("accepted", "rejected"):
         edge_ids.append(
             factory.data_flow.register_edge(
-                run_id=run_id,
+                coordination_token=coordination_token,
                 from_node_id=gate_id,
                 to_node_id=sink_id,
                 label=label,
@@ -78,23 +92,23 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
                 edge_id=f"edge-{label}-{suffix}",
             ).edge_id
         )
-    row = factory.data_flow.create_row(
-        run_id,
+    _row, token = factory.data_flow.create_row_with_token(
         source_id,
         0,
         {"route": "accepted"},
         row_id=f"row-{suffix}",
         source_row_index=0,
         ingest_sequence=0,
+        token_id=f"token-{suffix}",
+        coordination_token=coordination_token,
     )
-    token = factory.data_flow.create_token(row.row_id, token_id=f"token-{suffix}")
     factory.execution.begin_node_state(
         token.token_id,
         gate_id,
-        run_id,
         0,
         {"route": "accepted"},
         state_id=state_id,
+        member_token=coordination_token.membership,
     )
     return state_id, edge_ids[0], edge_ids[1]
 
@@ -102,29 +116,44 @@ def _seed_routing_state(factory: RecorderFactory, *, suffix: str) -> tuple[str, 
 def _seed_additional_state(factory: RecorderFactory, *, suffix: str) -> str:
     """Add another state in an existing seeded run for PK-collision proof."""
     run_id = f"routing-reason-{suffix}"
-    row = factory.data_flow.create_row(
-        run_id,
+    coordination_token = leader_coordination_token(factory, run_id)
+    _row, token = factory.data_flow.create_row_with_token(
         f"source-{suffix}",
         1,
         {"route": "accepted"},
         row_id=f"row-{suffix}-second",
         source_row_index=1,
         ingest_sequence=1,
+        token_id=f"token-{suffix}-second",
+        coordination_token=coordination_token,
     )
-    token = factory.data_flow.create_token(row.row_id, token_id=f"token-{suffix}-second")
     return factory.execution.begin_node_state(
         token.token_id,
         f"gate-{suffix}",
-        run_id,
         0,
         {"route": "accepted"},
         state_id=f"state-{suffix}-second",
+        member_token=coordination_token.membership,
     ).state_id
 
 
 def _physical_connection(conn: Any) -> tuple[int, int]:
     driver_connection = conn.connection.driver_connection
     return id(driver_connection), int(driver_connection.info.backend_pid)
+
+
+def _assert_server_blocked(db: LandscapeDB, physical: dict[str, tuple[int, int]], *, winner_thread: str) -> None:
+    assert len(physical) == 2
+    winner_pid = physical[winner_thread][1]
+    loser_pid = next(pid for name, (_identity, pid) in physical.items() if name != winner_thread)
+    assert winner_pid != loser_pid
+    with db.read_only_connection() as conn:
+        for _ in range(200):
+            blocked = conn.exec_driver_sql("SELECT %s = ANY(pg_blocking_pids(%s))", (winner_pid, loser_pid)).scalar_one()
+            if blocked:
+                break
+            threading.Event().wait(0.01)
+    assert blocked, "PostgreSQL did not report the contender waiting on routing authority"
 
 
 def _install_group_authority_pause(
@@ -181,6 +210,8 @@ def test_postgres_identical_writers_return_one_exact_event(postgres_url: str, tm
     first = RecorderFactory(db, payload_store=store_a)
     second = RecorderFactory(db, payload_store=store_b)
     state_id, edge_id, _ = _seed_routing_state(first, suffix="identical")
+    member_token = leader_coordination_token(first, "routing-reason-identical").membership
+    peer_token = _admit_peer(db, run_id=member_token.run_id)
     reason: ConfigGateReason = {"condition": "route == accepted", "result": "true"}
     winner_has_authority, loser_reached_lock, _loser_has_authority, release_winner, physical, hooks = _install_group_authority_pause(
         db,
@@ -192,10 +223,7 @@ def test_postgres_identical_writers_return_one_exact_event(postgres_url: str, tm
     def worker(name: str, factory: RecorderFactory) -> None:
         try:
             result: RoutingEvent | BaseException = factory.execution.record_routing_event(
-                state_id,
-                edge_id,
-                RoutingMode.MOVE,
-                reason=reason,
+                state_id, edge_id, RoutingMode.MOVE, reason=reason, member_token=member_token if name == "first" else peer_token
             )
         except BaseException as exc:  # pragma: no cover - asserted below
             result = exc
@@ -211,6 +239,7 @@ def test_postgres_identical_writers_return_one_exact_event(postgres_url: str, tm
         assert winner_has_authority.wait(timeout=10)
         threads[1].start()
         assert loser_reached_lock.wait(timeout=10)
+        _assert_server_blocked(db, physical, winner_thread="routing-first")
         release_winner.set()
         for thread in threads:
             thread.join(timeout=30)
@@ -252,6 +281,8 @@ def test_postgres_divergent_contender_fails_closed_without_mixed_group(postgres_
     first = RecorderFactory(db, payload_store=store_a)
     second = RecorderFactory(db, payload_store=store_b)
     state_id, accepted_edge, rejected_edge = _seed_routing_state(first, suffix="divergent")
+    member_token = leader_coordination_token(first, "routing-reason-divergent").membership
+    peer_token = _admit_peer(db, run_id=member_token.run_id)
     accepted_reason: ConfigGateReason = {"condition": "route == accepted", "result": "true"}
     rejected_reason: ConfigGateReason = {"condition": "route == rejected", "result": "true"}
     winner_has_authority, loser_reached_lock, _loser_has_authority, release_winner, physical, hooks = _install_group_authority_pause(
@@ -264,10 +295,7 @@ def test_postgres_divergent_contender_fails_closed_without_mixed_group(postgres_
     def worker(name: str, factory: RecorderFactory, edge_id: str, reason: ConfigGateReason) -> None:
         try:
             result: RoutingEvent | BaseException = factory.execution.record_routing_event(
-                state_id,
-                edge_id,
-                RoutingMode.MOVE,
-                reason=reason,
+                state_id, edge_id, RoutingMode.MOVE, reason=reason, member_token=member_token if name == "accepted" else peer_token
             )
         except BaseException as exc:
             result = exc
@@ -291,6 +319,7 @@ def test_postgres_divergent_contender_fails_closed_without_mixed_group(postgres_
         assert winner_has_authority.wait(timeout=10)
         threads[1].start()
         assert loser_reached_lock.wait(timeout=10)
+        _assert_server_blocked(db, physical, winner_thread="routing-accepted")
         release_winner.set()
         for thread in threads:
             thread.join(timeout=30)
@@ -339,6 +368,20 @@ def test_postgres_single_group_race_has_one_complete_winner(
     first = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     second = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     state_id, accepted_edge, rejected_edge = _seed_routing_state(first, suffix=suffix)
+    member_token = leader_coordination_token(first, f"routing-reason-{suffix}").membership
+    peer_token = _admit_peer(db, run_id=member_token.run_id)
+    data = {"route": "accepted"}
+    work_item = first.scheduler.enqueue_ready_claimed(
+        member_token=member_token,
+        token_id=f"token-{suffix}",
+        row_id=f"row-{suffix}",
+        node_id=f"gate-{suffix}",
+        step_index=0,
+        ingest_sequence=0,
+        row_payload_json=first.scheduler.serialize_row_payload(PipelineRow(data, create_observed_contract(data))),
+        lease_owner=member_token.worker_id,
+        lease_seconds=60,
+    )
     loser_kind = "group" if winner_kind == "single" else "single"
     winner_thread_name = f"routing-{winner_kind}"
     winner_has_authority, loser_reached_lock, _loser_has_authority, release_winner, physical, hooks = _install_group_authority_pause(
@@ -357,6 +400,7 @@ def test_postgres_single_group_race_has_one_complete_winner(
                         accepted_edge,
                         RoutingMode.MOVE,
                         reason={"condition": "route chosen", "result": "true"},
+                        member_token=peer_token,
                     )
                 ]
             else:
@@ -367,6 +411,8 @@ def test_postgres_single_group_race_has_one_complete_winner(
                         RoutingSpec(edge_id=rejected_edge, mode=RoutingMode.MOVE),
                     ],
                     reason={"condition": "route chosen", "result": "true"},
+                    member_token=member_token,
+                    work_item=work_item,
                 )
         except BaseException as exc:
             result = exc
@@ -382,6 +428,7 @@ def test_postgres_single_group_race_has_one_complete_winner(
         assert winner_has_authority.wait(timeout=10)
         threads[1].start()
         assert loser_reached_lock.wait(timeout=10)
+        _assert_server_blocked(db, physical, winner_thread=winner_thread_name)
         release_winner.set()
         for thread in threads:
             thread.join(timeout=30)
@@ -417,6 +464,8 @@ def test_postgres_cross_state_shared_group_has_one_durable_owner(
     first = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     second = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     first_state, edge_id, _ = _seed_routing_state(first, suffix="cross-state-group")
+    member_token = leader_coordination_token(first, "routing-reason-cross-state-group").membership
+    peer_token = _admit_peer(db, run_id=member_token.run_id)
     second_state = _seed_additional_state(first, suffix="cross-state-group")
     routing_group_id = "caller-shared-cross-state-group"
     winner_has_authority, loser_reached_lock, loser_has_authority, release_winner, physical, hooks = _install_group_authority_pause(
@@ -436,6 +485,7 @@ def test_postgres_cross_state_shared_group_has_one_durable_owner(
                 event_id=f"cross-state-event-{ordinal}",
                 routing_group_id=routing_group_id,
                 ordinal=ordinal,
+                member_token=member_token if name == "first" else peer_token,
             )
         except BaseException as exc:
             result = exc
@@ -451,6 +501,7 @@ def test_postgres_cross_state_shared_group_has_one_durable_owner(
         assert winner_has_authority.wait(timeout=10)
         threads[1].start()
         assert loser_reached_lock.wait(timeout=10)
+        _assert_server_blocked(db, physical, winner_thread="routing-state-first")
         with outcomes_lock:
             assert "second" not in outcomes
         assert threads[1].is_alive()
@@ -503,6 +554,7 @@ def test_postgres_unrelated_event_id_collision_remains_landscape_record_error(
     store = FilesystemPayloadStore(tmp_path / "payloads")
     factory = RecorderFactory(db, payload_store=store)
     first_state, edge_id, _ = _seed_routing_state(factory, suffix="event-pk")
+    member_token = leader_coordination_token(factory, "routing-reason-event-pk").membership
     second_state = _seed_additional_state(factory, suffix="event-pk")
     factory.execution.record_routing_event(
         first_state,
@@ -511,6 +563,7 @@ def test_postgres_unrelated_event_id_collision_remains_landscape_record_error(
         reason={"condition": "first", "result": "true"},
         event_id="supplied-event-id-collision",
         routing_group_id="supplied-first-group",
+        member_token=member_token,
     )
 
     try:
@@ -522,6 +575,7 @@ def test_postgres_unrelated_event_id_collision_remains_landscape_record_error(
                 reason={"condition": "second", "result": "true"},
                 event_id="supplied-event-id-collision",
                 routing_group_id="supplied-second-group",
+                member_token=member_token,
             )
         assert factory.query.get_routing_events(second_state) == []
     finally:
@@ -538,6 +592,7 @@ def test_postgres_foreign_key_violation_remains_landscape_record_error(
     db = LandscapeDB.from_url(postgres_url)
     factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(tmp_path / "payloads"))
     state_id, edge_id, _ = _seed_routing_state(factory, suffix="event-fk")
+    member_token = leader_coordination_token(factory, "routing-reason-event-fk").membership
     original_values = factory.execution.node_states._routing_event_values
 
     def values_with_missing_edge(routing_event: RoutingEvent, *, run_id: str) -> dict[str, object]:
@@ -549,10 +604,7 @@ def test_postgres_foreign_key_violation_remains_landscape_record_error(
     try:
         with pytest.raises(LandscapeRecordError, match="database rejected audit write: IntegrityError"):
             factory.execution.record_routing_event(
-                state_id,
-                edge_id,
-                RoutingMode.MOVE,
-                reason={"condition": "foreign key", "result": "true"},
+                state_id, edge_id, RoutingMode.MOVE, reason={"condition": "foreign key", "result": "true"}, member_token=member_token
             )
         assert factory.query.get_routing_events(state_id) == []
     finally:

@@ -1272,6 +1272,13 @@ class RunCoordinationRepository:
         and, in wave 2, its claim verbs. A caller never constructs one.
         """
         with begin_write(self._engine) as conn:
+            # Serialize admission with takeover and finalization before reading
+            # their predicates. In particular, a finalizer locks its follower
+            # roster before token decisions; joining after that snapshot must
+            # re-observe the terminal run instead of leaving an active orphan.
+            conn.execute(
+                select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == run_id).with_for_update()
+            ).one_or_none()
             database_now = read_landscape_transaction_time(conn)
             run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one_or_none()
             if run is None:
