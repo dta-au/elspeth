@@ -23,6 +23,7 @@ from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.types import NodeID
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding, GroupBindingRegistry
 from elspeth.testing import make_contract, make_token_info
+from tests.fixtures.landscape import leader_coordination_token
 from tests.unit.engine.test_processor import _make_factory, _make_processor, _persist_token_for_scheduler
 
 OPENER = NodeID("explode-node")
@@ -73,7 +74,7 @@ def _mint(factory: Any, *, opener_node: NodeID, registry: GroupBindingRegistry |
     factory.execution.record_completed_node_state(
         token_id=parent.token_id,
         node_id=str(opener_node),
-        run_id="test-run",
+        coordination_token=leader_coordination_token(factory, "test-run"),
         step_index=_STEPS[opener_node],
         input_data={"value": 1},
         output_data={"value": 1},
@@ -84,7 +85,7 @@ def _mint(factory: Any, *, opener_node: NodeID, registry: GroupBindingRegistry |
         expanded_rows=[{"value": 1}, {"value": 2}],
         output_contract=make_contract(),
         node_id=opener_node,
-        run_id="test-run",
+        member_token=leader_coordination_token(factory, "test-run").membership,
     )
     return children, group_id
 
@@ -132,7 +133,7 @@ def _complete_member_at(factory: Any, token_id: str, node_id: NodeID) -> None:
     factory.execution.record_completed_node_state(
         token_id=token_id,
         node_id=str(node_id),
-        run_id="test-run",
+        coordination_token=leader_coordination_token(factory, "test-run"),
         step_index=_STEPS[node_id],
         input_data={"value": 1},
         output_data={"value": 1},
@@ -203,7 +204,7 @@ def test_two_declared_opener_nodes_holding_the_opener_token_fail_closed() -> Non
     factory.execution.record_completed_node_state(
         token_id=parent_id,
         node_id=str(OTHER_OPENER),
-        run_id="test-run",
+        coordination_token=leader_coordination_token(factory, "test-run"),
         step_index=_STEPS[OTHER_OPENER],
         input_data={"value": 1},
         output_data={"value": 1},
@@ -246,6 +247,7 @@ def test_processor_without_a_restore_read_model_fails_closed_instead_of_strandin
         source_on_success="default",
         traversal=DAGTraversalContext(node_step_map={NodeID("source-0"): 0}, node_to_plugin={}, node_to_next={}, coalesce_node_map={}),
         scheduler=setup.factory.scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         group_bindings=_registry(),
     )
     token = make_token_info(

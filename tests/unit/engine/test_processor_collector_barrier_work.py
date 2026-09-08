@@ -40,7 +40,6 @@ from tests.unit.engine.test_processor import _make_factory, _make_processor, _pe
 _COLLECTOR_NAME = "stitch"
 _EXPAND_GROUP_ID = "expand-1"
 _COLLECTOR_NODE = NodeID("collector::stitch")
-_LEASE_OWNER = "test-harness"
 
 
 class _CollectorExecutorDouble:
@@ -78,15 +77,15 @@ def _member_token(ordinal: int) -> Any:
 def _enqueue_claimed(factory: RecorderFactory, processor: RowProcessor, token: Any, *, ordinal: int, collector_name: str | None) -> Any:
     """Enqueue+claim one member at the collector node via the production journal verbs."""
     _persist_token_for_scheduler(factory, token, ingest_sequence=ordinal)
-    return processor._scheduler.enqueue_ready_claimed_legacy_unfenced(
-        run_id=processor.run_id,
+    return processor._scheduler.enqueue_ready_claimed(
+        member_token=leader_coordination_token(factory, processor.run_id).membership,
         token_id=token.token_id,
         row_id=token.row_id,
         node_id=str(_COLLECTOR_NODE),
         step_index=processor.resolve_node_step(_COLLECTOR_NODE),
         ingest_sequence=ordinal,
         row_payload_json=processor._scheduler.serialize_row_payload(token.row_data),
-        lease_owner=_LEASE_OWNER,
+        lease_owner=processor._scheduler_lease_owner,
         lease_seconds=60,
         lineage_path=token.lineage_path,
         collector_name=collector_name,
@@ -99,10 +98,11 @@ def _persist_blocked_collector_member(factory: RecorderFactory, processor: RowPr
     ``collector_barrier_key(name, group_id)`` as the barrier address."""
     item = _enqueue_claimed(factory, processor, _member_token(ordinal), ordinal=ordinal, collector_name=_COLLECTOR_NAME)
     processor._scheduler.mark_blocked(
+        member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
         queue_key=None,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
-        expected_lease_owner=_LEASE_OWNER,
+        expected_lease_owner=processor._scheduler_lease_owner,
     )
     return str(item.work_item_id)
 
@@ -112,10 +112,11 @@ def _persist_blocked_queue_hold(factory: RecorderFactory, processor: RowProcesso
     ADR-028 queue-hold — BLOCKED with a ``queue_key`` and NO ``barrier_key``."""
     item = _enqueue_claimed(factory, processor, _member_token(ordinal), ordinal=ordinal, collector_name=None)
     processor._scheduler.mark_blocked(
+        member_token=leader_coordination_token(factory, processor.run_id).membership,
         work_item_id=item.work_item_id,
         queue_key=str(_COLLECTOR_NODE),
         barrier_key=None,
-        expected_lease_owner=_LEASE_OWNER,
+        expected_lease_owner=processor._scheduler_lease_owner,
     )
 
 
@@ -139,7 +140,6 @@ def test_settled_collector_member_stops_counting_as_barrier_work() -> None:
     assert processor.has_blocked_barrier_work() is True
 
     released = processor._scheduler.mark_blocked_barrier_terminal(
-        run_id=processor.run_id,
         barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
         token_ids=("member-0",),
         coordination_token=leader_coordination_token(factory, processor.run_id),
@@ -176,7 +176,7 @@ def _run_eof_flush(processor: RowProcessor) -> None:
     run_end_of_input_barrier_flush(
         config=_CollectorOnlyConfig(),  # type: ignore[arg-type]
         processor=processor,
-        ctx=make_context(),
+        ctx=make_context(run_id=processor.run_id, coordination_token=processor.coordination_token),
         counters=ExecutionCounters(),
         pending_tokens={},
         coalesce_executor=None,
@@ -226,7 +226,6 @@ def test_eof_loop_exits_once_the_real_collector_hold_settles(monkeypatch: pytest
     def _settling_intake(ctx: Any) -> list[Any]:
         calls["count"] += 1
         processor._scheduler.mark_blocked_barrier_terminal(
-            run_id=processor.run_id,
             barrier_key=collector_barrier_key(_COLLECTOR_NAME, _EXPAND_GROUP_ID),
             token_ids=("member-0",),
             coordination_token=leader_coordination_token(factory, processor.run_id),

@@ -47,6 +47,7 @@ from elspeth.engine.orchestrator.preflight import (
     validate_pipeline_sink_effect_capabilities,
 )
 from elspeth.engine.orchestrator.schema_reconstruction import _json_schema_to_python_type, reconstruct_schema_from_json
+from tests.fixtures.landscape import leader_coordination_token
 
 
 @contextmanager
@@ -1449,7 +1450,14 @@ class TestExportNodeRegistrationIdempotence:
                 ),
                 pytest.raises(RuntimeError, match="publication response lost"),
             ):
-                export_landscape(db, run_id, settings, sink_factory)
+                export_landscape(
+                    db,
+                    run_id,
+                    settings,
+                    sink_factory,
+                    coordination_token=leader_coordination_token(real_factory, run_id),
+                    worker_id=leader_coordination_token(real_factory, run_id).worker_id,
+                )
 
             assert real_factory.data_flow.get_node("export:output", run_id) is not None
 
@@ -1464,7 +1472,14 @@ class TestExportNodeRegistrationIdempotence:
                     side_effect=lambda **_kwargs: executed.append("effect"),
                 ),
             ):
-                export_landscape(db, run_id, settings, sink_factory)
+                export_landscape(
+                    db,
+                    run_id,
+                    settings,
+                    sink_factory,
+                    coordination_token=leader_coordination_token(real_factory, run_id),
+                    worker_id=leader_coordination_token(real_factory, run_id).worker_id,
+                )
 
             assert executed == ["effect"], "retry must reach durable effect recovery"
             assert real_factory.data_flow.get_node("export:output", run_id) is not None
@@ -1496,7 +1511,14 @@ class TestExportNodeRegistrationIdempotence:
                 patch("elspeth.engine.orchestrator.audit_export_effects.execute_audit_export_effect") as execute,
                 pytest.raises(AuditIntegrityError, match="export:output"),
             ):
-                export_landscape(db, run_id, settings, sink_factory)
+                export_landscape(
+                    db,
+                    run_id,
+                    settings,
+                    sink_factory,
+                    coordination_token=leader_coordination_token(real_factory, run_id),
+                    worker_id=leader_coordination_token(real_factory, run_id).worker_id,
+                )
 
             execute.assert_not_called()
             sink.close.assert_called_once()
@@ -1526,7 +1548,7 @@ class TestExportNodeRegistrationIdempotence:
             valid_source_hash = "sha256:" + "0" * 16
             registered_sink, _ = _make_sink_and_factory(**{"source_file_hash": valid_source_hash, **registered_overrides})
             real_factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=leader_coordination_token(real_factory, run_id),
                 node_id="export:output",
                 plugin_name=registered_sink.name,
                 node_type=NodeType.SINK,
@@ -1548,7 +1570,14 @@ class TestExportNodeRegistrationIdempotence:
                 patch("elspeth.engine.orchestrator.audit_export_effects.execute_audit_export_effect") as execute,
                 pytest.raises(AuditIntegrityError, match=divergent_field),
             ):
-                export_landscape(db, run_id, settings, sink_factory)
+                export_landscape(
+                    db,
+                    run_id,
+                    settings,
+                    sink_factory,
+                    coordination_token=leader_coordination_token(real_factory, run_id),
+                    worker_id=leader_coordination_token(real_factory, run_id).worker_id,
+                )
 
             execute.assert_not_called()
             retry_sink.close.assert_called_once()

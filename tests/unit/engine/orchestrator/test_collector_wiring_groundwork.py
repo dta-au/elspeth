@@ -16,7 +16,6 @@ from typing import Any
 import pytest
 
 from elspeth.config_loading import load_settings_from_yaml_string
-from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
@@ -204,6 +203,21 @@ def _build(settings_yaml: str) -> tuple[ElspethSettings, Any, ExecutionGraph, Pi
 
 def _build_processor(graph: ExecutionGraph, config: PipelineConfig, settings: ElspethSettings | None, *, mode: ProcessorMode) -> Any:
     setup = make_recorder_with_run(source_node_id=str(graph.get_sources()[0]))
+    from tests.fixtures.landscape import leader_coordination_token
+
+    leader = leader_coordination_token(setup.factory, setup.run_id)
+    run = setup.run_lifecycle.get_run(setup.run_id)
+    assert run is not None
+    member = (
+        setup.factory.run_coordination.admit_follower(
+            run_id=setup.run_id,
+            worker_id="follower-1",
+            config_hash=run.config_hash,
+            window_seconds=80,
+        )
+        if mode is ProcessorMode.FOLLOWER
+        else leader.membership
+    )
     processor, _coalesce_map, _coalesce_executor = build_row_processor(
         graph=graph,
         config=config,
@@ -221,8 +235,9 @@ def _build_processor(graph: ExecutionGraph, config: PipelineConfig, settings: El
         max_workers=None,
         telemetry=None,
         mode=mode,
+        coordination_token=leader if mode is ProcessorMode.LEADER else None,
         scheduler_lease_owner="follower-1" if mode is ProcessorMode.FOLLOWER else None,
-        member_token=WorkerMembershipToken(run_id=setup.run_id, worker_id="follower-1") if mode is ProcessorMode.FOLLOWER else None,
+        member_token=member if mode is ProcessorMode.FOLLOWER else None,
     )
     return processor
 

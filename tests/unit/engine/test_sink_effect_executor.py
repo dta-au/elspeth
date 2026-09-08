@@ -536,10 +536,145 @@ def _annotation_type_name(annotation: ast.expr | None) -> str | None:
     return None
 
 
+def _declaration_names(tree: ast.Module) -> list[str]:
+    names = [node.name for node in ast.walk(tree) if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))]
+    names.extend(
+        alias.asname or alias.name for node in ast.walk(tree) if isinstance(node, (ast.Import, ast.ImportFrom)) for alias in node.names
+    )
+    return names
+
+
+def _label_writer_declarations(tree: ast.Module) -> frozenset[str]:
+    """Recognize a concrete write(str, object) API, not a row/context API.
+
+    This is a declaration check, not runtime duck typing. Unknown bases,
+    decorators and rebinding remain subject to the structural publication rule.
+    """
+    dataclasses = {
+        alias.asname or alias.name
+        for statement in tree.body
+        if isinstance(statement, ast.ImportFrom) and statement.module == "dataclasses"
+        for alias in statement.names
+        if alias.name == "dataclass"
+    }
+    stores = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    shadowed_types = stores | {
+        node.name for node in ast.walk(tree) if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    shadowed_types.update(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+        if not (isinstance(node, ast.ImportFrom) and node.module == "dataclasses" and alias.name == "dataclass")
+    )
+    if (
+        shadowed_types & {"str", "object", *dataclasses}
+        or "write" in stores
+        or any(
+            (isinstance(node, ast.Attribute) and (node.attr == "__dict__" or (node.attr == "write" and isinstance(node.ctx, ast.Store))))
+            or (isinstance(node, ast.Name) and node.id == "setattr")
+            for node in ast.walk(tree)
+        )
+    ):
+        return frozenset()
+    names = set()
+    declarations = _declaration_names(tree)
+    for declaration in tree.body:
+        if not isinstance(declaration, ast.ClassDef) or declaration.bases or declaration.keywords or declaration.name in stores:
+            continue
+        if declarations.count(declaration.name) != 1:
+            continue
+        if any(
+            not (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Name)
+                and decorator.func.id in dataclasses
+                and not decorator.args
+                and all(
+                    keyword.arg in {"frozen", "slots"} and isinstance(keyword.value, ast.Constant) and keyword.value.value is True
+                    for keyword in decorator.keywords
+                )
+            )
+            for decorator in declaration.decorator_list
+        ):
+            continue
+        methods = [
+            member for member in declaration.body if isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)) and member.name == "write"
+        ]
+        if (
+            len(methods) != 1
+            or not isinstance(methods[0], ast.FunctionDef)
+            or any(
+                isinstance(member, ast.FunctionDef) and member.name in {"__new__", "__getattribute__", "__getattr__"}
+                for member in declaration.body
+            )
+        ):
+            continue
+        method = methods[0]
+        arguments = [*method.args.posonlyargs, *method.args.args]
+        if (
+            len(arguments) == 3
+            and not method.decorator_list
+            and not method.args.vararg
+            and not method.args.kwarg
+            and not method.args.kwonlyargs
+            and not method.args.defaults
+            and isinstance(arguments[1].annotation, ast.Name)
+            and arguments[1].annotation.id == "str"
+            and isinstance(arguments[2].annotation, ast.Name)
+            and arguments[2].annotation.id == "object"
+            and isinstance(method.returns, ast.Constant)
+            and method.returns.value is None
+        ):
+            names.add(declaration.name)
+    return frozenset(names)
+
+
+def _label_writer_names(source_path: Path, tree: ast.Module) -> frozenset[str]:
+    """Resolve only direct owned imports; reexports and dynamic factories fail closed."""
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "write"
+        and len(node.args) == 2
+        and not node.keywords
+        for node in ast.walk(tree)
+    ):
+        return frozenset()
+    names = set(_label_writer_declarations(tree))
+    if any(
+        (isinstance(node, ast.Attribute) and (node.attr == "__dict__" or (node.attr == "write" and isinstance(node.ctx, ast.Store))))
+        or (isinstance(node, ast.Name) and node.id == "setattr")
+        for node in ast.walk(tree)
+    ):
+        return frozenset()
+    source_root = next((parent for parent in source_path.parents if parent.name == "src"), None)
+    if source_root is not None:
+        for statement in tree.body:
+            if (
+                not isinstance(statement, ast.ImportFrom)
+                or statement.level
+                or not statement.module
+                or not statement.module.startswith("elspeth.")
+            ):
+                continue
+            imported_path = source_root.joinpath(*statement.module.split(".")).with_suffix(".py")
+            if imported_path.is_file():
+                declarations = _label_writer_declarations(ast.parse(imported_path.read_text(encoding="utf-8")))
+                names.update(alias.asname or alias.name for alias in statement.names if alias.name in declarations)
+    # A local assignment or parameter with a class's spelling cannot borrow its declaration.
+    shadowed = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    shadowed.update(node.arg for node in ast.walk(tree) if isinstance(node, ast.arg))
+    declarations = _declaration_names(tree)
+    shadowed.update(name for name in declarations if declarations.count(name) != 1)
+    return frozenset(names - shadowed)
+
+
 class _ScopeSinkBindings(ast.NodeVisitor):
     """Collect sink-protocol bindings without descending into nested scopes."""
 
-    def __init__(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+    def __init__(self, node: ast.FunctionDef | ast.AsyncFunctionDef, label_writer_names: frozenset[str]) -> None:
         arguments = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
         self.local_names = {argument.arg for argument in arguments}
         self.names = {argument.arg for argument in arguments if _is_sink_protocol_annotation(argument.annotation)}
@@ -552,6 +687,9 @@ class _ScopeSinkBindings(ast.NodeVisitor):
                 if _is_sink_protocol_annotation(variadic.annotation):
                     self.names.add(variadic.arg)
         self._aliases: list[tuple[str, str]] = []
+        self._stores: dict[str, int] = {}
+        self._constructors: dict[str, str] = {}
+        parameter_names = set(self.local_names)
         for statement in node.body:
             self.visit(statement)
         while True:
@@ -559,6 +697,25 @@ class _ScopeSinkBindings(ast.NodeVisitor):
             if discovered <= self.names:
                 break
             self.names.update(discovered)
+        # Rebound parameters/locals do not retain an annotation-based exemption.
+        defaulted = (
+            {argument.arg for argument in (*node.args.posonlyargs, *node.args.args)[-len(node.args.defaults) :]}
+            if node.args.defaults
+            else set()
+        )
+        defaulted.update(
+            argument.arg for argument, default in zip(node.args.kwonlyargs, node.args.kw_defaults, strict=True) if default is not None
+        )
+        self.label_object_types = {
+            name: value for name, value in self.object_types.items() if name not in self._stores and name not in defaulted
+        }
+        for target, constructor in self._constructors.items():
+            if target not in parameter_names and self._stores[target] == 1 and constructor in label_writer_names:
+                self.label_object_types[target] = constructor
+        for _ in self._aliases:
+            for target, source in self._aliases:
+                if target not in parameter_names and self._stores[target] == 1 and source in self.label_object_types:
+                    self.label_object_types[target] = self.label_object_types[source]
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         del node
@@ -572,6 +729,7 @@ class _ScopeSinkBindings(ast.NodeVisitor):
     def visit_Name(self, node: ast.Name) -> None:
         if isinstance(node.ctx, ast.Store):
             self.local_names.add(node.id)
+            self._stores[node.id] = self._stores.get(node.id, 0) + 1
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if isinstance(node.target, ast.Name) and _is_sink_protocol_annotation(node.annotation):
@@ -584,6 +742,8 @@ class _ScopeSinkBindings(ast.NodeVisitor):
             self._aliases.extend((target, node.value.id) for target in targets)
         elif isinstance(node.value, ast.Call) and _cast_sink_protocol(node.value):
             self.names.update(targets)
+        elif isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name):
+            self._constructors.update((target, node.value.func.id) for target in targets)
         self.generic_visit(node)
 
 
@@ -607,14 +767,28 @@ def _is_precise_non_sink_write(
     *,
     os_module_names: frozenset[str],
     local_names: frozenset[str],
+    object_types: dict[str, str],
+    label_writer_names: frozenset[str],
 ) -> bool:
     """Exclude module APIs whose two-argument shape cannot dispatch a sink."""
-    return (
+    module_write = (
         isinstance(call.func, ast.Attribute)
         and isinstance(call.func.value, ast.Name)
         and call.func.value.id in os_module_names
         and call.func.value.id not in local_names
     )
+    label_write = (
+        isinstance(call.func, ast.Attribute)
+        and isinstance(call.func.value, ast.Name)
+        and object_types.get(call.func.value.id) in label_writer_names
+        and len(call.args) == 2
+        and not call.keywords
+        and (
+            (isinstance(call.args[0], ast.Constant) and type(call.args[0].value) is str)
+            or (isinstance(call.args[0], ast.Name) and object_types.get(call.args[0].id) == "str")
+        )
+    )
+    return module_write or label_write
 
 
 class _LegacySinkPublicationVisitor(ast.NodeVisitor):
@@ -623,22 +797,28 @@ class _LegacySinkPublicationVisitor(ast.NodeVisitor):
         *,
         os_module_names: frozenset[str],
         class_sink_attributes: dict[str, frozenset[str]],
+        label_writer_names: frozenset[str],
     ) -> None:
         self.violations: list[tuple[int, int, str]] = []
         self._sink_binding_scopes: list[frozenset[str]] = [frozenset()]
         self._local_name_scopes: list[frozenset[str]] = [frozenset()]
         self._object_type_scopes: list[dict[str, str]] = [{}]
+        self._label_type_scopes: list[dict[str, str]] = [{}]
         self._os_module_names = os_module_names
         self._class_sink_attributes = class_sink_attributes
+        self._label_writer_names = label_writer_names
 
     def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
-        bindings = _ScopeSinkBindings(node)
+        bindings = _ScopeSinkBindings(node, self._label_writer_names)
         self._sink_binding_scopes.append(frozenset(bindings.names))
-        self._local_name_scopes.append(frozenset(bindings.local_names))
+        self._local_name_scopes.append(self._local_name_scopes[-1] | frozenset(bindings.local_names))
         self._object_type_scopes.append(bindings.object_types)
+        inherited_types = {name: value for name, value in self._label_type_scopes[-1].items() if name not in bindings.local_names}
+        self._label_type_scopes.append({**inherited_types, **bindings.label_object_types})
         for statement in node.body:
             self.visit(statement)
         self._object_type_scopes.pop()
+        self._label_type_scopes.pop()
         self._local_name_scopes.pop()
         self._sink_binding_scopes.pop()
 
@@ -668,6 +848,8 @@ class _LegacySinkPublicationVisitor(ast.NodeVisitor):
                     node,
                     os_module_names=self._os_module_names,
                     local_names=self._local_name_scopes[-1],
+                    object_types=self._label_type_scopes[-1],
+                    label_writer_names=self._label_writer_names,
                 )
             )
             if bound_sink or legacy_write_shape:
@@ -696,6 +878,7 @@ def _legacy_sink_publication_calls(source_path: Path) -> list[tuple[int, int, st
     visitor = _LegacySinkPublicationVisitor(
         os_module_names=os_module_names,
         class_sink_attributes=class_sink_attributes,
+        label_writer_names=_label_writer_names(source_path, tree),
     )
     visitor.visit(tree)
     return visitor.violations
@@ -752,6 +935,87 @@ def persist(stream: object, descriptor: int, payload: bytes) -> None:
     )
 
     assert _legacy_sink_publication_calls(source_path) == []
+
+
+_LABEL_WRITER = """class Journal:
+    def write(self, label: str, document: object) -> None:
+        pass
+
+"""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "def persist(journal: Journal, label: str, document: object):\n    journal.write(label, document)\n",
+        'def persist(document):\n    journal = Journal()\n    alias = journal\n    alias.write("label", document)\n',
+        'def persist(journal: Journal, document):\n    def nested():\n        journal.write("label", document)\n    nested()\n',
+    ],
+)
+def test_legacy_publication_guard_recognizes_declared_label_writer(tmp_path: Path, body: str) -> None:
+    source_path = tmp_path / "writer.py"
+    source_path.write_text(_LABEL_WRITER + body, encoding="utf-8")
+    assert _legacy_sink_publication_calls(source_path) == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "def publish(journal: Journal, rows, context):\n    journal.write(rows, context)\n",
+        'def publish(journal: Journal, sink, context):\n    journal = sink\n    journal.write("label", context)\n',
+        'def publish(sink, context):\n    journal = Journal()\n    journal = sink\n    journal.write("label", context)\n',
+        'def publish(Journal, context):\n    journal = Journal()\n    journal.write("label", context)\n',
+        'def publish(journal: Journal, sink, context):\n    def nested(journal):\n        journal.write("label", context)\n    nested(sink)\n',
+        "def publish(journal: Journal, label: str, rows, context):\n    label = rows\n    journal.write(label, context)\n",
+        'def publish(sink, context):\n    journal = Journal()\n    alias = journal\n    alias = sink\n    alias.write("label", context)\n',
+        'def publish(context, journal: Journal = external_sink):\n    journal.write("label", context)\n',
+        'Journal = external_sink\ndef publish(context):\n    journal = Journal()\n    journal.write("label", context)\n',
+        'class Journal:\n    def write(self, rows, ctx):\n        pass\ndef publish(journal: Journal, context):\n    journal.write("label", context)\n',
+        'def publish(journal: Journal, sink, context):\n    journal.write = sink.write\n    journal.write("label", context)\n',
+        'def publish(journal: Journal, sink, context):\n    setattr(journal, "write", sink.write)\n    journal.write("label", context)\n',
+    ],
+)
+def test_legacy_publication_guard_refuses_unresolved_or_shadowed_label_writer(tmp_path: Path, body: str) -> None:
+    source_path = tmp_path / "writer.py"
+    source_path.write_text(_LABEL_WRITER + body, encoding="utf-8")
+    assert [operation for _, _, operation in _legacy_sink_publication_calls(source_path)] == ["write"]
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        _LABEL_WRITER,
+        _LABEL_WRITER.replace("label: str", "rows: list"),
+        _LABEL_WRITER.replace("class Journal:", "class Journal(SinkProtocol):"),
+        "@external_decorator\n" + _LABEL_WRITER,
+        "from foreign import str\n" + _LABEL_WRITER,
+        _LABEL_WRITER.replace("label: str", "label: foreign.str"),
+        _LABEL_WRITER + "    def __new__(cls):\n        return external_sink\n",
+        _LABEL_WRITER + "    write = external_write\n",
+        _LABEL_WRITER + "class Journal:\n    def write(self, rows, ctx):\n        pass\n",
+        _LABEL_WRITER + "if condition:\n    class Journal:\n        def write(self, rows, ctx):\n            pass\n",
+    ],
+)
+def test_legacy_publication_guard_checks_imported_declaration(tmp_path: Path, declaration: str) -> None:
+    root = tmp_path / "src" / "elspeth"
+    root.mkdir(parents=True)
+    (root / "journal.py").write_text(declaration, encoding="utf-8")
+    source_path = root / "driver.py"
+    source_path.write_text(
+        "from elspeth.journal import Journal as EvidenceWriter\n"
+        'def persist(document):\n    writer = EvidenceWriter()\n    writer.write("label", document)\n',
+        encoding="utf-8",
+    )
+    assert bool(_legacy_sink_publication_calls(source_path)) is (declaration != _LABEL_WRITER)
+
+
+def test_legacy_publication_guard_keeps_outer_os_shadow(tmp_path: Path) -> None:
+    source_path = tmp_path / "writer.py"
+    source_path.write_text(
+        "import os\ndef outer(os):\n    def nested(rows, context):\n        os.write(rows, context)\n",
+        encoding="utf-8",
+    )
+    assert _legacy_sink_publication_calls(source_path) == [(4, 8, "write")]
 
 
 def test_production_tree_has_no_legacy_write_or_flush_publication_boundary() -> None:
@@ -879,19 +1143,18 @@ def _document_pipeline_members(
     candidates: list[SinkEffectMemberCandidate] = []
     for ordinal, value in enumerate(values):
         payload = {"announcement_text": value}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source_id,
             row_index=ordinal,
             data=payload,
             source_row_index=ordinal,
             ingest_sequence=ordinal,
         )
-        token = factory.data_flow.create_token(row.row_id)
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data=payload,
         )

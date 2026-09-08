@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -23,6 +24,7 @@ from elspeth.contracts.types import CoalesceName, NodeID
 from elspeth.core.config import AggregationSettings
 from elspeth.core.dag.group_bindings import CloserKind, GroupBinding
 from elspeth.testing import make_row, make_token_info
+from tests.fixtures.landscape import leader_coordination_token
 from tests.unit.engine.test_processor import (
     _FlushContext,
     _make_claimed_work_item,
@@ -84,7 +86,10 @@ class _RecordingCoalesceExecutor:
     def __init__(self) -> None:
         self.notified: list[tuple[str, str, str, str]] = []
 
-    def notify_branch_lost(self, *, coalesce_name: Any, fork_group_id: Any, lost_branch: Any, reason: Any) -> None:
+    def notify_branch_lost(
+        self, *, coalesce_name: Any, fork_group_id: Any, lost_branch: Any, reason: Any, coordination_token: CoordinationToken
+    ) -> None:
+        assert isinstance(coordination_token, CoordinationToken)
         self.notified.append((str(coalesce_name), str(fork_group_id), str(lost_branch), str(reason)))
         return None
 
@@ -344,7 +349,7 @@ def test_record_group_member_terminals_settles_once_not_per_consumed_token(proce
 
     with (
         patch.object(proc, "_settle_member_losses", return_value=[]) as mock_settle,
-        patch.object(proc._data_flow, "record_token_outcome") as mock_record_token_outcome,
+        patch.object(proc._data_flow, "record_token_outcome_leader") as mock_record_token_outcome,
     ):
         proc._record_group_member_terminals(
             consumed_tokens=(token_a, token_b),
@@ -480,6 +485,7 @@ def test_group_bindings_registry_identity_survives_processor_factory_wiring() ->
         settings=None,
         factory=setup.factory,
         run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_id=graph.get_sources()[0],
         edge_map={},
         route_resolution_map=None,

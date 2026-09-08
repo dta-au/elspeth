@@ -40,7 +40,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.config import AggregationSettings, TriggerConfig
 from elspeth.engine.processor import _FlushContext
 from elspeth.testing import make_contract, make_token_info
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 # ---------------------------------------------------------------------------
 # Counting contract: records each batch-flush dispatcher invocation's
@@ -187,6 +187,7 @@ def _make_processor() -> Any:
         source_on_success="default",
         traversal=traversal,
         scheduler=setup.factory.scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
     )
 
 

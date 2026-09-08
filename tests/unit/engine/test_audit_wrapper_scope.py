@@ -12,10 +12,43 @@ from elspeth.contracts.declaration_contracts import (
     _attach_contract_name_from_dispatcher,
 )
 from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.engine.executors import SinkExecutor, TransformExecutor
 from elspeth.engine.spans import SpanFactory
 from elspeth.testing import make_token_info
+from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
+
+
+@pytest.fixture
+def audit_context():
+    setup = make_recorder_with_run(run_id="run-1")
+    leader = leader_coordination_token(setup.factory, setup.run_id)
+    node_id = register_test_node(setup.data_flow, setup.run_id, "node-1")
+    row, token = setup.data_flow.create_row_with_token(
+        coordination_token=leader,
+        source_node_id=setup.source_node_id,
+        row_index=0,
+        source_row_index=0,
+        ingest_sequence=0,
+        row_id="row-1",
+        token_id="token-1",
+        data={},
+    )
+    item = setup.factory.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=setup.factory.scheduler.serialize_row_payload(make_token_info().row_data),
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
+    yield make_context(run_id=setup.run_id, landscape=setup.factory.plugin_audit_writer(), coordination_token=leader, work_item=item)
+    setup.db.close()
 
 
 class _ViolationPayload(TypedDict):
@@ -42,6 +75,11 @@ class _RecordingDataFlow:
             raise self._record_error
         self.token_outcomes.append(kwargs)
 
+    def record_token_outcome_leader(self, **kwargs: object) -> None:
+        if self._record_error is not None:
+            raise self._record_error
+        self.token_outcomes.append(kwargs)
+
 
 def _make_violation(*, token_id: str, row_id: str) -> _TestBoundaryViolation:
     return _TestBoundaryViolation(
@@ -55,7 +93,7 @@ def _make_violation(*, token_id: str, row_id: str) -> _TestBoundaryViolation:
     )
 
 
-def test_transform_terminal_contract_failure_keeps_to_audit_dict_bug_visible() -> None:
+def test_transform_terminal_contract_failure_keeps_to_audit_dict_bug_visible(audit_context: PluginContext) -> None:
     """Transform helper must not relabel declaration-payload regressions as recorder failures."""
     data_flow = _RecordingDataFlow()
     executor = TransformExecutor(
@@ -72,14 +110,14 @@ def test_transform_terminal_contract_failure_keeps_to_audit_dict_bug_visible() -
         executor._record_terminal_contract_failure(
             transform=transform,
             token=token,
-            run_id="run-1",
+            ctx=audit_context,
             violation=violation,
         )
 
     assert data_flow.token_outcomes == []
 
 
-def test_transform_terminal_contract_failure_wraps_typed_recorder_failures() -> None:
+def test_transform_terminal_contract_failure_wraps_typed_recorder_failures(audit_context: PluginContext) -> None:
     """Transform helper still upgrades durable recorder failures to AuditIntegrityError."""
     data_flow = _RecordingDataFlow(record_error=LandscapeRecordError("audit DB down"))
     executor = TransformExecutor(
@@ -97,12 +135,12 @@ def test_transform_terminal_contract_failure_wraps_typed_recorder_failures() -> 
         executor._record_terminal_contract_failure(
             transform=transform,
             token=token,
-            run_id="run-1",
+            ctx=audit_context,
             violation=violation,
         )
 
 
-def test_sink_boundary_failure_outcomes_keep_non_recorder_bug_visible() -> None:
+def test_sink_boundary_failure_outcomes_keep_non_recorder_bug_visible(audit_context: PluginContext) -> None:
     """Sink helper must not relabel serializer/type bugs as recorder failures."""
     data_flow = _RecordingDataFlow(record_error=ValueError("serializer bug"))
     executor = SinkExecutor(
@@ -110,6 +148,7 @@ def test_sink_boundary_failure_outcomes_keep_non_recorder_bug_visible() -> None:
         data_flow=data_flow,
         span_factory=SpanFactory(),
         run_id="run-1",
+        coordination_token=audit_context.require_coordination_token(),
     )
     token = make_token_info(token_id="token-1", row_id="row-1")
     violation = _make_violation(token_id=token.token_id, row_id=token.row_id)
@@ -124,7 +163,7 @@ def test_sink_boundary_failure_outcomes_keep_non_recorder_bug_visible() -> None:
         )
 
 
-def test_sink_boundary_failure_outcomes_wrap_typed_recorder_failures() -> None:
+def test_sink_boundary_failure_outcomes_wrap_typed_recorder_failures(audit_context: PluginContext) -> None:
     """Sink helper still upgrades durable recorder failures to AuditIntegrityError."""
     data_flow = _RecordingDataFlow(record_error=LandscapeRecordError("audit DB down"))
     executor = SinkExecutor(
@@ -132,6 +171,7 @@ def test_sink_boundary_failure_outcomes_wrap_typed_recorder_failures() -> None:
         data_flow=data_flow,
         span_factory=SpanFactory(),
         run_id="run-1",
+        coordination_token=audit_context.require_coordination_token(),
     )
     token = make_token_info(token_id="token-1", row_id="row-1")
     violation = _make_violation(token_id=token.token_id, row_id=token.row_id)
@@ -146,7 +186,7 @@ def test_sink_boundary_failure_outcomes_wrap_typed_recorder_failures() -> None:
         )
 
 
-def test_sink_boundary_failure_outcomes_terminalize_every_token_in_the_batch() -> None:
+def test_sink_boundary_failure_outcomes_terminalize_every_token_in_the_batch(audit_context: PluginContext) -> None:
     """EVERY token in a failing batch gets a terminal outcome, not just the first.
 
     Sinks write batches; a boundary violation fails the whole batch. Recording
@@ -165,6 +205,7 @@ def test_sink_boundary_failure_outcomes_terminalize_every_token_in_the_batch() -
         data_flow=data_flow,
         span_factory=SpanFactory(),
         run_id="run-1",
+        coordination_token=audit_context.require_coordination_token(),
     )
     tokens = [make_token_info(token_id=f"token-{i}", row_id=f"row-{i}") for i in range(1, 4)]
     # The violation names ONE failing token; the whole batch still fails.

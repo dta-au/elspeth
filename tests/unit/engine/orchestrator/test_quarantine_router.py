@@ -29,6 +29,7 @@ from elspeth.engine.orchestrator.ceremony import RunCeremony
 from elspeth.engine.orchestrator.quarantine_router import QUARANTINE_ERROR_MAX_CHARS, QuarantineRouter
 from elspeth.engine.orchestrator.run_state import LoopContext
 from elspeth.engine.orchestrator.types import ExecutionCounters, RouteValidationError
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
 SOURCE_ID = NodeID("source-node")
 
@@ -39,11 +40,17 @@ def _make_source(*, name: str = "quarantine_source", on_validation_failure: str 
 
 def _make_loop_ctx(*, sinks: tuple[str, ...] = ("quarantine",), validation_error_id: str | None = None) -> LoopContext:
     token = SimpleNamespace(token_id="tok-1", row_id="row-1")
+    setup = make_recorder_with_run(run_id="run-1")
+    authority = leader_coordination_token(setup.factory, setup.run_id)
     processor = SimpleNamespace(
         token_manager=SimpleNamespace(create_quarantine_token=lambda **kwargs: token),
-        coordination_token=object(),
+        coordination_token=authority,
     )
-    ctx = SimpleNamespace(pop_pending_quarantine_validation_error_id=lambda row: validation_error_id)
+    ctx = SimpleNamespace(
+        pop_pending_quarantine_validation_error_id=lambda row: validation_error_id,
+        require_coordination_token=lambda: authority,
+        require_member_token=lambda: authority.membership,
+    )
     return LoopContext(
         counters=ExecutionCounters(),
         pending_tokens={name: [] for name in sinks},

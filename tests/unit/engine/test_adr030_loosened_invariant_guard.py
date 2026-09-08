@@ -33,8 +33,8 @@ This closes the N=1 holes the bare loosening opened:
   - N=1 self-BLOCKED STILL raises — arm (3) fails (own rows carry the leader's
     owner, BLOCKED carries none → no peer-owned work); BLOCKED is additionally
     caught by the run-level backstop;
-  - the unregistered (legacy/test) path raises immediately — the
-    ``_scheduler_lease_owner_registered`` guard is never entered.
+  - an omitted lease owner derives from the registered leader and preserves
+    the same refusal for FAILED pending continuations.
 
 The HAPPY path (N>=2 peer handoff) clears+breaks WITHOUT raising AND emits a
 Relinquishing log line: ready==0, no FAILED pending, and a peer holds a lease —
@@ -49,8 +49,6 @@ bare pre-M1 loosening AND the coarse run-level interim gate.
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 import pytest
 from sqlalchemy import update
 
@@ -60,14 +58,20 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import token_work_items_table
 from elspeth.engine.clock import MockClock
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from elspeth.engine.work_items import WorkItem
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node, reschedule_work_item
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    leader_coordination_token,
+    make_recorder_with_run,
+    member_token_for,
+    register_test_node,
+    reschedule_work_item,
+)
 
 NODE_ID = "normalize"
 LEADER_OWNER = "leader-a"
@@ -80,8 +84,8 @@ _PAYLOAD = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1},
 def _build_processor(*, scheduler_lease_owner: str | None) -> tuple[RowProcessor, TokenSchedulerRepository, RecorderSetup, MockClock]:
     """Real RowProcessor + real scheduler DB, with a deterministic MockClock.
 
-    ``scheduler_lease_owner=None`` exercises the unregistered (legacy/test)
-    path (``_scheduler_lease_owner_registered=False``).
+    ``scheduler_lease_owner=None`` exercises owner derivation from the actual
+    registered leader token.
     """
     setup = make_recorder_with_run(
         run_id="run-loosen-guard",
@@ -89,6 +93,9 @@ def _build_processor(*, scheduler_lease_owner: str | None) -> tuple[RowProcessor
         leader_worker_id=scheduler_lease_owner,
     )
     register_test_node(setup.data_flow, setup.run_id, NODE_ID)
+    run = setup.run_lifecycle.get_run(setup.run_id)
+    assert run is not None
+    setup.factory.run_coordination.admit_follower(run_id=setup.run_id, worker_id=PEER_OWNER, config_hash=run.config_hash, window_seconds=80)
     clock = MockClock(start=1_750_000_000.0)
     processor = RowProcessor(
         execution=setup.execution,
@@ -99,6 +106,7 @@ def _build_processor(*, scheduler_lease_owner: str | None) -> tuple[RowProcessor
         source_on_success="default",
         traversal=DAGTraversalContext(node_step_map={}, node_to_plugin={}, node_to_next={}, coalesce_node_map={}),
         scheduler=setup.factory.scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         scheduler_lease_owner=scheduler_lease_owner,
         clock=clock,
     )
@@ -114,7 +122,7 @@ def _enqueue_ready(
     future available_at means claim_ready skips it, but it is still READY).
     """
     row, token = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
@@ -122,7 +130,7 @@ def _enqueue_ready(
         ingest_sequence=sequence,
     )
     item = scheduler.enqueue_ready(
-        run_id=setup.run_id,
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -144,24 +152,12 @@ def _pending_work_item(work_item_id: str, token: TokenInfo) -> dict[str, WorkIte
 
 
 def _seed_peer_leased_row(setup: RecorderSetup, scheduler: TokenSchedulerRepository, clock: MockClock, *, sequence: int) -> None:
-    """Create an unrelated row and force it LEASED under a PEER owner.
-
-    Direct SQL flip (the technique used across the e2e follower suites) so the
-    leader's ``peer_active_leases()`` sees an unexpired peer-held lease.
-    """
+    """Create an unrelated row and claim it through the registered peer."""
     work_item_id, _token = _enqueue_ready(setup, scheduler, clock, sequence=sequence)
-    with setup.db.engine.begin() as conn:
-        conn.execute(
-            update(token_work_items_table)
-            .where(token_work_items_table.c.work_item_id == work_item_id)
-            .values(
-                status=TokenWorkStatus.LEASED.value,
-                lease_owner=PEER_OWNER,
-                # A live peer lease is live on the DATABASE clock (ADR-047); the
-                # MockClock instant is years in its past.
-                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
-            )
-        )
+    claimed = scheduler.claim_ready(
+        member_token=member_token_for(setup.db.engine, worker_id=PEER_OWNER, run_id=setup.run_id), lease_owner=PEER_OWNER, lease_seconds=300
+    )
+    assert claimed is not None and claimed.work_item_id == work_item_id
 
 
 def test_n1_stranded_ready_still_raises() -> None:
@@ -183,7 +179,11 @@ def test_n1_stranded_ready_still_raises() -> None:
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=[work_item_id]) == 1
     with pytest.raises(OrchestrationInvariantError, match="no READY work item could be claimed"):
         processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )
 
 
@@ -199,9 +199,15 @@ def test_n1_self_failed_still_raises() -> None:
     processor, scheduler, setup, clock = _build_processor(scheduler_lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
     # Claim under the leader, then mark FAILED under the leader's OWN owner.
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
+    claimed = scheduler.claim_ready(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership, lease_owner=LEADER_OWNER, lease_seconds=300
+    )
     assert claimed is not None and claimed.work_item_id == work_item_id
-    scheduler.mark_failed(work_item_id=work_item_id, expected_lease_owner=LEADER_OWNER)
+    scheduler.mark_failed(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+        work_item_id=work_item_id,
+        expected_lease_owner=LEADER_OWNER,
+    )
 
     pending = _pending_work_item(work_item_id, token)
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=[work_item_id]) == 0
@@ -210,7 +216,11 @@ def test_n1_self_failed_still_raises() -> None:
 
     with pytest.raises(OrchestrationInvariantError, match="no READY work item could be claimed"):
         processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )
 
 
@@ -229,9 +239,12 @@ def test_n1_self_blocked_still_raises_and_backstop_counts_blocked() -> None:
     """
     processor, scheduler, setup, clock = _build_processor(scheduler_lease_owner=LEADER_OWNER)
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
+    claimed = scheduler.claim_ready(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership, lease_owner=LEADER_OWNER, lease_seconds=300
+    )
     assert claimed is not None and claimed.work_item_id == work_item_id
     scheduler.mark_blocked(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         work_item_id=work_item_id,
         queue_key=None,
         barrier_key="barrier-1",
@@ -247,20 +260,20 @@ def test_n1_self_blocked_still_raises_and_backstop_counts_blocked() -> None:
 
     with pytest.raises(OrchestrationInvariantError, match="no READY work item could be claimed"):
         processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )
 
 
-def test_unregistered_owner_path_raises_immediately() -> None:
-    """Test 3: scheduler_lease_owner=None (_scheduler_lease_owner_registered=False)
-    → the loosening guard is never entered, so a non-empty pending set with no
-    claimable READY raises immediately — even though a peer lease exists.
-
-    NOTE: defensive positive-contract pin for the ``if
-    self._scheduler_lease_owner_registered:`` guard. It raises under both pre- and
-    post-M1 code (the unregistered path never enters the loosening at all)."""
+def test_derived_registered_owner_still_refuses_failed_pending_item() -> None:
+    """An omitted lease owner derives from the admitted leader. A failed
+    pending continuation still refuses relinquishment even with a live peer."""
     processor, scheduler, setup, clock = _build_processor(scheduler_lease_owner=None)
-    # A peer lease exists, but the unregistered guard must short-circuit it.
+    assert processor._scheduler_lease_owner == leader_coordination_token(setup.factory, setup.run_id).worker_id
+    # A peer lease exists, but a failed pending item must still refuse.
     _seed_peer_leased_row(setup, scheduler, clock, sequence=1)
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
     # Move it out of READY so claim_ready returns None for our pending item.
@@ -274,7 +287,11 @@ def test_unregistered_owner_path_raises_immediately() -> None:
 
     with pytest.raises(OrchestrationInvariantError, match="no READY work item could be claimed"):
         processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )
 
 
@@ -283,9 +300,8 @@ def test_n2_peer_claim_handoff_clears_and_breaks_without_raising(caplog: pytest.
     longer READY (a peer claimed it) AND a peer holds an active lease →
     clears+breaks WITHOUT raising. This is the loosening doing its job.
 
-    We model the peer-claimed continuation as a FAILED/non-READY row under the
-    leader (count_ready_in_set==0) while a SEPARATE peer-held LEASED row makes
-    peer_active_leases() non-empty.
+    Both continuations are claimed by the actual registered peer. Neither is
+    READY or FAILED, and peer_active_leases() sees their unexpired leases.
 
     SCOPE: this pins only the LEADER's relinquish decision (clear+break without
     raising) and the observability log line at that decision. The full custody
@@ -299,18 +315,11 @@ def test_n2_peer_claim_handoff_clears_and_breaks_without_raising(caplog: pytest.
     _seed_peer_leased_row(setup, scheduler, clock, sequence=1)
     # The leader's pending continuation is no longer READY (peer took it).
     work_item_id, token = _enqueue_ready(setup, scheduler, clock, sequence=0)
-    with setup.db.engine.begin() as conn:
-        conn.execute(
-            update(token_work_items_table)
-            .where(token_work_items_table.c.work_item_id == work_item_id)
-            .values(
-                status=TokenWorkStatus.LEASED.value,
-                lease_owner=PEER_OWNER,
-                # A live peer lease is live on the DATABASE clock (ADR-047); the
-                # MockClock instant is years in its past.
-                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
-            )
-        )
+    claimed = scheduler.claim_ready(
+        member_token=member_token_for(setup.db.engine, worker_id=PEER_OWNER, run_id=setup.run_id), lease_owner=PEER_OWNER, lease_seconds=300
+    )
+    assert claimed is not None and claimed.work_item_id == work_item_id
+
     pending = _pending_work_item(work_item_id, token)
 
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=[work_item_id]) == 0
@@ -324,7 +333,11 @@ def test_n2_peer_claim_handoff_clears_and_breaks_without_raising(caplog: pytest.
     # subsystem since the elspeth-c49f33d6e4 component-3 extraction.
     with caplog.at_level(logging.INFO, logger="elspeth.engine.scheduler_drain"):
         results = processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )
     assert results == [], "no rows processed by the leader; the peer owns the continuation"
     assert pending == {}, "the leader relinquished (cleared) its pending continuations to the peer"
@@ -358,25 +371,23 @@ def test_mixed_self_failed_and_peer_still_raises() -> None:
 
     # Item A: a genuine peer-claimed continuation (LEASED under PEER_OWNER).
     peer_item_id, peer_token = _enqueue_ready(setup, scheduler, clock, sequence=0)
-    with setup.db.engine.begin() as conn:
-        conn.execute(
-            update(token_work_items_table)
-            .where(token_work_items_table.c.work_item_id == peer_item_id)
-            .values(
-                status=TokenWorkStatus.LEASED.value,
-                lease_owner=PEER_OWNER,
-                # A live peer lease is live on the DATABASE clock (ADR-047); the
-                # MockClock instant is years in its past.
-                lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
-            )
-        )
+    claimed = scheduler.claim_ready(
+        member_token=member_token_for(setup.db.engine, worker_id=PEER_OWNER, run_id=setup.run_id), lease_owner=PEER_OWNER, lease_seconds=300
+    )
+    assert claimed is not None and claimed.work_item_id == peer_item_id
 
     # Item B: the leader's OWN self-FAILED stray (claimed by the leader, marked
     # FAILED under the leader's own owner — NO peer owns it).
     self_item_id, self_token = _enqueue_ready(setup, scheduler, clock, sequence=1)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEADER_OWNER, lease_seconds=300)
+    claimed = scheduler.claim_ready(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership, lease_owner=LEADER_OWNER, lease_seconds=300
+    )
     assert claimed is not None and claimed.work_item_id == self_item_id
-    scheduler.mark_failed(work_item_id=self_item_id, expected_lease_owner=LEADER_OWNER)
+    scheduler.mark_failed(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+        work_item_id=self_item_id,
+        expected_lease_owner=LEADER_OWNER,
+    )
 
     pending = {
         peer_item_id: WorkItem(token=peer_token, current_node_id=NodeID(NODE_ID)),
@@ -392,5 +403,9 @@ def test_mixed_self_failed_and_peer_still_raises() -> None:
 
     with pytest.raises(OrchestrationInvariantError, match="no READY work item could be claimed"):
         processor._drain_scheduler_claims(
-            ctx=PluginContext(run_id=setup.run_id, config={}, landscape=None), pending_items=pending, recover_pending_sinks=False
+            ctx=PluginContext(
+                run_id=setup.run_id, config={}, landscape=None, coordination_token=leader_coordination_token(setup.factory, setup.run_id)
+            ),
+            pending_items=pending,
+            recover_pending_sinks=False,
         )

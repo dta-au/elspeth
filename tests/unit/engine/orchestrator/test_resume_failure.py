@@ -53,8 +53,13 @@ from elspeth.engine.orchestrator.types import ExecutionCounters
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.row_union_executor import RowUnionExecutor
 from elspeth.testing import make_row_result, make_source_row
-from tests.fixtures.landscape import make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_landscape_db, make_recorder_with_run
 from tests.fixtures.stores import MockPayloadStore
+
+
+def _registered_context(run_id: str) -> PluginContext:
+    setup = make_recorder_with_run(run_id=run_id)
+    return PluginContext(run_id=run_id, config={}, coordination_token=leader_coordination_token(setup.factory, run_id))
 
 
 def _make_heartbeat_safe_token(run_id: str, mock_factory: MagicMock) -> CoordinationToken:
@@ -748,7 +753,7 @@ class TestResumeFinalizesAsFailed:
         row_union_executor.get_registered_names.return_value = ["variant_union"]
         row_union_executor.flush_pending.return_value = []
 
-        def _sweep(row_union_name: str) -> list[object]:
+        def _sweep(row_union_name: str, *, coordination_token: CoordinationToken) -> list[object]:
             call_order.append("sweep")
             return []
 
@@ -763,7 +768,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=_registered_context("run-sweep-before-drain"),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -805,7 +810,7 @@ class TestResumeFinalizesAsFailed:
         row_union_executor.get_registered_names.return_value = ["variant_union"]
         row_union_executor.flush_pending.return_value = []
 
-        def _sweep(row_union_name: str) -> list[object]:
+        def _sweep(row_union_name: str, *, coordination_token: CoordinationToken) -> list[object]:
             call_order.append("sweep")
             return []
 
@@ -820,7 +825,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=_registered_context("run-sweep-before-replay"),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=None,
@@ -874,7 +879,7 @@ class TestResumeFinalizesAsFailed:
         coalesce_executor.get_registered_names.return_value = ["merge"]
         coalesce_executor.flush_pending.return_value = []
 
-        def _sweep(coalesce_name: str) -> list[object]:
+        def _sweep(coalesce_name: str, *, coordination_token: CoordinationToken) -> list[object]:
             call_order.append("sweep")
             return []
 
@@ -888,7 +893,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=_registered_context("run-coalesce-sweep-before-drain"),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=coalesce_executor,
@@ -930,7 +935,7 @@ class TestResumeFinalizesAsFailed:
         coalesce_executor.get_registered_names.return_value = ["merge"]
         coalesce_executor.flush_pending.return_value = []
 
-        def _sweep(coalesce_name: str) -> list[object]:
+        def _sweep(coalesce_name: str, *, coordination_token: CoordinationToken) -> list[object]:
             call_order.append("sweep")
             return []
 
@@ -944,7 +949,7 @@ class TestResumeFinalizesAsFailed:
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
             processor=processor,
-            ctx=MagicMock(spec=PluginContext),
+            ctx=_registered_context("run-coalesce-sweep-before-replay"),
             config=config,
             agg_transform_lookup={},
             coalesce_executor=coalesce_executor,
@@ -1514,7 +1519,9 @@ class TestResumeFinalizesAsFailed:
             )
 
         assert shutdown.is_set()
-        row_union_executor.check_timeouts.assert_called_once_with("variant_union")
+        row_union_executor.check_timeouts.assert_called_once_with(
+            "variant_union", coordination_token=loop_ctx.ctx.require_coordination_token()
+        )
 
     def test_row_union_timeout_alone_enables_idle_source_sweeps(self) -> None:
         """A row_union-only pipeline must sweep while blocked fetching its first row."""
@@ -1547,13 +1554,14 @@ class TestResumeFinalizesAsFailed:
         row_union_executor.has_timeout_configured.return_value = True
         row_union_executor.get_registered_names.return_value = ["variant_union"]
 
-        def _check_timeouts(_name: str) -> list[object]:
+        def _check_timeouts(_name: str, *, coordination_token: CoordinationToken) -> list[object]:
             idle_sweep_seen.set()
             return []
 
         row_union_executor.check_timeouts.side_effect = _check_timeouts
         processor.row_union_executor = row_union_executor
         processor.process_row.side_effect = lambda **kwargs: shutdown.set() or []
+        authority_ctx = _registered_context("run-row-union-idle")
         loop_ctx = LoopContext(
             counters=ExecutionCounters(),
             pending_tokens={"default": []},
@@ -1562,6 +1570,7 @@ class TestResumeFinalizesAsFailed:
                 run_id="run-row-union-idle",
                 config={},
                 node_id=NodeID("source-rows"),
+                coordination_token=authority_ctx.require_coordination_token(),
             ),
             config=config,
             agg_transform_lookup={},
@@ -1587,7 +1596,7 @@ class TestResumeFinalizesAsFailed:
                 active_source_name="rows",
                 active_source=source,
                 shutdown_event=shutdown,
-                coordination_token=CoordinationToken(run_id="run-row-union-idle", worker_id="worker:test", leader_epoch=1),
+                coordination_token=authority_ctx.require_coordination_token(),
             )
 
         assert idle_sweep_seen.is_set()
@@ -1644,7 +1653,7 @@ class TestResumeFinalizesAsFailed:
         # One sweep BEFORE any replay (elspeth-0bffbd1af1) plus the per-row
         # boundary sweep — the same boundary discipline as a fresh run.
         assert row_union_executor.check_timeouts.call_count == 2
-        row_union_executor.check_timeouts.assert_called_with("variant_union")
+        row_union_executor.check_timeouts.assert_called_with("variant_union", coordination_token=loop_ctx.ctx.require_coordination_token())
 
     def test_source_exhaustion_is_recorded_before_eof_flush_failure(self) -> None:
         """A crash in EOF engine work must not look like an incomplete source load."""

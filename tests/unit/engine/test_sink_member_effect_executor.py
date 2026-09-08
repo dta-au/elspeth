@@ -22,7 +22,7 @@ from elspeth.core.landscape.execution.sink_effect_identity import (
 from elspeth.core.landscape.schema import sink_effects_table
 from elspeth.engine.executors.sink_effects import SinkEffectCoordinator, SinkEffectExecutionRequest
 from elspeth.plugins.sinks.chroma_sink import ChromaSink
-from tests.fixtures.landscape import leader_token_for, make_factory, make_landscape_db, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, make_landscape_db, register_test_node
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
 
@@ -87,19 +87,18 @@ def test_response_lost_member_is_reconciled_and_only_missing_members_are_committ
         candidates: list[SinkEffectMemberCandidate] = []
         for ordinal in range(3):
             payload = {"doc_id": f"d{ordinal}", "text": f"document {ordinal}", "topic": "test"}
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source_id,
                 row_index=ordinal,
                 data=payload,
                 source_row_index=ordinal,
                 ingest_sequence=ordinal,
             )
-            token = factory.data_flow.create_token(row.row_id)
             factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id=sink_id,
-                run_id=run.run_id,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
                 step_index=0,
                 input_data=payload,
             )

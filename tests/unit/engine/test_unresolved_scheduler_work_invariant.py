@@ -35,7 +35,7 @@ from elspeth.contracts.types import NodeID
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
-from tests.fixtures.landscape import RecorderSetup, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run, register_test_node
 
 NODE_ID = "normalize"
 LEASE_OWNER = "worker-a"
@@ -58,6 +58,7 @@ def _build_processor() -> tuple[RowProcessor, TokenSchedulerRepository, Recorder
         source_on_success="default",
         traversal=DAGTraversalContext(node_step_map={}, node_to_plugin={}, node_to_next={}, coalesce_node_map={}),
         scheduler=scheduler,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         scheduler_lease_owner=LEASE_OWNER,
     )
     return processor, scheduler, setup
@@ -66,7 +67,7 @@ def _build_processor() -> tuple[RowProcessor, TokenSchedulerRepository, Recorder
 def _enqueue_ready_token(setup: RecorderSetup, scheduler: TokenSchedulerRepository, *, sequence: int = 0) -> TokenWorkItem:
     """Create a real row/token pair and enqueue its READY continuation."""
     row, token = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
@@ -74,7 +75,7 @@ def _enqueue_ready_token(setup: RecorderSetup, scheduler: TokenSchedulerReposito
         ingest_sequence=sequence,
     )
     return scheduler.enqueue_ready(
-        run_id=setup.run_id,
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -84,14 +85,19 @@ def _enqueue_ready_token(setup: RecorderSetup, scheduler: TokenSchedulerReposito
     )
 
 
-def _claim(scheduler: TokenSchedulerRepository, run_id: str) -> TokenWorkItem:
-    item = scheduler.claim_ready(run_id=run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
+def _claim(scheduler: TokenSchedulerRepository, setup: RecorderSetup) -> TokenWorkItem:
+    item = scheduler.claim_ready(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+        lease_owner=LEASE_OWNER,
+        lease_seconds=300,
+    )
     assert item is not None
     return item
 
 
-def _mark_pending_sink(scheduler: TokenSchedulerRepository, work_item_id: str) -> TokenWorkItem:
+def _mark_pending_sink(scheduler: TokenSchedulerRepository, work_item_id: str, setup: RecorderSetup) -> TokenWorkItem:
     return scheduler.mark_pending_sink(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         work_item_id=work_item_id,
         row_payload_json=_PAYLOAD,
         sink_name="sink-a",
@@ -122,7 +128,7 @@ def test_fires_for_leased_transform_work() -> None:
     """LEASED work without a pending_sink_name (transform in flight) blocks run completion."""
     processor, scheduler, setup = _build_processor()
     _enqueue_ready_token(setup, scheduler)
-    claimed = _claim(scheduler, setup.run_id)
+    claimed = _claim(scheduler, setup)
     assert claimed.status is TokenWorkStatus.LEASED
     assert claimed.pending_sink_name is None
     assert processor.has_unresolved_scheduler_work() is True
@@ -132,8 +138,9 @@ def test_fires_for_blocked_work() -> None:
     """BLOCKED work (parked at a barrier) blocks run completion."""
     processor, scheduler, setup = _build_processor()
     _enqueue_ready_token(setup, scheduler)
-    claimed = _claim(scheduler, setup.run_id)
+    claimed = _claim(scheduler, setup)
     blocked = scheduler.mark_blocked(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
         work_item_id=claimed.work_item_id,
         queue_key=None,
         barrier_key="barrier-1",
@@ -149,8 +156,8 @@ def test_passes_for_pending_sink_handoff() -> None:
     durability (the merge-authored refinement over has_scheduled_work)."""
     processor, scheduler, setup = _build_processor()
     _enqueue_ready_token(setup, scheduler)
-    claimed = _claim(scheduler, setup.run_id)
-    parked = _mark_pending_sink(scheduler, claimed.work_item_id)
+    claimed = _claim(scheduler, setup)
+    parked = _mark_pending_sink(scheduler, claimed.work_item_id, setup)
     assert parked.status is TokenWorkStatus.PENDING_SINK
     assert processor.has_unresolved_scheduler_work() is False
     assert processor.has_scheduled_work() is True
@@ -161,9 +168,11 @@ def test_passes_for_leased_pending_sink_reclaim() -> None:
     is still resolved: its producer work is durably complete."""
     processor, scheduler, setup = _build_processor()
     _enqueue_ready_token(setup, scheduler)
-    claimed = _claim(scheduler, setup.run_id)
-    _mark_pending_sink(scheduler, claimed.work_item_id)
-    reclaimed = scheduler.claim_pending_sink(run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
+    claimed = _claim(scheduler, setup)
+    _mark_pending_sink(scheduler, claimed.work_item_id, setup)
+    reclaimed = scheduler.claim_pending_sink(
+        coordination_token=leader_coordination_token(setup.factory, setup.run_id), lease_owner=LEASE_OWNER, lease_seconds=300
+    )
     assert reclaimed is not None
     assert reclaimed.status is TokenWorkStatus.LEASED
     assert reclaimed.pending_sink_name == "sink-a"
@@ -176,9 +185,17 @@ def test_passes_after_terminal_and_failed_work() -> None:
     processor, scheduler, setup = _build_processor()
     _enqueue_ready_token(setup, scheduler, sequence=0)
     _enqueue_ready_token(setup, scheduler, sequence=1)
-    first = _claim(scheduler, setup.run_id)
-    scheduler.mark_terminal(work_item_id=first.work_item_id, expected_lease_owner=LEASE_OWNER)
-    second = _claim(scheduler, setup.run_id)
-    scheduler.mark_failed(work_item_id=second.work_item_id, expected_lease_owner=LEASE_OWNER)
+    first = _claim(scheduler, setup)
+    scheduler.mark_terminal(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+        work_item_id=first.work_item_id,
+        expected_lease_owner=LEASE_OWNER,
+    )
+    second = _claim(scheduler, setup)
+    scheduler.mark_failed(
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
+        work_item_id=second.work_item_id,
+        expected_lease_owner=LEASE_OWNER,
+    )
     assert processor.has_unresolved_scheduler_work() is False
     assert processor.has_scheduled_work() is False

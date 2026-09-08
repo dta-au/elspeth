@@ -1515,9 +1515,10 @@ class TestFollowerBarrierNodeIds:
 
         # Register the aggregation node in Landscape (FK constraint).
         from elspeth.contracts import NodeType
+        from tests.fixtures.landscape import leader_coordination_token
 
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="aggregation",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -1541,7 +1542,16 @@ class TestFollowerBarrierNodeIds:
         # the return value.
         stub_scheduler = _UnusedScheduler()
 
-        from tests.fixtures.landscape import leader_coordination_token
+        from elspeth.engine.scheduler_drain import ProcessorMode
+
+        run = setup.run_lifecycle.get_run(run_id)
+        assert run is not None
+        member = factory.run_coordination.admit_follower(
+            run_id=run_id,
+            worker_id="follower-barrier-worker",
+            config_hash=run.config_hash,
+            window_seconds=80,
+        )
 
         processor = RowProcessor(
             execution=factory.execution,
@@ -1555,7 +1565,9 @@ class TestFollowerBarrierNodeIds:
             follower_barrier_node_ids=frozenset({agg_node_id}),  # the fix
             sink_names=frozenset({"default"}),
             scheduler=stub_scheduler,
-            coordination_token=leader_coordination_token(factory, run_id),
+            member_token=member,
+            mode=ProcessorMode.FOLLOWER,
+            scheduler_lease_owner=member.worker_id,
         )
 
         from elspeth.testing import make_token_info

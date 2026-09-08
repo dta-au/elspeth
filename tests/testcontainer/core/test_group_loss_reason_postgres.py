@@ -36,6 +36,7 @@ from pathlib import Path
 import pytest
 from sqlalchemy import insert, select
 from sqlalchemy.exc import DataError
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.helpers.postgres_target import postgres_test_target
 from tests.unit.engine.test_processor import _make_factory, _make_processor, _persist_token_for_scheduler
 
@@ -43,6 +44,7 @@ from elspeth.contracts import NodeType, TokenInfo, TransformResult
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import GroupLossSpec
 from elspeth.contracts.types import BranchName, CoalesceName, NodeID
 from elspeth.core.landscape.database import LandscapeDB, begin_write
@@ -143,11 +145,14 @@ def _produce_quarantine_group_loss_spec() -> GroupLossSpec:
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-path_a", member_key="path_a"),),
     )
     _persist_token_for_scheduler(factory, token)
+    authority = leader_coordination_token(factory, "test-run")
+    work_item = claim_test_work_item(factory, member_token=authority.membership, token_id=token.token_id, node_id="source-0")
     processor._handle_transform_error_status(
         transform_result=TransformResult.error(reason=BATTERY_REASON),
         current_token=token,
         error_sink="discard",
         child_items=[],
+        ctx=PluginContext(run_id=authority.run_id, config={}, coordination_token=authority, work_item=work_item),
     )
     return processor._pending_group_losses.pop()
 

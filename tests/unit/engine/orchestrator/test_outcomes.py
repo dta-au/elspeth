@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from elspeth.contracts import PendingOutcome, TokenInfo
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.enums import FrameKind, TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.identity import LineageFrame
@@ -31,6 +32,7 @@ from elspeth.engine.orchestrator.outcomes import (
 from elspeth.engine.orchestrator.types import ExecutionCounters
 from elspeth.engine.row_union_executor import RowUnionOutcome
 from elspeth.testing import make_row, make_token_info
+from tests.fixtures.landscape import RecorderSetup, leader_coordination_token, make_recorder_with_run
 
 # =============================================================================
 # Helpers
@@ -62,6 +64,13 @@ class _FakeCoalesceOutcome:
 class _FakeContext:
     run_id: str = "run-1"
     emitted_events: list[Any] = field(default_factory=list)
+    setup: RecorderSetup = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.setup = make_recorder_with_run(run_id=self.run_id)
+
+    def require_coordination_token(self) -> CoordinationToken:
+        return leader_coordination_token(self.setup.factory, self.run_id)
 
     def telemetry_emit(self, event: Any) -> None:
         self.emitted_events.append(event)
@@ -80,11 +89,13 @@ class _FakeCoalesceExecutor:
         self.get_registered_names_call_count += 1
         return list(self.registered_names)
 
-    def check_timeouts(self, *, coalesce_name: str) -> list[_FakeCoalesceOutcome]:
+    def check_timeouts(self, *, coalesce_name: str, coordination_token: CoordinationToken) -> list[_FakeCoalesceOutcome]:
+        assert isinstance(coordination_token, CoordinationToken)
         self.check_timeouts_calls.append(coalesce_name)
         return list(self.timed_out_outcomes)
 
-    def flush_pending(self) -> list[_FakeCoalesceOutcome]:
+    def flush_pending(self, *, coordination_token: CoordinationToken) -> list[_FakeCoalesceOutcome]:
+        assert isinstance(coordination_token, CoordinationToken)
         self.flush_pending_call_count += 1
         return list(self.flush_outcomes)
 
@@ -97,11 +108,13 @@ class _FakeRowUnionExecutor:
     def get_registered_names(self) -> list[str]:
         return ["variant_union"]
 
-    def check_timeouts(self, row_union_name: str) -> list[RowUnionOutcome]:
+    def check_timeouts(self, row_union_name: str, *, coordination_token: CoordinationToken) -> list[RowUnionOutcome]:
+        assert isinstance(coordination_token, CoordinationToken)
         assert row_union_name == "variant_union"
         return list(self.timed_out_outcomes)
 
-    def flush_pending(self) -> list[RowUnionOutcome]:
+    def flush_pending(self, *, coordination_token: CoordinationToken) -> list[RowUnionOutcome]:
+        assert isinstance(coordination_token, CoordinationToken)
         return list(self.flush_outcomes)
 
 

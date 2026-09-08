@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -38,9 +39,44 @@ from elspeth.contracts.identity import LineageFrame
 from elspeth.contracts.schema_contract import FieldContract, PipelineRow, SchemaContract
 from elspeth.contracts.types import NodeID
 from elspeth.engine.tokens import TokenManager
+from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 from tests.strategies.ids import multiple_branches
 from tests.strategies.json import row_data
 from tests.strategies.mutable import deeply_nested_data, mutable_nested_data
+
+
+class _AdmittedTokenAuthority:
+    """Give isolation-only repository doubles a real admitted parent claim."""
+
+    @pytest.fixture(autouse=True)
+    def _admit_parent(self):
+        setup = make_recorder_with_run(run_id="test_run_1")
+        authority = leader_coordination_token(setup.factory, setup.run_id)
+        node_id = register_test_node(setup.data_flow, setup.run_id, "node_fork")
+        row, token = setup.data_flow.create_row_with_token(
+            coordination_token=authority,
+            source_node_id=setup.source_node_id,
+            row_index=0,
+            source_row_index=0,
+            ingest_sequence=0,
+            row_id="row_1",
+            token_id="parent_1",
+            data={},
+        )
+        self.member_token = authority.membership
+        self.work_item = setup.factory.scheduler.enqueue_ready_claimed(
+            member_token=self.member_token,
+            token_id=token.token_id,
+            row_id=row.row_id,
+            node_id=node_id,
+            step_index=1,
+            ingest_sequence=0,
+            row_payload_json=setup.factory.scheduler.serialize_row_payload(_wrap_dict_as_pipeline_row({})),
+            lease_owner=self.member_token.worker_id,
+            lease_seconds=300,
+        )
+        yield
+        setup.db.close()
 
 
 def _make_observed_contract() -> SchemaContract:
@@ -109,7 +145,7 @@ def _create_fake_recorder(branches: list[str]) -> _RecordingTokenRepository:
     return _RecordingTokenRepository(branches=branches)
 
 
-class TestForkIsolationProperties:
+class TestForkIsolationProperties(_AdmittedTokenAuthority):
     """Property tests for data isolation during fork operations."""
 
     @given(
@@ -138,8 +174,9 @@ class TestForkIsolationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         assert len(children) == len(branches), "Wrong number of children"
@@ -188,8 +225,9 @@ class TestForkIsolationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child has independent PipelineRow instances
@@ -235,7 +273,7 @@ class TestForkIsolationProperties:
             check_independent_nested(data_0, data_1)
 
 
-class TestForkParentPreservationProperties:
+class TestForkParentPreservationProperties(_AdmittedTokenAuthority):
     """Property tests for parent preservation during fork."""
 
     @given(
@@ -266,8 +304,9 @@ class TestForkParentPreservationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify parent's PipelineRow is not shared with any child
@@ -310,8 +349,9 @@ class TestForkParentPreservationProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child
@@ -331,7 +371,7 @@ class TestForkParentPreservationProperties:
             assert child.fork_group_id is not None, f"Child {i} missing fork_group_id"
 
 
-class TestForkRowDataOverrideProperties:
+class TestForkRowDataOverrideProperties(_AdmittedTokenAuthority):
     """Property tests for row_data override during fork."""
 
     @given(
@@ -363,8 +403,9 @@ class TestForkRowDataOverrideProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
             row_data=_wrap_dict_as_pipeline_row(override_data),  # Explicit override
         )
 
@@ -401,8 +442,9 @@ class TestForkRowDataOverrideProperties:
         children, _fork_group_id = manager.fork_token(
             parent_token=parent,
             branches=branches,
+            work_item=self.work_item,
             node_id=NodeID("node_fork"),
-            run_id="test_run_1",
+            member_token=self.member_token,
             # No row_data override
         )
 
@@ -451,7 +493,7 @@ def _create_fake_recorder_for_expand(count: int) -> _RecordingTokenRepository:
 # =============================================================================
 
 
-class TestExpandIsolationProperties:
+class TestExpandIsolationProperties(_AdmittedTokenAuthority):
     """Property tests for data isolation during expand operations.
 
     Mirrors TestForkIsolationProperties but exercises the expand_token
@@ -483,7 +525,7 @@ class TestExpandIsolationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         assert len(children) == count, f"Wrong number of children: {len(children)} != {count}"
@@ -528,7 +570,7 @@ class TestExpandIsolationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify each child has independent PipelineRow instances
@@ -557,7 +599,7 @@ class TestExpandIsolationProperties:
             check_independent_nested(data_0, data_1)
 
 
-class TestExpandParentPreservationProperties:
+class TestExpandParentPreservationProperties(_AdmittedTokenAuthority):
     """Property tests for parent preservation during expand."""
 
     @given(row_data=mutable_nested_data, count=st.integers(min_value=2, max_value=5))
@@ -586,7 +628,7 @@ class TestExpandParentPreservationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         # Verify parent's PipelineRow is not shared with any child
@@ -625,7 +667,7 @@ class TestExpandParentPreservationProperties:
             expanded_rows=expanded_rows,
             output_contract=output_contract,
             node_id=NodeID("node_expand"),
-            run_id="test_run_1",
+            member_token=self.member_token,
         )
 
         seen_token_ids = set()
@@ -674,7 +716,7 @@ class TestExpandParentPreservationProperties:
                 expanded_rows=expanded_rows,
                 output_contract=unlocked_contract,
                 node_id=NodeID("node_expand"),
-                run_id="test_run_1",
+                member_token=self.member_token,
             )
 
         assert not mock_recorder.expand_called
