@@ -23,7 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.blobs import BlobGuidedOperationWriteFence
 from elspeth.contracts.composer_progress import ComposerProgressEvent
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.core.canonical import canonical_json
@@ -3787,6 +3787,67 @@ class TestComposeTimeout:
         assert exc_info.value.partial_state.sources["source"].plugin == "csv"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("error_type", [AuditIntegrityError, FrameworkBugError, RuntimeError])
+    async def test_early_advisor_internal_failure_preserves_completed_tool_audit(
+        self, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception]
+    ) -> None:
+        """A failed advisor cannot discard a tool mutation already executed."""
+        service, session_id = _composer_service_with_session(_mock_catalog(), _make_settings())
+        sessions = service._require_sessions_service()
+        await sessions.update_composer_preferences(UUID(session_id), trust_mode="auto_commit", density_default="high", actor="user:test")
+        monkeypatch.setattr(service, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl))
+        failure = error_type("advisor internal failure")
+        checkpoint_telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
+        monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", checkpoint_telemetry)
+        source_arguments = {
+            "plugin": "csv",
+            "on_success": "rows",
+            "options": {"path": "/data/input.csv", "schema": {"mode": "observed"}},
+            "on_validation_failure": "discard",
+        }
+
+        def mutate_source(
+            _tool_name: str, _arguments: dict[str, Any], current_state: CompositionState, _catalog: Any, **_kwargs: Any
+        ) -> ToolResult:
+            updated_state = current_state.with_source(SourceSpec(**source_arguments))
+            return ToolResult(
+                success=True, updated_state=updated_state, validation=updated_state.validate(), affected_nodes=("source",), data=None
+            )
+
+        with (
+            patch.object(
+                service,
+                "_call_llm_before_deadline",
+                new_callable=AsyncMock,
+                return_value=_make_llm_response(tool_calls=[{"id": "source-1", "name": "set_source", "arguments": source_arguments}]),
+            ),
+            patch.object(service, "_call_advisor_with_audit", new_callable=AsyncMock, side_effect=failure) as advisor,
+            patch("elspeth.web.composer.tool_batch.execute_tool", side_effect=mutate_source),
+            pytest.raises(error_type) as raised,
+        ):
+            await service.compose("Build a CSV pipeline", [], _empty_state(), session_id=session_id)
+
+        assert raised.value is failure
+        assert advisor.await_count == 1
+        checkpoint_telemetry.assert_not_called()
+        engine = service._session_engine
+        assert engine is not None
+        with engine.connect() as conn:
+            rows = conn.execute(
+                select(chat_messages_table.c.role, chat_messages_table.c.tool_call_id, chat_messages_table.c.composition_state_id).where(
+                    chat_messages_table.c.session_id == session_id
+                )
+            ).all()
+        tool_rows = [row for row in rows if row.role == "tool"]
+        assert len(tool_rows) == 1
+        assert tool_rows[0].tool_call_id == "source-1"
+        assert tool_rows[0].composition_state_id is not None
+        assert any(row.role == "assistant" for row in rows)
+        current = await sessions.get_current_state(UUID(session_id))
+        assert current is not None
+        assert current.sources["source"]["plugin"] == "csv"
+
+    @pytest.mark.asyncio
     async def test_mutation_tool_state_preserved_on_timeout(self) -> None:
         """Mutation tools that complete before timeout must have their
         state reflected in partial_state.
@@ -5925,7 +5986,7 @@ class TestToolArgumentError:
             expected="a string",
             actual_type="int",
         )
-        for name in ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code"):
+        for name in ("_safe_argument", "_safe_expected", "_safe_actual_type"):
             BaseException.__setattr__(exc, name, canary)
         BaseException.__setattr__(exc, "_tool_argument_error_sealed", False)
         with pytest.raises(AttributeError, match="frozen after construction"):
@@ -5949,8 +6010,8 @@ class TestToolArgumentError:
         assert canary not in serialized
 
     @pytest.mark.parametrize("replacement", (None, 7, ["not", "a", "scalar"]))
-    def test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks(self, replacement: object) -> None:
-        """Missing and malformed private state cannot crash public projections."""
+    def test_private_display_backing_missing_or_wrong_typed_uses_fixed_fallbacks(self, replacement: object) -> None:
+        """Missing and malformed display text cannot expose raw input."""
         from elspeth.web.composer.tool_error_payloads import arg_error_payload
 
         exc = ToolArgumentError(
@@ -5958,7 +6019,7 @@ class TestToolArgumentError:
             expected="a string",
             actual_type="int",
         )
-        private_names = ("_safe_argument", "_safe_expected", "_safe_actual_type", "_safe_code")
+        private_names = ("_safe_argument", "_safe_expected", "_safe_actual_type")
         if replacement is None:
             for name in private_names:
                 BaseException.__delattr__(exc, name)
@@ -5972,6 +6033,22 @@ class TestToolArgumentError:
         assert exc.code is None
         assert exc.args == ("'tool argument' must be a valid value, got invalid value",)
         assert arg_error_payload(exc, "set_metadata")["error"].endswith(exc.safe_message)
+
+    @pytest.mark.parametrize("replacement", (None, 7, ["not", "a", "scalar"], "CODE_CORRUPTION_CANARY"))
+    def test_corrupt_private_code_cannot_silently_erase_audit_classification(self, replacement: object) -> None:
+        from elspeth.web.composer.tool_error_payloads import arg_error_payload
+
+        exc = ToolArgumentError(argument="pipeline", expected="a mapping", actual_type="str", code="SCHEMA_VALIDATION")
+        if replacement is None:
+            BaseException.__delattr__(exc, "_safe_code")
+        else:
+            BaseException.__setattr__(exc, "_safe_code", replacement)
+        # Display rendering remains safe even when classification must abort.
+        assert "CODE_CORRUPTION_CANARY" not in str(exc)
+        assert "CODE_CORRUPTION_CANARY" not in str(arg_error_payload(exc, "set_pipeline"))
+        with pytest.raises(FrameworkBugError, match="classification code") as caught:
+            _ = exc.code
+        assert "CODE_CORRUPTION_CANARY" not in str(caught.value)
 
     @pytest.mark.parametrize(
         ("argument", "model_name"),

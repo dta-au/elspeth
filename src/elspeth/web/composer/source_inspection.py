@@ -26,7 +26,6 @@ import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Final, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID
@@ -298,25 +297,6 @@ def observed_columns_from_content(*, content: bytes, filename: str, mime_type: s
     return facts.observed_headers or ()
 
 
-def observed_columns_from_path(*, path: Path, filename: str, mime_type: str) -> tuple[str, ...]:
-    """Bounded-read variant of :func:`observed_columns_from_content` for a file.
-
-    Reads at most ``_MAX_BYTES`` from ``path`` — the exact window
-    :func:`inspect_blob_content` would inspect — instead of slurping the whole
-    file, so backfilling a header from a large blob does not allocate the entire
-    upload. A missing or unreadable file (``OSError`` — not found, permission
-    denied, is-a-directory, or a mid-read I/O failure) degrades to ``()``:
-    column backfill is best-effort enrichment, never a gate on committing the
-    source. The read bound stays private to this module.
-    """
-    try:
-        with path.open("rb") as handle:
-            prefix = handle.read(_MAX_BYTES)
-    except OSError:
-        return ()
-    return observed_columns_from_content(content=prefix, filename=filename, mime_type=mime_type)
-
-
 def inspect_csv_source_content(
     *,
     content: bytes,
@@ -449,7 +429,12 @@ def _redact_url_candidate(raw_url: str) -> str:
     matches those — so the port access is guarded and a bad port is simply
     dropped (host hint preserved) rather than propagated up through inspection.
     """
-    parts = urlsplit(raw_url)
+    try:
+        parts = urlsplit(raw_url)
+    except ValueError:
+        # An invalid authority (brackets or NFKC-sensitive delimiters) has
+        # no trustworthy host hint. Preserve an explicit redaction marker.
+        return _REDACTED_URL_PART
     host = parts.hostname
     if not parts.scheme or not host:
         return _REDACTED_URL_PART

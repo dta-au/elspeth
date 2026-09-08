@@ -5,8 +5,8 @@ Covers the backend-initiated checkpoint primitives:
   audited ``_call_advisor_with_audit`` call, and maps the guidance to an
   :class:`AdvisorCheckpointVerdict` (FLAGGED => blocking, CLEAN => not).
 - A CLEAN-prefixed sign-off yields a non-blocking verdict.
-- An advisor call that keeps failing yields ``ok=False`` (unavailable) after
-  the bounded retry, never raising.
+- Declared provider failures yield ``ok=False`` after bounded retry;
+  internal failures propagate unchanged without retrying.
 
 Async collaborators are faked locally; ``_build_checkpoint_arguments`` and
 ``_summarize_pipeline_for_advisor`` run for real against ``simple_state``.
@@ -30,6 +30,7 @@ import structlog
 from opentelemetry.metrics import Counter
 from structlog.typing import FilteringBoundLogger
 
+from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
@@ -50,7 +51,9 @@ from elspeth.web.composer.service import (
     _ADVISOR_UNAVAILABLE_USER_DETAIL,
     AdvisorCheckpointVerdict,
     ComposerServiceImpl,
+    _MalformedLLMResponseError,
     _node_required_input_fields,
+    admit_llm_provider_metadata,
 )
 from elspeth.web.composer.state import (
     CompositionState,
@@ -73,6 +76,13 @@ from elspeth.web.sessions.protocol import SessionServiceProtocol
 from elspeth_lints.core.ast_walker import iter_python_files
 
 _ROOT = Path(__file__).resolve().parents[4]
+
+
+def _malformed_provider_error(message: str) -> _MalformedLLMResponseError:
+    return _MalformedLLMResponseError(
+        message,
+        provider_metadata=admit_llm_provider_metadata(SimpleNamespace(), choice=None, message=None),
+    )
 
 
 def _composer_service_method(name: str) -> ast.AsyncFunctionDef | ast.FunctionDef:
@@ -1208,6 +1218,7 @@ def test_render_schema_preserves_sanctioned_observed_contract_lists_only() -> No
 
     for schema_fact in ("'mode': 'observed'", "doc_bucket", "doc_key", "trace_id"):
         assert schema_fact in rendered
+    assert "withheld" not in rendered
     assert _OPAQUE_SCHEMA_INJECTION_SENTINEL not in rendered
 
 
@@ -1234,6 +1245,7 @@ def test_render_schema_canonicalizes_field_type_flexible_contract() -> None:
 
     for schema_fact in ("'mode': 'flexible'", "'name': 'doc_bucket'", "'type': 'str'", "'required': True"):
         assert schema_fact in rendered
+    assert "withheld" not in rendered
     assert "field_type" not in rendered
     assert _UNKNOWN_SCHEMA_METADATA_SENTINEL not in rendered
 
@@ -1953,11 +1965,12 @@ async def test_exhausted_litellm_timeout_classified_unavailable(make_service, si
     "Timeout", and it is NOT a builtin TimeoutError) — it must still classify as
     a genuine outage, not fail closed as malformed."""
 
-    class Timeout(Exception):  # mirrors litellm.exceptions.Timeout.__name__
-        pass
+    from litellm.exceptions import Timeout
 
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=Timeout("upstream 504 https://provider.example api_key=sk-secret"))
+    service._call_advisor_with_audit = _AsyncRecorder(
+        side_effect=Timeout("upstream 504 https://provider.example api_key=sk-secret", model="advisor", llm_provider="openai")
+    )
     verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
     assert verdict.ok is False
     assert verdict.failure_class == "unavailable"
@@ -1972,12 +1985,13 @@ async def test_exhausted_litellm_service_unavailable_classified_unavailable(make
     it must classify UNAVAILABLE (escapable), not fail closed as malformed, so a
     503 storm does not permanently block completion. Locks the allowlist entry."""
 
-    class ServiceUnavailableError(Exception):  # mirrors litellm.exceptions name
-        pass
+    from litellm.exceptions import ServiceUnavailableError
 
     service = make_service()
     service._call_advisor_with_audit = _AsyncRecorder(
-        side_effect=ServiceUnavailableError("provider 503 https://provider.example api_key=sk-secret")
+        side_effect=ServiceUnavailableError(
+            "provider 503 https://provider.example api_key=sk-secret", model="advisor", llm_provider="openai"
+        )
     )
     verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
     assert verdict.ok is False
@@ -1992,7 +2006,7 @@ async def test_exhausted_malformed_failure_classified_malformed_fail_closed(make
     """P5.3/D13: a parse/value/shape error classifies MALFORMED (fail-closed, NOT
     escapable) and carries NO raw provider exception text."""
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=ValueError("raw parse failure"))
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=_malformed_provider_error("raw parse failure"))
     verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
     assert verdict.ok is False
     assert verdict.failure_class == "malformed"
@@ -2002,18 +2016,19 @@ async def test_exhausted_malformed_failure_classified_malformed_fail_closed(make
 
 
 @pytest.mark.asyncio
-async def test_exhausted_unknown_exception_fails_closed_as_malformed(make_service, simple_state):
-    """Fail-closed default: an unrecognised exception class (not on the tight
-    transport allowlist) must classify MALFORMED, never UNAVAILABLE — so a
-    goal-pressured model cannot slip the gate by raising garbage."""
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError, TypeError, KeyError, AuditIntegrityError, FrameworkBugError])
+async def test_checkpoint_internal_failure_propagates_without_retry(make_service, simple_state, monkeypatch, error_type):
+    """An internal failure cannot become a malformed-provider verdict."""
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=RuntimeError("provider 500 internal request_id=req-secret"))
-    verdict = await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
-    assert verdict.ok is False
-    assert verdict.failure_class == "malformed"
-    assert verdict.findings_text == "advisor response was malformed"
-    assert "RuntimeError" not in verdict.findings_text
-    assert "req-secret" not in verdict.findings_text
+    failure = error_type("internal defect")
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=failure)
+    telemetry = MagicMock(spec=record_advisor_checkpoint_pass)
+    monkeypatch.setattr("elspeth.web.composer.service.record_advisor_checkpoint_pass", telemetry)
+    with pytest.raises(error_type) as raised:
+        await service._run_advisor_checkpoint(phase="end", state=simple_state, session_id="s1", recorder=make_recorder())
+    assert raised.value is failure
+    assert service._call_advisor_with_audit.await_count == 1
+    telemetry.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2081,7 +2096,7 @@ async def test_checkpoint_deadline_preserves_malformed_attempt_before_retry_expi
 
     async def malformed_after_deadline(*_args: object, **_kwargs: object) -> object:
         await asyncio.sleep(0.01)
-        raise ValueError("malformed provider response")
+        raise _malformed_provider_error("malformed provider response")
 
     service._call_advisor_with_audit = AsyncMock(
         spec=service._call_advisor_with_audit,
@@ -2150,7 +2165,7 @@ async def test_checkpoint_deadline_preserves_cancellation_primacy(make_service, 
 @pytest.mark.asyncio
 async def test_checkpoint_deadline_preserves_provider_error_classification(make_service, simple_state):
     service = make_service()
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=ValueError("malformed provider response"))
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=_malformed_provider_error("malformed provider response"))
 
     verdict = await service._run_advisor_checkpoint(
         phase="end",
@@ -3534,7 +3549,7 @@ async def test_end_gate_unavailable_redacts_raw_provider_exception(make_service,
     """Advisor provider failures fail closed without returning raw SDK text."""
     service = make_service()
     raw_provider_detail = "provider 502 from https://internal-provider.example/v1 request_id=req-secret api_key=sk-live-secret"
-    service._call_advisor_with_audit = _AsyncRecorder(side_effect=RuntimeError(raw_provider_detail))
+    service._call_advisor_with_audit = _AsyncRecorder(side_effect=_malformed_provider_error(raw_provider_detail))
 
     outcome = await drive_try_terminate(service, clean_runnable_state, advisor_checkpoint_passes_used=0)
 
