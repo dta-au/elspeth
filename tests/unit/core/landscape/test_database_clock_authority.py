@@ -154,7 +154,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "cc6179ddb3f44049a3abcdf675e2c6a5a219eded7049095440d0eec539518219"
+_CLOCK_BOUNDARY_DIGEST = "4e63924457b8d23d40888e21e78fb06168122d1b0da863c1281352e4ba71e644"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -271,6 +271,8 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._finalize_follower_admission_on"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._finalize_leader_registration_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
@@ -281,6 +283,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.release_seat"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.worker_heartbeat"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "_renew_leader_deadline_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "fenced_leader_transaction"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "verify_and_extend_leader_fence"),
         ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.complete_run"),
@@ -1561,15 +1564,213 @@ def _connection_context_identities(records: tuple[_FunctionRecord, ...], sources
     return proven
 
 
+_DECISION_CLOCK_MODULE = "src/elspeth/core/landscape/database_clock.py"
+_DECISION_CLOCK_CONTROL = """
+from datetime import UTC, datetime
+from sqlalchemy import DateTime, func
+from elspeth.contracts.errors import AuditIntegrityError
+
+def read_landscape_decision_time(conn):
+    dialect = conn.dialect.name
+    if dialect == "postgresql":
+        stamped = conn.scalar(func.clock_timestamp())
+        if type(stamped) is not datetime or stamped.tzinfo is None or stamped.utcoffset() is None:
+            raise AuditIntegrityError(f"Tier 1: PostgreSQL clock_timestamp returned {type(stamped).__name__}, expected an aware datetime")
+        return stamped.astimezone(UTC)
+    if dialect == "sqlite":
+        stamped = conn.scalar(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
+        if type(stamped) is not datetime or stamped.tzinfo is not None:
+            raise AuditIntegrityError(f"Tier 1: SQLite strftime returned {type(stamped).__name__}, expected a naive UTC datetime")
+        return stamped.replace(tzinfo=UTC)
+    raise NotImplementedError(f"read_landscape_decision_time is not implemented for dialect {dialect!r}")
+"""
+
+
+def _clock_lexical_scopes(tree: ast.Module) -> tuple[ast.AST, ...]:
+    return (
+        tree,
+        *(
+            node if not isinstance(node, ast.ClassDef) else ast.Module(body=node.body, type_ignores=[])
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ),
+    )
+
+
+def _clock_captured_alias_is_mutated(tree: ast.Module, protected: set[str]) -> bool:
+    """Retain alias origins when mutation occurs in a different lexical scope."""
+    aliases = set(protected)
+    declarations: dict[str, list[ast.AST]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for assignment in ast.walk(tree):
+            if not isinstance(assignment, (ast.Assign, ast.AnnAssign)) or assignment.value is None:
+                continue
+            value = assignment.value
+            # A call result is a value, while a bare reference or container
+            # retains a capability that an inner scope can later mutate.
+            if any(isinstance(node, ast.Call) for node in ast.walk(value)):
+                continue
+            if not any(isinstance(node, ast.Name) and node.id in aliases for node in ast.walk(value)):
+                continue
+            targets = assignment.targets if isinstance(assignment, ast.Assign) else (assignment.target,)
+            for target in targets:
+                for binding in ast.walk(target):
+                    if isinstance(binding, ast.Name) and isinstance(binding.ctx, ast.Store):
+                        if binding.id not in aliases:
+                            aliases.add(binding.id)
+                            changed = True
+                        if binding not in declarations.setdefault(binding.id, []):
+                            declarations[binding.id].append(binding)
+    for scope in _clock_lexical_scopes(tree):
+        bindings = _lexical_binding_sites(scope)
+        for alias in aliases - protected:
+            if any(binding not in declarations[alias] for binding in bindings.get(alias, [])):
+                return True
+    return False
+
+
+def _decision_clock_source_is_owned(sources: dict[str, str]) -> bool:
+    """Admit a fresh clock by its owned implementation, never its spelling.
+
+    This deliberately narrow recipe proves both dialects, the connection
+    subject, UTC conversion, and refusal paths. The transaction-clock helper
+    is a separate authority and cannot substitute for this function.
+    """
+    source = sources.get(_DECISION_CLOCK_MODULE)
+    if source is None:
+        return False
+    tree = ast.parse(source)
+    name = "read_landscape_decision_time"
+    definitions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
+    if len(definitions) != 1 or definitions[0] not in tree.body:
+        return False
+    helper = definitions[0]
+    if not isinstance(helper, ast.FunctionDef) or helper.decorator_list:
+        return False
+    expected = _function(ast.parse(_DECISION_CLOCK_CONTROL), name)
+    if expected is None:
+        raise AssertionError("decision clock control lost its helper")
+    if (
+        helper.args.posonlyargs
+        or [argument.arg for argument in helper.args.args] != ["conn"]
+        or helper.args.kwonlyargs
+        or helper.args.defaults
+        or helper.args.vararg is not None
+        or helper.args.kwarg is not None
+    ):
+        return False
+
+    # Error messages are diagnostic prose; every executed expression and
+    # control-flow statement remains part of the exact source recipe.
+    def body_shape(function: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
+        class RefusalMessage(ast.NodeTransformer):
+            def visit_Raise(self, node: ast.Raise) -> ast.Raise:
+                if isinstance(node.exc, ast.Call) and len(node.exc.args) == 1:
+                    argument = node.exc.args[0]
+                    if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                        node.exc.args = [ast.Constant("refused")]
+                    elif isinstance(argument, ast.JoinedStr):
+                        argument.values = [value for value in argument.values if not isinstance(value, ast.Constant)]
+                return node
+
+        clone = ast.parse(ast.unparse(function)).body[0]
+        assert isinstance(clone, (ast.FunctionDef, ast.AsyncFunctionDef))
+        return tuple(ast.dump(RefusalMessage().visit(statement), include_attributes=False) for statement in _executable_statements(clone))
+
+    if body_shape(helper) != body_shape(expected):
+        return False
+    module_bindings = _lexical_binding_sites(tree)
+    if module_bindings.get(name) != [helper] or "*" in module_bindings:
+        return False
+    expected_imports = {
+        "UTC": "datetime.UTC",
+        "datetime": "datetime.datetime",
+        "DateTime": "sqlalchemy.DateTime",
+        "func": "sqlalchemy.func",
+        "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    }
+    for local, origin in expected_imports.items():
+        sites = module_bindings.get(local, [])
+        if len(sites) != 1 or not isinstance(sites[0], ast.ImportFrom):
+            return False
+        imports = {f"{sites[0].module}.{alias.name}" for alias in sites[0].names if (alias.asname or alias.name) == local}
+        if imports != {origin}:
+            return False
+    # No enclosing definition may replace a trusted module dependency at
+    # runtime through global assignment, namespace mutation, or a code write.
+    protected = {*expected_imports, name, "type", "str", "NotImplementedError"}
+    for scope in _clock_lexical_scopes(tree)[1:]:
+        bindings = _lexical_binding_sites(scope)
+        if "*" in bindings or any(bindings.get(dependency) for dependency in protected):
+            return False
+    if _clock_captured_alias_is_mutated(tree, protected):
+        return False
+    for path, consumer in sources.items():
+        if path == _DECISION_CLOCK_MODULE:
+            continue
+        consumer_tree = ast.parse(consumer)
+        consumer_scopes = _clock_lexical_scopes(consumer_tree)
+        clock_module = "elspeth.core.landscape.database_clock"
+        for scope in consumer_scopes:
+            scope_bindings = _lexical_binding_sites(scope)
+            for imported in _scoped_nodes(scope):
+                aliases: list[str] = []
+                if isinstance(imported, ast.ImportFrom):
+                    module = _relative_import_module(path, imported)
+                    aliases = [
+                        alias.asname or alias.name
+                        for alias in imported.names
+                        if (origin := f"{module}.{alias.name}") == f"{clock_module}.{name}"
+                        or origin == clock_module
+                        or clock_module.startswith(origin + ".")
+                    ]
+                elif isinstance(imported, ast.Import):
+                    aliases = [
+                        alias.asname or alias.name.split(".")[0]
+                        for alias in imported.names
+                        if alias.name == clock_module or clock_module.startswith(alias.name + ".")
+                    ]
+                for alias in aliases:
+                    if _clock_captured_alias_is_mutated(consumer_tree, {alias}):
+                        return False
+                    if scope_bindings.get(alias) != [imported] or "*" in scope_bindings:
+                        return False
+                    for nested_scope in consumer_scopes:
+                        if nested_scope is scope:
+                            continue
+                        nested_bindings = _lexical_binding_sites(nested_scope)
+                        # A separate local import is checked in its own scope;
+                        # writes through an inherited module/helper alias are
+                        # forbidden wherever that alias can be captured.
+                        if "*" in nested_bindings or any(
+                            not isinstance(binding, (ast.Import, ast.ImportFrom)) for binding in nested_bindings.get(alias, [])
+                        ):
+                            return False
+    return not any(module_bindings.get(name) for name in ("type", "str", "NotImplementedError"))
+
+
 def _clock_returning_references(
     sources: dict[str, str],
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     """Summarize process, pure-database, and unresolved clock wrappers."""
 
     records = _function_records(sources)
+    decision_clock_identity = (
+        "src/elspeth/core/landscape/database_clock.py",
+        "read_landscape_decision_time",
+    )
+    owned_decision_clock = _decision_clock_source_is_owned(sources)
     process_identities: set[tuple[str, str]] = set()
     database_candidates: set[tuple[str, str]] = set()
     unresolved_identities: set[tuple[str, str]] = set()
+    if owned_decision_clock:
+        database_candidates.add(decision_clock_identity)
+    else:
+        # An implementation retaining this public name cannot silently fall
+        # back to the otherwise-admitted transaction-time clock domain.
+        unresolved_identities.add(decision_clock_identity)
 
     def references(identities: set[tuple[str, str]]) -> set[str]:
         return {f"{module}.{symbol}" for path, symbol in identities if (module := _module_name(path)) is not None}
@@ -1622,6 +1823,11 @@ def _clock_returning_references(
     known_references = _PROCESS_CLOCKS | references(process_identities) | references(database_candidates)
     record_references = {f"{module}.{record.symbol}" for record in records if (module := _module_name(record.path)) is not None}
     for record in records:
+        if owned_decision_clock and (record.path, record.symbol) == decision_clock_identity:
+            # Only this source-proven helper may introduce clock_timestamp.
+            # Arbitrary inline SQL functions and same-named imports remain
+            # unresolved at deadline sinks.
+            continue
         module = _module_name(record.path)
         parameter_names = {
             parameter.arg for parameter in (*record.node.args.posonlyargs, *record.node.args.args, *record.node.args.kwonlyargs)
@@ -1805,6 +2011,7 @@ class _ClockScanner(ast.NodeVisitor):
         external_unresolved_callables: frozenset[str] = frozenset(),
         external_sessions_callables: frozenset[str] = frozenset(),
         external_landscape_callables: frozenset[str] = frozenset(),
+        proven_database_parameters: frozenset[tuple[str, str, str]] = frozenset(),
     ) -> None:
         self._source = source
         self._path = path
@@ -1840,6 +2047,7 @@ class _ClockScanner(ast.NodeVisitor):
         self._external_unresolved_callables = external_unresolved_callables
         self._external_sessions_callables = external_sessions_callables
         self._external_landscape_callables = external_landscape_callables
+        self._proven_database_parameters = proven_database_parameters
         self.violations: list[ClockViolation] = []
         self._collect_bindings()
         self._build_flow_bindings()
@@ -2555,7 +2763,7 @@ class _ClockScanner(ast.NodeVisitor):
             if lowered in _FORENSIC_NAMES:
                 sources.add("forensic")
             if any(node.id in params for params in self._parameter_stack):
-                sources.add("caller")
+                sources.add("database" if (self._path, self._symbol(), node.id) in self._proven_database_parameters else "caller")
             if self._is_process_clock_callable(node, seen=seen, scope=scope):
                 sources.add("process")
         elif isinstance(node, ast.Attribute):
@@ -2718,6 +2926,7 @@ class _ClockScanner(ast.NodeVisitor):
             name
             for name in candidates
             if name not in _NON_CLOCK_CONTEXT_PARAMETERS
+            and (self._path, self._symbol(), name) not in self._proven_database_parameters
             and name.lower() not in _FORENSIC_NAMES
             and not name.endswith("_id")
             and not self._duration_is_database_offset(resolved_node, name)
@@ -3059,6 +3268,13 @@ def _scan_sources(sources: dict[str, str]) -> tuple[ClockViolation, ...]:
     terminals = frozenset(boundary.symbol.rsplit(".", 1)[-1] for boundary in boundaries)
     process_callables, database_callables, unresolved_callables = _clock_returning_references(sources)
     sessions_callables, landscape_callables = _clock_domain_returning_references(sources)
+    proven_database_parameters = (
+        frozenset(
+            {("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._insert_worker_row", "database_now")}
+        )
+        if _worker_registration_sources_are_proven(sources)
+        else frozenset()
+    )
     for relative, source in sources.items():
         violations.extend(
             _ClockScanner(
@@ -3070,6 +3286,7 @@ def _scan_sources(sources: dict[str, str]) -> tuple[ClockViolation, ...]:
                 external_unresolved_callables=unresolved_callables,
                 external_sessions_callables=sessions_callables,
                 external_landscape_callables=landscape_callables,
+                proven_database_parameters=proven_database_parameters,
             ).scan()
         )
     return tuple(sorted(set(violations)))
@@ -3859,7 +4076,19 @@ def _first_fence_contract_violations(source: str) -> tuple[str, ...]:
     values_calls = methods.get("values", [])
     assignments = _local_assignments(verify)
     deadline_values = _deadline_values(values_calls[0], assignments) if len(values_calls) == 1 else ()
-    if len(deadline_values) != 1:
+    identity_admission = (
+        len(values_calls) == 1
+        and ast.dump(values_calls[0].keywords[0].value, include_attributes=False)
+        == ast.dump(ast.parse("run_coordination_table.c.leader_epoch", mode="eval").body, include_attributes=False)
+        if len(values_calls) == 1
+        and not values_calls[0].args
+        and len(values_calls[0].keywords) == 1
+        and values_calls[0].keywords[0].arg == "leader_epoch"
+        else False
+    )
+    if identity_admission:
+        problems.extend(_split_leader_issuance_violations(tree, verify, owner))
+    elif len(deadline_values) != 1:
         problems.append("missing-database-time-expression")
     else:
         database_time, caller_or_process = _deadline_expression_is_database_authoritative(deadline_values[0], verify)
@@ -3905,6 +4134,521 @@ def _first_fence_contract_violations(source: str) -> tuple[str, ...]:
     return tuple(problems)
 
 
+_LEADER_RENEWAL_RECIPE = """
+def _renew_leader_deadline_on(conn, *, token, window_seconds, verb):
+    database_now = read_landscape_decision_time(conn)
+    expires = database_now + timedelta(seconds=window_seconds)
+    renewed = conn.execute(
+        update(run_coordination_table)
+        .where(run_coordination_table.c.run_id == token.run_id,
+               run_coordination_table.c.leader_worker_id == token.worker_id,
+               run_coordination_table.c.leader_epoch == token.leader_epoch)
+        .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
+    )
+    if renewed.rowcount != 1:
+        raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb=verb)
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+"""
+
+_LEADER_REGISTRATION_RECIPE = """
+def _finalize_leader_registration_on(conn, *, token, window_seconds):
+    database_now = read_landscape_decision_time(conn)
+    expires = database_now + timedelta(seconds=window_seconds)
+    seat = conn.execute(
+        update(run_coordination_table)
+        .where(run_coordination_table.c.run_id == token.run_id,
+               run_coordination_table.c.leader_worker_id == token.worker_id,
+               run_coordination_table.c.leader_epoch == token.leader_epoch)
+        .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
+    )
+    if seat.rowcount != 1:
+        raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb="finalize_leader_registration")
+    member = conn.execute(
+        update(run_workers_table)
+        .where(run_workers_table.c.run_id == token.run_id,
+               run_workers_table.c.worker_id == token.worker_id,
+               run_workers_table.c.role == "leader",
+               run_workers_table.c.status == "active")
+        .values(heartbeat_expires_at=expires)
+    )
+    if member.rowcount != 1:
+        raise AuditIntegrityError(f"Newly registered leader {token.worker_id!r} has no active same-run leader membership")
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+    record_issued_deadline(conn, key=_worker_deadline_key(run_id=token.run_id, worker_id=token.worker_id), expires_at=expires, window_seconds=window_seconds)
+"""
+
+_DEADLINE_KEY_RECIPES = """
+def _leader_deadline_key(token):
+    return DeadlineKey(DeadlineKind.LEADER, (token.run_id, token.worker_id, str(token.leader_epoch)))
+
+def _worker_deadline_key(*, run_id, worker_id):
+    return DeadlineKey(DeadlineKind.WORKER, (run_id, worker_id))
+"""
+
+_FOLLOWER_ADMISSION_RECIPE = """
+def _finalize_follower_admission_on(conn, *, run_id, worker_id, window_seconds):
+    database_now = read_landscape_decision_time(conn)
+    live_seat = conn.execute(
+        select(run_coordination_table.c.run_id).where(
+            run_coordination_table.c.run_id == run_id,
+            run_coordination_table.c.leader_worker_id.is_not(None),
+            run_coordination_table.c.leader_heartbeat_expires_at >= database_now,
+        )
+    ).one_or_none()
+    if live_seat is None:
+        raise JoinRefusedError(run_id, "leader seat expired during follower admission")
+    expires = database_now + timedelta(seconds=window_seconds)
+    renewed = conn.execute(
+        update(run_workers_table)
+        .where(run_workers_table.c.run_id == run_id,
+               run_workers_table.c.worker_id == worker_id,
+               run_workers_table.c.role == "follower",
+               run_workers_table.c.status == "active")
+        .values(heartbeat_expires_at=expires)
+    )
+    if renewed.rowcount != 1:
+        raise AuditIntegrityError(f"Newly admitted follower {worker_id!r} has no active same-run membership")
+    record_issued_deadline(conn, key=_worker_deadline_key(run_id=run_id, worker_id=worker_id), expires_at=expires, window_seconds=window_seconds)
+"""
+
+
+_WORKER_INSERT_RECIPE = """
+def _insert_worker_row(conn, *, run_id, worker_id, role, window_seconds, entry_point, database_now):
+    expires = database_now + timedelta(seconds=window_seconds)
+    conn.execute(
+        insert(run_workers_table).values(
+            worker_id=worker_id, run_id=run_id, role=role, status="active",
+            registered_at=database_now, heartbeat_expires_at=expires,
+            pid=os.getpid(), hostname=socket.gethostname(), entry_point=entry_point,
+        )
+    )
+    record_issued_deadline(conn, key=_worker_deadline_key(run_id=run_id, worker_id=worker_id), expires_at=expires, window_seconds=window_seconds)
+"""
+
+
+def _clock_recipe_matches(tree: ast.Module, name: str, recipe: str, *, static_method: bool = False, instance_method: bool = False) -> bool:
+    """Check an explicit SQL/registration sequence, including all control flow."""
+    matches = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name]
+    if len(matches) != 1 or not isinstance(matches[0], ast.FunctionDef):
+        return False
+    function = matches[0]
+    local_names = set(_lexical_binding_sites(function))
+    dependencies = {
+        node.id
+        for node in ast.walk(function)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id not in local_names
+    }
+    if _clock_captured_alias_is_mutated(tree, dependencies | {name, "RunCoordinationRepository"}):
+        return False
+    if static_method or instance_method:
+        owners = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "RunCoordinationRepository"]
+        if (
+            len(owners) != 1
+            or function not in owners[0].body
+            or [ast.unparse(node) for node in function.decorator_list] != (["staticmethod"] if static_method else [])
+        ):
+            return False
+        owner = owners[0]
+        if owner.bases or owner.keywords or owner.decorator_list or _lexical_binding_sites(tree).get(owner.name) != [owner]:
+            return False
+        if _lexical_binding_sites(ast.Module(body=owner.body, type_ignores=[])).get(name) != [function]:
+            return False
+        if any(
+            _lexical_binding_sites(scope).get(owner.name)
+            for scope in ast.walk(tree)
+            if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            return False
+    elif function not in tree.body or function.decorator_list:
+        return False
+    expected = _function(ast.parse(recipe), name)
+    if expected is None:
+        raise AssertionError(f"missing clock recipe {name}")
+
+    def signature_shape(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        arguments = ast.parse(ast.unparse(node)).body[0].args
+        for parameter in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs):
+            parameter.annotation = None
+        return ast.dump(arguments, include_attributes=False)
+
+    if signature_shape(function) != signature_shape(expected):
+        return False
+    if tuple(ast.dump(node, include_attributes=False) for node in _executable_statements(function)) != tuple(
+        ast.dump(node, include_attributes=False) for node in _executable_statements(expected)
+    ):
+        return False
+    if not (static_method or instance_method) and _lexical_binding_sites(tree).get(name) != [function]:
+        return False
+    for scope in (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        bindings = _lexical_binding_sites(scope)
+        if "*" in bindings or bindings.get(name):
+            return False
+    return True
+
+
+def _split_leader_issuance_violations(
+    tree: ast.Module,
+    verifier: ast.FunctionDef | ast.AsyncFunctionDef,
+    owner: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[str, ...]:
+    """Prove admission precedes fresh issuance and successful body-tail renewal."""
+    problems: list[str] = []
+    for function, parameters in (
+        (verifier, ("conn", "token", "window_seconds", "verb")),
+        (owner, ("engine", "token", "window_seconds", "verb")),
+    ):
+        bindings = _lexical_binding_sites(function)
+        for parameter in parameters:
+            sites = bindings.get(parameter, [])
+            if len(sites) != 1 or not isinstance(sites[0], ast.arg):
+                problems.append(f"rebound-split-fence-input:{function.name}:{parameter}")
+    expected_call = ast.parse("_renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)").body[0]
+    statements = _executable_statements(verifier)
+    if len(statements) != 3 or ast.dump(statements[-1], include_attributes=False) != ast.dump(expected_call, include_attributes=False):
+        problems.append("split-fence-renewal-order-or-subject")
+    if not _clock_recipe_matches(tree, "_renew_leader_deadline_on", _LEADER_RENEWAL_RECIPE):
+        problems.append("unproven-leader-deadline-renewal")
+    if not _clock_recipe_matches(tree, "_leader_deadline_key", _DEADLINE_KEY_RECIPES):
+        problems.append("unproven-leader-deadline-key")
+    expected_refusal = ast.parse(
+        "if result.rowcount != 1:\n"
+        "    raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb=verb)\n"
+    ).body[0]
+    if len(statements) < 2 or ast.dump(statements[1], include_attributes=False) != ast.dump(expected_refusal, include_attributes=False):
+        problems.append("split-fence-refusal-subject")
+    expected_tail = ast.parse(
+        "if has_issued_deadline(conn, key=_leader_deadline_key(token)):\n"
+        "    _renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)\n"
+    ).body[0]
+    transactions = [
+        node
+        for node in ast.walk(owner)
+        if isinstance(node, ast.With)
+        and any(isinstance(item.context_expr, ast.Call) and _terminal_name(item.context_expr.func) == "begin_write" for item in node.items)
+    ]
+    if (
+        len(transactions) != 1
+        or len(transactions[0].body) != 3
+        or ast.dump(transactions[0].body[-1], include_attributes=False) != ast.dump(expected_tail, include_attributes=False)
+    ):
+        problems.append("missing-or-unconditional-leader-tail-renewal")
+    imports = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    dependencies = {
+        "begin_write": "elspeth.core.landscape.database.begin_write",
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "has_issued_deadline": "elspeth.core.landscape.lease_deadlines.has_issued_deadline",
+        "DeadlineKey": "elspeth.core.landscape.lease_deadlines.DeadlineKey",
+        "DeadlineKind": "elspeth.core.landscape.lease_deadlines.DeadlineKind",
+        "timedelta": "datetime.timedelta",
+        "update": "sqlalchemy.update",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+        "RunLeadershipLostError": "elspeth.contracts.errors.RunLeadershipLostError",
+    }
+    scopes = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    for name, origin in dependencies.items():
+        if imports.get(name) != origin or _first_fence_dependency_is_rebound(tree, name, scopes):
+            problems.append(f"untrusted-split-fence-dependency:{name}")
+    if _lexical_binding_sites(tree).get("str") or any(_lexical_binding_sites(scope).get("str") for scope in scopes):
+        problems.append("untrusted-split-fence-dependency:str")
+    return tuple(problems)
+
+
+def _leader_registration_contract_violations(source: str) -> tuple[str, ...]:
+    """The final paired issuance preserves active membership and one stamp."""
+    tree = ast.parse(source)
+    problems: list[str] = []
+    if not _clock_recipe_matches(tree, "_finalize_leader_registration_on", _LEADER_REGISTRATION_RECIPE, static_method=True):
+        problems.append("unproven-paired-registration-finalizer")
+    for name in ("_leader_deadline_key", "_worker_deadline_key"):
+        if not _clock_recipe_matches(tree, name, _DEADLINE_KEY_RECIPES):
+            problems.append(f"unproven-registration-key:{name}")
+    scopes = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    imports = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    for name, origin in {
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "DeadlineKey": "elspeth.core.landscape.lease_deadlines.DeadlineKey",
+        "DeadlineKind": "elspeth.core.landscape.lease_deadlines.DeadlineKind",
+        "timedelta": "datetime.timedelta",
+        "update": "sqlalchemy.update",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+        "run_workers_table": "elspeth.core.landscape.schema.run_workers_table",
+        "RunLeadershipLostError": "elspeth.contracts.errors.RunLeadershipLostError",
+        "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+    }.items():
+        if imports.get(name) != origin or _first_fence_dependency_is_rebound(tree, name, scopes):
+            problems.append(f"untrusted-registration-dependency:{name}")
+    for builtin in ("str", "staticmethod"):
+        if _lexical_binding_sites(tree).get(builtin) or any(_lexical_binding_sites(scope).get(builtin) for scope in scopes):
+            problems.append(f"untrusted-registration-dependency:{builtin}")
+    return tuple(problems)
+
+
+def _follower_admission_contract_violations(source: str) -> tuple[str, ...]:
+    """Recheck the locked seat before issuing the active follower's deadline."""
+    tree = ast.parse(source)
+    problems = list(_leader_registration_contract_violations(source))
+    if not _clock_recipe_matches(tree, "_finalize_follower_admission_on", _FOLLOWER_ADMISSION_RECIPE, static_method=True):
+        problems.append("unproven-follower-admission-finalizer")
+    imports = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    scopes = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    for name, origin in {"select": "sqlalchemy.select", "JoinRefusedError": "elspeth.contracts.errors.JoinRefusedError"}.items():
+        if imports.get(name) != origin or _first_fence_dependency_is_rebound(tree, name, scopes):
+            problems.append(f"untrusted-follower-admission-dependency:{name}")
+    return tuple(problems)
+
+
+def _leader_deadline_sources_are_proven(sources: dict[str, str]) -> bool:
+    """Source proof reusable by the mutation gate's subordinate-edge checks.
+
+    The renewal helper requires its caller's full-token admission lock; the
+    registration finalizers require their caller's seat/member locks. This
+    predicate proves the implementations and the leader context's call order.
+    Caller-owned registration lock edges are checked by the mutation gate.
+    """
+    source = sources.get("src/elspeth/core/landscape/run_coordination_repository.py")
+    if source is None:
+        return False
+    tree = ast.parse(source)
+    verifiers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "verify_and_extend_leader_fence"]
+    owners = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "fenced_leader_transaction"]
+    if len(verifiers) != 1 or len(owners) != 1:
+        return False
+    verifier, owner = verifiers[0], owners[0]
+    return (
+        verifier is not None
+        and owner is not None
+        and _decision_clock_source_is_owned(sources)
+        and not _first_fence_contract_violations(source)
+        and not _split_leader_issuance_violations(tree, verifier, owner)
+        and not _leader_registration_contract_violations(source)
+        and not _follower_admission_contract_violations(source)
+    )
+
+
+_WORKER_HEARTBEAT_RECIPE = """
+def worker_heartbeat(self, *, member_token, window_seconds):
+    if not isinstance(member_token, WorkerMembershipToken):
+        raise TypeError("worker heartbeat requires a WorkerMembershipToken")
+    try:
+        with fenced_heartbeat_transaction(self._engine, member_token=member_token, verb="worker_heartbeat") as conn:
+            role = conn.execute(
+                select(run_workers_table.c.role).where(
+                    run_workers_table.c.run_id == member_token.run_id,
+                    run_workers_table.c.worker_id == member_token.worker_id,
+                )
+            ).scalar_one()
+            database_now = read_landscape_decision_time(conn)
+            expires = database_now + timedelta(seconds=window_seconds)
+            conn.execute(
+                update(run_workers_table)
+                .where(run_workers_table.c.run_id == member_token.run_id, run_workers_table.c.worker_id == member_token.worker_id)
+                .values(heartbeat_expires_at=expires)
+            )
+            record_issued_deadline(conn, key=_worker_deadline_key(run_id=member_token.run_id, worker_id=member_token.worker_id), expires_at=expires, window_seconds=window_seconds)
+            leader_renewed = False
+            if role == "leader":
+                renewed = conn.execute(
+                    update(run_coordination_table)
+                    .where(run_coordination_table.c.run_id == member_token.run_id, run_coordination_table.c.leader_worker_id == member_token.worker_id)
+                    .values(leader_heartbeat_expires_at=expires, updated_at=database_now)
+                )
+                leader_renewed = renewed.rowcount == 1
+            seat = conn.execute(
+                select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch,
+                       (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label("seat_live"))
+                .where(run_coordination_table.c.run_id == member_token.run_id)
+            ).one_or_none()
+            if seat is None:
+                raise AuditIntegrityError(f"Run {member_token.run_id!r} has no run_coordination seat row; "
+                                          "worker registration requires a seat created atomically by begin_run.")
+            if leader_renewed:
+                record_issued_deadline(conn, key=DeadlineKey(DeadlineKind.LEADER, (member_token.run_id, member_token.worker_id, str(seat.leader_epoch))), expires_at=expires, window_seconds=window_seconds)
+    except RunMembershipLostError:
+        _record_best_effort_event(self._engine, run_id=member_token.run_id, event_type="fence_refusal", worker_id=member_token.worker_id,
+                                  leader_epoch=None, recorded_at=datetime.now(UTC), context={"verb": "worker_heartbeat", "fence": "membership"})
+        return WorkerMembershipLost(member_token=member_token)
+    return CoordinationSnapshot(leader_worker_id=seat.leader_worker_id, leader_epoch=int(seat.leader_epoch),
+                                seat_live=seat.leader_worker_id is not None and bool(seat.seat_live), worker_active=True, worker_role=role)
+"""
+
+
+def _worker_heartbeat_contract_violations(source: str) -> tuple[str, ...]:
+    """Verify paired deadlines and register only the seat actually renewed."""
+    tree = ast.parse(source)
+    problems = list(_leader_registration_contract_violations(source))
+    if not _clock_recipe_matches(tree, "worker_heartbeat", _WORKER_HEARTBEAT_RECIPE, instance_method=True):
+        problems.append("unproven-worker-heartbeat-issuance")
+    imports = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    scopes = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    for name, origin in {
+        "WorkerMembershipToken": "elspeth.contracts.coordination.WorkerMembershipToken",
+        "WorkerMembershipLost": "elspeth.contracts.coordination.WorkerMembershipLost",
+        "CoordinationSnapshot": "elspeth.contracts.coordination.CoordinationSnapshot",
+        "RunMembershipLostError": "elspeth.contracts.errors.RunMembershipLostError",
+        "select": "sqlalchemy.select",
+        "datetime": "datetime.datetime",
+        "UTC": "datetime.UTC",
+    }.items():
+        if imports.get(name) != origin or _first_fence_dependency_is_rebound(tree, name, scopes):
+            problems.append(f"untrusted-worker-heartbeat-dependency:{name}")
+    for builtin in ("isinstance", "TypeError", "bool", "int", "str"):
+        if _lexical_binding_sites(tree).get(builtin) or any(_lexical_binding_sites(scope).get(builtin) for scope in scopes):
+            problems.append(f"untrusted-worker-heartbeat-dependency:{builtin}")
+    return tuple(problems)
+
+
+def _worker_registration_contract_violations(source: str) -> tuple[str, ...]:
+    """Prove the worker INSERT and every direct caller's shared sample.
+
+    This is a closed caller set, not a parameter annotation granting clock
+    authority. A fresh sample must dominate the call on the same connection;
+    role, identity, duration and admission provenance are forwarded exactly.
+    """
+    tree = ast.parse(source)
+    problems: list[str] = []
+    if not _clock_recipe_matches(tree, "_insert_worker_row", _WORKER_INSERT_RECIPE, static_method=True):
+        problems.append("unproven-worker-registration-insert")
+    if not _clock_recipe_matches(tree, "_worker_deadline_key", _DEADLINE_KEY_RECIPES):
+        problems.append("unproven-worker-registration-key")
+    parents = {id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    expected_callers = {
+        "register_run_leader_on": ("leader", "entry_point"),
+        "_acquire_run_leadership_on": ("leader", "entry_point"),
+        "_acquire_export_leadership_on": ("leader", '"export"'),
+        "admit_follower": ("follower", '"join"'),
+    }
+    observed: set[str] = set()
+    references = [node for node in ast.walk(tree) if isinstance(node, ast.Attribute) and node.attr == "_insert_worker_row"]
+    for reference in references:
+        call = parents[id(reference)]
+        owner = call
+        while not isinstance(owner, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            owner = parents[id(owner)]
+        if not isinstance(owner, ast.FunctionDef) or owner.name not in expected_callers or owner.name in observed:
+            problems.append("unknown-or-repeated-worker-registration-caller")
+            continue
+        observed.add(owner.name)
+        if owner.decorator_list:
+            problems.append("decorated-worker-registration-caller")
+        container = parents[id(owner)]
+        if not isinstance(container, ast.ClassDef) or container.name != "RunCoordinationRepository":
+            problems.append("foreign-worker-registration-receiver")
+        role, entry = expected_callers[owner.name]
+        expected = ast.parse(
+            f'self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role="{role}", '
+            f"window_seconds=window_seconds, entry_point={entry}, database_now=database_now)",
+            mode="eval",
+        ).body
+        if (
+            not isinstance(call, ast.Call)
+            or call.func is not reference
+            or ast.dump(call, include_attributes=False) != ast.dump(expected, include_attributes=False)
+        ):
+            problems.append("worker-registration-sample-or-subject-forwarding")
+            continue
+        assignments = [
+            node
+            for node in _scoped_nodes(owner)
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "database_now"
+        ]
+        bindings = _lexical_binding_sites(owner)
+        if any(len(bindings.get(name, [])) != 1 for name in ("self", "run_id", "worker_id", "window_seconds")):
+            problems.append("worker-registration-rebound-subject")
+        sample_shape = ast.dump(ast.parse("read_landscape_decision_time(conn)", mode="eval").body, include_attributes=False)
+        if (
+            len(assignments) != 1
+            or len(bindings.get("database_now", [])) != 1
+            or ast.dump(assignments[0].value, include_attributes=False) != sample_shape
+        ):
+            problems.append("worker-registration-unproven-caller-clock")
+            continue
+        if len(bindings.get("conn", [])) != 1:
+            problems.append("worker-registration-rebound-connection")
+        sample = assignments[0]
+        sample_parent = parents[id(sample)]
+        dominating = False
+        branch: ast.AST = call
+        while branch is not owner:
+            parent = parents[id(branch)]
+            if parent is sample_parent:
+                for _field, items in ast.iter_fields(parent):
+                    if isinstance(items, list) and sample in items and branch in items and items.index(sample) < items.index(branch):
+                        dominating = True
+            branch = parent
+        if not dominating:
+            problems.append("worker-registration-sample-does-not-dominate")
+    if observed != set(expected_callers):
+        problems.append("worker-registration-caller-inventory")
+    imports = {
+        alias.asname or alias.name: f"{node.module}.{alias.name}"
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    imports.update({alias.asname or alias.name: alias.name for node in tree.body if isinstance(node, ast.Import) for alias in node.names})
+    scopes = tuple(node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)))
+    for name, origin in {
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "DeadlineKey": "elspeth.core.landscape.lease_deadlines.DeadlineKey",
+        "DeadlineKind": "elspeth.core.landscape.lease_deadlines.DeadlineKind",
+        "timedelta": "datetime.timedelta",
+        "insert": "sqlalchemy.insert",
+        "run_workers_table": "elspeth.core.landscape.schema.run_workers_table",
+        "os": "os",
+        "socket": "socket",
+    }.items():
+        if imports.get(name) != origin or _first_fence_dependency_is_rebound(tree, name, scopes):
+            problems.append(f"untrusted-worker-registration-dependency:{name}")
+    return tuple(problems)
+
+
+def _worker_registration_sources_are_proven(sources: dict[str, str]) -> bool:
+    """Only the reviewed admission callers may supply the INSERT's clock."""
+    path = "src/elspeth/core/landscape/run_coordination_repository.py"
+    source = sources.get(path)
+    if source is None or _worker_registration_contract_violations(source) or not _decision_clock_source_is_owned(sources):
+        return False
+    if any(isinstance(node, ast.Constant) and node.value == "_insert_worker_row" for node in ast.walk(ast.parse(source))):
+        return False
+    for other_path, other_source in sources.items():
+        if other_path == path:
+            continue
+        for node in ast.walk(ast.parse(other_source)):
+            if (
+                (isinstance(node, ast.Attribute) and node.attr == "_insert_worker_row")
+                or (isinstance(node, ast.Name) and node.id == "_insert_worker_row")
+                or (isinstance(node, ast.Constant) and node.value == "_insert_worker_row")
+            ):
+                return False
+    return True
+
+
 _GOOD_FENCE_SOURCE = """
 def verify_and_extend_leader_fence(conn, *, token, window_seconds, verb):
     result = conn.execute(
@@ -3931,6 +4675,522 @@ def fenced_leader_transaction(engine, *, token, window_seconds, verb):
 
 def test_first_fence_shape_accepts_exact_positive_control() -> None:
     assert _first_fence_contract_violations(_GOOD_FENCE_SOURCE) == ()
+
+
+def _split_fence_source() -> str:
+    """A full-token admission CAS followed by separately sampled issuance."""
+    source = _GOOD_FENCE_SOURCE.replace(
+        "leader_heartbeat_expires_at=func.current_timestamp() + window_seconds,\n            updated_at=func.current_timestamp(),",
+        "leader_epoch=run_coordination_table.c.leader_epoch,",
+    ).replace(
+        "        raise RunLeadershipLostError()\n",
+        "        raise RunLeadershipLostError(run_id=token.run_id, worker_id=token.worker_id, leader_epoch=token.leader_epoch, verb=verb)\n"
+        "    _renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)\n",
+    )
+    source = source.replace(
+        "        yield conn\n",
+        "        yield conn\n"
+        "        if has_issued_deadline(conn, key=_leader_deadline_key(token)):\n"
+        "            _renew_leader_deadline_on(conn, token=token, window_seconds=window_seconds, verb=verb)\n",
+    )
+    imports = """
+from datetime import timedelta
+from sqlalchemy import select, update
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError
+from elspeth.core.landscape.database import begin_write
+from elspeth.contracts.errors import JoinRefusedError
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.schema import run_coordination_table, run_workers_table
+from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, has_issued_deadline, record_issued_deadline
+"""
+    finalizer = "class RunCoordinationRepository:\n    @staticmethod\n" + "\n".join(
+        "    " + line for line in _LEADER_REGISTRATION_RECIPE.strip().splitlines()
+    )
+    finalizer += "\n\n    @staticmethod\n" + "\n".join("    " + line for line in _FOLLOWER_ADMISSION_RECIPE.strip().splitlines())
+    return imports + source + _LEADER_RENEWAL_RECIPE + _DEADLINE_KEY_RECIPES + "\n" + finalizer + "\n"
+
+
+def test_split_first_fence_accepts_identity_cas_before_fresh_issuance() -> None:
+    assert _first_fence_contract_violations(_split_fence_source()) == ()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("leader_epoch=run_coordination_table.c.leader_epoch,", "leader_epoch=token.leader_epoch + 1,"),
+        ("read_landscape_decision_time(conn)", "read_landscape_transaction_time(conn)"),
+        ("read_landscape_decision_time(conn)", "read_landscape_decision_time(other)"),
+        ("read_landscape_decision_time(conn)", "func.clock_timestamp()"),
+        ("database_now + timedelta(seconds=window_seconds)", "database_now + timedelta(seconds=1)"),
+        ("updated_at=database_now", "updated_at=func.current_timestamp()"),
+        ("leader_heartbeat_expires_at=expires", "leader_heartbeat_expires_at=foreign"),
+        ("renewed.rowcount != 1", "renewed.rowcount == 0"),
+        ("record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)", "pass"),
+        ("expires_at=expires, window_seconds=window_seconds", "expires_at=foreign, window_seconds=window_seconds"),
+        ("expires_at=expires, window_seconds=window_seconds", "expires_at=expires, window_seconds=1"),
+        ("record_issued_deadline(conn,", "record_issued_deadline(other,"),
+        ("if has_issued_deadline(conn, key=_leader_deadline_key(token)):", "if True:"),
+        (
+            "if has_issued_deadline(conn, key=_leader_deadline_key(token)):",
+            "if has_issued_deadline(other, key=_leader_deadline_key(token)):",
+        ),
+        (
+            "if has_issued_deadline(conn, key=_leader_deadline_key(token)):",
+            "if has_issued_deadline(conn, key=_leader_deadline_key(other)):",
+        ),
+        ("        yield conn\n        if has_issued_deadline", "        return\n        yield conn\n        if has_issued_deadline"),
+        ("DeadlineKind.LEADER, (token.run_id, token.worker_id, str(token.leader_epoch))", "DeadlineKind.LEADER, (token.run_id,)"),
+        ("DeadlineKind.LEADER", "DeadlineKind.WORKER"),
+        ("def _renew_leader_deadline_on", "@foreign\ndef _renew_leader_deadline_on"),
+        ("from elspeth.core.landscape.database_clock import", "from attacker import"),
+        ("from elspeth.core.landscape.lease_deadlines import", "from attacker import"),
+    ],
+    ids=[
+        "epoch-change",
+        "stale-sample",
+        "foreign-clock-connection",
+        "inline-clock",
+        "wrong-window",
+        "split-stamps",
+        "foreign-expiry",
+        "rowcount",
+        "missing-registration",
+        "wrong-registered-expiry",
+        "wrong-registered-window",
+        "foreign-registration-connection",
+        "unconditional-tail",
+        "foreign-tail-connection",
+        "foreign-tail-token",
+        "unreachable-yield",
+        "incomplete-key",
+        "wrong-kind",
+        "decorated-renewal",
+        "foreign-clock-import",
+        "foreign-register-import",
+    ],
+)
+def test_split_first_fence_rejects_issuance_and_tail_bypasses(old: str, new: str) -> None:
+    source = _split_fence_source()
+    assert old in source
+    assert _first_fence_contract_violations(source.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "_renew_leader_deadline_on = foreign",
+        "_renew_leader_deadline_on.__code__ = foreign.__code__",
+        "alias = _renew_leader_deadline_on\nalias.__code__ = foreign.__code__",
+        "_leader_deadline_key = foreign",
+        "globals()['record_issued_deadline'] = foreign",
+        "str = foreign",
+    ],
+)
+def test_split_first_fence_rejects_dependency_rebinding(mutation: str) -> None:
+    assert _first_fence_contract_violations(_split_fence_source() + "\n" + mutation)
+
+
+def test_split_first_fence_refuses_fresh_sample_before_admission() -> None:
+    source = _split_fence_source().replace(
+        "def verify_and_extend_leader_fence(conn, *, token, window_seconds, verb):\n",
+        "def verify_and_extend_leader_fence(conn, *, token, window_seconds, verb):\n    before_lock = read_landscape_decision_time(conn)\n",
+    )
+    assert _first_fence_contract_violations(source)
+
+
+def test_paired_registration_finalizer_accepts_exact_positive_control() -> None:
+    assert _leader_registration_contract_violations(_split_fence_source()) == ()
+
+
+def test_follower_admission_finalizer_and_combined_source_proof_positive_control() -> None:
+    source = _split_fence_source()
+    assert _follower_admission_contract_violations(source) == ()
+    assert _leader_deadline_sources_are_proven(
+        {_DECISION_CLOCK_MODULE: _DECISION_CLOCK_CONTROL, "src/elspeth/core/landscape/run_coordination_repository.py": source}
+    )
+
+
+def _worker_registration_source() -> str:
+    source = "import os\nimport socket\nfrom sqlalchemy import insert\n" + _split_fence_source()
+    source += "\n    @staticmethod\n" + "\n".join("    " + line for line in _WORKER_INSERT_RECIPE.strip().splitlines()) + "\n"
+    for name, role, entry in (
+        ("register_run_leader_on", "leader", "entry_point"),
+        ("_acquire_run_leadership_on", "leader", "entry_point"),
+        ("_acquire_export_leadership_on", "leader", '"export"'),
+        ("admit_follower", "follower", '"join"'),
+    ):
+        source += (
+            f"\n    def {name}(self, conn, *, run_id, worker_id, window_seconds, entry_point):\n"
+            "        database_now = read_landscape_decision_time(conn)\n"
+            f'        self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role="{role}", '
+            f"window_seconds=window_seconds, entry_point={entry}, database_now=database_now)\n"
+        )
+    return source
+
+
+def test_worker_registration_source_and_all_callers_share_exact_sample_positive_control() -> None:
+    assert _worker_registration_contract_violations(_worker_registration_source()) == ()
+
+
+def _worker_heartbeat_source() -> str:
+    source = (
+        "from datetime import UTC, datetime\n"
+        "from elspeth.contracts.coordination import WorkerMembershipToken, WorkerMembershipLost, CoordinationSnapshot\n"
+        "from elspeth.contracts.errors import RunMembershipLostError\n"
+    ) + _split_fence_source()
+    source += "\n" + "\n".join("    " + line for line in _WORKER_HEARTBEAT_RECIPE.strip().splitlines()) + "\n"
+    return source
+
+
+def test_worker_heartbeat_paired_issuance_positive_control() -> None:
+    assert _worker_heartbeat_contract_violations(_worker_heartbeat_source()) == ()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('if role == "leader":', 'if role == "follower":'),
+        ("leader_renewed = renewed.rowcount == 1", "leader_renewed = True"),
+        ("if leader_renewed:", "if True:"),
+        ("str(seat.leader_epoch)", '"1"'),
+        ("member_token.worker_id, str(seat.leader_epoch)", "other.worker_id, str(seat.leader_epoch)"),
+        ("heartbeat_expires_at=expires", "heartbeat_expires_at=expires + timedelta(seconds=1)"),
+        ("database_now = read_landscape_decision_time(conn)", "database_now = read_landscape_transaction_time(conn)"),
+        ("fenced_heartbeat_transaction(self._engine", "fenced_heartbeat_transaction(other"),
+        ("if seat is None:", "if False:"),
+        ("return WorkerMembershipLost(member_token=member_token)", "return WorkerMembershipLost(member_token=other)"),
+        ("worker_active=True", "worker_active=False"),
+    ],
+)
+def test_worker_heartbeat_refuses_paired_deadline_or_registration_drift(old: str, new: str) -> None:
+    source = _worker_heartbeat_source()
+    assert old in source
+    assert _worker_heartbeat_contract_violations(source.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("database_now=database_now)", "database_now=foreign)"),
+        ("self._insert_worker_row(conn,", "self._insert_worker_row(other,"),
+        ("database_now = read_landscape_decision_time(conn)", "database_now = read_landscape_transaction_time(conn)"),
+        ("database_now = read_landscape_decision_time(conn)", "database_now = supplied"),
+        (
+            "        database_now = read_landscape_decision_time(conn)",
+            "        if flag:\n            database_now = read_landscape_decision_time(conn)",
+        ),
+        ("        self._insert_worker_row", "        database_now = supplied\n        self._insert_worker_row"),
+        ("        self._insert_worker_row", "        conn = other\n        self._insert_worker_row"),
+        ("        self._insert_worker_row", "        worker_id = other_id\n        self._insert_worker_row"),
+        ("    def admit_follower", "    @foreign\n    def admit_follower"),
+        ("def admit_follower", "def another_caller"),
+        ("pid=os.getpid()", "pid=foreign()"),
+        ("heartbeat_expires_at=expires,", "heartbeat_expires_at=database_now,"),
+    ],
+)
+def test_worker_registration_source_refuses_unproven_sample_or_caller(old: str, new: str) -> None:
+    source = _worker_registration_source()
+    assert old in source
+    assert _worker_registration_contract_violations(source.replace(old, new))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "RunCoordinationRepository._finalize_leader_registration_on = foreign",
+        "alias = RunCoordinationRepository\nalias._finalize_leader_registration_on = foreign",
+        "setattr(RunCoordinationRepository, '_finalize_follower_admission_on', foreign)",
+        "def mutate():\n    RunCoordinationRepository._finalize_leader_registration_on = foreign",
+    ],
+)
+def test_registration_source_proof_refuses_class_method_mutation(mutation: str) -> None:
+    assert _leader_registration_contract_violations(_split_fence_source() + "\n" + mutation)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "run_coordination_table.c.leader_heartbeat_expires_at >= database_now",
+            "run_coordination_table.c.leader_heartbeat_expires_at >= foreign",
+        ),
+        ("if live_seat is None:", "if False:"),
+        ('run_workers_table.c.role == "follower"', 'run_workers_table.c.role == "leader"'),
+        ("run_workers_table.c.worker_id == worker_id", "run_workers_table.c.worker_id == other_id"),
+        ("run_workers_table.c.run_id == run_id", "run_workers_table.c.run_id == other_run"),
+        ("key=_worker_deadline_key(run_id=run_id, worker_id=worker_id)", "key=_worker_deadline_key(run_id=run_id, worker_id=other_id)"),
+        ("from elspeth.contracts.errors import JoinRefusedError", "from attacker import JoinRefusedError"),
+    ],
+)
+def test_follower_admission_finalizer_refuses_lost_seat_or_foreign_membership(old: str, new: str) -> None:
+    source = _split_fence_source()
+    assert old in source
+    assert _follower_admission_contract_violations(source.replace(old, new))
+
+
+def test_combined_source_proof_refuses_rebound_decision_helper_body() -> None:
+    assert not _leader_deadline_sources_are_proven(
+        {
+            _DECISION_CLOCK_MODULE: _DECISION_CLOCK_CONTROL.replace("func.clock_timestamp()", "func.current_timestamp()"),
+            "src/elspeth/core/landscape/run_coordination_repository.py": _split_fence_source(),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("run_workers_table.c.run_id == token.run_id", "run_workers_table.c.run_id == other.run_id"),
+        ("run_workers_table.c.worker_id == token.worker_id", "run_workers_table.c.worker_id == other.worker_id"),
+        ('run_workers_table.c.status == "active"', 'run_workers_table.c.status == "departed"'),
+        ('run_workers_table.c.role == "leader"', 'run_workers_table.c.role == "follower"'),
+        ("heartbeat_expires_at=expires)", "heartbeat_expires_at=expires + timedelta(seconds=1))"),
+        ("if member.rowcount != 1:", "if False:"),
+        (
+            "key=_worker_deadline_key(run_id=token.run_id, worker_id=token.worker_id)",
+            "key=_worker_deadline_key(run_id=token.run_id, worker_id=other.worker_id)",
+        ),
+        ("read_landscape_decision_time(conn)", "read_landscape_transaction_time(conn)"),
+        ("    @staticmethod\n", "    @foreign\n"),
+        ("DeadlineKind.WORKER, (run_id, worker_id)", "DeadlineKind.WORKER, (run_id, other_id)"),
+        ("from elspeth.core.landscape.lease_deadlines import", "from attacker import"),
+    ],
+    ids=[
+        "foreign-run",
+        "foreign-worker",
+        "revive-member",
+        "wrong-role",
+        "divergent-expiry",
+        "ignored-cas",
+        "wrong-registration-key",
+        "stale-sample",
+        "decorator",
+        "key-body",
+        "foreign-register",
+    ],
+)
+def test_paired_registration_finalizer_refuses_authority_or_deadline_drift(old: str, new: str) -> None:
+    source = _split_fence_source()
+    assert old in source
+    assert _leader_registration_contract_violations(source.replace(old, new))
+
+
+def _fresh_clock_control_sources() -> dict[str, str]:
+    return {
+        _DECISION_CLOCK_MODULE: _DECISION_CLOCK_CONTROL,
+        "src/elspeth/core/landscape/decision_writer.py": """
+from datetime import timedelta
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.schema import token_work_items_table
+
+def renew_lease(conn, lease_seconds):
+    decision = read_landscape_decision_time(conn)
+    conn.execute(token_work_items_table.update().values(lease_expires_at=decision + timedelta(seconds=lease_seconds)))
+""",
+    }
+
+
+def test_fresh_clock_provenance_requires_owned_body_positive_control() -> None:
+    sources = _fresh_clock_control_sources()
+    assert _decision_clock_source_is_owned(sources)
+    assert _scan_sources(sources) == ()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("func.clock_timestamp()", "func.current_timestamp()"),
+        ("conn.scalar(func.clock_timestamp())", "other.scalar(func.clock_timestamp())"),
+        ("func.clock_timestamp()", "datetime.now(UTC)"),
+        ('"%Y-%m-%d %H:%M:%f"', '"%Y-%m-%d %H:%M:%S"'),
+        ('"now", type_=DateTime()', '"now", "+1 hour", type_=DateTime()'),
+        ("return stamped.astimezone(UTC)", "return stamped"),
+        ("stamped.tzinfo is None", "stamped.tzinfo is not None"),
+        (" or stamped.utcoffset() is None", ""),
+        ("return stamped.replace(tzinfo=UTC)", "return datetime.now(UTC)"),
+        ("def read_landscape_decision_time(conn):", "@foreign\ndef read_landscape_decision_time(conn):"),
+        ("def read_landscape_decision_time(conn):", "def read_landscape_decision_time(conn=foreign()):"),
+        ("from sqlalchemy import DateTime, func", "from attacker import DateTime, func"),
+        ("{type(stamped).__name__}", "{foreign()}"),
+    ],
+    ids=[
+        "transaction-time",
+        "other-connection",
+        "process-time",
+        "seconds-only",
+        "offset",
+        "naive-return",
+        "wrong-guard",
+        "missing-offset-guard",
+        "sqlite-process",
+        "decorator",
+        "default",
+        "imports",
+        "refusal-effect",
+    ],
+)
+def test_fresh_clock_provenance_refuses_changed_implementation(old: str, new: str) -> None:
+    sources = _fresh_clock_control_sources()
+    assert old in sources[_DECISION_CLOCK_MODULE]
+    sources[_DECISION_CLOCK_MODULE] = sources[_DECISION_CLOCK_MODULE].replace(old, new)
+    assert not _decision_clock_source_is_owned(sources)
+    assert _scan_sources(sources)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "read_landscape_decision_time = foreign",
+        "read_landscape_decision_time.__code__ = foreign.__code__",
+        "alias = read_landscape_decision_time\nalias.__code__ = foreign.__code__",
+        "globals()['read_landscape_decision_time'] = foreign",
+        "namespace = globals()\nnamespace['func'] = foreign",
+        "setattr(read_landscape_decision_time, '__code__', foreign.__code__)",
+        "def replace_helper():\n    global read_landscape_decision_time\n    read_landscape_decision_time = foreign",
+        "class Mutator:\n    read_landscape_decision_time.__code__ = foreign.__code__",
+        "type = foreign",
+        "DateTime = foreign",
+    ],
+)
+def test_fresh_clock_provenance_refuses_dependency_mutation(mutation: str) -> None:
+    sources = _fresh_clock_control_sources()
+    sources[_DECISION_CLOCK_MODULE] += "\n" + mutation + "\n"
+    assert not _decision_clock_source_is_owned(sources)
+
+
+def test_fresh_clock_provenance_refuses_missing_or_foreign_module() -> None:
+    sources = _fresh_clock_control_sources()
+    helper = sources.pop(_DECISION_CLOCK_MODULE)
+    assert _scan_sources(sources)
+    sources["src/elspeth/core/landscape/untrusted_clock.py"] = helper
+    writer = "src/elspeth/core/landscape/decision_writer.py"
+    sources[writer] = sources[writer].replace("landscape.database_clock", "landscape.untrusted_clock")
+    assert _scan_sources(sources)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "read_landscape_decision_time.__code__ = foreign.__code__",
+        "alias = read_landscape_decision_time\nalias.__code__ = foreign.__code__",
+        "def mutate():\n    read_landscape_decision_time.__code__ = foreign.__code__",
+    ],
+)
+def test_fresh_clock_provenance_refuses_consumer_mutating_imported_helper(mutation: str) -> None:
+    sources = _fresh_clock_control_sources()
+    sources["src/elspeth/core/landscape/decision_writer.py"] += "\n" + mutation
+    assert not _decision_clock_source_is_owned(sources)
+    assert _scan_sources(sources)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "from elspeth.core.landscape import database_clock as clock_module\n"
+        "clock_module.read_landscape_decision_time.__code__ = foreign.__code__",
+        "import elspeth.core.landscape as landscape\nlandscape.database_clock.read_landscape_decision_time.__code__ = foreign.__code__",
+        "def mutate():\n"
+        "    from elspeth.core.landscape.database_clock import read_landscape_decision_time as clock\n"
+        "    clock.__code__ = foreign.__code__",
+        "class Mutator:\n"
+        "    from elspeth.core.landscape import database_clock as clock\n"
+        "    clock.read_landscape_decision_time.__code__ = foreign.__code__",
+        "from elspeth.core.landscape.database_clock import read_landscape_decision_time as clock\n"
+        "local = clock\n"
+        "def mutate():\n"
+        "    local.__code__ = foreign.__code__",
+    ],
+)
+def test_fresh_clock_provenance_refuses_nested_and_ancestor_import_mutation(mutation: str) -> None:
+    sources = _fresh_clock_control_sources()
+    sources["src/elspeth/core/landscape/mutation.py"] = mutation
+    assert not _decision_clock_source_is_owned(sources)
+    assert _scan_sources(sources)
+
+
+def test_fresh_clock_name_cannot_downgrade_to_an_ordinary_transaction_clock_wrapper() -> None:
+    sources = _fresh_clock_control_sources()
+    sources[_DECISION_CLOCK_MODULE] = (
+        "from sqlalchemy import func\ndef read_landscape_decision_time(conn):\n    return conn.scalar(func.current_timestamp())\n"
+    )
+    assert not _decision_clock_source_is_owned(sources)
+    assert _scan_sources(sources)
+
+
+@pytest.mark.parametrize("mutation", ["none", "caller-sample", "missing-clock", "extra-caller", "reflective-caller"])
+def test_worker_insert_parameter_clock_requires_complete_source_proof(mutation: str) -> None:
+    sources = _fresh_clock_control_sources()
+    path = "src/elspeth/core/landscape/run_coordination_repository.py"
+    sources[path] = _worker_registration_source()
+    if mutation == "caller-sample":
+        sources[path] = sources[path].replace("database_now = read_landscape_decision_time(conn)", "database_now = foreign_clock()")
+    elif mutation == "missing-clock":
+        del sources[_DECISION_CLOCK_MODULE]
+    elif mutation == "extra-caller":
+        sources["src/elspeth/core/landscape/extra.py"] = "def extra(repo, conn, now):\n    repo._insert_worker_row(conn, database_now=now)"
+    elif mutation == "reflective-caller":
+        sources["src/elspeth/core/landscape/extra.py"] = (
+            "def extra(repo, conn, now):\n    getattr(repo, '_insert_worker_row')(conn, database_now=now)"
+        )
+    expected = mutation == "none"
+    assert _worker_registration_sources_are_proven(sources) is expected
+    violations = [
+        violation
+        for violation in _scan_sources(sources)
+        if violation.path == path and violation.symbol == "RunCoordinationRepository._insert_worker_row"
+    ]
+    if expected:
+        assert not violations
+    else:
+        assert {violation.kind for violation in violations} >= {"caller-clock-authority", "missing-database-time"}
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["token = other", "window_seconds = 999", "engine = foreign", "verb = 'other'"],
+)
+def test_split_first_fence_rejects_rebound_owner_authority_inputs(mutation: str) -> None:
+    source = _split_fence_source().replace("    with begin_write(engine)", f"    {mutation}\n    with begin_write(engine)")
+    assert _first_fence_contract_violations(source)
+
+
+def test_split_first_fence_requires_owned_transaction_import() -> None:
+    source = _split_fence_source().replace("from elspeth.core.landscape.database import begin_write", "")
+    assert _first_fence_contract_violations(source)
+
+
+def test_combined_source_proof_requires_split_issuance_even_with_registration_helpers() -> None:
+    sources = _fresh_clock_control_sources()
+    source = _split_fence_source()
+    tree = ast.parse(source)
+    verifier = _function(tree, "verify_and_extend_leader_fence")
+    assert verifier is not None
+    legacy = _function(ast.parse(_GOOD_FENCE_SOURCE), "verify_and_extend_leader_fence")
+    assert legacy is not None
+    source = source.replace(ast.get_source_segment(source, verifier), ast.unparse(legacy))
+    sources["src/elspeth/core/landscape/run_coordination_repository.py"] = source
+    assert not _leader_deadline_sources_are_proven(sources)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "alias = RunCoordinationRepository\ndef mutate():\n    alias._finalize_leader_registration_on = foreign",
+        "alias = _renew_leader_deadline_on\ndef mutate():\n    alias.__code__ = foreign.__code__",
+        "alias = record_issued_deadline\ndef mutate():\n    alias.__code__ = foreign.__code__",
+    ],
+)
+def test_combined_source_proof_refuses_captured_recipe_and_dependency_mutation(mutation: str) -> None:
+    sources = _fresh_clock_control_sources()
+    sources["src/elspeth/core/landscape/run_coordination_repository.py"] = _split_fence_source() + "\n" + mutation
+    assert not _leader_deadline_sources_are_proven(sources)
+
+
+def test_fresh_clock_does_not_admit_inline_clock_timestamp_at_deadline_sink() -> None:
+    sources = _fresh_clock_control_sources()
+    writer = "src/elspeth/core/landscape/decision_writer.py"
+    sources[writer] = sources[writer].replace("decision = read_landscape_decision_time(conn)", "decision = func.clock_timestamp()")
+    assert _scan_sources(sources)
 
 
 _NOMINAL_FENCE_SOURCE = "from elspeth.contracts.coordination import CoordinationToken\n" + _GOOD_FENCE_SOURCE.replace(
@@ -6558,6 +7818,26 @@ def test_first_leader_fence_statement_uses_database_time_and_full_token() -> Non
     path = _ROOT / "src/elspeth/core/landscape/run_coordination_repository.py"
     violations = _first_fence_contract_violations(path.read_text(encoding="utf-8"))
     assert violations == (), "first Landscape fence contract violations: " + ", ".join(violations)
+
+
+def test_production_leader_deadline_issuance_is_source_proven() -> None:
+    sources = {
+        source_file.relative_to(_ROOT).as_posix(): source_file.read_text(encoding="utf-8")
+        for source_file in iter_gate_files(_ROOT / "src/elspeth")
+    }
+    assert _leader_deadline_sources_are_proven(sources), "leader deadline source provenance or split issuance contract drifted"
+
+
+def test_production_worker_registration_deadlines_are_source_proven() -> None:
+    source = (_ROOT / "src/elspeth/core/landscape/run_coordination_repository.py").read_text(encoding="utf-8")
+    violations = _worker_registration_contract_violations(source)
+    assert not violations, "worker registration source contract drifted: " + ", ".join(violations)
+
+
+def test_production_worker_heartbeat_deadlines_are_source_proven() -> None:
+    source = (_ROOT / "src/elspeth/core/landscape/run_coordination_repository.py").read_text(encoding="utf-8")
+    violations = _worker_heartbeat_contract_violations(source)
+    assert not violations, "worker heartbeat source contract drifted: " + ", ".join(violations)
 
 
 def test_divergent_sessions_and_landscape_clocks_never_cross_production_fence(

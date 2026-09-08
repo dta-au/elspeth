@@ -53,6 +53,14 @@ from pathlib import Path
 
 import pytest
 from tests.helpers.tree_gate import iter_gate_files
+from tests.unit.core.landscape.test_database_clock_authority import (
+    _clock_captured_alias_is_mutated,
+    _clock_lexical_scopes,
+    _leader_deadline_sources_are_proven,
+    _lexical_binding_sites,
+    _worker_heartbeat_contract_violations,
+    _worker_registration_contract_violations,
+)
 
 from elspeth_lints.core.ast_dump import stable_ast_dump
 
@@ -305,9 +313,11 @@ _FRESH_EPOCH_ONE_EXCEPTION = AuthorityEstablishmentException(
     write_counts=(
         ("run_attributions", "insert", 1),
         ("run_coordination", "insert", 1),
+        ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
+        ("run_workers", "update", 1),
         ("runs", "insert", 1),
     ),
     temporary=True,
@@ -321,10 +331,10 @@ _EXISTING_RUN_LEADERSHIP_ESTABLISHMENT = AuthorityEstablishmentException(
     callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
     callee_symbol="RunCoordinationRepository._acquire_run_leadership_on",
     write_counts=(
-        ("run_coordination", "update", 1),
+        ("run_coordination", "update", 2),
         ("run_coordination_events", "insert", 3),
         ("run_workers", "insert", 1),
-        ("run_workers", "update", 1),
+        ("run_workers", "update", 2),
         ("runs", "update", 1),
     ),
     temporary=False,
@@ -340,6 +350,7 @@ _FOLLOWER_MEMBERSHIP_ESTABLISHMENT = AuthorityEstablishmentException(
     write_counts=(
         ("run_coordination_events", "insert", 1),
         ("run_workers", "insert", 1),
+        ("run_workers", "update", 1),
     ),
     temporary=False,
     sunset=None,
@@ -352,10 +363,10 @@ _EXPORT_SEAT_ESTABLISHMENT = AuthorityEstablishmentException(
     callee_path="src/elspeth/core/landscape/run_coordination_repository.py",
     callee_symbol="RunCoordinationRepository._acquire_export_leadership_on",
     write_counts=(
-        ("run_coordination", "update", 1),
+        ("run_coordination", "update", 2),
         ("run_coordination_events", "insert", 3),
         ("run_workers", "insert", 1),
-        ("run_workers", "update", 1),
+        ("run_workers", "update", 2),
     ),
     temporary=False,
     sunset=None,
@@ -575,7 +586,7 @@ def _verb_authority_scope(path: str, method: str) -> str:
 # already took an UPDATE through depart_worker and evict_worker, so this is a
 # new construction of an existing write shape, not a new shape. Re-derived from
 # this file's own printed output on the rebased tree, applied and run.
-_EXPECTED_DML_COUNT = 146
+_EXPECTED_DML_COUNT = 150
 # D8.1 (P4-D8 elspeth-43ddb79074): 6ca139a7… → 504d39e2…. Count 139 and the write set
 # unchanged; twelve construction FINGERPRINTS moved because the constructions
 # themselves were rewritten to fence first / execute once: the eleven
@@ -645,7 +656,10 @@ _EXPECTED_DML_COUNT = 146
 # The existing write-shape set is unchanged. Re-derived with scan_dml_identities.
 # Actual INSERT RETURNING cardinality checks and the finalizer's locked follower
 # roster change function fingerprints; the DML count and write-shape set stay unchanged.
-_EXPECTED_DML_INVENTORY_SHA256 = "1049f1f915f9f3bc58fff2efb57df266048dac1dda89842c448109e47c1d5093"
+# Fresh-time renewal and explicit registration finalizers add four DML sites;
+# the approved helper extraction adds seven edges. Table/operation shapes and
+# public caller inventories remain unchanged (measured from the live AST).
+_EXPECTED_DML_INVENTORY_SHA256 = "c3b43f8fe38e43d916e79dc0dddc5c5a5e90bdb6a21df411be77039efe60c0f0"
 _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
     {
         ("aggregation_result_members", "insert"),
@@ -720,8 +734,8 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # and forwards exact member/leader/item authorities through every live caller.
 _EXPECTED_CALL_COUNT = 274
 _EXPECTED_PRODUCTION_CALLER_SHA256 = "92e579b2c4ee6a39a03689c9fd21f52bbfbbb5528876e3541106d97ddb547a6b"
-_EXPECTED_SUBORDINATE_EDGE_COUNT = 129
-_EXPECTED_SUBORDINATE_EDGE_SHA256 = "067fa38b951646c441d308c88aebac61430abfaab29b53cc16fd78955a5c366d"
+_EXPECTED_SUBORDINATE_EDGE_COUNT = 136
+_EXPECTED_SUBORDINATE_EDGE_SHA256 = "0561dddd71e704031510290def021516e75e0d0668316c25a6e659ad2702c6fe"
 _EXPECTED_COORDINATION_CALL_COUNT = 23
 _EXPECTED_COORDINATION_CALL_SHA256 = "214a5dba39b8edea91a2c101f247fd44c1b005765042622fe4f2217260f73090"
 _EXPECTED_INTERNAL_EDGE_COUNT = 88
@@ -2677,6 +2691,14 @@ def _authority_factory_return_contract(
     proof: _AuthorityProof, function: ast.FunctionDef | ast.AsyncFunctionDef, resolver: _Resolver, scope: str
 ) -> bool:
     """Check actual returned subjects of the three established factory APIs."""
+    key = (resolver.unit.path, _symbol(function))
+    expected_scope = {
+        "RunCoordinationRepository.acquire_run_leadership": _LEADER_SCOPE,
+        "RunCoordinationRepository.acquire_export_leadership": _LEADER_SCOPE,
+        "RunCoordinationRepository.admit_follower": _MEMBER_SCOPE,
+    }.get(key[1])
+    if expected_scope == scope and key in _proven_coordination_deadline_writers(proof.units):
+        return True
     path = "src/elspeth/core/landscape/run_coordination_repository.py"
     scopes = {
         "RunCoordinationRepository.acquire_run_leadership": _LEADER_SCOPE,
@@ -5946,7 +5968,13 @@ def _database_effect_calls(node: ast.FunctionDef | ast.AsyncFunctionDef) -> tupl
                 for child in _walk_same_scope(node)
                 if isinstance(child, ast.Call)
                 and (
-                    _resolved_callable_name(child.func, resolver, use=child) in effect_names or _indirect_dml_execution(child, resolver)[0]
+                    _resolved_callable_name(child.func, resolver, use=child) in effect_names
+                    or resolver.qualified_name(child.func, use=child)
+                    in {
+                        "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+                        "elspeth.core.landscape.database_clock.read_landscape_transaction_time",
+                    }
+                    or _indirect_dml_execution(child, resolver)[0]
                 )
                 and not (
                     _resolved_callable_name(child.func, resolver, use=child) == "scalar"
@@ -7040,11 +7068,3031 @@ def _non_run_writer_violation(node: ast.FunctionDef | ast.AsyncFunctionDef, dml:
     return None
 
 
+# Closed executable-source binding for the reviewed registry and journal
+# dependency graph. This proves equality to the implementation validated by
+# real database controls; it does not replace issuer lock/caller proofs.
+# Rebinding requires semantic review and applicable mutation/runtime controls.
+_REVIEWED_REGISTRY_MODULES = {
+    # Nominal identities, outer-transaction ownership, exact issued expiry,
+    # reserve arithmetic, no renewal DML/callbacks, and physical rollback.
+    "src/elspeth/core/landscape/lease_deadlines.py": "44de6eafb463b54cdb75087ca45a41eb4259bec4122a3eff44a1045af7c3f009",
+    # Separate fresh database sample, dialect-specific shape/UTC validation.
+    "src/elspeth/core/landscape/database_clock.py": "e9c23dc544de396b4dab3421dba030908898eda27da4685b82c7b042ec909e65",
+    # Guard registration after serialization/outbox INSERT; precommit failure
+    # cleanup, transitive serialization helpers, and postcommit drain ordering.
+    "src/elspeth/core/landscape/journal.py": "96162bebbae30b8eaf5d26a2b9ae1ce48101e0cbc5983468af8824ab958e4ddc",
+    # Installation in both engine constructors and bare-engine begin_write;
+    # transaction ownership and engine/Connection event setup are also bound.
+    "src/elspeth/core/landscape/database.py": "a41206e20766c46a54831b529f229b395060fd1588b923b2240d248d99786d5a",
+}
+
+
+def _registry_executable_ast(source: str) -> str:
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and (
+            node.body
+            and isinstance(node.body[0], ast.Expr)
+            and isinstance(node.body[0].value, ast.Constant)
+            and isinstance(node.body[0].value.value, str)
+        ):
+            del node.body[0]
+    return stable_ast_dump(tree)
+
+
+def _issued_deadline_registry_source_is_proven(sources: dict[str, str]) -> bool:
+    for path, reviewed in _REVIEWED_REGISTRY_MODULES.items():
+        if path not in sources:
+            return False
+        try:
+            canonical = _registry_executable_ast(sources[path])
+        except SyntaxError:
+            return False
+        if hashlib.sha256(canonical.encode()).hexdigest() != reviewed:
+            return False
+    return True
+
+
+_DEADLINE_FIELDS = {
+    "run_coordination": ("leader_heartbeat_expires_at", "LEADER", ("run_id", "leader_worker_id", "leader_epoch")),
+    "run_workers": ("heartbeat_expires_at", "WORKER", ("run_id", "worker_id")),
+    "token_work_items": ("lease_expires_at", "ITEM", ("work_item_id",)),
+    "sink_effects": ("lease_expires_at", "SINK_EFFECT", ("effect_id",)),
+}
+_FRESH_CLOCK = "elspeth.core.landscape.database_clock.read_landscape_decision_time"
+_DEADLINE_API = "elspeth.core.landscape.lease_deadlines."
+
+
+def _deadline_api_is_visible(qualified: str, resolver: _Resolver, use: ast.AST) -> bool:
+    if _trusted_qualified_name_is_mutated(qualified, resolver=resolver, use=use):
+        return False
+    owner = _owner_function(use)
+    if owner is not None and not _receiver_callable_code_is_visible(owner, use):
+        return False
+    for part in ast.walk(resolver.unit.tree):
+        if (
+            isinstance(part, ast.Attribute)
+            and isinstance(part.ctx, (ast.Store, ast.Del))
+            and (resolver.qualified_name(part, use=part) == qualified or resolver.qualified_name(part.value, use=part) == qualified)
+        ):
+            return False
+    return True
+
+
+def _deadline_binding(expression: ast.expr, resolver: _Resolver, use: ast.AST) -> ast.expr:
+    """Follow only unchanged, dominating local assignments, never a last-store guess."""
+    seen: set[int] = set()
+    while isinstance(expression, ast.Name) and id(expression) not in seen:
+        seen.add(id(expression))
+        owner = _owner_function(use)
+        binding = None if owner is None else _authority_binding_origin(expression.id, owner, use)
+        if not isinstance(binding, ast.expr):
+            break
+        expression, use = binding, binding
+    return expression
+
+
+def _deadline_term(expression: ast.expr, resolver: _Resolver, use: ast.AST, parameters: dict[str, str] | None = None) -> str:
+    """Stable expression identity; imports normalize, unsafe mutable aliases do not."""
+    if isinstance(expression, ast.Name) and parameters is not None and expression.id in parameters:
+        return parameters[expression.id]
+    expression = _deadline_binding(expression, resolver, use)
+    if isinstance(expression, ast.Name):
+        return resolver.qualified_name(expression, use=expression) or expression.id
+    if isinstance(expression, ast.Constant):
+        return repr(expression.value)
+    if isinstance(expression, ast.Attribute):
+        if isinstance(expression.value, ast.Name) and parameters is not None:
+            projected = parameters.get(f"{expression.value.id}.{expression.attr}")
+            if projected is not None:
+                return projected
+        value = _deadline_binding(expression.value, resolver, expression)
+        if isinstance(value, ast.Call) and resolver.qualified_name(value.func, use=value) in {
+            "elspeth.contracts.coordination.CoordinationToken",
+            "elspeth.contracts.coordination.WorkerMembershipToken",
+        }:
+            fields = [keyword.value for keyword in value.keywords if keyword.arg == expression.attr]
+            if len(fields) == 1 and not value.args and all(keyword.arg is not None for keyword in value.keywords):
+                return _deadline_term(fields[0], resolver, value, parameters)
+        return f"{_deadline_term(expression.value, resolver, expression, parameters)}.{expression.attr}"
+    if isinstance(expression, ast.Subscript):
+        return f"{_deadline_term(expression.value, resolver, expression, parameters)}[{_deadline_term(expression.slice, resolver, expression, parameters)}]"
+    if isinstance(expression, ast.Call):
+        arguments = [_deadline_term(item, resolver, expression, parameters) for item in expression.args]
+        arguments.extend(f"{item.arg}={_deadline_term(item.value, resolver, expression, parameters)}" for item in expression.keywords)
+        rendered = f"{_deadline_term(expression.func, resolver, expression, parameters)}({','.join(arguments)})"
+        if resolver.qualified_name(expression.func, use=expression) == _FRESH_CLOCK:
+            return f"{rendered}@{expression.lineno}:{expression.col_offset}"
+        return rendered
+    if isinstance(expression, ast.BinOp):
+        return f"({_deadline_term(expression.left, resolver, expression, parameters)} {type(expression.op).__name__} {_deadline_term(expression.right, resolver, expression, parameters)})"
+    return ast.dump(expression, include_attributes=False)
+
+
+def _deadline_duration_seconds(duration: ast.expr, resolver: _Resolver) -> str:
+    duration = _deadline_binding(duration, resolver, duration)
+    if (
+        isinstance(duration, ast.Call)
+        and resolver.qualified_name(duration.func, use=duration) == "datetime.timedelta"
+        and not duration.args
+        and len(duration.keywords) == 1
+        and duration.keywords[0].arg == "seconds"
+    ):
+        return _deadline_term(duration.keywords[0].value, resolver, duration)
+    return f"{_deadline_term(duration, resolver, duration)}.total_seconds()"
+
+
+def _deadline_column(expression: ast.expr, resolver: _Resolver, table: str) -> str | None:
+    if (
+        isinstance(expression, ast.Attribute)
+        and isinstance(expression.value, ast.Attribute)
+        and expression.value.attr == "c"
+        and _table_name(expression.value.value, resolver, use=expression) == table
+    ):
+        return expression.attr
+    return None
+
+
+def _deadline_write_identity(write: ast.Call, resolver: _Resolver, table: str) -> dict[str, ast.expr]:
+    """Extract conjunctive exact-row predicates or INSERT's explicit identity values."""
+    identity: dict[str, ast.expr] = {}
+    examined: set[int] = set()
+
+    def predicates(node: ast.expr) -> None:
+        if id(node) in examined:
+            return
+        examined.add(id(node))
+        if isinstance(node, ast.Name):
+            # ``clauses = and_(clauses, extra)`` reads the prior assignment,
+            # not its own multiline RHS merely because that starts above the
+            # nested Name's line number. Source order follows statements.
+            statement = _admission_statement(node)
+            binding = resolver.binding(node.id, use=statement or node)
+            if binding is not None:
+                predicates(binding)
+        elif isinstance(node, ast.Call) and resolver.qualified_name(node.func, use=node) in {"sqlalchemy.and_", "sqlalchemy.sql.and_"}:
+            for argument in node.args:
+                predicates(argument)
+        elif isinstance(node, ast.Compare) and len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq):
+            column = _deadline_column(node.left, resolver, table)
+            if column is not None:
+                identity[column] = node.comparators[0]
+
+    current: ast.expr = write
+    while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
+        if current.func.attr == "where":
+            for argument in current.args:
+                predicates(argument)
+        current = current.func.value
+    shape = _dml_shape(current, resolver) if isinstance(current, ast.Call) else None
+    if shape is not None:
+        # Issuance keys identify the row AFTER the successful statement. A
+        # takeover legitimately changes worker/epoch in its SET values.
+        values = _deadline_write_values(write, resolver)
+        if values is not None:
+            identity.update(values)
+    return identity
+
+
+def _deadline_write_values(write: ast.Call, resolver: _Resolver) -> dict[str, ast.expr] | None:
+    values: dict[str, ast.expr] = {}
+
+    def mapping(expression: ast.expr) -> bool:
+        expression = _deadline_binding(expression, resolver, expression)
+        if not isinstance(expression, ast.Dict):
+            return False
+        for key, value in zip(expression.keys, expression.values, strict=True):
+            if key is None:
+                if not mapping(value):
+                    return False
+            elif isinstance(key, ast.Constant) and isinstance(key.value, str) and key.value not in values:
+                values[key.value] = value
+            else:
+                return False
+        return True
+
+    if len(write.args) > 1 or (write.args and not mapping(write.args[0])):
+        return None
+    for keyword in write.keywords:
+        if keyword.arg is None:
+            if not mapping(keyword.value):
+                return None
+        elif keyword.arg in values:
+            return None
+        else:
+            values[keyword.arg] = keyword.value
+    return values
+
+
+def _deadline_key_terms(
+    key: ast.expr,
+    resolver: _Resolver,
+    proof: _AuthorityProof,
+    parameters: dict[str, str] | None = None,
+    seen: frozenset[int] = frozenset(),
+) -> tuple[str, tuple[str, ...]] | None:
+    """Inline only an actual pure owned key constructor, with its caller's values."""
+    if not isinstance(key, ast.Call) or id(key) in seen:
+        return None
+    if resolver.qualified_name(key.func, use=key) == _DEADLINE_API + "DeadlineKey":
+        if not _deadline_api_is_visible(_DEADLINE_API + "DeadlineKey", resolver, key):
+            return None
+        if len(key.args) != 2 or key.keywords or not isinstance(key.args[1], ast.Tuple):
+            return None
+        kind = resolver.qualified_name(key.args[0], use=key)
+        if kind is None or not kind.startswith(_DEADLINE_API + "DeadlineKind."):
+            return None
+        if not _deadline_api_is_visible(kind, resolver, key):
+            return None
+        return kind.rsplit(".", 1)[-1], tuple(_deadline_term(item, resolver, key, parameters) for item in key.args[1].elts)
+    called = proof.called_function(key, resolver, key)
+    if called is None:
+        return None
+    function, helper_resolver = called
+    body = [
+        statement
+        for statement in function.body
+        if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and isinstance(statement.value.value, str))
+    ]
+    if len(body) != 1 or not isinstance(body[0], ast.Return) or body[0].value is None:
+        return None
+    arguments = [*function.args.posonlyargs, *function.args.args]
+    if function.args.vararg is not None or function.args.kwarg is not None or len(key.args) > len(arguments):
+        return None
+    supplied = {argument.arg: value for argument, value in zip(arguments, key.args, strict=False)}
+    for keyword in key.keywords:
+        if keyword.arg is None or keyword.arg in supplied:
+            return None
+        supplied[keyword.arg] = keyword.value
+    if set(supplied) != {argument.arg for argument in (*arguments, *function.args.kwonlyargs)}:
+        return None
+    substitutions = {name: _deadline_term(value, resolver, key, parameters) for name, value in supplied.items()}
+    # Project token fields before passing the pure helper environment. The
+    # key's token may be the just-created immutable admission result.
+    for name, value in supplied.items():
+        resolved = _deadline_binding(value, resolver, key)
+        if isinstance(resolved, ast.Call) and resolver.qualified_name(resolved.func, use=resolved) in {
+            "elspeth.contracts.coordination.CoordinationToken",
+            "elspeth.contracts.coordination.WorkerMembershipToken",
+        }:
+            for field in resolved.keywords:
+                if field.arg is not None:
+                    substitutions[f"{name}.{field.arg}"] = _deadline_term(field.value, resolver, resolved, parameters)
+    return _deadline_key_terms(body[0].value, helper_resolver, proof, substitutions, seen | {id(key)})
+
+
+def _deadline_registration_shape(
+    call: ast.Call, resolver: _Resolver, proof: _AuthorityProof
+) -> tuple[str, tuple[str, ...], str, str, str] | None:
+    if resolver.qualified_name(call.func, use=call) != _DEADLINE_API + "record_issued_deadline" or len(call.args) != 1:
+        return None
+    if not _deadline_api_is_visible(_DEADLINE_API + "record_issued_deadline", resolver, call):
+        return None
+    keywords = {item.arg: item.value for item in call.keywords}
+    if set(keywords) != {"key", "expires_at", "window_seconds"}:
+        return None
+    key = _deadline_key_terms(keywords["key"], resolver, proof)
+    if key is None:
+        return None
+    return (
+        *key,
+        _deadline_term(call.args[0], resolver, call),
+        _deadline_term(keywords["expires_at"], resolver, call),
+        _deadline_term(keywords["window_seconds"], resolver, call),
+    )
+
+
+def _deadline_registration_covers_success(write: ast.Call, registration: ast.Call) -> bool:
+    """Every successful-write path registers before normal transaction exit.
+
+    Evaluate only literal flags and this exact UPDATE result's rowcount. An
+    unknown branch is checked on both arms; returning before registration is
+    never treated as rollback. This also proves the scheduler's explicit
+    ``lease_lost`` flag without granting conditional registrations generally.
+    """
+    statement = _admission_statement(write)
+    block = None if statement is None else _admission_block(statement)
+    if block is None:
+        return False
+    result_name = (
+        statement.targets[0].id
+        if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name)
+        else None
+    )
+    owner = _owner_function(write)
+    if (
+        result_name is not None
+        and owner is not None
+        and any(
+            isinstance(part, ast.Name)
+            and part.id == result_name
+            and isinstance(part.ctx, (ast.Store, ast.Del))
+            and part is not statement.targets[0]
+            and part.lineno > statement.lineno
+            for part in _walk_same_scope(owner)
+        )
+    ):
+        return False
+    flags: dict[str, bool] = {}
+    predecessors: list[ast.stmt] = []
+    continuation = list(block[block.index(statement) + 1 :])
+    current = statement
+    while current is not None:
+        current_block = _admission_block(current)
+        if current_block is None:
+            break
+        predecessors = [*current_block[: current_block.index(current)], *predecessors]
+        parent = getattr(current, "_landscape_parent", None)
+        if isinstance(parent, ast.If):
+            parent_block = _admission_block(parent)
+            if parent_block is None:
+                return False
+            continuation.extend(parent_block[parent_block.index(parent) + 1 :])
+        if not isinstance(parent, (ast.If, ast.With, ast.Try)):
+            break
+        current = parent
+    for previous in predecessors:
+        if isinstance(previous, ast.Assign) and len(previous.targets) == 1 and isinstance(previous.targets[0], ast.Name):
+            if isinstance(previous.value, ast.Constant) and isinstance(previous.value.value, bool):
+                flags[previous.targets[0].id] = previous.value.value
+            else:
+                flags.pop(previous.targets[0].id, None)
+        elif isinstance(previous, (ast.AnnAssign, ast.AugAssign)) and isinstance(previous.target, ast.Name):
+            flags.pop(previous.target.id, None)
+    owner = _owner_function(write)
+    if owner is not None:
+        for part in ast.walk(owner):
+            if isinstance(part, (ast.Nonlocal, ast.Global)):
+                for name in part.names:
+                    flags.pop(name, None)
+
+    def condition(expression: ast.expr, known: dict[str, bool]) -> bool | None:
+        if isinstance(expression, ast.Constant) and isinstance(expression.value, bool):
+            return expression.value
+        if isinstance(expression, ast.Name):
+            return known.get(expression.id)
+        if isinstance(expression, ast.UnaryOp) and isinstance(expression.op, ast.Not):
+            value = condition(expression.operand, known)
+            return None if value is None else not value
+        if (
+            result_name is not None
+            and isinstance(expression, ast.Compare)
+            and len(expression.ops) == 1
+            and isinstance(expression.left, ast.Attribute)
+            and expression.left.attr == "rowcount"
+            and isinstance(expression.left.value, ast.Name)
+            and expression.left.value.id == result_name
+            and isinstance(expression.comparators[0], ast.Constant)
+            and type(expression.comparators[0].value) is int
+        ):
+            expected = expression.comparators[0].value
+            if isinstance(expression.ops[0], ast.Eq):
+                return expected == 1
+            if isinstance(expression.ops[0], ast.NotEq):
+                return expected != 1
+        return None
+
+    def covers(statements: list[ast.stmt], known: dict[str, bool]) -> bool:
+        if not statements:
+            return False
+        head, *tail = statements
+        if isinstance(head, ast.Expr) and head.value is registration:
+            return True
+        if isinstance(head, ast.Raise):
+            for ancestor in _ancestors(head):
+                if isinstance(ancestor, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    break
+                if (
+                    isinstance(ancestor, ast.Try)
+                    and any(_is_descendant(head, statement) for statement in ancestor.body)
+                    and any(not _authority_block_raises(handler.body) for handler in ancestor.handlers)
+                ):
+                    return False
+            return True
+        if isinstance(head, (ast.Return, ast.Break, ast.Continue, ast.Try, ast.With, ast.For, ast.While)):
+            return False
+        if isinstance(head, ast.If):
+            verdict = condition(head.test, known)
+            branches = [head.body] if verdict is True else [head.orelse] if verdict is False else [head.body, head.orelse]
+            return all(covers([*branch, *tail], dict(known)) for branch in branches)
+        if isinstance(head, ast.Assign) and len(head.targets) == 1 and isinstance(head.targets[0], ast.Name):
+            value = condition(head.value, known)
+            if value is None:
+                known.pop(head.targets[0].id, None)
+            else:
+                known[head.targets[0].id] = value
+        elif isinstance(head, (ast.AnnAssign, ast.AugAssign)) and isinstance(head.target, ast.Name):
+            known.pop(head.target.id, None)
+        for part in ast.walk(head):
+            if isinstance(part, ast.NamedExpr) and isinstance(part.target, ast.Name):
+                known.pop(part.target.id, None)
+        return covers(tail, known)
+
+    return covers(continuation, flags)
+
+
+def _deadline_lock_predecessors(use, function):
+    """Earlier statements which dominate this use, excluding branch decoys."""
+    levels = []
+    current = _admission_statement(use)
+    while current is not None and current is not function:
+        block = _admission_block(current)
+        if block is None:
+            return ()
+        levels.append(tuple(block[: block.index(current)]))
+        parent = getattr(current, "_landscape_parent", None)
+        if parent is function:
+            break
+        current = _admission_statement(parent)
+    return tuple(statement for level in reversed(levels) for statement in level)
+
+
+def _deadline_lock_builtin(node, name, resolver, use):
+    return (
+        isinstance(node, ast.Name)
+        and node.id == name
+        and resolver.binding(name, use) is None
+        and resolver.parameter(name, use) is None
+        and not resolver.is_local(name, use)
+        and resolver.qualified_name(node, use=use) in {name, f"builtins.{name}"}
+    )
+
+
+def _deadline_lock_unalias(node, resolver, use, parameters, seen=frozenset()):
+    """Return an expression together with its original lexical use site."""
+    identity = (id(node), id(use))
+    if identity in seen:
+        return None
+    seen = seen | {identity}
+    if not isinstance(node, ast.Name):
+        return node, resolver, use
+    owner = _owner_function(use)
+    value = resolver.binding(node.id, use)
+    for part in _walk_same_scope(owner) if owner is not None else ():
+        if not isinstance(part, (ast.AugAssign, ast.NamedExpr, ast.Delete)):
+            continue
+        if getattr(part, "lineno", 0) >= getattr(use, "lineno", 0):
+            continue
+        if value is not None and getattr(part, "lineno", 0) < getattr(value, "lineno", 0):
+            continue
+        if any(
+            isinstance(target, ast.Name) and target.id == node.id and isinstance(target.ctx, (ast.Store, ast.Del))
+            for target in ast.walk(part)
+        ):
+            return None
+    if value is not None:
+        if not _receiver_binding_dominates(value, use):
+            return None
+        return _deadline_lock_unalias(value, resolver, value, parameters, seen)
+    supplied = parameters.get((id(owner), node.id))
+    if supplied is not None:
+        actual, actual_resolver, actual_use = supplied
+        return _deadline_lock_unalias(actual, actual_resolver, actual_use, parameters, seen)
+    # A conditional, loop, walrus, augmented, or deleted binding cannot be
+    # mistaken for the original parameter/with-bound connection.
+    for part in _walk_same_scope(owner) if owner is not None else ():
+        if isinstance(part, ast.Name) and part.id == node.id and isinstance(part.ctx, (ast.Store, ast.Del)):
+            if getattr(part, "lineno", 0) >= getattr(use, "lineno", 0):
+                continue
+            parent = getattr(part, "_landscape_parent", None)
+            if isinstance(parent, ast.withitem) and parent.optional_vars is part:
+                continue
+            return None
+    return node, resolver, use
+
+
+def _deadline_completed_select(node, resolver, use, parameters):
+    """Resolve consumed conn.execute(SELECT), never an unexecuted query value."""
+    resolved = _deadline_lock_unalias(node, resolver, use, parameters)
+    if resolved is None:
+        return None
+    node, resolver, use = resolved
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+        return None
+    if node.func.attr not in {"all", "fetchall", "fetchone", "first", "one", "one_or_none", "scalar_one", "scalar_one_or_none"}:
+        return None
+    if node.args or node.keywords:
+        return None
+    current = node.func.value
+    while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute) and current.func.attr in {"mappings", "scalars"}:
+        if current.args or current.keywords:
+            return None
+        current = current.func.value
+    if not isinstance(current, ast.Call) or not isinstance(current.func, ast.Attribute) or current.func.attr != "execute":
+        return None
+    if len(current.args) != 1 or current.keywords:
+        return None
+    query = _deadline_lock_unalias(current.args[0], resolver, current, parameters)
+    if query is None:
+        return None
+    query_node, query_resolver, query_use = query
+    methods = []
+    while isinstance(query_node, ast.Call) and isinstance(query_node.func, ast.Attribute):
+        if query_node.func.attr not in {"where", "order_by", "with_for_update", "select_from", "limit", "offset"}:
+            return None  # No CTE, limit, offset, UNION, stream options or opaque SQL.
+        methods.append(query_node)
+        query_node = query_node.func.value
+    if not isinstance(query_node, ast.Call) or query_resolver.qualified_name(query_node.func, use=query_node) not in {
+        "sqlalchemy.select",
+        "sqlalchemy.sql.select",
+        "sqlalchemy.sql.expression.select",
+    }:
+        return None
+    return current.func.value, resolver, current, query_node, methods, query_resolver, query_use
+
+
+def _deadline_lock_conjuncts(node, resolver):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+        return (*_deadline_lock_conjuncts(node.left, resolver), *_deadline_lock_conjuncts(node.right, resolver))
+    if isinstance(node, ast.Call) and resolver.qualified_name(node.func, use=node) in {"sqlalchemy.and_", "sqlalchemy.sql.and_"}:
+        if node.keywords:
+            return ()
+        return tuple(atom for argument in node.args for atom in _deadline_lock_conjuncts(argument, resolver))
+    # Do not walk into OR, arbitrary calls, NOT, subqueries or conditional terms.
+    return (node,)
+
+
+def _deadline_lock_column(node, resolver, use):
+    if not isinstance(node, ast.Attribute) or not isinstance(node.value, ast.Attribute) or node.value.attr != "c":
+        return None
+    table = _table_identity(node.value.value, resolver, use=use)
+    return None if table is None else (table, node.attr)
+
+
+def _deadline_lock_unrelated_label(node, fields):
+    # Extra computed SELECT columns cannot change target lock identity. Their
+    # explicit SQL result label must not shadow any key projected from the row.
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "label"
+        and len(node.args) == 1
+        and not node.keywords
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+        and node.args[0].value not in fields
+    )
+
+
+def _deadline_lock_term(node, resolver, use, parameters, seen=frozenset()):
+    identity = (id(node), id(use))
+    if identity in seen:
+        return None
+    seen = seen | {identity}
+    resolved = _deadline_lock_unalias(node, resolver, use, parameters)
+    if resolved is None:
+        return None
+    node, resolver, use = resolved
+    if isinstance(node, ast.Name):
+        return ("binding", id(_owner_function(use)), node.id)
+    if isinstance(node, ast.Constant):
+        return ("constant", type(node.value).__name__, repr(node.value))
+    if isinstance(node, ast.Call):
+        # A row materialized once by an assignment has a distinct evaluation
+        # identity; separate query calls never collapse just because SQL matches.
+        parent = getattr(node, "_landscape_parent", None)
+        if (
+            isinstance(parent, (ast.Assign, ast.AnnAssign))
+            and parent.value is node
+            and _deadline_completed_select(node, resolver, use, parameters) is not None
+        ):
+            return ("materialized-row", id(node))
+        return None
+    if isinstance(node, ast.Attribute):
+        base, field = node.value, node.attr
+    elif isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+        base, field = node.value, node.slice.value
+    else:
+        return None
+    # An exact key projected from a locked row is the key the SELECT matched,
+    # not a new identity named 'row'. This handles row = locked_row safely.
+    projection = _deadline_completed_select(base, resolver, use, parameters)
+    if projection is not None:
+        _conn, _cr, _cu, selected_root, methods, qr, qu = projection
+        projection_tables = []
+        for argument in selected_root.args:
+            column = _deadline_lock_column(argument, qr, qu)
+            selected_table = column[0] if column is not None else _table_identity(argument, qr, use=qu)
+            if selected_table is None:
+                if _deadline_lock_unrelated_label(argument, {field}):
+                    continue
+                return None
+            projection_tables.append(selected_table)
+        if len(set(projection_tables)) != 1:
+            return None
+        subjects = []
+        for method in methods:
+            if method.func.attr != "where":
+                continue
+            for predicate in method.args:
+                for atom in _deadline_lock_conjuncts(predicate, qr):
+                    if isinstance(atom, ast.Compare) and len(atom.ops) == 1 and isinstance(atom.ops[0], ast.Eq):
+                        for column, subject in ((atom.left, atom.comparators[0]), (atom.comparators[0], atom.left)):
+                            identity_column = _deadline_lock_column(column, qr, atom)
+                            if identity_column == (projection_tables[0], field):
+                                subjects.append(_deadline_lock_term(subject, qr, atom, parameters, seen))
+        if len(subjects) == 1:
+            return subjects[0]
+        if subjects:
+            return None
+        # No key equality on an optimistic SELECT: retain that exact row's
+        # evaluation identity for the later locking SELECT's key predicate.
+    parent = _deadline_lock_term(base, resolver, use, parameters, seen)
+    return None if parent is None else ("field", parent, field)
+
+
+def _deadline_lock_set_contains(node, expected, resolver, use, parameters, proof, seen=frozenset()):
+    """Prove inclusion in explicit collections, including sorted({key,...}-{None})."""
+    if id(node) in seen:
+        return False
+    seen = seen | {id(node)}
+    resolved = _deadline_lock_unalias(node, resolver, use, parameters)
+    if resolved is None:
+        return False
+    node, resolver, use = resolved
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        return any(_deadline_lock_term(value, resolver, use, parameters) == expected for value in node.elts)
+    if (
+        isinstance(node, ast.Call)
+        and len(node.args) == 1
+        and not node.keywords
+        and _deadline_lock_builtin(node.func, "sorted", resolver, use)
+    ):
+        return _deadline_lock_set_contains(node.args[0], expected, resolver, use, parameters, proof, seen)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Sub) and isinstance(node.right, ast.Set):
+        # Removing None is safe for an exact key only when its non-nullness is
+        # proven by the caller's supplied key or an owned fail-closed guard.
+        removed = [_deadline_lock_term(value, resolver, use, parameters) for value in node.right.elts]
+        if any(value is None or value == expected for value in removed):
+            return False
+        if removed != [("constant", "NoneType", "None")]:
+            return False
+        if not _deadline_lock_nonnull_key(expected, resolver, use, parameters, proof):
+            return False
+        return _deadline_lock_set_contains(node.left, expected, resolver, use, parameters, proof, seen)
+    return False
+
+
+def _deadline_guard_refuses_none(test, expected, resolver, parameters):
+    # Positive Boolean evidence only: one true OR arm suffices; every AND
+    # arm must be true. An unknown call cannot manufacture non-null evidence.
+    if isinstance(test, ast.BoolOp):
+        values = [_deadline_guard_refuses_none(part, expected, resolver, parameters) for part in test.values]
+        return any(values) if isinstance(test.op, ast.Or) else all(values)
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+        return False
+    right = test.comparators[0]
+    if isinstance(test.ops[0], ast.Is) and isinstance(right, ast.Constant) and right.value is None:
+        return _deadline_lock_term(test.left, resolver, test, parameters) == expected
+    # Actual _require_hash uses `type(value) is not str or ...`. This proves
+    # refusal of None from its body, not from the function spelling or annotation.
+    left = test.left
+    return (
+        isinstance(test.ops[0], ast.IsNot)
+        and isinstance(left, ast.Call)
+        and len(left.args) == 1
+        and not left.keywords
+        and _deadline_lock_builtin(left.func, "type", resolver, test)
+        and _deadline_lock_builtin(right, "str", resolver, test)
+        and _deadline_lock_term(left.args[0], resolver, test, parameters) == expected
+    )
+
+
+def _deadline_lock_nonnull_key(expected, resolver, use, parameters, proof):
+    owner = _owner_function(use)
+    for statement in _deadline_lock_predecessors(use, owner):
+        candidates = [(statement, resolver, parameters)]
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            found = proof.called_function(call, resolver, call, parameter_values=parameters)
+            if found is not None:
+                callee, callee_resolver = found
+                bound = _receiver_call_parameters(callee, call, resolver, call, parameters)
+                # Only a straight-line, synchronous guard before any early
+                # return or side effect is admitted. Actual hash guard is one If.
+                if bound is not None and not isinstance(callee, ast.AsyncFunctionDef):
+                    body = callee.body
+                    if (
+                        body
+                        and isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)
+                    ):
+                        body = body[1:]
+                    if body and isinstance(body[0], ast.If):
+                        candidates.append((body[0], callee_resolver, bound))
+        for guard, guard_resolver, guard_parameters in candidates:
+            if (
+                isinstance(guard, ast.If)
+                and not guard.orelse
+                and _authority_block_raises(guard.body)
+                and _deadline_guard_refuses_none(guard.test, expected, guard_resolver, guard_parameters)
+            ):
+                return True
+    return False
+
+
+def _deadline_select_locks_target(value, resolver, use, parameters, proof, *, expected_connection, table, expected_keys):
+    parsed = _deadline_completed_select(value, resolver, use, parameters)
+    if parsed is None:
+        return False
+    conn, conn_resolver, conn_use, root, methods, query_resolver, query_use = parsed
+    if _deadline_lock_term(conn, conn_resolver, conn_use, parameters) != expected_connection:
+        return False
+    if any(method.func.attr in {"limit", "offset"} for method in methods):
+        return False
+    locks = [method for method in methods if method.func.attr == "with_for_update"]
+    if len(locks) != 1 or locks[0].args:
+        return False
+    for keyword in locks[0].keywords:
+        if keyword.arg == "of":
+            if _table_identity(keyword.value, query_resolver, use=keyword.value) != table:
+                return False
+        elif keyword.arg not in {"read", "key_share", "nowait", "skip_locked"} or not (
+            isinstance(keyword.value, ast.Constant) and keyword.value.value is False
+        ):
+            return False
+    selected = []
+    for argument in root.args:
+        column = _deadline_lock_column(argument, query_resolver, query_use)
+        identity = column[0] if column is not None else _table_identity(argument, query_resolver, use=query_use)
+        if identity is None:
+            if _deadline_lock_unrelated_label(argument, set(expected_keys)):
+                continue
+            return False
+        selected.append(identity)
+    if table not in selected or any(identity != table for identity in selected):
+        return False
+    if root.keywords:
+        return False
+    for method in methods:
+        if method.func.attr == "select_from":
+            if method.keywords or not method.args or any(_table_identity(arg, query_resolver, use=method) != table for arg in method.args):
+                return False
+        elif method.func.attr in {"where", "order_by"} and method.keywords:
+            return False
+    proven = set()
+    for method in methods:
+        if method.func.attr != "where":
+            continue
+        for predicate in method.args:
+            atoms = _deadline_lock_conjuncts(predicate, query_resolver)
+            if not atoms:
+                return False
+            for atom in atoms:
+                matched = None
+                if isinstance(atom, ast.Compare) and len(atom.ops) == 1 and isinstance(atom.ops[0], ast.Eq):
+                    for column, subject in ((atom.left, atom.comparators[0]), (atom.comparators[0], atom.left)):
+                        identity = _deadline_lock_column(column, query_resolver, atom)
+                        if (
+                            identity is not None
+                            and identity[0] == table
+                            and identity[1] in expected_keys
+                            and (_deadline_lock_term(subject, query_resolver, atom, parameters) == expected_keys[identity[1]])
+                        ):
+                            matched = identity[1]
+                elif (
+                    isinstance(atom, ast.Call)
+                    and isinstance(atom.func, ast.Attribute)
+                    and atom.func.attr == "in_"
+                    and len(atom.args) == 1
+                    and not atom.keywords
+                ):
+                    identity = _deadline_lock_column(atom.func.value, query_resolver, atom)
+                    if (
+                        identity is not None
+                        and identity[0] == table
+                        and identity[1] in expected_keys
+                        and _deadline_lock_set_contains(atom.args[0], expected_keys[identity[1]], query_resolver, atom, parameters, proof)
+                    ):
+                        matched = identity[1]
+                # A correct key conjunct does not cancel an additional false,
+                # foreign-key or state predicate: that SELECT may lock no row.
+                if matched is None:
+                    return False
+                proven.add(matched)
+    return proven == set(expected_keys)
+
+
+def _deadline_lock_carries_connection(value, resolver, use, parameters, expected_connection, seen=frozenset()):
+    resolved = _deadline_lock_unalias(value, resolver, use, parameters)
+    if resolved is None:
+        # An unresolved name can conceal an augmented/deleted connection alias.
+        return isinstance(value, ast.Name)
+    value, resolver, use = resolved
+    if id(value) in seen:
+        return True
+    seen = seen | {id(value)}
+    if _deadline_lock_term(value, resolver, use, parameters) == expected_connection:
+        return True
+    if isinstance(value, (ast.Attribute, ast.Subscript)):
+        return _deadline_lock_carries_connection(value.value, resolver, use, parameters, expected_connection, seen)
+    if isinstance(value, (ast.Tuple, ast.List, ast.Set)):
+        return any(_deadline_lock_carries_connection(part, resolver, use, parameters, expected_connection, seen) for part in value.elts)
+    if isinstance(value, ast.Dict):
+        return any(
+            _deadline_lock_carries_connection(part, resolver, use, parameters, expected_connection, seen)
+            for part in (*value.keys, *value.values)
+            if part is not None
+        )
+    if isinstance(value, ast.IfExp):
+        return any(
+            _deadline_lock_carries_connection(part, resolver, use, parameters, expected_connection, seen)
+            for part in (value.body, value.orelse)
+        )
+    # Call arguments are checked separately. A returned PID or materialized row
+    # does not carry Connection merely because its producing call used one.
+    return False
+
+
+def _deadline_lock_execute_is_select(call, resolver, parameters):
+    # Preserve ordinary SELECT helper reads, without trusting execute's name
+    # as evidence that an opaque SQL payload cannot commit/rollback.
+    if len(call.args) != 1 or call.keywords:
+        return False
+    resolved = _deadline_lock_unalias(call.args[0], resolver, call, parameters)
+    if resolved is None:
+        return False
+    query, query_resolver, _use = resolved
+    while isinstance(query, ast.Call) and isinstance(query.func, ast.Attribute):
+        if query.func.attr not in {"where", "order_by", "with_for_update", "select_from", "limit", "offset"}:
+            return False
+        query = query.func.value
+    return isinstance(query, ast.Call) and query_resolver.qualified_name(query.func, use=query) in {
+        "sqlalchemy.select",
+        "sqlalchemy.sql.select",
+        "sqlalchemy.sql.expression.select",
+    }
+
+
+def _deadline_lock_call_preserves_transaction(call, resolver, proof, parameters, expected_connection, seen):
+    receiver = call.func.value if isinstance(call.func, ast.Attribute) else None
+    receiver_is_connection = receiver is not None and _deadline_lock_term(receiver, resolver, call, parameters) == expected_connection
+    if receiver_is_connection:
+        if call.func.attr == "execute":
+            return _deadline_lock_execute_is_select(call, resolver, parameters)
+        if call.func.attr == "exec_driver_sql":
+            # The actual observer helper issues this fixed read. Raw arbitrary
+            # SQL, multiple statements and search-path function names are refused.
+            return (
+                len(call.args) == 1
+                and not call.keywords
+                and isinstance(call.args[0], ast.Constant)
+                and isinstance(call.args[0].value, str)
+                and " ".join(call.args[0].value.split()).upper() == "SELECT PG_BACKEND_PID()"
+            )
+        return False  # commit/rollback/close/invalidate and unknown methods.
+    supplied = [call.func, *call.args, *(keyword.value for keyword in call.keywords)]
+    if receiver is not None:
+        supplied.append(receiver)
+    carries = any(_deadline_lock_carries_connection(value, resolver, call, parameters, expected_connection) for value in supplied)
+    if not carries:
+        return True
+    if _deadline_lock_builtin(call.func, "id", resolver, call) and len(call.args) == 1 and not call.keywords:
+        return True  # builtin id cannot invoke callbacks or release a transaction.
+    found = proof.called_function(call, resolver, call, parameter_values=parameters)
+    if found is None:
+        return False  # Unknown callback carrying this connection can release it.
+    callee, callee_resolver = found
+    if id(callee) in seen or isinstance(callee, ast.AsyncFunctionDef):
+        return False
+    bound = _receiver_call_parameters(callee, call, resolver, call, parameters)
+    if bound is None:
+        return False
+    return _deadline_lock_scope_preserves_transaction(callee, callee_resolver, proof, bound, expected_connection, seen | {id(callee)})
+
+
+def _deadline_lock_scope_preserves_transaction(scope, resolver, proof, parameters, expected_connection, seen):
+    for part in _walk_same_scope(scope):
+        if isinstance(part, ast.Call) and not _deadline_lock_call_preserves_transaction(
+            part, resolver, proof, parameters, expected_connection, seen
+        ):
+            return False
+        if isinstance(part, (ast.With, ast.AsyncWith)):
+            for item in part.items:
+                if _deadline_lock_carries_connection(item.context_expr, resolver, item, parameters, expected_connection):
+                    return False  # Context exit can release the supplied connection.
+        if isinstance(part, (ast.Assign, ast.AnnAssign)):
+            value = part.value
+            targets = part.targets if isinstance(part, ast.Assign) else [part.target]
+            if (
+                value is not None
+                and _deadline_lock_carries_connection(value, resolver, part, parameters, expected_connection)
+                and any(not isinstance(target, ast.Name) for target in targets)
+            ):
+                return False  # Do not allow escape into a receiver/container.
+        if (
+            isinstance(part, ast.Return)
+            and part.value is not None
+            and _deadline_lock_carries_connection(part.value, resolver, part, parameters, expected_connection)
+        ):
+            return False  # An unmodelled returned capability can hide later release.
+    return True
+
+
+def _deadline_target_lock_before(use, function, resolver, proof, parameters, *, expected_connection, table, expected_keys, seen):
+    if id(function) in seen:
+        return False
+    seen = seen | {id(function)}
+    for statement in reversed(_deadline_lock_predecessors(use, function)):
+        # Inspect transitive helper effects and fail closed on unknown calls
+        # receiving this connection, even when the call is nested in a branch.
+        if not _deadline_lock_scope_preserves_transaction(statement, resolver, proof, parameters, expected_connection, frozenset()):
+            return False
+        if not isinstance(statement, (ast.Expr, ast.Assign, ast.AnnAssign, ast.Return)) or statement.value is None:
+            continue
+        value = statement.value
+        if _deadline_select_locks_target(
+            value, resolver, value, parameters, proof, expected_connection=expected_connection, table=table, expected_keys=expected_keys
+        ):
+            return True
+        if not isinstance(value, ast.Call):
+            continue
+        found = proof.called_function(value, resolver, value, parameter_values=parameters)
+        if found is None:
+            continue
+        callee, callee_resolver = found
+        if not callee_resolver.unit.path.startswith("src/elspeth/core/landscape/") or isinstance(callee, ast.AsyncFunctionDef):
+            continue
+        # This is an ordinary completed call, never a deferred generator.
+        if any(isinstance(part, (ast.Yield, ast.YieldFrom, ast.Await)) for part in _walk_same_scope(callee)):
+            continue
+        bound = _receiver_call_parameters(callee, value, resolver, value, parameters)
+        if bound is None:
+            continue
+        returns = [part for part in _walk_same_scope(callee) if isinstance(part, ast.Return)]
+        if not returns or not _authority_relay_block_terminates(callee.body):
+            continue  # Conservative: an implicit-return helper needs its own CFG proof.
+        if all(
+            _deadline_target_lock_before(
+                ret,
+                callee,
+                callee_resolver,
+                proof,
+                bound,
+                expected_connection=expected_connection,
+                table=table,
+                expected_keys=expected_keys,
+                seen=seen,
+            )
+            or (
+                ret.value is not None
+                and _deadline_select_locks_target(
+                    ret.value,
+                    callee_resolver,
+                    ret,
+                    bound,
+                    proof,
+                    expected_connection=expected_connection,
+                    table=table,
+                    expected_keys=expected_keys,
+                )
+            )
+            for ret in returns
+        ):
+            return True
+    return False
+
+
+def _target_lock_precedes_fresh_sample(sample, *, function, resolver, proof, connection, table, key_values):
+    """Prove completed source-owned exclusive target lock before this sample.
+
+    table: exact (metadata_module, table_name), never a suffix/name hint.
+    key_values: every required column mapped to its caller expression at sample.
+    No authority is granted to a helper based on its name.
+    """
+    expected_connection = _deadline_lock_term(connection, resolver, sample, {})
+    expected_keys = {key: _deadline_lock_term(value, resolver, sample, {}) for key, value in key_values.items()}
+    if expected_connection is None or not expected_keys or any(value is None for value in expected_keys.values()):
+        return False
+    return _deadline_target_lock_before(
+        sample,
+        function,
+        resolver,
+        proof,
+        {},
+        expected_connection=expected_connection,
+        table=table,
+        expected_keys=expected_keys,
+        seen=frozenset(),
+    )
+
+
+def _deadline_executed_writes(function, resolver):
+    """Enumerate execution payloads as well as fluent values; never skip bulk parameters."""
+    for call in _walk_same_scope(function):
+        if not isinstance(call, ast.Call) or not call.args:
+            continue
+        callee = resolver.resolve_callable(call.func, use=call)
+        if not isinstance(callee, ast.Attribute) or callee.attr != "execute":
+            continue
+        statement = _deadline_binding(call.args[0], resolver, call)
+        roots = [item for item in ast.walk(statement) if isinstance(item, ast.Call) and _dml_shape(item, resolver) is not None]
+        if len(roots) != 1:
+            continue
+        construction = _dml_construction(roots[0], resolver)
+        assert construction is not None
+        table = _table_identity(construction[0], resolver, use=construction[2])
+        if table is None or table[0] != "elspeth.core.landscape.schema" or table[1] not in _DEADLINE_FIELDS:
+            continue
+        if construction[1] == "delete":
+            continue
+        value_calls = [
+            item
+            for item in ast.walk(statement)
+            if isinstance(item, ast.Call) and isinstance(item.func, ast.Attribute) and item.func.attr == "values"
+        ]
+        write = value_calls[0] if len(value_calls) == 1 else statement
+        values = _deadline_write_values(value_calls[0], resolver) if len(value_calls) == 1 else {} if not value_calls else None
+        parameters = [*call.args[1:], *(keyword.value for keyword in call.keywords if keyword.arg == "parameters")]
+        if len(parameters) > 1:
+            yield write, call, callee.value, table[1], None
+            continue
+        if not parameters:
+            yield write, call, callee.value, table[1], values
+            continue
+        payload = _deadline_binding(parameters[0], resolver, call)
+        rows = payload.elts if isinstance(payload, (ast.List, ast.Tuple)) else [payload]
+        for row in rows:
+            parameter_call = ast.Call(func=ast.Name(id="parameters", ctx=ast.Load()), args=[row], keywords=[])
+            supplied = _deadline_write_values(parameter_call, resolver)
+            if values is None or supplied is None or values.keys() & supplied.keys():
+                yield write, call, callee.value, table[1], None
+            else:
+                yield write, call, callee.value, table[1], {**values, **supplied}
+
+
+def _deadline_decision_uses_one_sample(write, execute, sample, write_values, table, resolver, function):
+    for stamp in {"updated_at", "lease_heartbeat_at", "registered_at"} & write_values.keys():
+        if _deadline_binding(write_values[stamp], resolver, execute) is not sample:
+            return False
+    seen: set[int] = set()
+    comparisons: list[ast.Compare] = []
+
+    def visit(node):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        if isinstance(node, ast.Name):
+            origin = resolver.binding(node.id, use=_admission_statement(node) or node)
+            if origin is not None:
+                visit(origin)
+        elif isinstance(node, ast.Compare):
+            comparisons.append(node)
+        else:
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+
+    # UPDATE eligibility includes predicates bound through an explicit local
+    # WHERE expression. Read-only candidate discovery is deliberately excluded.
+    current = write
+    while isinstance(current, ast.Call) and isinstance(current.func, ast.Attribute):
+        if current.func.attr == "where":
+            for argument in current.args:
+                visit(argument)
+        current = current.func.value
+    for call in _walk_same_scope(function):
+        if (
+            isinstance(call, ast.Call)
+            and resolver.qualified_name(call.func, use=call) == "elspeth.core.landscape.execution.sink_effect_lifecycle.lease_is_live"
+        ):
+            for argument in call.args:
+                visit(argument)
+    temporal = {"available_at", "lease_expires_at", "leader_heartbeat_expires_at", "heartbeat_expires_at"}
+    for comparison in comparisons:
+        if len(comparison.ops) != 1:
+            return False
+        for column, value in ((comparison.left, comparison.comparators[0]), (comparison.comparators[0], comparison.left)):
+            if _deadline_column(column, resolver, table) in temporal and _deadline_binding(value, resolver, comparison) is not sample:
+                return False
+    return True
+
+
+# Conjunct this mutation/escape proof with the separate
+# exact implementation recipes. It never grants authority by namespace alone.
+
+_DEADLINE_REGISTRY_NAMESPACES = frozenset(
+    {
+        "elspeth.core.landscape.lease_deadlines",
+        "elspeth.core.landscape.database_clock",
+        "elspeth.core.landscape.journal",
+        "elspeth.core.landscape.database",
+    }
+)
+
+
+_DEADLINE_FINALIZATION_DEPENDENCIES = frozenset(
+    {
+        "elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository",
+        "elspeth.core.landscape.run_lifecycle_repository.RunLifecycleRepository",
+        "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+    }
+)
+
+
+def _deadline_dependency_mutation_violations(units, protected_names: frozenset[str]) -> tuple[str, ...]:
+    return _deadline_dependency_mutation_violations_for_units(tuple(units), protected_names)
+
+
+@cache
+def _deadline_dependency_mutation_violations_for_units(units: tuple[SourceUnit, ...], protected_names: frozenset[str]) -> tuple[str, ...]:
+    """Reject writes, reflection or opaque escapes of reviewed dependencies.
+
+    Names may be exact callable/class identities or complete audited module
+    roots. Passing the four registry module roots binds their variables and
+    transitive callable objects as well as the public registration function.
+    Source implementation equality is a separate prerequisite; this helper
+    checks the all-production-module mutation edges that equality cannot see.
+    """
+
+    def protected(qualified):
+        return qualified is not None and any(qualified == name or qualified.startswith(name + ".") for name in protected_names)
+
+    def namespace(qualified):
+        # A package or class dictionary can replace a protected descendant.
+        return qualified is not None and any(qualified == name or name.startswith(qualified + ".") for name in protected_names)
+
+    reviewed_callables = {
+        unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + _symbol(node)
+        for unit in units
+        if unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".") in protected_names
+        for node in ast.walk(unit.tree)
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+    }
+    problems = set()
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        module = unit.path.removeprefix("src/").removesuffix(".py").replace("/", ".")
+        reviewed_module = module in protected_names
+        for node in ast.walk(unit.tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                qualified = resolver.qualified_name(node, use=node)
+                if protected(qualified):
+                    problems.add(f"deadline-dependency attribute replacement: {unit.path}:{node.lineno}")
+            if isinstance(node, ast.Attribute) and node.attr in {
+                "__dict__",
+                "__code__",
+                "__defaults__",
+                "__kwdefaults__",
+                "__globals__",
+                "__closure__",
+            }:
+                receiver = resolver.qualified_name(node.value, use=node)
+                if protected(receiver) or namespace(receiver):
+                    problems.add(f"deadline-dependency mutable metadata exposure: {unit.path}:{node.lineno}")
+            if not isinstance(node, ast.Call):
+                # Container/conditional laundering makes the receiver's later
+                # identity opaque. Current reviewed external callers need none.
+                parent = getattr(node, "_landscape_parent", None)
+                exception_types = isinstance(parent, ast.ExceptHandler) and parent.type is node
+                if not reviewed_module and not exception_types and isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.IfExp)):
+                    pending = list(ast.iter_child_nodes(node))
+                    while pending:
+                        child = pending.pop()
+                        child_name = resolver.qualified_name(child, use=child) if isinstance(child, (ast.Name, ast.Attribute)) else None
+                        if namespace(child_name) or child_name in reviewed_callables:
+                            problems.add(f"deadline-dependency container/choice escape: {unit.path}:{node.lineno}")
+                            break
+                        if isinstance(child, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.IfExp)):
+                            pending.extend(ast.iter_child_nodes(child))
+                continue
+            method = _resolved_callable_name(node.func, resolver, use=node)
+            function = resolver.qualified_name(node.func, use=node)
+            if method in {"getattr", "setattr", "delattr", "__setattr__", "__delattr__"}:
+                pairs = []
+                if len(node.args) >= 2:
+                    pairs.append((node.args[0], node.args[1]))
+                if method in {"__setattr__", "__delattr__"} and isinstance(node.func, ast.Attribute) and node.args:
+                    pairs.append((node.func.value, node.args[0]))
+                for receiver, attribute_node in pairs:
+                    receiver_name = resolver.qualified_name(receiver, use=node)
+                    attribute = _constant_string_value(attribute_node, resolver, use=node)
+                    target = None if receiver_name is None or attribute is None else receiver_name + "." + attribute
+                    if protected(target) or (attribute is None and (protected(receiver_name) or namespace(receiver_name))):
+                        problems.add(f"deadline-dependency reflected access/replacement: {unit.path}:{node.lineno}")
+            if method == "vars" and node.args:
+                receiver = resolver.qualified_name(node.args[0], use=node)
+                if protected(receiver) or namespace(receiver):
+                    problems.add(f"deadline-dependency namespace dictionary exposure: {unit.path}:{node.lineno}")
+            if reviewed_module or function in reviewed_callables:
+                # These exact module bodies/callees are separately verified by
+                # the registry implementation predicate. Do not infer that an
+                # unreviewed callback is safe merely because it is source-owned.
+                continue
+            for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
+                argument_name = resolver.qualified_name(argument, use=node)
+                if protected(argument_name) or namespace(argument_name):
+                    problems.add(f"deadline-dependency opaque callback escape: {unit.path}:{node.lineno}")
+    return tuple(sorted(problems))
+
+
+_COORDINATION_FINALIZATION_RECIPES = {
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "record_coordination_event"): """
+def record_coordination_event(conn: Connection, *, run_id: str, event_type: str, worker_id: str, leader_epoch: int | None, recorded_at: datetime, context: Mapping[str, object] | None=None) -> None:
+    context_json = canonical_json({} if context is None else dict(context))
+    conn.execute(insert(run_coordination_events_table).values(event_id=_coordination_event_id(run_id=run_id, event_type=event_type, worker_id=worker_id, leader_epoch=leader_epoch, recorded_at=recorded_at, context_json=context_json), run_id=run_id, event_type=event_type, worker_id=worker_id, leader_epoch=leader_epoch, recorded_at=recorded_at, context_json=context_json))
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"): """
+def register_run_leader_on(self, conn: Connection, *, run_id: str, worker_id: str, window_seconds: float, entry_point: str='run') -> CoordinationToken:
+    database_now = read_landscape_decision_time(conn)
+    expires = database_now + timedelta(seconds=window_seconds)
+    conn.execute(insert(run_coordination_table).values(run_id=run_id, leader_worker_id=worker_id, leader_epoch=1, leader_heartbeat_expires_at=expires, updated_at=database_now))
+    token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+    self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='leader', window_seconds=window_seconds, entry_point=entry_point, database_now=database_now)
+    record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=1, recorded_at=database_now, context={'role': 'leader', 'entry_point': entry_point})
+    record_coordination_event(conn, run_id=run_id, event_type='leader_acquire', worker_id=worker_id, leader_epoch=1, recorded_at=database_now, context={'entry_point': entry_point})
+    return token
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"): """
+def acquire_run_leadership(self, *, run_id: str, worker_id: str, window_seconds: float, entry_point: str='resume') -> CoordinationToken:
+    try:
+        with begin_write(self._engine) as conn:
+            token = self._acquire_run_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds, entry_point=entry_point)
+            self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+        return token
+    except OperationalError as exc:
+        if not _is_database_locked(exc):
+            raise
+        raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"): """
+def _acquire_run_leadership_on(self, conn: Connection, *, run_id: str, worker_id: str, window_seconds: float, entry_point: str) -> CoordinationToken:
+    seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id).with_for_update()).one_or_none()
+    if seat is None:
+        raise AuditIntegrityError(f'Run {run_id!r} has no run_coordination seat row; at schema epoch 21 begin_run creates it atomically with the run. The audit DB is corrupt or was written by incompatible code.')
+    database_now = read_landscape_decision_time(conn)
+    prior_worker: str | None = seat.leader_worker_id
+    expires = database_now + timedelta(seconds=window_seconds)
+    run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+    if run_status in _IMMUTABLE_SUCCESS_RUN_STATUSES:
+        status_enum = RunStatus(run_status)
+        raise AuditIntegrityError(f"Cannot acquire run leadership: cannot transition run {run_id} from {status_enum.name} ({status_enum.value!r}) to 'running'. Successful terminal runs are immutable. FAILED/INTERRUPTED runs can be resumed via seat takeover.")
+    cas = conn.execute(update(run_coordination_table).where(run_coordination_table.c.run_id == run_id, run_coordination_table.c.leader_worker_id.is_(None) | (run_coordination_table.c.leader_heartbeat_expires_at < database_now)).values(leader_worker_id=worker_id, leader_epoch=run_coordination_table.c.leader_epoch + 1, leader_heartbeat_expires_at=expires, updated_at=database_now))
+    if cas.rowcount != 1:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+        held_expiry = seat.leader_heartbeat_expires_at
+        expiry_text = 'unknown' if held_expiry is None else _utc(held_expiry).isoformat()
+        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})')
+    new_epoch = int(seat.leader_epoch) + 1
+    token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+    conn.execute(update(runs_table).where(runs_table.c.run_id == run_id, runs_table.c.status.in_((*_TAKEOVER_FLIPPABLE_RUN_STATUSES, RunStatus.RUNNING.value))).values(status=RunStatus.RUNNING.value, completed_at=None, reproducibility_grade=None))
+    if prior_worker is not None and prior_worker != worker_id:
+        evicted = conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == prior_worker, run_workers_table.c.status == 'active').values(status='evicted', evicted_at=database_now, evicted_by_worker_id=worker_id))
+        if evicted.rowcount == 1:
+            record_coordination_event(conn, run_id=run_id, event_type='worker_evict', worker_id=prior_worker, leader_epoch=new_epoch, recorded_at=database_now, context={'evicted_by_worker_id': worker_id, 'reason': 'deposed_leader_takeover'})
+    self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='leader', window_seconds=window_seconds, entry_point=entry_point, database_now=database_now)
+    record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'role': 'leader', 'entry_point': entry_point})
+    record_coordination_event(conn, run_id=run_id, event_type='leader_acquire', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'entry_point': entry_point, 'deposed_leader_worker_id': prior_worker})
+    return token
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"): """
+def acquire_export_leadership(self, *, run_id: str, worker_id: str, window_seconds: float) -> CoordinationToken:
+    try:
+        with begin_write(self._engine) as conn:
+            token = self._acquire_export_leadership_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)
+            self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)
+        return token
+    except OperationalError as exc:
+        if not _is_database_locked(exc):
+            raise
+        raise WriteLockHeldError(run_id=run_id, workers=self._read_registered_workers(run_id)) from exc
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"): """
+def _acquire_export_leadership_on(self, conn: Connection, *, run_id: str, worker_id: str, window_seconds: float) -> CoordinationToken:
+    seat = conn.execute(select(run_coordination_table.c.leader_worker_id, run_coordination_table.c.leader_epoch, run_coordination_table.c.leader_heartbeat_expires_at).where(run_coordination_table.c.run_id == run_id).with_for_update()).one_or_none()
+    if seat is None:
+        raise AuditIntegrityError(f'Run {run_id!r} has no run_coordination seat row; at schema epoch 21 begin_run creates it atomically with the run. The audit DB is corrupt or was written by incompatible code.')
+    database_now = read_landscape_decision_time(conn)
+    run_status = conn.execute(select(runs_table.c.status).where(runs_table.c.run_id == run_id)).scalar_one_or_none()
+    if run_status == RunStatus.RUNNING.value:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+        raise NonResumableRunError(run_id, 'run is not terminal; its running leader owns finalization')
+    if run_status not in _EXPORT_SEAT_RUN_STATUSES:
+        raise AuditIntegrityError(f"Cannot acquire export leadership: run {run_id} is {run_status!r}, not terminal. An audit export is re-driven only for a finalized run; a RUNNING run is its leader's.")
+    prior_worker: str | None = seat.leader_worker_id
+    expires = database_now + timedelta(seconds=window_seconds)
+    cas = conn.execute(update(run_coordination_table).where(run_coordination_table.c.run_id == run_id, run_coordination_table.c.leader_worker_id.is_(None) | (run_coordination_table.c.leader_heartbeat_expires_at < database_now)).values(leader_worker_id=worker_id, leader_epoch=run_coordination_table.c.leader_epoch + 1, leader_heartbeat_expires_at=expires, updated_at=database_now))
+    if cas.rowcount != 1:
+        from elspeth.core.checkpoint.recovery import NonResumableRunError
+        held_expiry = seat.leader_heartbeat_expires_at
+        expiry_text = 'unknown' if held_expiry is None else _utc(held_expiry).isoformat()
+        raise NonResumableRunError(run_id, f'run leadership is held by {prior_worker!r} (seat expires {expiry_text})')
+    new_epoch = int(seat.leader_epoch) + 1
+    token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
+    record_issued_deadline(conn, key=_leader_deadline_key(token), expires_at=expires, window_seconds=window_seconds)
+    if prior_worker is not None and prior_worker != worker_id:
+        evicted = conn.execute(update(run_workers_table).where(run_workers_table.c.worker_id == prior_worker, run_workers_table.c.status == 'active').values(status='evicted', evicted_at=database_now, evicted_by_worker_id=worker_id))
+        if evicted.rowcount == 1:
+            record_coordination_event(conn, run_id=run_id, event_type='worker_evict', worker_id=prior_worker, leader_epoch=new_epoch, recorded_at=database_now, context={'evicted_by_worker_id': worker_id, 'reason': 'deposed_leader_export_takeover'})
+    self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='leader', window_seconds=window_seconds, entry_point='export', database_now=database_now)
+    record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'role': 'leader', 'entry_point': 'export'})
+    record_coordination_event(conn, run_id=run_id, event_type='leader_acquire', worker_id=worker_id, leader_epoch=new_epoch, recorded_at=database_now, context={'entry_point': 'export', 'deposed_leader_worker_id': prior_worker})
+    return token
+""",
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"): """
+def admit_follower(self, *, run_id: str, worker_id: str, config_hash: str, window_seconds: float) -> WorkerMembershipToken:
+    with begin_write(self._engine) as conn:
+        conn.execute(select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == run_id).with_for_update()).one_or_none()
+        database_now = read_landscape_decision_time(conn)
+        run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).one_or_none()
+        if run is None:
+            raise JoinRefusedError(run_id, 'run not found')
+        if run.status != RunStatus.RUNNING.value:
+            raise JoinRefusedError(run_id, f'run status is {run.status!r} — ' + ('a terminal run cannot be joined' if run.status == RunStatus.COMPLETED.value else 'use `elspeth resume`'))
+        if run.config_hash != config_hash:
+            raise JoinRefusedError(run_id, f"resolved settings hash {config_hash!r} does not match the run's config_hash {run.config_hash!r}; a joiner must run the identical pipeline")
+        seat = conn.execute(select(run_coordination_table.c.leader_worker_id, (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label('seat_live')).where(run_coordination_table.c.run_id == run_id)).one_or_none()
+        seat_live = seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live)
+        if not seat_live:
+            raise JoinRefusedError(run_id, 'no live leader — use `elspeth resume` to take the seat')
+        self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='follower', window_seconds=window_seconds, entry_point='join', database_now=database_now)
+        record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=None, recorded_at=database_now, context={'role': 'follower', 'entry_point': 'join'})
+        self._finalize_follower_admission_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)
+    return WorkerMembershipToken(run_id=run_id, worker_id=worker_id)
+""",
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._coordination_repo"): """
+@property
+def _coordination_repo(self) -> RunCoordinationRepository:
+    if self._run_coordination is None:
+        self._run_coordination = RunCoordinationRepository(self._db.engine)
+    return self._run_coordination
+""",
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): """
+def begin_run(self, config: Mapping[str, Any], canonical_version: str, *, run_id: str | None=None, reproducibility_grade: ReproducibilityGrade | None=None, status: RunStatus=RunStatus.RUNNING, source_schema_json: str | None=None, initiated_by_user_id: str | None=None, auth_provider_type: str | None=None, openrouter_catalog_sha256: str, openrouter_catalog_source: str, leader_worker_id: str | None=None, web_plugin_policy_evidence: WebPluginPolicyEvidence | None=None) -> Run:
+    if status == RunStatus.COMPLETED:
+        raise AuditIntegrityError('begin_run() cannot create a COMPLETED run. Use complete_run() so completed_at is recorded in the audit trail.')
+    validate_run_attribution(initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type)
+    _validate_openrouter_catalog_snapshot(sha256=openrouter_catalog_sha256, source=openrouter_catalog_source)
+    if web_plugin_policy_evidence is not None and (not isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)):
+        raise AuditIntegrityError('web_plugin_policy_evidence must be a WebPluginPolicyEvidence value')
+    run_id = run_id or generate_id()
+    settings_json = canonical_json(config)
+    config_hash = stable_hash(config)
+    timestamp = now()
+    runtime_val_manifest_json = _frozen_runtime_val_manifest_json()
+    run = Run(run_id=run_id, started_at=timestamp, config_hash=config_hash, settings_json=settings_json, canonical_version=canonical_version, status=status, reproducibility_grade=reproducibility_grade)
+    worker_id = leader_worker_id or mint_worker_id(run.run_id)
+    coordination = self._coordination_repo
+    try:
+        with self._db.write_connection() as conn:
+            conn.execute(runs_table.insert().values(run_id=run.run_id, started_at=run.started_at, config_hash=run.config_hash, settings_json=run.settings_json, canonical_version=run.canonical_version, status=run.status.value, reproducibility_grade=run.reproducibility_grade, source_schema_json=source_schema_json, runtime_val_manifest_json=runtime_val_manifest_json, llm_call_count=None, seeded_from_cache=False, cache_key=None, openrouter_catalog_sha256=openrouter_catalog_sha256, openrouter_catalog_source=openrouter_catalog_source))
+            if initiated_by_user_id is not None and auth_provider_type is not None:
+                conn.execute(run_attributions_table.insert().values(run_id=run.run_id, recorded_at=timestamp, initiated_by_user_id=initiated_by_user_id, auth_provider_type=auth_provider_type))
+            if web_plugin_policy_evidence is not None:
+                self._insert_web_plugin_policy_evidence(conn, run_id=run.run_id, evidence=web_plugin_policy_evidence)
+            leader_token = coordination.register_run_leader_on(conn, run_id=run.run_id, worker_id=worker_id, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='run')
+            coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(f'begin_run — database rejected audit write: {type(exc).__name__}: {exc}') from exc
+    return run
+""",
+}
+
+_COORDINATION_FINALIZATION_DEPENDENCIES = {
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "record_coordination_event"): {
+        "Connection": "sqlalchemy.engine.Connection",
+        "datetime": "datetime.datetime",
+        "canonical_json": "elspeth.core.canonical.canonical_json",
+        "insert": "sqlalchemy.insert",
+        "run_coordination_events_table": "elspeth.core.landscape.schema.run_coordination_events_table",
+        "_coordination_event_id": "elspeth.core.landscape.run_coordination_repository._coordination_event_id",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.register_run_leader_on"): {
+        "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+        "Connection": "sqlalchemy.engine.Connection",
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "record_coordination_event": "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+        "timedelta": "datetime.timedelta",
+        "_leader_deadline_key": "elspeth.core.landscape.run_coordination_repository._leader_deadline_key",
+        "insert": "sqlalchemy.insert",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"): {
+        "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+        "OperationalError": "sqlalchemy.exc.OperationalError",
+        "begin_write": "elspeth.core.landscape.database.begin_write",
+        "WriteLockHeldError": "elspeth.contracts.errors.WriteLockHeldError",
+        "_is_database_locked": "elspeth.core.landscape.run_coordination_repository._is_database_locked",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"): {
+        "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+        "Connection": "sqlalchemy.engine.Connection",
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "record_coordination_event": "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+        "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+        "timedelta": "datetime.timedelta",
+        "RunStatus": "elspeth.contracts.enums.RunStatus",
+        "NonResumableRunError": "elspeth.core.checkpoint.recovery.NonResumableRunError",
+        "_leader_deadline_key": "elspeth.core.landscape.run_coordination_repository._leader_deadline_key",
+        "_utc": "elspeth.core.landscape.run_coordination_repository._utc",
+        "select": "sqlalchemy.select",
+        "update": "sqlalchemy.update",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+        "runs_table": "elspeth.core.landscape.schema.runs_table",
+        "run_workers_table": "elspeth.core.landscape.schema.run_workers_table",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"): {
+        "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+        "OperationalError": "sqlalchemy.exc.OperationalError",
+        "begin_write": "elspeth.core.landscape.database.begin_write",
+        "WriteLockHeldError": "elspeth.contracts.errors.WriteLockHeldError",
+        "_is_database_locked": "elspeth.core.landscape.run_coordination_repository._is_database_locked",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"): {
+        "CoordinationToken": "elspeth.contracts.coordination.CoordinationToken",
+        "Connection": "sqlalchemy.engine.Connection",
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_issued_deadline": "elspeth.core.landscape.lease_deadlines.record_issued_deadline",
+        "record_coordination_event": "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+        "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+        "NonResumableRunError": "elspeth.core.checkpoint.recovery.NonResumableRunError",
+        "timedelta": "datetime.timedelta",
+        "RunStatus": "elspeth.contracts.enums.RunStatus",
+        "_leader_deadline_key": "elspeth.core.landscape.run_coordination_repository._leader_deadline_key",
+        "_utc": "elspeth.core.landscape.run_coordination_repository._utc",
+        "select": "sqlalchemy.select",
+        "update": "sqlalchemy.update",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+        "runs_table": "elspeth.core.landscape.schema.runs_table",
+        "run_workers_table": "elspeth.core.landscape.schema.run_workers_table",
+    },
+    ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"): {
+        "WorkerMembershipToken": "elspeth.contracts.coordination.WorkerMembershipToken",
+        "begin_write": "elspeth.core.landscape.database.begin_write",
+        "read_landscape_decision_time": "elspeth.core.landscape.database_clock.read_landscape_decision_time",
+        "record_coordination_event": "elspeth.core.landscape.run_coordination_repository.record_coordination_event",
+        "JoinRefusedError": "elspeth.contracts.errors.JoinRefusedError",
+        "RunStatus": "elspeth.contracts.enums.RunStatus",
+        "select": "sqlalchemy.select",
+        "runs_table": "elspeth.core.landscape.schema.runs_table",
+        "run_coordination_table": "elspeth.core.landscape.schema.run_coordination_table",
+    },
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository._coordination_repo"): {
+        "RunCoordinationRepository": "elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository"
+    },
+    ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"): {
+        "Run": "elspeth.contracts.Run",
+        "RunStatus": "elspeth.contracts.RunStatus",
+        "validate_run_attribution": "elspeth.core.landscape.run_lifecycle_repository.validate_run_attribution",
+        "_validate_openrouter_catalog_snapshot": "elspeth.core.landscape.run_lifecycle_repository._validate_openrouter_catalog_snapshot",
+        "canonical_json": "elspeth.core.canonical.canonical_json",
+        "stable_hash": "elspeth.core.canonical.stable_hash",
+        "now": "elspeth.core.landscape._helpers.now",
+        "_frozen_runtime_val_manifest_json": "elspeth.core.landscape.run_lifecycle_repository._frozen_runtime_val_manifest_json",
+        "SQLAlchemyError": "sqlalchemy.exc.SQLAlchemyError",
+        "ReproducibilityGrade": "elspeth.contracts.ReproducibilityGrade",
+        "WebPluginPolicyEvidence": "elspeth.contracts.plugin_policy_audit.WebPluginPolicyEvidence",
+        "AuditIntegrityError": "elspeth.contracts.errors.AuditIntegrityError",
+        "generate_id": "elspeth.core.ids.generate_id",
+        "mint_worker_id": "elspeth.contracts.coordination.mint_worker_id",
+        "LandscapeRecordError": "elspeth.core.landscape.errors.LandscapeRecordError",
+        "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS": "elspeth.contracts.coordination.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS",
+        "runs_table": "elspeth.core.landscape.schema.runs_table",
+        "run_attributions_table": "elspeth.core.landscape.schema.run_attributions_table",
+    },
+}
+
+_COORDINATION_FINALIZATION_RECIPES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.__init__")] = """
+def __init__(self, db: LandscapeDB, ops: DatabaseOps, run_loader: RunLoader) -> None:
+    self._db = db
+    self._ops = ops
+    self._run_loader = run_loader
+    self._run_coordination: RunCoordinationRepository | None = None
+    self._token_outcomes: TokenOutcomeRepository | None = None
+    self._operation_repository: OperationRepository | None = None
+"""
+_COORDINATION_FINALIZATION_DEPENDENCIES[("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.__init__")] = {}
+
+_COORDINATION_FINALIZATION_CALLERS = {
+    "_finalize_leader_registration_on": {
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
+    },
+    "_finalize_follower_admission_on": {
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.admit_follower"),
+    },
+    "register_run_leader_on": {
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"),
+    },
+    "_acquire_run_leadership_on": {
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_run_leadership"),
+    },
+    "_acquire_export_leadership_on": {
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_export_leadership"),
+    },
+}
+
+
+def _finalization_recipe_dump(function):
+    # Comments/initial documentation are not authority behavior. Everything
+    # executable, including defaults/decorators/returns, remains in the recipe.
+    value = ast.parse(ast.unparse(function)).body[0]
+    if (
+        value.body
+        and isinstance(value.body[0], ast.Expr)
+        and isinstance(value.body[0].value, ast.Constant)
+        and isinstance(value.body[0].value.value, str)
+    ):
+        value.body.pop(0)
+    return stable_ast_dump(value)
+
+
+def _finalization_begin_run_receiver_is_owned(call, resolver, proof, functions):
+    # The generic resolver does not currently model this lazy property. Prove
+    # the exact visible creation/None-initialization graph, without granting an
+    # arbitrary receiver merely because its local variable is 'coordination'.
+    lifecycle_path = "src/elspeth/core/landscape/run_lifecycle_repository.py"
+    if resolver.unit.path != lifecycle_path or _symbol(call) != "RunLifecycleRepository.begin_run":
+        return False
+    for symbol in ("RunLifecycleRepository.begin_run", "RunLifecycleRepository._coordination_repo", "RunLifecycleRepository.__init__"):
+        key = (lifecycle_path, symbol)
+        found = functions.get(key, ())
+        if len(found) != 1 or _finalization_recipe_dump(found[0][0]) != _finalization_recipe_dump(
+            ast.parse(_COORDINATION_FINALIZATION_RECIPES[key]).body[0]
+        ):
+            return False
+    owner = proof.class_for("elspeth.core.landscape.run_lifecycle_repository.RunLifecycleRepository")
+    target = proof.class_for("elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository")
+    if owner is None or target is None or owner[0].bases or owner[0].decorator_list or target[0].bases or target[0].decorator_list:
+        return False
+    if not isinstance(call.func, ast.Attribute) or not isinstance(call.func.value, ast.Name) or call.func.value.id != "coordination":
+        return False
+    if not _receiver_class_body_is_visible(proof, *owner) or not _receiver_class_body_is_visible(proof, *target):
+        return False
+    if not _receiver_method_is_unmodified(proof, *owner, "_coordination_repo", call) or not _receiver_method_is_unmodified(
+        proof, *target, call.func.attr, call
+    ):
+        return False
+    allowed_stores = {
+        (lifecycle_path, "RunLifecycleRepository.__init__"),
+        (lifecycle_path, "RunLifecycleRepository._coordination_repo"),
+    }
+    fields = {"_run_coordination", "_coordination_repo"}
+    for unit in proof.units:
+        unit_resolver = _resolver_for_unit(unit)
+        for part in ast.walk(unit.tree):
+            if isinstance(part, ast.Attribute) and part.attr in fields and isinstance(part.ctx, (ast.Store, ast.Del)):
+                # A same-spelled field on a distinct, unrelated nominal class
+                # is not a mutation of RunLifecycleRepository's lazy receiver.
+                function = _owner_function(part)
+                declaring = next((ancestor for ancestor in _ancestors(part) if isinstance(ancestor, ast.ClassDef)), None)
+                parameters = () if function is None else (*function.args.posonlyargs, *function.args.args)
+                unrelated_self = (
+                    declaring is not None
+                    and declaring is not owner[0]
+                    and not declaring.bases
+                    and not declaring.keywords
+                    and not declaring.decorator_list
+                    and function is not None
+                    and function.name == "__init__"
+                    and not function.decorator_list
+                    and parameters
+                    and isinstance(part.value, ast.Name)
+                    and part.value.id == parameters[0].arg
+                    and not any(
+                        isinstance(binding, ast.Name) and binding.id == parameters[0].arg and isinstance(binding.ctx, (ast.Store, ast.Del))
+                        for binding in _walk_same_scope(function)
+                    )
+                )
+                if unrelated_self:
+                    continue
+                if part.attr == "_coordination_repo" or (unit.path, _symbol(part)) not in allowed_stores:
+                    return False
+            if (
+                isinstance(part, ast.Subscript)
+                and isinstance(part.ctx, (ast.Store, ast.Del))
+                and isinstance(part.value, ast.Attribute)
+                and part.value.attr == "__dict__"
+                and _constant_string_value(part.slice, unit_resolver, use=part) in fields
+            ):
+                return False
+            if (
+                isinstance(part, ast.Call)
+                and _call_name(part) in {"setattr", "delattr", "__setattr__", "__delattr__"}
+                and len(part.args) >= 2
+                and any(_constant_string_value(argument, unit_resolver, use=part) in fields for argument in part.args[:2])
+            ):
+                return False
+    return True
+
+
+def _deadline_finalization_caller_violations(units) -> tuple[str, ...]:
+    return _deadline_finalization_caller_violations_for_units(tuple(units))
+
+
+def _finalization_graph_is_present(units: tuple[SourceUnit, ...]) -> bool:
+    """Require the closed graph for admission capabilities, not a module path.
+
+    Evidence-only snippets may share the real module path. They receive no
+    deadline-writer exemption: that grant separately requires every recipe.
+    Definitions keep missing-call mutations relevant even after call removal.
+    """
+    protected = set(_COORDINATION_FINALIZATION_CALLERS)
+    callers = set().union(*_COORDINATION_FINALIZATION_CALLERS.values())
+    classes = {
+        "elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository",
+        "elspeth.core.landscape.run_lifecycle_repository.RunLifecycleRepository",
+    }
+    proof = _AuthorityProof(units)
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(unit.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
+                node.name in protected or (unit.path, _symbol(node)) in callers
+            ):
+                return True
+            if isinstance(node, ast.Attribute) and node.attr in protected:
+                return True
+            if not isinstance(node, ast.Call) or len(node.args) < 2:
+                continue
+            if _resolved_callable_name(node.func, resolver, use=node) not in {
+                "getattr",
+                "setattr",
+                "delattr",
+                "__setattr__",
+                "__delattr__",
+            }:
+                continue
+            if any(_constant_string_value(arg, resolver, use=node) in protected for arg in node.args[:2]):
+                return True
+            receiver = proof.receiver(node.args[0], resolver, node)
+            if resolver.qualified_name(node.args[0], use=node) in classes or (
+                receiver is not None
+                and receiver[1].unit.path == "src/elspeth/core/landscape/run_coordination_repository.py"
+                and receiver[0].name == "RunCoordinationRepository"
+            ):
+                return True
+    return False
+
+
+@cache
+def _deadline_finalization_caller_violations_for_units(units: tuple[SourceUnit, ...]) -> tuple[str, ...]:
+    """Prove the closed admission graph before granting inherited row locks.
+
+    Paired finalization follows one initial seat INSERT or a locked-seat CAS
+    and one new worker INSERT, on the original connection. Each owning body
+    finishes with that exact returned token's finalizer. Follower admission
+    takes its seat lock before inserting membership and finalizes at its tail.
+
+    These auditable AST recipes deliberately reject new compositions until
+    reviewed. The separate clock and registry predicates remain required by
+    _proven_coordination_deadline_writers before any generic-gate delegation.
+    """
+    units = tuple(units)
+    coordination_path = "src/elspeth/core/landscape/run_coordination_repository.py"
+    protected = set(_COORDINATION_FINALIZATION_CALLERS)
+    relevant = _finalization_graph_is_present(units)
+    if not relevant:
+        return ()
+    problems = []
+    proof = _AuthorityProof(units)
+    functions = {}
+    for unit in units:
+        for node in ast.walk(unit.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.setdefault((unit.path, _symbol(node)), []).append((node, _resolver_for_unit(unit)))
+    for key, recipe in _COORDINATION_FINALIZATION_RECIPES.items():
+        found = functions.get(key, ())
+        if len(found) != 1 or isinstance(found[0][0], ast.AsyncFunctionDef):
+            problems.append(f"deadline-finalization missing/ambiguous recipe owner: {key}")
+            continue
+        function, resolver = found[0]
+        expected = ast.parse(textwrap.dedent(recipe)).body[0]
+        if _finalization_recipe_dump(function) != _finalization_recipe_dump(expected):
+            problems.append(f"deadline-finalization caller/admission recipe changed: {key}")
+        for name, qualified in _COORDINATION_FINALIZATION_DEPENDENCIES[key].items():
+            references = [
+                part for part in ast.walk(function) if isinstance(part, ast.Name) and part.id == name and isinstance(part.ctx, ast.Load)
+            ]
+            if not references or any(
+                resolver.qualified_name(part, use=part) != qualified or not _deadline_api_is_visible(qualified, resolver, part)
+                for part in references
+            ):
+                problems.append(f"deadline-finalization dependency changed: {key}:{name}")
+        for name in {"int", "bool", "dict", "str", "property"}:
+            references = [
+                part for part in ast.walk(function) if isinstance(part, ast.Name) and part.id == name and isinstance(part.ctx, ast.Load)
+            ]
+            if any(not _deadline_lock_builtin(part, name, resolver, part) for part in references):
+                problems.append(f"deadline-finalization builtin rebound: {key}:{name}")
+    observed = {name: set() for name in protected}
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(unit.tree):
+            if not isinstance(node, ast.Attribute) or node.attr not in protected:
+                continue
+            parent = getattr(node, "_landscape_parent", None)
+            # Closed direct-call set: extraction into an alias, reflection,
+            # or a forwarding helper is an unproved additional authority edge.
+            if not isinstance(parent, ast.Call) or parent.func is not node:
+                problems.append(f"deadline-finalization indirect/altered reference: {unit.path}:{node.lineno}")
+                continue
+            owner = _owner_function(parent)
+            key = (unit.path, _symbol(owner)) if owner is not None else (unit.path, "<module>")
+            if key not in _COORDINATION_FINALIZATION_CALLERS[node.attr] or key in observed[node.attr]:
+                problems.append(f"deadline-finalization extra/repeated caller: {unit.path}:{node.lineno}")
+                continue
+            observed[node.attr].add(key)
+            target = proof.called_function(parent, resolver, parent)
+            exact_target = target is not None and (target[1].unit.path, _symbol(target[0])) == (
+                coordination_path,
+                "RunCoordinationRepository." + node.attr,
+            )
+            if not exact_target and not _finalization_begin_run_receiver_is_owned(parent, resolver, proof, functions):
+                problems.append(f"deadline-finalization unowned receiver: {unit.path}:{node.lineno}")
+    # Also reject reflective references, which do not contain an Attribute
+    # spelling but can expose either finalizer or its admission capability.
+    protected_qualified = {
+        path.removeprefix("src/").removesuffix(".py").replace("/", ".") + "." + symbol
+        for path, symbol in _COORDINATION_FINALIZATION_RECIPES
+    } | {"elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository." + name for name in protected}
+    protected_classes = {
+        "elspeth.core.landscape.run_coordination_repository.RunCoordinationRepository",
+        "elspeth.core.landscape.run_lifecycle_repository.RunLifecycleRepository",
+    }
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(unit.tree):
+            if isinstance(node, ast.Attribute) and (
+                isinstance(node.ctx, (ast.Store, ast.Del)) or node.attr in {"__dict__", "__code__", "__globals__"}
+            ):
+                qualified = resolver.qualified_name(node, use=node)
+                receiver_qualified = resolver.qualified_name(node.value, use=node)
+                if (
+                    isinstance(node.ctx, (ast.Store, ast.Del))
+                    and qualified is not None
+                    and any(qualified == name or qualified.startswith(name + ".") for name in protected_qualified)
+                ):
+                    problems.append(f"deadline-finalization external callable mutation: {unit.path}:{node.lineno}")
+                if node.attr in {"__dict__", "__code__", "__globals__"} and receiver_qualified in protected_classes | protected_qualified:
+                    problems.append(f"deadline-finalization callable dictionary/code exposure: {unit.path}:{node.lineno}")
+            callable_name = _resolved_callable_name(node.func, resolver, use=node) if isinstance(node, ast.Call) else None
+            if (
+                isinstance(node, ast.Call)
+                and callable_name in {"getattr", "setattr", "delattr", "__setattr__", "__delattr__"}
+                and len(node.args) >= 2
+            ):
+                attribute = _constant_string_value(node.args[1], resolver, use=node)
+                receiver = proof.receiver(node.args[0], resolver, node)
+                owned_receiver = (
+                    receiver is not None and receiver[1].unit.path == coordination_path and receiver[0].name == "RunCoordinationRepository"
+                )
+                owned_class = resolver.qualified_name(node.args[0], use=node) in protected_classes
+                reflected_protected = any(_constant_string_value(argument, resolver, use=node) in protected for argument in node.args[:2])
+                if reflected_protected or (attribute is None and (owned_receiver or owned_class)):
+                    problems.append(f"deadline-finalization reflected reference: {unit.path}:{node.lineno}")
+    for name, expected in _COORDINATION_FINALIZATION_CALLERS.items():
+        if observed[name] != expected:
+            problems.append(f"deadline-finalization caller set incomplete: {name}")
+    return tuple(sorted(set(problems)))
+
+
+@cache
+def _proven_coordination_deadline_writers(units: tuple[SourceUnit, ...]) -> frozenset[tuple[str, str]]:
+    """Only the exact graph and implementation recipes bypass generic issuance.
+
+    The registry binding independently pins the reviewed commit guard.
+    Missing/changed graph, implementation or registry means no granted symbols.
+    """
+    units = tuple(units)
+    sources = {unit.path: unit.source for unit in units}
+    coordination_path = "src/elspeth/core/landscape/run_coordination_repository.py"
+    source = sources.get(coordination_path)
+    if source is None or _deadline_finalization_caller_violations(units):
+        return frozenset()
+    if _deadline_dependency_mutation_violations(units, _DEADLINE_REGISTRY_NAMESPACES | _DEADLINE_FINALIZATION_DEPENDENCIES):
+        return frozenset()
+    if not _leader_deadline_sources_are_proven(sources) or not _issued_deadline_registry_source_is_proven(sources):
+        return frozenset()
+    if (
+        _worker_registration_contract_violations(source)
+        or _worker_heartbeat_contract_violations(source)
+        or _heartbeat_fence_implementation_violations(units)
+    ):
+        return frozenset()
+    symbols = {
+        "RunCoordinationRepository.register_run_leader_on",
+        "RunCoordinationRepository._acquire_run_leadership_on",
+        "RunCoordinationRepository._acquire_export_leadership_on",
+        "RunCoordinationRepository.acquire_run_leadership",
+        "RunCoordinationRepository.acquire_export_leadership",
+        "RunCoordinationRepository.admit_follower",
+        "RunCoordinationRepository._insert_worker_row",
+        "RunCoordinationRepository._finalize_leader_registration_on",
+        "RunCoordinationRepository._finalize_follower_admission_on",
+        "RunCoordinationRepository.worker_heartbeat",
+        "_renew_leader_deadline_on",
+    }
+    return frozenset(
+        {(coordination_path, symbol) for symbol in symbols}
+        | {
+            ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.begin_run"),
+        }
+    )
+
+
+# Permanent controls: actual owned recipes are the baseline; mutations
+# alter only the named AST/source seam and must never receive delegation.
+
+
+@pytest.fixture(scope="module")
+def finalization_source_units():
+    return tuple(unit for unit in _production_units() if unit.path.startswith("src/elspeth/core/landscape/"))
+
+
+def _finalization_mutate(units, path, old, new):
+    result = []
+    changed = False
+    for unit in units:
+        if unit.path == path:
+            assert old in unit.source
+            result.append(_parse_source(path, unit.source.replace(old, new, 1)))
+            changed = True
+        else:
+            result.append(unit)
+    assert changed
+    return tuple(result)
+
+
+def test_finalization_current_closed_caller_graph(finalization_source_units):
+    findings = _deadline_finalization_caller_violations(finalization_source_units)
+    assert findings == (), findings
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)",
+            "self._finalize_leader_registration_on(other_conn, token=token, window_seconds=window_seconds)",
+        ),
+        (
+            "self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)",
+            "self._finalize_leader_registration_on(conn, token=foreign_token, window_seconds=window_seconds)",
+        ),
+        (
+            "self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)",
+            "self._finalize_leader_registration_on(conn, token=token, window_seconds=window_seconds)\n                conn.execute(after_finalization)",
+        ),
+        ("            return token\n        except OperationalError", "            return foreign_token\n        except OperationalError"),
+        (
+            "self._finalize_follower_admission_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)",
+            "self._finalize_follower_admission_on(conn, run_id=run_id, worker_id=foreign_worker, window_seconds=window_seconds)",
+        ),
+        (
+            "return WorkerMembershipToken(run_id=run_id, worker_id=worker_id)",
+            "return WorkerMembershipToken(run_id=run_id, worker_id=foreign_worker)",
+        ),
+        (
+            ".with_for_update()\n        ).one_or_none()\n        if seat is None:",
+            ".with_for_update(read=True)\n        ).one_or_none()\n        if seat is None:",
+        ),
+        (
+            "token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=1)",
+            "token = CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=9)",
+        ),
+        (
+            "        return token\n\n    def acquire_run_leadership",
+            "        conn.rollback()\n        return token\n\n    def acquire_run_leadership",
+        ),
+        (
+            "    context_json = canonical_json({} if context is None else dict(context))",
+            "    getattr(conn, 'rollback')()\n    context_json = canonical_json({} if context is None else dict(context))",
+        ),
+        (
+            "from elspeth.core.landscape.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas",
+            "from foreign.database import Tier1Engine, begin_write, verify_sqlite_tier1_pragmas",
+        ),
+    ],
+)
+def test_finalization_refuses_coordination_graph_mutants(finalization_source_units, old, new):
+    mutated = _finalization_mutate(finalization_source_units, "src/elspeth/core/landscape/run_coordination_repository.py", old, new)
+    assert _deadline_finalization_caller_violations(mutated)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)",
+            "coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=1)",
+        ),
+        (
+            "                leader_token = coordination.register_run_leader_on(",
+            "                coordination._finalize_leader_registration_on(conn, token=foreign_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)\n                leader_token = coordination.register_run_leader_on(",
+        ),
+        ("with self._db.write_connection() as conn:", "with foreign_transaction() as conn:"),
+        ("        return self._run_coordination", "        return foreign_repository"),
+    ],
+)
+def test_finalization_refuses_begin_run_graph_mutants(finalization_source_units, old, new):
+    mutated = _finalization_mutate(finalization_source_units, "src/elspeth/core/landscape/run_lifecycle_repository.py", old, new)
+    assert _deadline_finalization_caller_violations(mutated)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "def extra(repo, conn, token):\n    repo._finalize_leader_registration_on(conn, token=token, window_seconds=60)\n",
+        "def extra(repo, conn, token):\n    relay = repo._finalize_leader_registration_on\n    relay(conn, token=token, window_seconds=60)\n",
+        "def extra(repo, conn, token):\n    getattr(repo, '_finalize_leader_registration_on')(conn, token=token, window_seconds=60)\n",
+    ],
+)
+def test_finalization_refuses_extra_and_laundered_callers(finalization_source_units, extra):
+    units = (*finalization_source_units, _parse_source("src/elspeth/extra_deadline_caller.py", extra))
+    assert _deadline_finalization_caller_violations(units)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "def corrupt(obj, foreign):\n    obj.__dict__['_run_coordination'] = foreign\n",
+        "def corrupt(obj, foreign):\n    object.__setattr__(obj, '_run_coordination', foreign)\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nRunCoordinationRepository._finalize_leader_registration_on = foreign\n",
+        "def extra(repo, conn, token):\n    name = '_finalize_' + 'leader_registration_on'\n    getattr(repo, name)(conn, token=token, window_seconds=60)\n",
+    ],
+)
+def test_finalization_refuses_property_and_reflective_mutations(finalization_source_units, extra):
+    units = (*finalization_source_units, _parse_source("src/elspeth/finalization_receiver_mutation.py", extra))
+    assert _deadline_finalization_caller_violations(units)
+
+
+def test_finalization_current_writer_delegation_and_factory_returns(finalization_source_units):
+    proven = _proven_coordination_deadline_writers(finalization_source_units)
+    expected = {
+        "RunCoordinationRepository.register_run_leader_on",
+        "RunCoordinationRepository._acquire_run_leadership_on",
+        "RunCoordinationRepository._acquire_export_leadership_on",
+        "RunCoordinationRepository.acquire_run_leadership",
+        "RunCoordinationRepository.acquire_export_leadership",
+        "RunCoordinationRepository.admit_follower",
+        "RunCoordinationRepository._insert_worker_row",
+        "RunCoordinationRepository._finalize_leader_registration_on",
+        "RunCoordinationRepository._finalize_follower_admission_on",
+        "RunCoordinationRepository.worker_heartbeat",
+        "_renew_leader_deadline_on",
+        "RunLifecycleRepository.begin_run",
+    }
+    assert {symbol for _path, symbol in proven} == expected, proven
+    proof = _AuthorityProof(finalization_source_units)
+    for unit in finalization_source_units:
+        if unit.path != "src/elspeth/core/landscape/run_coordination_repository.py":
+            continue
+        for function in ast.walk(unit.tree):
+            if isinstance(function, ast.FunctionDef) and function.name in {
+                "acquire_run_leadership",
+                "acquire_export_leadership",
+                "admit_follower",
+            }:
+                scope = _MEMBER_SCOPE if function.name == "admit_follower" else _LEADER_SCOPE
+                assert _authority_factory_return_contract(proof, function, _resolver_for_unit(unit), scope)
+
+
+def test_finalization_registry_mutation_removes_every_writer_grant(finalization_source_units):
+    units = _finalization_mutate(
+        finalization_source_units,
+        "src/elspeth/core/landscape/lease_deadlines.py",
+        "    install_deadline_guard(conn.engine)",
+        "    conn.rollback()\n    install_deadline_guard(conn.engine)",
+    )
+    assert not _proven_coordination_deadline_writers(units)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "class Mutator:\n    @staticmethod\n    def corrupt(obj, foreign):\n        obj._run_coordination = foreign\n",
+        "class Mutator:\n    def __init__(self, victim, foreign):\n        self = victim\n        self._run_coordination = foreign\n",
+    ],
+)
+def test_finalization_refuses_foreign_parameter_masquerading_as_constructor_self(finalization_source_units, extra):
+    units = (*finalization_source_units, _parse_source("src/elspeth/core/landscape/receiver_corruption.py", extra))
+    assert _deadline_finalization_caller_violations(units)
+
+
+def test_finalization_complete_production_graph_and_writer_grants():
+    units = _production_units()
+    findings = _deadline_finalization_caller_violations(units)
+    assert not findings, findings
+    assert len(_proven_coordination_deadline_writers(units)) == 12
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\ntype.__setattr__(RunCoordinationRepository, '_finalize_leader_registration_on', foreign)\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nfrom builtins import setattr as write\nwrite(RunCoordinationRepository, '_finalize_leader_registration_on', foreign)\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nRunCoordinationRepository.__dict__['_finalize_leader_registration_on'].__code__ = foreign.__code__\n",
+        "from elspeth.core.landscape.run_coordination_repository import record_coordination_event as record\nrecord.__code__ = foreign.__code__\n",
+    ],
+)
+def test_finalization_refuses_external_dependency_code_replacement(finalization_source_units, extra):
+    units = (*finalization_source_units, _parse_source("src/elspeth/core/landscape/dependency_mutation.py", extra))
+    assert _deadline_finalization_caller_violations(units)
+
+
+# Reviewed NULL-deadline mapping graph. Exact recipes intentionally fail closed on body drift.
+_NULL_DEADLINE_RECIPES = {}
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "_effect_row_values")] = r"""
+def _effect_row_values(conn: Connection, request: SinkEffectReservationRequest, identity: _EffectIdentity, *, stream_id: str | None, stream_sequence: int | None, predecessor_effect_id: str | None) -> dict[str, object]:
+    timestamp = read_landscape_transaction_time(conn)
+    primary_effect_ids = {member.primary_effect_id for member in identity.members if member.primary_effect_id is not None}
+    common_primary_effect_id = next(iter(primary_effect_ids)) if len(primary_effect_ids) == 1 else None
+    return {'effect_id': identity.effect_id, 'run_id': request.run_id, 'sink_node_id': request.sink_node_id, 'role': request.role.value, 'state': SinkEffectState.RESERVED.value, 'protocol_version': SINK_EFFECT_PROTOCOL_VERSION, 'input_kind': request.input_kind.value, 'required_member_ordinal': 0 if request.input_kind is SinkEffectInputKind.PIPELINE_MEMBERS else None, 'required_snapshot_slot': 0 if request.input_kind is SinkEffectInputKind.AUDIT_EXPORT_SNAPSHOT else None, 'config_hash': request.config_hash, 'membership_or_manifest_hash': identity.membership_or_manifest_hash, 'group_payload_hash': identity.group_payload_hash, 'artifact_id': identity.artifact_id, 'artifact_idempotency_key': identity.artifact_idempotency_key, 'target_json': _EMPTY_TARGET_JSON, 'inspection_mode': None, 'inspection_attempt_id': None, 'plan_json': None, 'plan_hash': None, 'descriptor_mode': None, 'expected_descriptor_hash': None, 'precondition_hash': None, 'prepared_at': None, 'lease_owner': None, 'generation': 0, 'lease_expires_at': None, 'lease_heartbeat_at': None, 'reconcile_kind': None, 'reconcile_evidence_hash': None, 'result_descriptor_hash': None, 'publication_performed': None, 'publication_evidence_kind': None, 'primary_effect_id': common_primary_effect_id, 'stream_id': stream_id, 'stream_sequence': stream_sequence, 'predecessor_effect_id': predecessor_effect_id, 'created_at': timestamp, 'updated_at': timestamp, 'finalized_at': None}
+"""
+
+_NULL_DEADLINE_RECIPES[
+    ("src/elspeth/core/landscape/execution/sink_effect_reservation.py", "SinkEffectReservation._insert_or_compare_effect")
+] = r"""
+def _insert_or_compare_effect(self, conn: Connection, request: SinkEffectReservationRequest, identity: _EffectIdentity, *, stream_id: str | None, stream_sequence: int | None, predecessor_effect_id: str | None, coordination_token: CoordinationToken) -> tuple[bool, SinkEffect]:
+    if request.run_id != coordination_token.run_id:
+        raise ValueError(f"sink effect reservation names run {request.run_id!r}, not the coordination token's run")
+    values = _effect_row_values(conn, request, identity, stream_id=stream_id, stream_sequence=stream_sequence, predecessor_effect_id=predecessor_effect_id)
+    if conn.dialect.name == 'sqlite':
+        inserted = conn.execute(sqlite_insert(sink_effects_table).values(**values).on_conflict_do_nothing(index_elements=['effect_id']).returning(sink_effects_table.c.effect_id)).fetchone() is not None
+    elif conn.dialect.name == 'postgresql':
+        inserted = conn.execute(postgresql_insert(sink_effects_table).values(**values).on_conflict_do_nothing(index_elements=['effect_id']).returning(sink_effects_table.c.effect_id)).fetchone() is not None
+    else:
+        raise _unsupported_backend(conn)
+    row = conn.execute(select(sink_effects_table).where(sink_effects_table.c.effect_id == identity.effect_id).with_for_update()).fetchone()
+    if row is None:
+        raise ValueError('sink effect winner disappeared')
+    immutable_fields = ((row.run_id, request.run_id), (row.sink_node_id, request.sink_node_id), (row.role, request.role.value), (row.protocol_version, SINK_EFFECT_PROTOCOL_VERSION), (row.input_kind, request.input_kind.value), (row.required_member_ordinal, values['required_member_ordinal']), (row.required_snapshot_slot, values['required_snapshot_slot']), (row.config_hash, request.config_hash), (row.membership_or_manifest_hash, identity.membership_or_manifest_hash), (row.group_payload_hash, identity.group_payload_hash), (row.artifact_id, identity.artifact_id), (row.artifact_idempotency_key, identity.artifact_idempotency_key), (row.primary_effect_id, values['primary_effect_id']), (row.stream_id, values['stream_id']), (row.stream_sequence, values['stream_sequence']), (row.predecessor_effect_id, values['predecessor_effect_id']))
+    if any((observed != expected for observed, expected in immutable_fields)):
+        raise ValueError('sink effect identity winner is divergent')
+    if inserted and row.target_json != _EMPTY_TARGET_JSON:
+        raise ValueError('new sink effect did not preserve its empty target sentinel')
+    return (inserted, self._effect_loader.load(row))
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "ready_work_item_values")] = r"""
+def ready_work_item_values(*, run_id: str, token_id: str, row_id: str, node_id: str | None, step_index: int, ingest_sequence: int, row_payload_json: str, available_at: datetime, attempt: int, queue_key: str | None, barrier_key: str | None, on_success_sink: str | None, join_group_id: str | None, lineage_path: tuple[LineageFrame, ...], coalesce_node_id: str | None, coalesce_name: str | None, row_union_name: str | None=None, collector_name: str | None=None) -> dict[str, object]:
+    return {'work_item_id': work_item_id(run_id, token_id, node_id, attempt), 'run_id': run_id, 'token_id': token_id, 'row_id': row_id, 'node_id': node_id, 'step_index': step_index, 'ingest_sequence': ingest_sequence, 'row_payload_json': row_payload_json, 'status': TokenWorkStatus.READY.value, 'queue_key': queue_key, 'barrier_key': barrier_key, 'on_success_sink': on_success_sink, 'pending_sink_name': None, 'pending_outcome': None, 'pending_path': None, 'pending_error_hash': None, 'pending_error_message': None, 'join_group_id': join_group_id, 'lineage_path_json': lineage_path_to_json(lineage_path), 'coalesce_node_id': coalesce_node_id, 'coalesce_name': coalesce_name, 'row_union_name': row_union_name, 'collector_name': collector_name, 'attempt': attempt, 'lease_owner': None, 'lease_expires_at': None, 'available_at': available_at, 'created_at': available_at, 'updated_at': available_at}
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "_validate_replay")] = r"""
+def _validate_replay(values: dict[str, object], existing: Mapping[str, object], *, operation: str) -> None:
+    comparable_fields = ('work_item_id', 'run_id', 'token_id', 'row_id', 'node_id', 'step_index', 'ingest_sequence', 'row_payload_json', 'queue_key', 'barrier_key', 'on_success_sink', 'pending_sink_name', 'pending_outcome', 'pending_path', 'pending_error_hash', 'pending_error_message', 'join_group_id', 'lineage_path_json', 'coalesce_node_id', 'coalesce_name', 'row_union_name', 'collector_name', 'attempt')
+    mismatches = {field_name: {'expected': mismatch_diagnostic_value(field_name, values[field_name]), 'actual': mismatch_diagnostic_value(field_name, existing[field_name])} for field_name in comparable_fields if existing[field_name] != values[field_name]}
+    if mismatches:
+        raise LandscapeRecordError(f'Scheduler {operation} found incompatible existing work item for {work_item_identity(values)}: {mismatches!r}')
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "insert_work_item_idempotent")] = r"""
+def insert_work_item_idempotent(conn: Connection, *, values: dict[str, object], operation: str) -> bool:
+    return bool(insert_work_items_idempotent(conn, values=[values], operation=operation))
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "insert_work_items_idempotent")] = r"""
+def insert_work_items_idempotent(conn: Connection, *, values: list[dict[str, object]], operation: str) -> frozenset[str]:
+    if not values:
+        return frozenset()
+    by_id: dict[str, dict[str, object]] = {}
+    for value in values:
+        identity = str(value['work_item_id'])
+        if identity in by_id:
+            _validate_replay(value, by_id[identity], operation=operation)
+        else:
+            by_id[identity] = value
+    try:
+        if conn.dialect.name == 'sqlite':
+            inserted = conn.execute(sqlite_insert(token_work_items_table).on_conflict_do_nothing(index_elements=['work_item_id']).returning(token_work_items_table.c.work_item_id), list(by_id.values())).scalars().all()
+        elif conn.dialect.name == 'postgresql':
+            inserted = conn.execute(postgresql_insert(token_work_items_table).on_conflict_do_nothing(index_elements=['work_item_id']).returning(token_work_items_table.c.work_item_id), list(by_id.values())).scalars().all()
+        else:
+            raise NotImplementedError(f'Scheduler idempotent enqueue unsupported dialect {conn.dialect.name!r}')
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(f'Scheduler {operation} failed; database rejected audit write') from exc
+    if len(inserted) != len(set(inserted)) or not set(inserted).issubset(by_id):
+        raise LandscapeRecordError(f'Scheduler {operation} returned unexpected work_item_id')
+    existing_rows = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id.in_(tuple(by_id)))).mappings().all()
+    if len(existing_rows) != len(by_id):
+        raise LandscapeRecordError(f'Scheduler {operation} failed; no matching row could be read back')
+    for row in existing_rows:
+        if row['work_item_id'] not in inserted:
+            _validate_replay(by_id[row['work_item_id']], dict(row), operation=operation)
+    return frozenset(inserted)
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/work_items.py", "insert_work_items")] = r"""
+def insert_work_items(conn: Connection, *, values: list[dict[str, object]], operation: str) -> None:
+    if not values:
+        return
+    expected = [value['work_item_id'] for value in values]
+    try:
+        inserted = conn.execute(token_work_items_table.insert().returning(token_work_items_table.c.work_item_id), values).scalars().all()
+    except SQLAlchemyError as exc:
+        raise LandscapeRecordError(f'Scheduler {operation} failed; database rejected audit write') from exc
+    if len(inserted) != len(expected) or frozenset(inserted) != frozenset(expected):
+        raise LandscapeRecordError(f'Scheduler {operation} returned an unexpected work item identity set')
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.enqueue_ready")] = r"""
+def enqueue_ready(self, *, member_token: WorkerMembershipToken, token_id: str, row_id: str, node_id: str | None, step_index: int, ingest_sequence: int, row_payload_json: str, attempt: int=1, queue_key: str | None=None, barrier_key: str | None=None, on_success_sink: str | None=None, join_group_id: str | None=None, lineage_path: tuple[LineageFrame, ...]=(), coalesce_node_id: str | None=None, coalesce_name: str | None=None, row_union_name: str | None=None, collector_name: str | None=None) -> TokenWorkItem:
+    run_id = member_token.run_id
+    work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
+    with fenced_member_transaction(self._engine, member_token=member_token, verb='enqueue_ready') as conn:
+        available_at = read_landscape_transaction_time(conn)
+        values = ready_work_item_values(run_id=run_id, token_id=token_id, row_id=row_id, node_id=node_id, step_index=step_index, ingest_sequence=ingest_sequence, row_payload_json=row_payload_json, available_at=available_at, attempt=attempt, queue_key=queue_key, barrier_key=barrier_key, on_success_sink=on_success_sink, join_group_id=join_group_id, lineage_path=lineage_path, coalesce_node_id=coalesce_node_id, coalesce_name=coalesce_name, row_union_name=row_union_name, collector_name=collector_name)
+        validate_work_item_references(conn, run_id=run_id, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, node_id=node_id, coalesce_node_id=coalesce_node_id)
+        inserted = insert_work_item_idempotent(conn, values=values, operation='enqueue READY scheduler work')
+        if inserted:
+            self._events.record(conn, event_type=SchedulerEventType.ENQUEUE, run_id=run_id, token_id=token_id, work_item_id=work_item_id, node_id=node_id, from_status=None, to_status=TokenWorkStatus.READY, from_lease_owner=None, to_lease_owner=None, from_attempt=None, to_attempt=attempt, recorded_at=available_at)
+        row = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
+    return item_from_mapping(row)
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.enqueue_ready_claimed_on")] = r"""
+def enqueue_ready_claimed_on(self, conn: Connection, *, run_id: str, token_id: str, row_id: str, node_id: str | None, step_index: int, ingest_sequence: int, row_payload_json: str, lease_owner: str, lease_seconds: int, attempt: int=1, queue_key: str | None=None, barrier_key: str | None=None, on_success_sink: str | None=None, join_group_id: str | None=None, lineage_path: tuple[LineageFrame, ...]=(), coalesce_node_id: str | None=None, coalesce_name: str | None=None, row_union_name: str | None=None, collector_name: str | None=None, worker_id: str | None=None) -> RowMapping:
+    work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
+    available_at = read_landscape_transaction_time(conn)
+    values = ready_work_item_values(run_id=run_id, token_id=token_id, row_id=row_id, node_id=node_id, step_index=step_index, ingest_sequence=ingest_sequence, row_payload_json=row_payload_json, available_at=available_at, attempt=attempt, queue_key=queue_key, barrier_key=barrier_key, on_success_sink=on_success_sink, join_group_id=join_group_id, lineage_path=lineage_path, coalesce_node_id=coalesce_node_id, coalesce_name=coalesce_name, row_union_name=row_union_name, collector_name=collector_name)
+    if worker_id is not None:
+        fence_holds = conn.execute(select(active_worker_fence_clause(worker_id=worker_id, run_id=run_id))).scalar()
+        if not fence_holds:
+            raise RunWorkerEvictedError(worker_id=worker_id, run_id=run_id)
+    validate_work_item_references(conn, run_id=run_id, token_id=token_id, row_id=row_id, ingest_sequence=ingest_sequence, node_id=node_id, coalesce_node_id=coalesce_node_id)
+    inserted = insert_work_item_idempotent(conn, values=values, operation='enqueue and claim READY scheduler work')
+    if inserted:
+        self._events.record(conn, event_type=SchedulerEventType.ENQUEUE, run_id=run_id, token_id=token_id, work_item_id=work_item_id, node_id=node_id, from_status=None, to_status=TokenWorkStatus.READY, from_lease_owner=None, to_lease_owner=None, from_attempt=None, to_attempt=attempt, recorded_at=available_at)
+    row = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
+    if row['status'] == TokenWorkStatus.READY.value:
+        claimed = self._leases.claim_ready_row(conn, row=row, run_id=run_id, lease_owner=lease_owner, lease_seconds=lease_seconds, strict_membership_fenced=worker_id is not None)
+        if claimed is not None:
+            row = claimed
+    return row
+"""
+
+_NULL_DEADLINE_RECIPES[
+    ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_with_ready_children")
+] = r"""
+def _transition_with_ready_children(self, *, work_item_id: str, emitted_ready: Sequence[BarrierEmission], status: TokenWorkStatus, image: DispositionImage, expected_lease_owner: str, group_losses: tuple[GroupLossSpec, ...], member_token: WorkerMembershipToken, require_complete_pending_sink_bundle: bool=False) -> tuple[TokenWorkItem, tuple[TokenWorkItem, ...]]:
+    if not emitted_ready:
+        raise ValueError('atomic child disposition requires at least one READY emission')
+    if expected_lease_owner != member_token.worker_id:
+        raise ValueError('disposition lease owner must match membership token')
+    with fenced_member_transaction(self._engine, member_token=member_token, verb='_transition_with_ready_children') as conn:
+        children = [self._prepare_ready_emission_on(conn, parent_work_item_id=work_item_id, run_id=member_token.run_id, emission=emission) for emission in emitted_ready]
+        inserted_ids = insert_work_items_idempotent(conn, values=[values for values, _event in children], operation=f'atomic child enqueue for parent work_item_id={work_item_id!r}')
+        events_by_id = {event.work_item_id: event for _values, event in children}
+        self._events.record_many(conn, records=[event for identity, event in events_by_id.items() if identity in inserted_ids])
+        persisted_children = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == member_token.run_id, token_work_items_table.c.work_item_id.in_(tuple(events_by_id)))).mappings().all()
+        rows_by_id = {row['work_item_id']: row for row in persisted_children}
+        child_rows = tuple((rows_by_id[event.work_item_id] for _values, event in children))
+        parent_row = self._transition_on(conn, work_item_id=work_item_id, status=status, image=image, expected_lease_owner=expected_lease_owner, group_losses=group_losses, member_token=member_token, require_complete_pending_sink_bundle=require_complete_pending_sink_bundle)
+    return (item_from_mapping(parent_row), tuple((item_from_mapping(row) for row in child_rows)))
+"""
+
+_NULL_DEADLINE_RECIPES[
+    ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._prepare_ready_emission_on")
+] = r"""
+def _prepare_ready_emission_on(self, conn: Connection, *, parent_work_item_id: str, run_id: str, emission: BarrierEmission) -> tuple[dict[str, object], SchedulerEventRecord]:
+    if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
+        raise AuditIntegrityError(f'Atomic child enqueue for parent work_item_id={parent_work_item_id!r} token_id={emission.token_id!r} requires row_id, step_index and ingest_sequence.')
+    validate_work_item_references(conn, run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, ingest_sequence=emission.ingest_sequence, node_id=emission.node_id, coalesce_node_id=emission.coalesce_node_id)
+    available_at = read_landscape_transaction_time(conn)
+    values = ready_work_item_values(run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, node_id=emission.node_id, step_index=emission.step_index, ingest_sequence=emission.ingest_sequence, row_payload_json=emission.row_payload_json, available_at=available_at, attempt=emission.attempt, queue_key=emission.queue_key, barrier_key=emission.barrier_key, on_success_sink=emission.on_success_sink, join_group_id=emission.join_group_id, lineage_path=emission.lineage_path, coalesce_node_id=emission.coalesce_node_id, coalesce_name=emission.coalesce_name, row_union_name=emission.row_union_name, collector_name=emission.collector_name)
+    event = SchedulerEventRecord(event_type=SchedulerEventType.ENQUEUE, run_id=run_id, token_id=emission.token_id, work_item_id=str(values['work_item_id']), node_id=emission.node_id, from_status=None, to_status=TokenWorkStatus.READY, from_lease_owner=None, to_lease_owner=None, from_attempt=None, to_attempt=emission.attempt, recorded_at=available_at)
+    return (values, event)
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.complete_barrier")] = r"""
+def complete_barrier(self, *, barrier_key: str, consumed_token_ids: Sequence[str], emitted_pending_sink: Sequence[BarrierEmission], emitted_ready: Sequence[BarrierEmission], require_exhaustive_release: bool=True, scope_row_id: str | None=None, intake_snapshot_token_ids: frozenset[str] | None=None, release_context: Mapping[str, object] | None=None, coordination_token: CoordinationToken, pending_sink_lease_owner: str | None=None, group_losses: Sequence[GroupLossSpec]=(), terminal_outcomes: Sequence[BarrierTerminalOutcomeSpec]=()) -> int:
+    require_coordination_token(coordination_token, verb='complete_barrier')
+    run_id = coordination_token.run_id
+    if scope_row_id is not None and (not require_exhaustive_release):
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received scope_row_id={scope_row_id!r} with require_exhaustive_release=False; row scoping narrows the exhaustiveness universe and is meaningless on the legacy partial-release arm.')
+    if intake_snapshot_token_ids is not None and (not require_exhaustive_release):
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received intake_snapshot_token_ids with require_exhaustive_release=False; the snapshot narrows the exhaustiveness universe and is meaningless on the legacy partial-release arm.')
+    consumed = tuple(consumed_token_ids)
+    consumed_set = frozenset(consumed)
+    if len(consumed_set) != len(consumed):
+        duplicates = sorted((token_id for token_id in consumed_set if consumed.count(token_id) > 1))
+        raise AuditIntegrityError(f'Scheduler barrier terminalization received duplicate live token_ids for run_id={run_id!r} barrier_key={barrier_key!r}: {duplicates!r}')
+    pending_token_ids = tuple((emission.token_id for emission in emitted_pending_sink))
+    if len(frozenset(pending_token_ids)) != len(pending_token_ids):
+        duplicates = sorted((token_id for token_id in frozenset(pending_token_ids) if pending_token_ids.count(token_id) > 1))
+        raise AuditIntegrityError(f'Scheduler barrier completion received duplicate pending-sink emissions for run_id={run_id!r} barrier_key={barrier_key!r}: {duplicates!r}')
+    ready_token_ids = tuple((emission.token_id for emission in emitted_ready))
+    if len(frozenset(ready_token_ids)) != len(ready_token_ids):
+        duplicates = sorted((token_id for token_id in frozenset(ready_token_ids) if ready_token_ids.count(token_id) > 1))
+        raise AuditIntegrityError(f'Scheduler barrier completion received duplicate ready emissions for run_id={run_id!r} barrier_key={barrier_key!r}: {duplicates!r}')
+    terminal_outcome_token_ids = tuple((spec.token_id for spec in terminal_outcomes))
+    if len(frozenset(terminal_outcome_token_ids)) != len(terminal_outcome_token_ids):
+        raise AuditIntegrityError(f'Scheduler barrier completion received duplicate terminal outcomes for run_id={run_id!r} barrier_key={barrier_key!r}.')
+    terminal_outcomes_outside_consumed = frozenset(terminal_outcome_token_ids) - consumed_set
+    if terminal_outcomes_outside_consumed:
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received terminal outcomes outside its consumed set: {sorted(terminal_outcomes_outside_consumed)!r}.')
+    pending_overlap = consumed_set & frozenset(pending_token_ids)
+    if pending_overlap:
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received token_ids both consumed and emitted to pending-sink: {sorted(pending_overlap)!r}; a BLOCKED row cannot be terminalized and handed off in the same completion.')
+    for emission in emitted_pending_sink:
+        if emission.sink_name is None or emission.outcome is None or emission.path is None:
+            raise AuditIntegrityError(f'Scheduler barrier completion pending-sink emission for run_id={run_id!r} barrier_key={barrier_key!r} token_id={emission.token_id!r} requires sink_name, outcome and path.')
+    if intake_snapshot_token_ids is not None:
+        consumed_outside_snapshot = consumed_set - intake_snapshot_token_ids
+        if consumed_outside_snapshot:
+            raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} consumed token(s) outside its own intake snapshot: {sorted(consumed_outside_snapshot)!r}; the flush caller may only consume tokens it durably adopted into this firing group (ADR-030 §E.3).')
+    if scope_row_id is not None:
+        for emission in (*emitted_pending_sink, *emitted_ready):
+            if emission.row_id is not None and emission.row_id != scope_row_id:
+                raise AuditIntegrityError(f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received emission token_id={emission.token_id!r} with row_id={emission.row_id!r} outside the scoped pending group scope_row_id={scope_row_id!r}; a scoped completion must not emit into another row's group.")
+    emission_context: dict[str, object] = {'barrier_key': barrier_key}
+    if require_exhaustive_release:
+        emission_context['consumed_count'] = len(consumed_set)
+    blocked_predicates = [token_work_items_table.c.run_id == coordination_token.run_id, token_work_items_table.c.barrier_key == barrier_key, token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value]
+    if scope_row_id is not None:
+        blocked_predicates.append(token_work_items_table.c.row_id == scope_row_id)
+    with fenced_write(self._engine, coordination_token=coordination_token, verb='complete_barrier') as conn:
+        database_now = read_landscape_transaction_time(conn)
+        if terminal_outcome_token_ids:
+            locked_tokens = conn.execute(select(tokens_table.c.token_id, tokens_table.c.run_id).where(tokens_table.c.token_id.in_(sorted(terminal_outcome_token_ids))).order_by(tokens_table.c.token_id).with_for_update(of=tokens_table)).all()
+            if {(str(row.token_id), str(row.run_id)) for row in locked_tokens} != {(token_id, run_id) for token_id in terminal_outcome_token_ids}:
+                raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received a terminal outcome for a missing or foreign token.')
+            existing_terminal_rows = conn.execute(select(token_outcomes_table.c.token_id).where(token_outcomes_table.c.run_id == coordination_token.run_id).where(token_outcomes_table.c.token_id.in_(terminal_outcome_token_ids)).where(token_outcomes_table.c.completed == 1)).all()
+            if existing_terminal_rows:
+                raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} would duplicate terminal outcomes for token_ids={sorted((str(row.token_id) for row in existing_terminal_rows))!r}.')
+        blocked_rows = conn.execute(select(token_work_items_table.c.work_item_id, token_work_items_table.c.token_id, token_work_items_table.c.node_id, token_work_items_table.c.attempt, token_work_items_table.c.lease_owner, token_work_items_table.c.lease_expires_at).where(*blocked_predicates).order_by(token_work_items_table.c.ingest_sequence, token_work_items_table.c.step_index, token_work_items_table.c.work_item_id)).mappings().all()
+        blocked_by_token: dict[str, list[RowMapping]] = {}
+        for row in blocked_rows:
+            blocked_by_token.setdefault(row['token_id'], []).append(row)
+        durable_token_ids = frozenset(blocked_by_token)
+        scope_note = '' if scope_row_id is None else f' scope_row_id={scope_row_id!r}.'
+        missing_token_ids = consumed_set - durable_token_ids
+        if missing_token_ids:
+            matching_count = len(consumed_set & durable_token_ids)
+            raise AuditIntegrityError(f'Scheduler barrier terminalization mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: live consumed {len(consumed_set)} token(s), but durable BLOCKED rows contained {matching_count} matching token(s) out of {len(durable_token_ids)} blocked token(s). missing token_ids={sorted(missing_token_ids)!r}; durable token_ids={sorted(durable_token_ids)!r}.{scope_note}')
+        if intake_snapshot_token_ids is not None:
+            unknown_snapshot_token_ids = intake_snapshot_token_ids - durable_token_ids
+            if unknown_snapshot_token_ids:
+                if scope_row_id is not None:
+                    cross_group_rows = conn.execute(select(token_work_items_table.c.token_id, token_work_items_table.c.row_id).where(token_work_items_table.c.run_id == coordination_token.run_id).where(token_work_items_table.c.barrier_key == barrier_key).where(token_work_items_table.c.status == TokenWorkStatus.BLOCKED.value).where(token_work_items_table.c.token_id.in_(sorted(unknown_snapshot_token_ids)))).all()
+                    cross_group = {row.token_id: row.row_id for row in cross_group_rows if row.row_id != scope_row_id}
+                    if cross_group:
+                        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} scope_row_id={scope_row_id!r} received intake snapshot token(s) whose durable BLOCKED rows belong to a DIFFERENT row group: {dict(sorted(cross_group.items()))!r}; the flush caller built its firing-group snapshot across row groups (ADR-030 §E.3 scope validation).')
+                raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received intake snapshot token(s) with no durable BLOCKED row under the barrier: {sorted(unknown_snapshot_token_ids)!r}; the leader believes in a token the journal does not hold.{scope_note}')
+        passthrough_emissions: list[BarrierEmission] = []
+        fresh_emissions: list[BarrierEmission] = []
+        for emission in emitted_pending_sink:
+            matching_rows = blocked_by_token[emission.token_id] if emission.token_id in blocked_by_token else []
+            if not matching_rows:
+                if require_exhaustive_release:
+                    fresh_emissions.append(emission)
+                    continue
+                raise AuditIntegrityError(f'Scheduler barrier pending-sink handoff for run_id={run_id!r} barrier_key={barrier_key!r} is missing token_id={emission.token_id!r}; refusing partial sink handoff.')
+            if len(matching_rows) != 1:
+                raise AuditIntegrityError(f'Scheduler barrier pending-sink handoff for run_id={run_id!r} barrier_key={barrier_key!r} token_id={emission.token_id!r} found {len(matching_rows)} matching rows; expected exactly one.')
+            passthrough_emissions.append(emission)
+        if require_exhaustive_release:
+            handed_off_token_ids = frozenset((emission.token_id for emission in passthrough_emissions))
+            if intake_snapshot_token_ids is not None:
+                handed_off_outside_snapshot = handed_off_token_ids - intake_snapshot_token_ids
+                if handed_off_outside_snapshot:
+                    raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} handed off buffered token(s) outside its own intake snapshot: {sorted(handed_off_outside_snapshot)!r}; the flush caller may only hand off tokens it durably adopted into this firing group (ADR-030 §E.3).')
+                required_token_ids = durable_token_ids & intake_snapshot_token_ids
+                late_arrival_token_ids = durable_token_ids - intake_snapshot_token_ids
+                if late_arrival_token_ids:
+                    emission_context['late_arrival_token_ids'] = sorted(late_arrival_token_ids)
+            else:
+                required_token_ids = durable_token_ids
+            uncovered_token_ids = required_token_ids - consumed_set - handed_off_token_ids
+            if uncovered_token_ids:
+                raise AuditIntegrityError(f'Scheduler barrier completion mismatch for run_id={run_id!r} barrier_key={barrier_key!r}: durable BLOCKED rows hold {len(uncovered_token_ids)} token(s) neither consumed nor handed off; the completion would orphan them. uncovered token_ids={sorted(uncovered_token_ids)!r}; consumed token_ids={sorted(consumed_set)!r}; handoff token_ids={sorted(handed_off_token_ids)!r}.{scope_note}')
+        terminalized = self._terminalize_consumed_barrier_rows(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, consumed=consumed, blocked_by_token=blocked_by_token, database_now=database_now, release_context=release_context)
+        record_terminal_outcomes_guarded(conn, run_id=coordination_token.run_id, outcomes=terminal_outcomes, recorded_at=database_now)
+        self._transition_passthrough_pending_sink(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, blocked_rows=blocked_rows, passthrough_emissions=passthrough_emissions, emission_context=emission_context, database_now=database_now, parked_lease_owner=pending_sink_lease_owner)
+        pending = [self._prepare_fresh_pending_sink_emission(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, emission=emission, emission_context=emission_context, database_now=database_now, parked_lease_owner=pending_sink_lease_owner) for emission in fresh_emissions]
+        ready = [self._prepare_ready_emission(conn, run_id=coordination_token.run_id, barrier_key=barrier_key, emission=emission, emission_context=emission_context, database_now=database_now, claim_order_at=database_now - timedelta(microseconds=len(emitted_ready) - emission_index - 1)) for emission_index, emission in enumerate(emitted_ready)]
+        insert_work_items(conn, values=[values for values, _event in (*pending, *ready)], operation='barrier-completion emissions')
+        self._events.record_many(conn, records=[event for _values, event in (*pending, *ready)])
+        record_group_losses(conn, run_id=coordination_token.run_id, specs=group_losses, recorded_by=coordination_token.worker_id, now=database_now)
+    return terminalized
+"""
+
+_NULL_DEADLINE_RECIPES[
+    ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._prepare_fresh_pending_sink_emission")
+] = r"""
+def _prepare_fresh_pending_sink_emission(self, conn: Connection, *, run_id: str, barrier_key: str, emission: BarrierEmission, emission_context: Mapping[str, object], database_now: datetime, parked_lease_owner: str | None=None) -> tuple[dict[str, object], SchedulerEventRecord]:
+    if emission.node_id is not None:
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received fresh pending-sink emission token_id={emission.token_id!r} with node_id={emission.node_id!r}; fresh sink-bound emissions live on the node_id-NULL terminal lane.')
+    if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} fresh pending-sink emission token_id={emission.token_id!r} requires row_id, step_index and ingest_sequence; the inserted journal row must be a complete resume cursor.')
+    validate_work_item_references(conn, run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, ingest_sequence=emission.ingest_sequence, node_id=None, coalesce_node_id=emission.coalesce_node_id)
+    work_item_id = make_work_item_id(run_id, emission.token_id, None, emission.attempt)
+    values: dict[str, object] = {'work_item_id': work_item_id, 'run_id': run_id, 'token_id': emission.token_id, 'row_id': emission.row_id, 'node_id': None, 'step_index': emission.step_index, 'ingest_sequence': emission.ingest_sequence, 'row_payload_json': emission.row_payload_json, 'status': TokenWorkStatus.PENDING_SINK.value, 'queue_key': emission.queue_key, 'barrier_key': emission.barrier_key, 'on_success_sink': emission.on_success_sink, 'pending_sink_name': emission.sink_name, 'pending_outcome': emission.outcome, 'pending_path': emission.path, 'pending_error_hash': emission.error_hash, 'pending_error_message': emission.error_message, 'join_group_id': emission.join_group_id, 'lineage_path_json': lineage_path_to_json(emission.lineage_path), 'coalesce_node_id': emission.coalesce_node_id, 'coalesce_name': emission.coalesce_name, 'row_union_name': emission.row_union_name, 'collector_name': emission.collector_name, 'attempt': emission.attempt, 'lease_owner': parked_lease_owner, 'lease_expires_at': None, 'available_at': database_now, 'created_at': database_now, 'updated_at': database_now}
+    event = SchedulerEventRecord(event_type=SchedulerEventType.MARK_PENDING_SINK, run_id=run_id, token_id=emission.token_id, work_item_id=work_item_id, node_id=None, from_status=None, to_status=TokenWorkStatus.PENDING_SINK, from_lease_owner=None, to_lease_owner=parked_lease_owner, from_attempt=None, to_attempt=emission.attempt, recorded_at=database_now, context=emission_context)
+    return (values, event)
+"""
+
+_NULL_DEADLINE_RECIPES[("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository._prepare_ready_emission")] = r"""
+def _prepare_ready_emission(self, conn: Connection, *, run_id: str, barrier_key: str, emission: BarrierEmission, emission_context: Mapping[str, object], database_now: datetime, claim_order_at: datetime) -> tuple[dict[str, object], SchedulerEventRecord]:
+    if emission.row_id is None or emission.step_index is None or emission.ingest_sequence is None:
+        raise AuditIntegrityError(f'Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} ready emission token_id={emission.token_id!r} requires row_id, step_index and ingest_sequence; the inserted journal row must be a complete resume cursor.')
+    validate_work_item_references(conn, run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, ingest_sequence=emission.ingest_sequence, node_id=emission.node_id, coalesce_node_id=emission.coalesce_node_id)
+    values = ready_work_item_values(run_id=run_id, token_id=emission.token_id, row_id=emission.row_id, node_id=emission.node_id, step_index=emission.step_index, ingest_sequence=emission.ingest_sequence, row_payload_json=emission.row_payload_json, available_at=read_landscape_transaction_time(conn), attempt=emission.attempt, queue_key=emission.queue_key, barrier_key=emission.barrier_key, on_success_sink=emission.on_success_sink, join_group_id=emission.join_group_id, lineage_path=emission.lineage_path, coalesce_node_id=emission.coalesce_node_id, coalesce_name=emission.coalesce_name, row_union_name=emission.row_union_name, collector_name=emission.collector_name)
+    values['created_at'] = claim_order_at
+    event = SchedulerEventRecord(event_type=SchedulerEventType.ENQUEUE, run_id=run_id, token_id=emission.token_id, work_item_id=str(values['work_item_id']), node_id=emission.node_id, from_status=None, to_status=TokenWorkStatus.READY, from_lease_owner=None, to_lease_owner=None, from_attempt=None, to_attempt=emission.attempt, recorded_at=database_now, context=emission_context)
+    return (values, event)
+"""
+
+_NULL_DEADLINE_IMPORT_RECIPES = {
+    "src/elspeth/core/landscape/execution/sink_effect_reservation.py": (
+        "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
+        "Import(names=[alias(name='re')])",
+        "ImportFrom(module='collections.abc', names=[alias(name='Mapping'), alias(name='Sequence')], level=0)",
+        "ImportFrom(module='dataclasses', names=[alias(name='dataclass'), alias(name='replace')], level=0)",
+        "ImportFrom(module='hashlib', names=[alias(name='sha256')], level=0)",
+        "ImportFrom(module='typing', names=[alias(name='Any'), alias(name='Final')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='Row'), alias(name='select')], level=0)",
+        "ImportFrom(module='sqlalchemy.dialects.postgresql', names=[alias(name='insert', asname='postgresql_insert')], level=0)",
+        "ImportFrom(module='sqlalchemy.dialects.sqlite', names=[alias(name='insert', asname='sqlite_insert')], level=0)",
+        "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection')], level=0)",
+        "ImportFrom(module='sqlalchemy.exc', names=[alias(name='IntegrityError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.audit', names=[alias(name='SinkEffect')], level=0)",
+        "ImportFrom(module='elspeth.contracts.audit_export', names=[alias(name='C'), alias(name='H'), alias(name='final_manifest_identity_payload'), alias(name='hash_final_manifest_identity_payload')], level=0)",
+        "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken')], level=0)",
+        "ImportFrom(module='elspeth.contracts.enums', names=[alias(name='NodeStateStatus'), alias(name='RunStatus')], level=0)",
+        "ImportFrom(module='elspeth.contracts.freeze', names=[alias(name='freeze_fields')], level=0)",
+        "ImportFrom(module='elspeth.contracts.hashing', names=[alias(name='canonical_json')], level=0)",
+        "ImportFrom(module='elspeth.contracts.sink_effects', names=[alias(name='SINK_EFFECT_PROTOCOL_VERSION'), alias(name='AuditExportSignedManifestInput'), alias(name='AuditExportSigningMode'), alias(name='SinkEffectInputKind'), alias(name='SinkEffectMember'), alias(name='SinkEffectReservationRequest'), alias(name='SinkEffectState')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='LandscapeDB')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.model_loaders', names=[alias(name='SinkEffectLoader')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='audit_export_snapshots_table'), alias(name='node_states_table'), alias(name='operations_table'), alias(name='rows_table'), alias(name='runs_table'), alias(name='sink_effect_export_snapshots_table'), alias(name='sink_effect_members_table'), alias(name='sink_effect_streams_table'), alias(name='sink_effects_table'), alias(name='tokens_table')], level=0)",
+    ),
+    "src/elspeth/core/landscape/scheduler/work_items.py": (
+        "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
+        "Import(names=[alias(name='hashlib')])",
+        "ImportFrom(module='collections.abc', names=[alias(name='Mapping')], level=0)",
+        "ImportFrom(module='datetime', names=[alias(name='UTC'), alias(name='datetime')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='select')], level=0)",
+        "ImportFrom(module='sqlalchemy.dialects.postgresql', names=[alias(name='insert', asname='postgresql_insert')], level=0)",
+        "ImportFrom(module='sqlalchemy.dialects.sqlite', names=[alias(name='insert', asname='sqlite_insert')], level=0)",
+        "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='sqlalchemy.exc', names=[alias(name='SQLAlchemyError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame'), alias(name='lineage_path_from_json'), alias(name='lineage_path_to_json')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.errors', names=[alias(name='LandscapeRecordError')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='nodes_table'), alias(name='rows_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
+    ),
+    "src/elspeth/core/landscape/scheduler/queue.py": (
+        "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
+        "ImportFrom(module='typing', names=[alias(name='TYPE_CHECKING')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='select')], level=0)",
+        "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken'), alias(name='WorkerMembershipToken')], level=0)",
+        "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError'), alias(name='RunWorkerEvictedError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='LineageFrame')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='SchedulerEventType'), alias(name='SourceIngestSpec'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction'), alias(name='fenced_member_transaction')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventStore')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.leases', names=[alias(name='SchedulerLeaseRepository')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_item_idempotent'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='work_item_id', asname='make_work_item_id')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='active_worker_fence_clause'), alias(name='token_work_items_table')], level=0)",
+    ),
+    "src/elspeth/core/landscape/scheduler/dispositions.py": (
+        "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
+        "ImportFrom(module='collections.abc', names=[alias(name='Sequence')], level=0)",
+        "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
+        "ImportFrom(module='typing', names=[alias(name='ClassVar')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='and_'), alias(name='case'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken'), alias(name='WorkerMembershipToken')], level=0)",
+        "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction'), alias(name='fenced_member_transaction')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord'), alias(name='SchedulerEventStore')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.fencing', names=[alias(name='fenced_write')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.group_losses', names=[alias(name='record_group_losses')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.payload_codec', names=[alias(name='scrubbed_row_payload_json')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_items_idempotent'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='pending_sink_bundle_clause'), alias(name='token_outcomes_table'), alias(name='token_work_items_table')], level=0)",
+    ),
+    "src/elspeth/core/landscape/scheduler/barrier.py": (
+        "ImportFrom(module='__future__', names=[alias(name='annotations')], level=0)",
+        "ImportFrom(module='collections.abc', names=[alias(name='Mapping'), alias(name='Sequence')], level=0)",
+        "ImportFrom(module='dataclasses', names=[alias(name='dataclass')], level=0)",
+        "ImportFrom(module='datetime', names=[alias(name='UTC'), alias(name='datetime'), alias(name='timedelta')], level=0)",
+        "ImportFrom(module='sqlalchemy', names=[alias(name='case'), alias(name='func'), alias(name='select'), alias(name='update')], level=0)",
+        "ImportFrom(module='sqlalchemy.engine', names=[alias(name='Connection'), alias(name='RowMapping')], level=0)",
+        "ImportFrom(module='elspeth.contracts.coordination', names=[alias(name='DEFAULT_RUN_LIVENESS_WINDOW_SECONDS'), alias(name='CoordinationToken')], level=0)",
+        "ImportFrom(module='elspeth.contracts.errors', names=[alias(name='AuditIntegrityError')], level=0)",
+        "ImportFrom(module='elspeth.contracts.identity', names=[alias(name='lineage_path_to_json')], level=0)",
+        "ImportFrom(module='elspeth.contracts.scheduler', names=[alias(name='BarrierEmission'), alias(name='BarrierTerminalOutcomeSpec'), alias(name='BatchMembershipSpec'), alias(name='BlockedPendingSinkHandoff'), alias(name='BufferedOutcomeSpec'), alias(name='GroupLossSpec'), alias(name='SchedulerEventType'), alias(name='TokenWorkItem'), alias(name='TokenWorkStatus')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.data_flow.outcomes', names=[alias(name='record_buffered_outcome_guarded'), alias(name='record_terminal_outcomes_guarded')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database', names=[alias(name='Tier1Engine')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.database_clock', names=[alias(name='read_landscape_transaction_time')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.execution.batches', names=[alias(name='add_batch_member_guarded')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.run_coordination_repository', names=[alias(name='fenced_leader_transaction')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.events', names=[alias(name='SchedulerEventRecord'), alias(name='SchedulerEventStore')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.fencing', names=[alias(name='fenced_write'), alias(name='require_coordination_token')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.group_losses', names=[alias(name='record_group_losses')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.payload_codec', names=[alias(name='scrubbed_row_payload_json')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='insert_work_items'), alias(name='item_from_mapping'), alias(name='ready_work_item_values'), alias(name='validate_work_item_references')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.scheduler.work_items', names=[alias(name='work_item_id', asname='make_work_item_id')], level=0)",
+        "ImportFrom(module='elspeth.core.landscape.schema', names=[alias(name='blocked_barrier_hold_clause'), alias(name='token_outcomes_table'), alias(name='token_work_items_table'), alias(name='tokens_table')], level=0)",
+    ),
+}
+_NULL_WORK_ITEMS_PATH = "src/elspeth/core/landscape/scheduler/work_items.py"
+_NULL_EFFECT_PATH = "src/elspeth/core/landscape/execution/sink_effect_reservation.py"
+_NULL_INSERT_TARGETS = frozenset(
+    {
+        (_NULL_EFFECT_PATH, "SinkEffectReservation._insert_or_compare_effect"),
+        (_NULL_WORK_ITEMS_PATH, "insert_work_items_idempotent"),
+        (_NULL_WORK_ITEMS_PATH, "insert_work_items"),
+    }
+)
+_NULL_VALUE_CALLERS = {
+    "insert_work_item_idempotent": frozenset(
+        {
+            ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.enqueue_ready"),
+            ("src/elspeth/core/landscape/scheduler/queue.py", "SchedulerQueueRepository.enqueue_ready_claimed_on"),
+        }
+    ),
+    "insert_work_items_idempotent": frozenset(
+        {
+            (_NULL_WORK_ITEMS_PATH, "insert_work_item_idempotent"),
+            ("src/elspeth/core/landscape/scheduler/dispositions.py", "SchedulerDispositionRepository._transition_with_ready_children"),
+        }
+    ),
+    "insert_work_items": frozenset(
+        {
+            ("src/elspeth/core/landscape/scheduler/barrier.py", "BarrierJournalRepository.complete_barrier"),
+        }
+    ),
+}
+
+
+def _null_recipe_shape(function):
+    clone = ast.parse(ast.unparse(function)).body[0]
+    if (
+        clone.body
+        and isinstance(clone.body[0], ast.Expr)
+        and isinstance(clone.body[0].value, ast.Constant)
+        and isinstance(clone.body[0].value.value, str)
+    ):
+        clone.body.pop(0)
+    return ast.dump(clone, include_attributes=False)
+
+
+def _null_recipe_is_visible(function, resolver, proof):
+    imported = [node for node in resolver.unit.tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
+    if tuple(ast.dump(node, include_attributes=False) for node in imported) != _NULL_DEADLINE_IMPORT_RECIPES[resolver.unit.path]:
+        return False
+    module_bindings = _lexical_binding_sites(resolver.unit.tree)
+    for declaration in imported:
+        for alias in declaration.names:
+            name = alias.asname or (alias.name.split(".")[0] if isinstance(declaration, ast.Import) else alias.name)
+            if module_bindings.get(name) != [declaration]:
+                return False
+            if any(_lexical_binding_sites(scope).get(name) for scope in _clock_lexical_scopes(resolver.unit.tree)[1:]):
+                return False
+    if not _authority_return_body_is_visible(function, resolver):
+        return False
+    if not _receiver_callable_code_is_visible(function, function) or not proof._callback_function_unmodified(function):
+        return False
+    parent = next(_ancestors(function), None)
+    if isinstance(parent, ast.ClassDef) and not _receiver_class_body_is_visible(proof, parent, resolver):
+        return False
+    local_names = set(_lexical_binding_sites(function))
+    protected = {
+        n.func.id for n in ast.walk(function) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id not in local_names
+    }
+    protected.add(function.name)
+    if isinstance(parent, ast.ClassDef):
+        protected.add(parent.name)
+    if _clock_captured_alias_is_mutated(resolver.unit.tree, protected):
+        return False
+    # Global calls that construct or copy the INSERT payload must keep their
+    # imported/builtin binding. A body recipe alone cannot prove rebinding.
+    builtin_calls = {"list", "dict", "bool", "str", "set", "frozenset", "len", "any", "next", "iter", "enumerate"}
+    module_bindings = _lexical_binding_sites(resolver.unit.tree)
+    for name in protected & builtin_calls:
+        if module_bindings.get(name):
+            return False
+        if any(_lexical_binding_sites(scope).get(name) for scope in _clock_lexical_scopes(resolver.unit.tree)[1:]):
+            return False
+    for call in (part for part in ast.walk(function) if isinstance(part, ast.Call) and isinstance(part.func, ast.Name)):
+        origin = resolver.qualified_name(call.func, use=call)
+        if (
+            origin is not None
+            and "." in origin
+            and origin.rsplit(".", 1)[-1] == call.func.id
+            and _trusted_qualified_name_is_mutated(origin, resolver=resolver, use=call)
+        ):
+            return False
+    return True
+
+
+def _null_recipe_graph_is_closed(units, proof, required):
+    index = _function_index(units)
+    functions = {}
+    terminals = {symbol.rsplit(".", 1)[-1]: (path, symbol) for path, symbol in required}
+    for key in required:
+        function = index.get(key)
+        if function is None:
+            return False
+        resolver = _resolver_for_node(function)
+        expected = ast.parse(_NULL_DEADLINE_RECIPES[key]).body[0]
+        if _null_recipe_shape(function) != _null_recipe_shape(expected) or not _null_recipe_is_visible(function, resolver, proof):
+            return False
+        if function.name in {"_effect_row_values", "ready_work_item_values", "_prepare_fresh_pending_sink_emission"}:
+            literal_rows = [
+                part
+                for part in ast.walk(function)
+                if isinstance(part, ast.Dict)
+                and any(isinstance(key, ast.Constant) and key.value == "lease_expires_at" for key in part.keys)
+            ]
+            if len(literal_rows) != 1:
+                return False
+            row = literal_rows[0]
+            if any(not isinstance(key, ast.Constant) or not isinstance(key.value, str) for key in row.keys):
+                return False
+            deadlines = [value for key, value in zip(row.keys, row.values, strict=True) if key.value == "lease_expires_at"]
+            if len(deadlines) != 1 or not isinstance(deadlines[0], ast.Constant) or deadlines[0].value is not None:
+                return False
+        functions[key] = function
+    qualified_targets = {path[4:-3].replace("/", ".") + "." + symbol for path, symbol in required}
+    owned_modules = {path[4:-3].replace("/", ".") for path, _symbol_name in required}
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for part in ast.walk(unit.tree):
+            if isinstance(part, (ast.Name, ast.Attribute)):
+                qualified = resolver.qualified_name(part, use=part)
+                if qualified in qualified_targets:
+                    parent = next(_ancestors(part), None)
+                    if not isinstance(part.ctx, ast.Load) or not isinstance(parent, ast.Call) or parent.func is not part:
+                        return False
+                if isinstance(part, ast.Attribute) and part.attr in terminals and isinstance(part.ctx, (ast.Store, ast.Del)):
+                    return False
+                if (
+                    isinstance(part, ast.Attribute)
+                    and part.attr == "__dict__"
+                    and resolver.qualified_name(part.value, use=part) in owned_modules
+                ):
+                    return False
+            if isinstance(part, ast.Call):
+                operation = _resolved_callable_name(part.func, resolver, use=part)
+                if operation in {"getattr", "setattr", "__getattribute__", "__setattr__", "vars"} and part.args:
+                    if resolver.qualified_name(part.args[0], use=part) in owned_modules | qualified_targets:
+                        return False
+                    if len(part.args) > 1 and _constant_string_value(part.args[1], resolver, use=part) in terminals:
+                        return False
+    # Every edge between reviewed recipes resolves the actual owned body,
+    # including instance methods and aliases of imported module functions.
+    for function in functions.values():
+        resolver = _resolver_for_node(function)
+        for call in (part for part in ast.walk(function) if isinstance(part, ast.Call)):
+            terminal = _resolved_callable_name(call.func, resolver, use=call)
+            if terminal not in terminals:
+                continue
+            target = proof.called_function(call, resolver, call)
+            if target is None or target[0] is not functions[terminals[terminal]]:
+                return False
+    return True
+
+
+def _null_insert_value_callers_are_closed(units, proof, functions):
+    observed = {name: set() for name in _NULL_VALUE_CALLERS}
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for part in ast.walk(unit.tree):
+            if isinstance(part, ast.Call):
+                terminal = _resolved_callable_name(part.func, resolver, use=part)
+                if terminal in _NULL_VALUE_CALLERS:
+                    target = proof.called_function(part, resolver, part)
+                    expected = functions.get((_NULL_WORK_ITEMS_PATH, terminal))
+                    caller = _owner_function(part)
+                    if target is None or target[0] is not expected or caller is None:
+                        return False
+                    identity = (unit.path, _symbol(caller))
+                    if identity not in _NULL_VALUE_CALLERS[terminal] or identity in observed[terminal]:
+                        return False
+                    if len([kw for kw in part.keywords if kw.arg == "values"]) != 1 or any(kw.arg is None for kw in part.keywords):
+                        return False
+                    observed[terminal].add(identity)
+                # Reflective access to the module leaves the set of callers
+                # open, even when the requested attribute is computed later.
+                if terminal in {"getattr", "__getattribute__", "vars"} and part.args:
+                    receiver = part.args[0]
+                    origin = resolver.qualified_name(receiver, use=part)
+                    if origin == "elspeth.core.landscape.scheduler.work_items":
+                        return False
+            elif isinstance(part, (ast.Name, ast.Attribute)) and isinstance(part.ctx, ast.Load):
+                terminal = _resolved_callable_name(part, resolver, use=part)
+                if terminal not in _NULL_VALUE_CALLERS:
+                    continue
+                parent = next(_ancestors(part), None)
+                if not isinstance(parent, ast.Call) or parent.func is not part:
+                    return False
+    return all(observed[name] == expected for name, expected in _NULL_VALUE_CALLERS.items())
+
+
+@cache
+def _non_issuing_deadline_insert_keys(units):
+    proof = _AuthorityProof(units)
+    index = _function_index(units)
+    admitted = set()
+    effects = frozenset(key for key in _NULL_DEADLINE_RECIPES if key[0] == _NULL_EFFECT_PATH)
+    scheduler = frozenset(_NULL_DEADLINE_RECIPES) - effects
+    if _null_recipe_graph_is_closed(units, proof, effects):
+        admitted.add((_NULL_EFFECT_PATH, "SinkEffectReservation._insert_or_compare_effect"))
+    if _null_recipe_graph_is_closed(units, proof, scheduler) and _null_insert_value_callers_are_closed(units, proof, index):
+        admitted.update({(_NULL_WORK_ITEMS_PATH, "insert_work_items_idempotent"), (_NULL_WORK_ITEMS_PATH, "insert_work_items")})
+    return frozenset(admitted)
+
+
+def _non_issuing_deadline_insert_is_proven(function, resolver, units):
+    """Prove the five dialect INSERT sites store NULL, never a lease grant.
+
+    Full executable recipes establish the fresh dictionary and preserve its
+    mapping through the two actual batching paths and scalar relay. All actual
+    suppliers of an INSERT helper's values parameter must resolve to those
+    reviewed bodies. No optional values input or function-name exemption is
+    sufficient to admit an unresolved mapping.
+    """
+    key = (resolver.unit.path, _symbol(function))
+    return key in _NULL_INSERT_TARGETS and key in _non_issuing_deadline_insert_keys(tuple(units))
+
+
+_NULL_TEST_QUEUE_PATH = "src/elspeth/core/landscape/scheduler/queue.py"
+_NULL_TEST_BARRIER_PATH = "src/elspeth/core/landscape/scheduler/barrier.py"
+_NULL_TEST_DISPOSITION_PATH = "src/elspeth/core/landscape/scheduler/dispositions.py"
+
+
+def _null_deadline_test_sources():
+    return {path: (_repo_root() / path).read_text() for path in _NULL_DEADLINE_IMPORT_RECIPES}
+
+
+def _null_deadline_test_admitted(sources):
+    units = tuple((_parse_source(path, source) for path, source in sources.items()))
+    return _non_issuing_deadline_insert_keys(units)
+
+
+def test_non_issuing_deadline_five_actual_insert_sites():
+    units = tuple((_parse_source(path, source) for path, source in _null_deadline_test_sources().items()))
+    assert _non_issuing_deadline_insert_keys(units) == _NULL_INSERT_TARGETS
+    index = _function_index(units)
+    writes = []
+    for key in _NULL_INSERT_TARGETS:
+        f = index[key]
+        resolver = _resolver_for_node(f)
+        assert _non_issuing_deadline_insert_is_proven(f, resolver, units)
+        writes.extend(_deadline_executed_writes(f, resolver))
+    assert len(writes) == 5
+
+
+@pytest.mark.parametrize(
+    "path,old,new",
+    [
+        (_NULL_WORK_ITEMS_PATH, '"lease_expires_at": None', '"lease_expires_at": available_at'),
+        (_NULL_EFFECT_PATH, '"lease_expires_at": None', '"lease_expires_at": timestamp'),
+        (_NULL_TEST_BARRIER_PATH, '"lease_expires_at": None', '"lease_expires_at": database_now'),
+        (
+            _NULL_TEST_QUEUE_PATH,
+            'inserted = insert_work_item_idempotent(conn, values=values, operation="enqueue READY scheduler work")',
+            'values["lease_expires_at"] = available_at\n            inserted = insert_work_item_idempotent(conn, values=values, operation="enqueue READY scheduler work")',
+        ),
+        (_NULL_WORK_ITEMS_PATH, "values=[values], operation=operation", "values=[foreign], operation=operation"),
+        (_NULL_WORK_ITEMS_PATH, "list(by_id.values()),", '[{**row, "lease_expires_at": foreign} for row in by_id.values()],'),
+        (
+            _NULL_TEST_DISPOSITION_PATH,
+            "values=[values for values, _event in children]",
+            'values=[{**values, "lease_expires_at": foreign} for values, _event in children]',
+        ),
+        (
+            _NULL_TEST_BARRIER_PATH,
+            "values=[values for values, _event in (*pending, *ready)]",
+            'values=[{**values, "lease_expires_at": foreign} for values, _event in (*pending, *ready)]',
+        ),
+        (
+            _NULL_WORK_ITEMS_PATH,
+            "from sqlalchemy.dialects.sqlite import insert as sqlite_insert",
+            "from foreign import insert as sqlite_insert",
+        ),
+        (_NULL_EFFECT_PATH, "def _effect_row_values(", "@foreign\ndef _effect_row_values("),
+    ],
+)
+def test_non_issuing_deadline_mapping_drift_is_refused(path, old, new):
+    sources = dict(_null_deadline_test_sources())
+    assert old in sources[path]
+    sources[path] = sources[path].replace(old, new)
+    expected_effect = (_NULL_EFFECT_PATH, "SinkEffectReservation._insert_or_compare_effect")
+    result = _null_deadline_test_admitted(sources)
+    if path == _NULL_EFFECT_PATH:
+        assert expected_effect not in result
+    else:
+        assert not {(_NULL_WORK_ITEMS_PATH, "insert_work_items"), (_NULL_WORK_ITEMS_PATH, "insert_work_items_idempotent")} & result
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'from elspeth.core.landscape.scheduler.work_items import insert_work_items\ndef extra(conn,values):\n    insert_work_items(conn,values=values,operation="extra")',
+        'from elspeth.core.landscape.scheduler.work_items import insert_work_items as writer\nalias=writer\ndef extra(conn,values):\n    alias(conn,values=values,operation="extra")',
+        'from elspeth.core.landscape.scheduler import work_items\ndef extra(conn,values,name):\n    getattr(work_items,name)(conn,values=values,operation="extra")',
+        "from elspeth.core.landscape.scheduler.work_items import ready_work_item_values as builder\nbuilder.__code__=foreign.__code__",
+        "from elspeth.core.landscape.scheduler.work_items import ready_work_item_values as builder\nmutate(builder)",
+    ],
+)
+def test_non_issuing_deadline_external_caller_or_escape_is_refused(extra):
+    sources = dict(_null_deadline_test_sources())
+    sources["src/elspeth/core/landscape/extra.py"] = extra
+    assert not {
+        (_NULL_WORK_ITEMS_PATH, "insert_work_items"),
+        (_NULL_WORK_ITEMS_PATH, "insert_work_items_idempotent"),
+    } & _null_deadline_test_admitted(sources)
+
+
+def _namespace_fixture(extra):
+    return (_parse_source("src/elspeth/namespace_consumer.py", "import elspeth.core.landscape.lease_deadlines as d\n" + extra),)
+
+
+def test_deadline_namespace_direct_audited_calls_are_not_mutations():
+    units = _namespace_fixture("d.record_issued_deadline(conn, key=key, expires_at=expires, window_seconds=60)\n")
+    assert not _deadline_dependency_mutation_violations(units, _DEADLINE_REGISTRY_NAMESPACES)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "d.record_issued_deadline = foreign\n",
+        "alias = d\nalias.record_issued_deadline = foreign\n",
+        "record = d.record_issued_deadline\nrecord.__code__ = foreign.__code__\n",
+        "setattr(d, 'record_issued_deadline', foreign)\n",
+        "from builtins import setattr as change\nchange(d, 'record_issued_deadline', foreign)\n",
+        "object.__setattr__(d, 'record_issued_deadline', foreign)\n",
+        "d.__setattr__('record_issued_deadline', foreign)\n",
+        "d.__dict__['record_issued_deadline'] = foreign\n",
+        "vars(d)['record_issued_deadline'] = foreign\n",
+        "setattr(d, unknown_name, foreign)\n",
+        "name = 'record_' + 'issued_deadline'\ngetattr(d, name)(conn, key=key)\n",
+        "def corrupt(namespace):\n    namespace.record_issued_deadline = foreign\ncorrupt(d)\n",
+        "callback(d.record_issued_deadline)\n",
+        "packed = {'namespace': d}\n",
+        "d._STATE_KEY = 'foreign-state'\n",
+    ],
+)
+def test_deadline_namespace_external_mutations_and_escapes_are_refused(extra):
+    assert _deadline_dependency_mutation_violations(_namespace_fixture(extra), _DEADLINE_REGISTRY_NAMESPACES)
+
+
+def test_deadline_namespace_whole_production_baseline():
+    findings = _deadline_dependency_mutation_violations(_production_units(), _DEADLINE_REGISTRY_NAMESPACES)
+    assert not findings, findings
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository\nRunLifecycleRepository.__getattribute__ = foreign\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\nsetattr(RunCoordinationRepository, '__getattr__', foreign)\n",
+        "import elspeth.core.landscape.run_lifecycle_repository as lifecycle\ncallback(lifecycle)\n",
+    ],
+)
+def test_deadline_namespace_external_repository_lookup_replacement(extra):
+    protected = _DEADLINE_REGISTRY_NAMESPACES | _DEADLINE_FINALIZATION_DEPENDENCIES
+    units = (_parse_source("src/elspeth/namespace_lookup_mutation.py", extra),)
+    assert _deadline_dependency_mutation_violations(units, protected)
+
+
+def test_deadline_namespace_complete_dependency_graph_baseline():
+    protected = _DEADLINE_REGISTRY_NAMESPACES | _DEADLINE_FINALIZATION_DEPENDENCIES
+    findings = _deadline_dependency_mutation_violations(_production_units(), protected)
+    assert not findings, findings
+
+
+def _deadline_issuance_violations(units: tuple[SourceUnit, ...]) -> tuple[str, ...]:
+    """Prove each fresh lease stamp is locked and registered with its actual recipe.
+
+    The clock gate proves the helper's dialect implementation. This gate proves
+    the caller's separate ordering and obligation identity; recognizing an
+    imported clock alone cannot establish either fact.
+    """
+    violations = list(_deadline_dependency_mutation_violations(units, _DEADLINE_REGISTRY_NAMESPACES | _DEADLINE_FINALIZATION_DEPENDENCIES))
+    proof = _AuthorityProof(units)
+    proven_coordination_writers = _proven_coordination_deadline_writers(units)
+    proven_null_insert_writers = _non_issuing_deadline_insert_keys(units)
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for function in ast.walk(unit.tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if (unit.path, _symbol(function)) in proven_coordination_writers:
+                continue
+            calls = [item for item in _walk_same_scope(function) if isinstance(item, ast.Call)]
+            # Inventory the deadline sink, not a recognizable producer. A
+            # wrapper, transaction clock, or missing registration must never
+            # cause the entire writer to disappear from this proof.
+            registrations = [(call, _deadline_registration_shape(call, resolver, proof)) for call in calls]
+            for write, execute, connection, table, write_values in _deadline_executed_writes(function, resolver):
+                field, kind, identity_columns = _DEADLINE_FIELDS[table]
+                if write_values is None:
+                    if (unit.path, _symbol(function)) in proven_null_insert_writers:
+                        continue
+                    violations.append(f"{unit.path}:{function.name}:{write.lineno}: deadline table has unresolved write values")
+                    continue
+                if field not in write_values:
+                    continue
+                value = write_values[field]
+                expiry = _deadline_binding(value, resolver, write)
+                if isinstance(expiry, ast.Constant) and expiry.value is None:
+                    continue
+                issue = f"{unit.path}:{function.name}:{write.lineno}: deadline issuance"
+                if not isinstance(expiry, ast.BinOp) or not isinstance(expiry.op, ast.Add):
+                    violations.append(issue + " lacks a fresh sample plus an explicit duration")
+                    continue
+                sample = _deadline_binding(expiry.left, resolver, expiry)
+                if (
+                    not isinstance(sample, ast.Call)
+                    or resolver.qualified_name(sample.func, use=sample) != _FRESH_CLOCK
+                    or len(sample.args) != 1
+                    or sample.keywords
+                    or not _deadline_api_is_visible(_FRESH_CLOCK, resolver, sample)
+                ):
+                    violations.append(issue + " lacks its own fresh database sample")
+                    continue
+                identity = _deadline_write_identity(write, resolver, table)
+                identity.update(write_values)
+                expected_identity = tuple(
+                    _deadline_term(identity[column], resolver, write) for column in identity_columns if column in identity
+                )
+                if kind == "LEADER" and len(expected_identity) == 3:
+                    expected_identity = (*expected_identity[:2], f"str({expected_identity[2]})")
+                expected = (
+                    kind,
+                    expected_identity,
+                    _deadline_term(connection, resolver, execute),
+                    _deadline_term(value, resolver, write),
+                    _deadline_duration_seconds(expiry.right, resolver),
+                )
+                matches = [
+                    call
+                    for call, actual in registrations
+                    if actual == expected and call.lineno > write.lineno and _deadline_registration_covers_success(execute, call)
+                ]
+                if len(expected_identity) != len(identity_columns) or len(matches) != 1:
+                    violations.append(issue + " does not register its exact row, connection, expiry and window")
+                if _deadline_term(sample.args[0], resolver, sample) != _deadline_term(connection, resolver, execute):
+                    violations.append(issue + " samples a different connection")
+                if not _deadline_decision_uses_one_sample(write, execute, sample, write_values, table, resolver, function):
+                    violations.append(issue + " splits eligibility or publication stamps from its issuing sample")
+                lock_keys = {column: identity[column] for column in identity_columns if column in identity}
+                if table == "run_coordination":
+                    lock_keys = {column: identity[column] for column in ("run_id",) if column in identity}
+                if table == "token_work_items" and "run_id" in identity:
+                    lock_keys["run_id"] = identity["run_id"]
+                if not _target_lock_precedes_fresh_sample(
+                    sample,
+                    function=function,
+                    resolver=resolver,
+                    proof=proof,
+                    connection=connection,
+                    table=("elspeth.core.landscape.schema", table),
+                    key_values=lock_keys,
+                ):
+                    violations.append(issue + " is not preceded by its completed exclusive target lock")
+    return tuple(violations)
+
+
+def _pre_admission_helper_effect_violations(units: tuple[SourceUnit, ...]) -> tuple[str, ...]:
+    """Do not hide clock reads before admission.
+
+    ADR-048 orders statements within each authority-owning transaction.
+    Independent identity/reference discovery is not that transaction's first
+    statement; independently fenced callees retain their own admission proof.
+    The complete DML/connection sweep separately checks every mutation owner.
+    """
+    proof = _AuthorityProof(units)
+    memo: dict[int, bool] = {}
+
+    def executes_database(call, resolver, seen):
+        if resolver.qualified_name(call.func, use=call) in {
+            _FRESH_CLOCK,
+            "elspeth.core.landscape.database_clock.read_landscape_transaction_time",
+        }:
+            return True
+        called = proof.called_function(call, resolver, call)
+        if called is None:
+            return False
+        function, helper_resolver = called
+        if _fenced_contexts(function) and _function_fence_violation(function) is None:
+            # The ordinary owner check proves this callee's own transaction.
+            # Its pre-admission helper calls are checked when this sweep visits
+            # that function, so delegation cannot conceal an early clock.
+            return False
+        if id(function) in memo:
+            return memo[id(function)]
+        if id(function) in seen:
+            return False
+        result = any(
+            executes_database(part, helper_resolver, seen | {id(function)})
+            for part in _walk_same_scope(function)
+            if isinstance(part, ast.Call)
+        )
+        if result:
+            memo[id(function)] = True
+        return result
+
+    problems = []
+    for unit in units:
+        resolver = _resolver_for_unit(unit)
+        for function in ast.walk(unit.tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            contexts = _fenced_contexts(function)
+            if len(contexts) != 1:
+                continue  # The ordinary fence-shape proof refuses this separately.
+            context = contexts[0].owner
+            admission = contexts[0].call
+            for call in _walk_same_scope(function):
+                if not isinstance(call, ast.Call) or call is admission:
+                    continue
+                if call.lineno >= context.lineno and not _is_descendant(call, admission):
+                    continue
+                if executes_database(call, resolver, frozenset()):
+                    problems.append(f"{unit.path}:{_symbol(function)} database helper executes before authority admission")
+    return tuple(problems)
+
+
+def _journal_outbox_sources_are_proven(units: tuple[SourceUnit, ...], dml: Sequence[DmlIdentity]) -> bool:
+    """Bind the extracted non-run outbox writer to its reviewed commit listener."""
+    sources = {unit.path: unit.source for unit in units}
+    if not _issued_deadline_registry_source_is_proven(sources):
+        return False
+    if _deadline_dependency_mutation_violations(units, _DEADLINE_REGISTRY_NAMESPACES):
+        return False
+    path = "src/elspeth/core/landscape/journal.py"
+    helper = (path, "LandscapeJournal._prepare_commit")
+    for unit in units:
+        if unit.path == path:
+            continue  # This complete module is bound by the registry recipe.
+        resolver = _resolver_for_unit(unit)
+        for node in ast.walk(unit.tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_prepare_commit":
+                return False
+            if isinstance(node, ast.Name) and node.id == "_prepare_commit":
+                return False
+            if isinstance(node, ast.expr) and _constant_string_value(node, resolver, use=node) == "_prepare_commit":
+                return False
+    callers = {
+        (edge.caller_path, edge.caller_symbol)
+        for edge in _subordinate_helper_edges(units, dml)
+        if (edge.helper_path, edge.helper_symbol) == helper
+    }
+    return callers == {(path, "LandscapeJournal._before_commit")}
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "other_caller", "unresolved_caller", "reflected_caller", "rebound_connection", "missing_rollback", "early_guard"]
+)
+def test_journal_outbox_extraction_requires_reviewed_body_event_order_and_closed_caller(fault):
+    sources = {path: (_repo_root() / path).read_text() for path in _REVIEWED_REGISTRY_MODULES}
+    journal = "src/elspeth/core/landscape/journal.py"
+    if fault == "other_caller":
+        sources["src/elspeth/extra_journal_caller.py"] = (
+            "from elspeth.core.landscape.journal import LandscapeJournal\n"
+            "def invoke(journal: LandscapeJournal, conn):\n    journal._prepare_commit(conn)\n"
+        )
+    elif fault == "unresolved_caller":
+        sources["src/elspeth/extra_journal_caller.py"] = "def invoke(journal, conn):\n    journal._prepare_commit(conn)\n"
+    elif fault == "reflected_caller":
+        sources["src/elspeth/extra_journal_caller.py"] = "def invoke(journal, conn):\n    getattr(journal, '_prepare_' + 'commit')(conn)\n"
+    elif fault == "rebound_connection":
+        sources[journal] = sources[journal].replace(
+            "all_records = self._take_buffered_records(conn)", "conn = foreign\n        all_records = self._take_buffered_records(conn)"
+        )
+    elif fault == "missing_rollback":
+        sources[journal] = sources[journal].replace("rollback_failed_commit(conn)", "pass")
+    elif fault == "early_guard":
+        sources[journal] = sources[journal].replace("install_deadline_guard(engine, after_journal=True)", "install_deadline_guard(engine)")
+    units = tuple(_parse_source(path, source) for path, source in sources.items())
+    assert _journal_outbox_sources_are_proven(units, scan_dml_identities(units)) is (fault is None)
+
+
 def _transaction_order_violations(
     units: Iterable[SourceUnit],
     dml: Sequence[DmlIdentity],
 ) -> tuple[str, ...]:
     unit_list = tuple(units)
+    journal_sources_proven = _journal_outbox_sources_are_proven(unit_list, dml)
+    deadline_sources_proven = (
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "_renew_leader_deadline_on",
+    ) in _proven_coordination_deadline_writers(unit_list)
     index = _function_index(unit_list)
     dml_symbols = {(site.path, site.symbol) for site in dml}
     # Each fence's OWN first statement. These are the fence, not a payload
@@ -7075,6 +10123,9 @@ def _transaction_order_violations(
     violations: list[str] = [
         *_subordinate_helper_resolution_violations(unit_list, dml),
         *_heartbeat_fence_implementation_violations(unit_list),
+        *_deadline_issuance_violations(unit_list),
+        *_deadline_finalization_caller_violations(unit_list),
+        *_pre_admission_helper_effect_violations(unit_list),
     ]
     admitted: dict[tuple[str, str], str | None] = {}
 
@@ -7251,6 +10302,16 @@ def _transaction_order_violations(
     def edge_violation(helper_key: tuple[str, str], caller_key: tuple[str, str], stack: frozenset[tuple[str, str]]) -> str | None:
         if caller_key not in index:
             return "is unresolved"
+        coordination_path = "src/elspeth/core/landscape/run_coordination_repository.py"
+        if helper_key == (coordination_path, "_renew_leader_deadline_on") and caller_key in {
+            (coordination_path, "verify_and_extend_leader_fence"),
+            (coordination_path, "fenced_leader_transaction"),
+        }:
+            # The independent clock proof checks executable bodies, exact
+            # token/connection forwarding, admission before sampling and the
+            # conditional success tail. Other callers still traverse the
+            # ordinary all-callers authority proof below.
+            return None if deadline_sources_proven else "has no proven admission/renewal/finalization source contract"
         if caller_key in _NON_RUN_DML_WRITERS:
             caller = index[caller_key]
             reason = _non_run_writer_violation(caller, dml)
@@ -7269,6 +10330,15 @@ def _transaction_order_violations(
             # Both endpoints sit inside one authority-establishment helper
             # graph: every write on the edge is pinned per table by that
             # establishment's exact write counts (_begin_run_edge_violations).
+            if (
+                helper_key[1]
+                in {
+                    "RunCoordinationRepository._finalize_leader_registration_on",
+                    "RunCoordinationRepository._finalize_follower_admission_on",
+                }
+                and not deadline_sources_proven
+            ):
+                return "has no proven deadline registration finalizer source contract"
             return None
         if (caller_key, helper_key) == (
             (_FENCE_REFUSAL_EVIDENCE_EDGE.caller_path, _FENCE_REFUSAL_EVIDENCE_EDGE.caller_symbol),
@@ -7301,6 +10371,14 @@ def _transaction_order_violations(
         return reason
 
     for path, symbol in sorted(dml_symbols | helper_keys):
+        if (
+            journal_sources_proven
+            and path == "src/elspeth/core/landscape/journal.py"
+            and symbol in {"LandscapeJournal._before_commit", "LandscapeJournal._prepare_commit"}
+        ):
+            # Only exact reviewed listener/preparer bodies, dependencies and
+            # their closed helper edge admit the non-run outbox INSERT.
+            continue
         if (path, symbol) in exact_establishment_symbols:
             continue
         node = index.get((path, symbol))
@@ -7365,6 +10443,10 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             (_RUN_LIFECYCLE_PATH, "RunLifecycleRepository._insert_web_plugin_policy_evidence"),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._finalize_leader_registration_on",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
                 "RunCoordinationRepository.register_run_leader_on",
             ),
             (
@@ -7389,6 +10471,10 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             ),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._finalize_leader_registration_on",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
                 "RunCoordinationRepository._insert_worker_row",
             ),
             (
@@ -7409,6 +10495,10 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             ),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._finalize_leader_registration_on",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
                 "RunCoordinationRepository._insert_worker_row",
             ),
             (
@@ -7422,6 +10512,10 @@ _ESTABLISHMENT_HELPER_SYMBOLS: dict[str, frozenset[tuple[str, str]]] = {
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
                 "RunCoordinationRepository.admit_follower",
+            ),
+            (
+                "src/elspeth/core/landscape/run_coordination_repository.py",
+                "RunCoordinationRepository._finalize_follower_admission_on",
             ),
             (
                 "src/elspeth/core/landscape/run_coordination_repository.py",
@@ -10404,6 +13498,541 @@ def test_raw_execution_admits_a_self_attribute_bound_to_a_constant_read_dictiona
     assert len(unknown_rows(splat_dictionary)) == 1
 
 
+@pytest.mark.parametrize("clock_name", ["read_landscape_decision_time", "sample_time"])
+def test_fresh_landscape_sample_is_a_database_effect_before_authority_admission(clock_name: str) -> None:
+    source = textwrap.dedent(
+        f"""\
+        from elspeth.contracts.coordination import CoordinationToken
+        from elspeth.core.landscape.database_clock import read_landscape_decision_time as {clock_name}
+        from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+
+        def change(conn, *, coordination_token: CoordinationToken):
+            sampled = {clock_name}(conn)
+            with fenced_leader_transaction(engine, token=coordination_token) as conn:
+                pass
+        """
+    )
+    unit = _parse_source("src/elspeth/core/landscape/clock_sample.py", source)
+    function = next(node for node in unit.tree.body if isinstance(node, ast.FunctionDef))
+    assert "first database effect" in (_function_fence_violation(function) or "")
+
+    admitted = _parse_source(
+        unit.path,
+        source.replace(f"    sampled = {clock_name}(conn)\n", "").replace("        pass", f"        sampled = {clock_name}(conn)"),
+    )
+    function = next(node for node in admitted.tree.body if isinstance(node, ast.FunctionDef))
+    assert _function_fence_violation(function) is None
+
+
+def _target_lock_fixture(body, *, extra="", table_name="token_work_items", keys=("work_item_id", "run_id")):
+    source = (
+        "from sqlalchemy import select\n"
+        "from elspeth.core.landscape.schema import token_work_items_table, sink_effects_table\n"
+        "from elspeth.core.landscape.database_clock import read_landscape_decision_time\n"
+        + extra
+        + "\n"
+        + "def issue(conn, other_conn, work_item_id, run_id, effect_id, predecessor, row, flag):\n"
+        + textwrap.indent(textwrap.dedent(body).strip() + "\n", "    ")
+    )
+    unit = _parse_source("src/elspeth/core/landscape/lock_fixture.py", source)
+    function = next(part for part in unit.tree.body if isinstance(part, ast.FunctionDef) and part.name == "issue")
+    sample = next(
+        part
+        for part in ast.walk(function)
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id == "read_landscape_decision_time"
+    )
+    subjects = next(
+        part for part in ast.walk(function) if isinstance(part, ast.Call) and isinstance(part.func, ast.Name) and part.func.id == "subjects"
+    )
+    return _target_lock_precedes_fresh_sample(
+        sample,
+        function=function,
+        resolver=_resolver_for_unit(unit),
+        proof=_AuthorityProof((unit,)),
+        connection=sample.args[0],
+        table=("elspeth.core.landscape.schema", table_name),
+        key_values=dict(zip(keys, subjects.args, strict=True)),
+    )
+
+
+_TARGET_LOCK_DIRECT = """
+conn.execute(select(token_work_items_table).where(
+    token_work_items_table.c.work_item_id == work_item_id,
+    token_work_items_table.c.run_id == run_id,
+).with_for_update(of=token_work_items_table)).mappings().all()
+now = read_landscape_decision_time(conn)
+subjects(work_item_id, run_id)
+"""
+
+
+def test_target_lock_direct_and_alias_positive():
+    assert _target_lock_fixture(_TARGET_LOCK_DIRECT)
+    alias = _TARGET_LOCK_DIRECT.replace("conn.execute", "target_conn.execute")
+    assert _target_lock_fixture("target_conn = conn\n" + alias)
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("conn.execute", "other_conn.execute"),
+        (".with_for_update(of=token_work_items_table)", ".with_for_update(read=True)"),
+        (".with_for_update(of=token_work_items_table)", ".with_for_update(skip_locked=True)"),
+        (".with_for_update(of=token_work_items_table)", ""),
+        (".mappings().all()", ""),
+        ("work_item_id == work_item_id", "work_item_id == 'another-item'"),
+        ("run_id == run_id", "run_id == 'another-run'"),
+        ("select(token_work_items_table)", "select(token_work_items_table).select_from(sink_effects_table)"),
+        ("select(token_work_items_table)", "select(token_work_items_table).add_cte(opaque_write)"),
+        ("now = read_landscape_decision_time(conn)", "conn.rollback()\nnow = read_landscape_decision_time(conn)"),
+        ("subjects(work_item_id, run_id)", "subjects('another-item', run_id)"),
+    ],
+)
+def test_target_lock_direct_adversaries(before, after):
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT.replace(before, after))
+
+
+def test_target_lock_order_branch_and_import_impostors():
+    lock, after = _TARGET_LOCK_DIRECT.split("now =", 1)
+    assert not _target_lock_fixture("now =" + after + lock)
+    assert not _target_lock_fixture("if flag:\n" + textwrap.indent(lock.strip() + "\n", "    ") + "now =" + after)
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT, extra="from foreign.schema import token_work_items_table\n")
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT, extra="def select(*args):\n    return impostor\n")
+
+
+_TARGET_LOCK_HELPER = """
+def not_a_magic_lock_name(conn, work_item_id, run_id):
+    conn.execute(select(token_work_items_table).where(
+        token_work_items_table.c.work_item_id == work_item_id,
+        token_work_items_table.c.run_id == run_id,
+    ).with_for_update()).fetchall()
+    return None
+"""
+_TARGET_LOCK_HELPER_CALL = """
+not_a_magic_lock_name(conn, work_item_id, run_id)
+now = read_landscape_decision_time(conn)
+subjects(work_item_id, run_id)
+"""
+
+
+def test_target_lock_resolves_owned_helper_body():
+    assert _target_lock_fixture(_TARGET_LOCK_HELPER_CALL, extra=_TARGET_LOCK_HELPER)
+    assert not _target_lock_fixture(
+        _TARGET_LOCK_HELPER_CALL, extra=_TARGET_LOCK_HELPER.replace("    conn.execute", "    return None\n    conn.execute")
+    )
+    assert not _target_lock_fixture(
+        _TARGET_LOCK_HELPER_CALL, extra=_TARGET_LOCK_HELPER.replace("    return None", "    conn.commit()\n    return None")
+    )
+    assert not _target_lock_fixture(
+        _TARGET_LOCK_HELPER_CALL, extra="def not_a_magic_lock_name(conn, work_item_id, run_id):\n    return None\n"
+    )
+    assert not _target_lock_fixture(_TARGET_LOCK_HELPER_CALL, extra=_TARGET_LOCK_HELPER + "\nnot_a_magic_lock_name = foreign_lock\n")
+
+
+def test_target_lock_row_projection_is_the_original_key():
+    body = """
+locked_row = conn.execute(select(token_work_items_table).where(
+    token_work_items_table.c.work_item_id == row["work_item_id"],
+    token_work_items_table.c.run_id == run_id,
+).with_for_update()).mappings().one_or_none()
+if locked_row is None:
+    return None
+row = locked_row
+now = read_landscape_decision_time(conn)
+subjects(row["work_item_id"], run_id)
+"""
+    assert _target_lock_fixture(body)
+    assert not _target_lock_fixture(body.replace("row = locked_row", "row = predecessor"))
+    assert not _target_lock_fixture(body.replace("token_work_items_table.c.work_item_id ==", "sink_effects_table.c.work_item_id =="))
+
+
+def test_target_lock_effect_set_requires_source_proven_nonnull():
+    guard = """
+def validate_key(value, name):
+    if type(value) is not str or invalid_digest(value):
+        raise ValueError(name)
+"""
+    body = """
+validate_key(effect_id, "effect_id")
+effect_ids = sorted({effect_id, predecessor} - {None})
+conn.execute(select(sink_effects_table).where(
+    sink_effects_table.c.effect_id.in_(effect_ids)
+).order_by(sink_effects_table.c.effect_id).with_for_update()).fetchall()
+now = read_landscape_decision_time(conn)
+subjects(effect_id)
+"""
+    assert _target_lock_fixture(body, extra=guard, table_name="sink_effects", keys=("effect_id",))
+    assert not _target_lock_fixture(
+        body, extra=guard.replace("        raise ValueError(name)", "        return None"), table_name="sink_effects", keys=("effect_id",)
+    )
+    assert not _target_lock_fixture(
+        body.replace("{effect_id, predecessor}", "{predecessor}"), extra=guard, table_name="sink_effects", keys=("effect_id",)
+    )
+    assert not _target_lock_fixture(body, extra=guard + "\nsorted = foreign_sorted\n", table_name="sink_effects", keys=("effect_id",))
+
+
+def test_target_lock_extra_projection_cannot_shadow_keys():
+    extra = "select(token_work_items_table, bundle.label('_pending_sink_bundle_complete'))"
+    assert _target_lock_fixture(_TARGET_LOCK_DIRECT.replace("select(token_work_items_table)", extra))
+    shadow = "select(token_work_items_table, bundle.label('work_item_id'))"
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT.replace("select(token_work_items_table)", shadow))
+
+
+@pytest.mark.parametrize("change", ["work_item_id += foreign", "del work_item_id", "if (work_item_id := foreign):\n    pass"])
+def test_target_lock_refuses_intervening_subject_mutation(change):
+    body = "subject = work_item_id\n" + _TARGET_LOCK_DIRECT.replace("== work_item_id", "== subject").replace("now =", change + "\nnow =")
+    assert not _target_lock_fixture(body)
+
+
+def test_target_lock_refuses_augmented_connection_alias():
+    body = "target_conn = conn\n" + _TARGET_LOCK_DIRECT.replace("conn.execute", "target_conn.execute").replace(
+        "now =", "target_conn += other_conn\nnow ="
+    ).replace("read_landscape_decision_time(conn)", "read_landscape_decision_time(target_conn)")
+    assert not _target_lock_fixture(body)
+
+
+@pytest.mark.parametrize(
+    "predicate", ["False", "token_work_items_table.c.status == 'never-written'", "token_work_items_table.c.work_item_id == 'different-id'"]
+)
+def test_target_lock_refuses_additional_narrowing_conjunct(predicate):
+    assert not _target_lock_fixture(
+        _TARGET_LOCK_DIRECT.replace(
+            "    token_work_items_table.c.run_id == run_id,", "    token_work_items_table.c.run_id == run_id,\n    " + predicate + ","
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "extra, action",
+    [
+        ("def release(conn):\n    conn.rollback()\n", "release(conn)"),
+        ("def inner(conn):\n    conn.rollback()\ndef outer(conn):\n    inner(conn)\n", "outer(conn)"),
+        ("", "callback(conn)"),
+        ("", "callback(connection=conn)"),
+        ("", "callback({'connection': conn})"),
+        ("", "conn.exec_driver_sql('COMMIT')"),
+        ("", "conn.connection.rollback()"),
+        ("", "if flag:\n    callback(conn)"),
+    ],
+)
+def test_target_lock_refuses_connection_release_and_unknown_escape(extra, action):
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT.replace("now =", action + "\nnow ="), extra=extra)
+
+
+def test_target_lock_preserves_source_owned_read_helper():
+    extra = "def inspect(conn):\n    return conn.execute(select(token_work_items_table.c.run_id)).fetchall()\n"
+    assert _target_lock_fixture(_TARGET_LOCK_DIRECT.replace("now =", "inspect(conn)\nnow ="), extra=extra)
+
+
+def test_target_lock_refuses_release_inside_the_lock_helper():
+    helper = (
+        _TARGET_LOCK_HELPER.replace("    return None", "    release(conn)\n    return None") + "\ndef release(conn):\n    conn.rollback()\n"
+    )
+    assert not _target_lock_fixture(_TARGET_LOCK_HELPER_CALL, extra=helper)
+
+
+@pytest.mark.parametrize(
+    "action", ["release = conn.rollback\nrelease()", "release = conn.close\nrelease()", "carried = conn\ncallback(carried)"]
+)
+def test_target_lock_refuses_connection_callable_alias_escape(action):
+    assert not _target_lock_fixture(_TARGET_LOCK_DIRECT.replace("now =", action + "\nnow ="))
+
+
+@pytest.mark.parametrize(
+    ("module", "before", "after"),
+    [
+        ("lease_deadlines", "if not isinstance(state, _TransactionDeadlines):", "if False:"),
+        ("lease_deadlines", "if state.transaction is not conn.get_transaction():", "if False:"),
+        ("lease_deadlines", "if not isinstance(key, DeadlineKey):", "if False:"),
+        (
+            "lease_deadlines",
+            "_IssuedDeadline(expires_at.astimezone(UTC), reserve)",
+            "_IssuedDeadline(expires_at.astimezone(UTC) + timedelta(seconds=1), reserve)",
+        ),
+        ("lease_deadlines", "deadline.expires_at - sampled_at <= deadline.reserve", "False"),
+        (
+            "lease_deadlines",
+            "sampled_at = read_landscape_decision_time(conn)",
+            'conn.exec_driver_sql("UPDATE token_work_items SET lease_expires_at = NULL")\n        sampled_at = read_landscape_decision_time(conn)',
+        ),
+        (
+            "lease_deadlines",
+            "sampled_at = read_landscape_decision_time(conn)",
+            "conn.commit()\n        sampled_at = read_landscape_decision_time(conn)",
+        ),
+        (
+            "lease_deadlines",
+            "sampled_at = read_landscape_decision_time(conn)",
+            'conn.info["callback"](conn)\n        sampled_at = read_landscape_decision_time(conn)',
+        ),
+        ("lease_deadlines", "conn.connection.rollback()", "pass"),
+        ("lease_deadlines", "state.issued.pop(key, None)", "state.issued.clear()"),
+        ("database_clock", "func.clock_timestamp()", "func.current_timestamp()"),
+        ("journal", "install_deadline_guard(engine, after_journal=True)", "install_deadline_guard(engine)"),
+        ("journal", "rollback_failed_commit(conn)", "pass"),
+        (
+            "journal",
+            "def _serialize_record(record: JournalRecord) -> str:",
+            "def _serialize_record(record: JournalRecord) -> str:\n        unknown_callback(record)",
+        ),
+        ("database", "install_deadline_guard(self._engine)", "pass"),
+        (
+            "lease_deadlines",
+            "_INSTALL_LOCK = Lock()",
+            "_INSTALL_LOCK = Lock()\nread_landscape_decision_time = lambda conn: datetime.now(UTC)",
+        ),
+    ],
+)
+def test_issued_deadline_registry_dependency_binding_rejects_semantic_mutations(module, before, after):
+    sources = {path: (_repo_root() / path).read_text() for path in _REVIEWED_REGISTRY_MODULES}
+    assert _issued_deadline_registry_source_is_proven(sources)
+    target = f"src/elspeth/core/landscape/{module}.py"
+    assert before in sources[target]
+    changed = {**sources, target: sources[target].replace(before, after, 1)}
+    assert not _issued_deadline_registry_source_is_proven(changed)
+
+
+def test_issued_deadline_registry_dependency_binding_requires_complete_source_but_ignores_comments():
+    sources = {path: (_repo_root() / path).read_text() for path in _REVIEWED_REGISTRY_MODULES}
+    assert _issued_deadline_registry_source_is_proven(sources)
+    assert _issued_deadline_registry_source_is_proven({path: source + "\n# documentation only\n" for path, source in sources.items()})
+    for missing in sources:
+        assert not _issued_deadline_registry_source_is_proven({path: source for path, source in sources.items() if path != missing})
+    assert not _issued_deadline_registry_source_is_proven({**sources, next(iter(sources)): "def ("})
+
+
+@pytest.mark.parametrize("placement", ["before", "argument"])
+def test_source_owned_clock_wrapper_cannot_execute_before_fence_admission(placement):
+    baseline = _deadline_issuance_fixture()
+    source = baseline.source + "\ndef read_clock(conn):\n    return read_landscape_decision_time(conn)\n"
+    if placement == "before":
+        source = source.replace(
+            "    with fenced_member_transaction", "    observed = read_clock(other_conn)\n    with fenced_member_transaction"
+        )
+    else:
+        source = source.replace("verb='heartbeat_lease'", "verb=read_clock(other_conn)")
+    mutant = _parse_source(baseline.path, source)
+    assert _pre_admission_helper_effect_violations((baseline,)) == ()
+    assert _pre_admission_helper_effect_violations((mutant,))
+
+
+@pytest.mark.parametrize("variant", ["own_fence", "own_early_clock", "independent_reference_read", "fake_fence"])
+def test_pre_admission_effects_respect_transaction_ownership(variant):
+    source = """from sqlalchemy import select, update
+from sqlalchemy.engine import Connection
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.core.landscape.run_coordination_repository import fenced_member_transaction
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.schema import token_work_items_table
+def delegated(member_token: WorkerMembershipToken):
+    with fenced_member_transaction(engine, member_token=member_token, verb='delegated') as conn:
+        observed = read_landscape_decision_time(conn)
+        conn.execute(update(token_work_items_table).values(updated_at=observed))
+def outer(member_token: WorkerMembershipToken):
+    delegated(member_token)
+    with fenced_member_transaction(engine, member_token=member_token, verb='outer') as conn:
+        conn.execute(update(token_work_items_table).values(status='READY'))
+"""
+    if variant == "own_early_clock":
+        source = source.replace(
+            "    with fenced_member_transaction(engine, member_token=member_token, verb='delegated')",
+            "    early = read_landscape_decision_time(other_conn)\n    with fenced_member_transaction(engine, member_token=member_token, verb='delegated')",
+        )
+    elif variant == "independent_reference_read":
+        source = source.replace(
+            "    with fenced_member_transaction(engine, member_token=member_token, verb='delegated') as conn:\n        observed = read_landscape_decision_time(conn)\n        conn.execute(update(token_work_items_table).values(updated_at=observed))",
+            "    with separate_db.read_only_connection() as snapshot:\n        return snapshot.execute(select(token_work_items_table.c.work_item_id))",
+        )
+    elif variant == "fake_fence":
+        source = source.replace("verb='delegated') as conn:", "verb='delegated') as other_conn:")
+    source = (
+        source.replace("WorkerMembershipToken", "CoordinationToken")
+        .replace("member_token", "token")
+        .replace("fenced_member_transaction", "fenced_leader_transaction")
+    )
+    source = source.replace(
+        "update(token_work_items_table).values",
+        "update(token_work_items_table).where(token_work_items_table.c.run_id == token.run_id).values",
+    )
+    unit = _parse_source("src/elspeth/transaction_discovery.py", source)
+    findings = _pre_admission_helper_effect_violations((unit,))
+    assert bool(findings) is (variant in {"own_early_clock", "fake_fence"}), findings
+
+
+@pytest.mark.parametrize("argument", ["", "conn=None", "conn=connection"])
+def test_pre_admission_clock_rule_does_not_reclassify_optional_reference_queries(argument):
+    source = f"""from sqlalchemy import select, update
+from sqlalchemy.engine import Connection
+from elspeth.contracts.coordination import CoordinationToken
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from elspeth.core.landscape.schema import token_work_items_table
+def reference(*, conn: Connection | None = None):
+    if conn is not None:
+        return conn.execute(select(token_work_items_table.c.run_id))
+    return separate_ops.execute_fetchone(select(token_work_items_table.c.run_id))
+def outer(token: CoordinationToken):
+    reference({argument})
+    with fenced_leader_transaction(engine, token=token, verb='outer') as conn:
+        conn.execute(update(token_work_items_table).where(token_work_items_table.c.run_id == token.run_id).values(status='READY'))
+"""
+    unit = _parse_source("src/elspeth/optional_reference.py", source)
+    assert _pre_admission_helper_effect_violations((unit,)) == ()
+    # The independent first-statement rule still refuses direct SQL before
+    # this owner's admission. Reference discovery cannot relax that rule.
+    changed = _parse_source(unit.path, source.replace(f"    reference({argument})", "    conn.execute(select(token_work_items_table))"))
+    owner = next(node for node in changed.tree.body if isinstance(node, ast.FunctionDef) and node.name == "outer")
+    assert _function_fence_violation(owner) == "full-token fence is not the transaction owner's first database effect"
+
+
+def _deadline_fixture_units(unit: SourceUnit) -> tuple[SourceUnit, ...]:
+    """Include the actual source dependencies required by the namespace proof."""
+    dependencies = (
+        "src/elspeth/core/landscape/lease_deadlines.py",
+        "src/elspeth/core/landscape/database_clock.py",
+    )
+    return (unit, *(_parse_source(path, (_repo_root() / path).read_text()) for path in dependencies))
+
+
+def _deadline_issuance_fixture() -> SourceUnit:
+    return _parse_source(
+        "src/elspeth/core/landscape/scheduler/leases.py",
+        textwrap.dedent(
+            """\
+            from datetime import timedelta
+            from sqlalchemy import select, update
+            from elspeth.contracts.coordination import WorkerMembershipToken
+            from elspeth.core.landscape.database_clock import read_landscape_decision_time
+            from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
+            from elspeth.core.landscape.run_coordination_repository import fenced_member_transaction
+            from elspeth.core.landscape.schema import token_work_items_table
+
+            def heartbeat_lease(*, member_token: WorkerMembershipToken, work_item_id, lease_seconds):
+                with fenced_member_transaction(engine, member_token=member_token, verb='heartbeat_lease') as conn:
+                    conn.execute(select(token_work_items_table.c.work_item_id).where(
+                        token_work_items_table.c.work_item_id == work_item_id,
+                        token_work_items_table.c.run_id == member_token.run_id,
+                    ).with_for_update()).fetchall()
+                    database_now = read_landscape_decision_time(conn)
+                    expires_at = database_now + timedelta(seconds=lease_seconds)
+                    result = conn.execute(update(token_work_items_table).where(
+                        token_work_items_table.c.work_item_id == work_item_id,
+                        token_work_items_table.c.run_id == member_token.run_id,
+                    ).values(lease_expires_at=expires_at, updated_at=database_now))
+                    if result.rowcount != 1:
+                        raise RuntimeError('lease refused')
+                    record_issued_deadline(conn,
+                        key=DeadlineKey(DeadlineKind.ITEM, (work_item_id,)),
+                        expires_at=expires_at, window_seconds=lease_seconds)
+            """
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ("database_now = read_landscape_decision_time(conn)", "database_now = read_landscape_decision_time(other_conn)"),
+        (".with_for_update()", ""),
+        (".with_for_update()", ".with_for_update(read=True)"),
+        ("expires_at=expires_at, window_seconds=lease_seconds", "expires_at=database_now, window_seconds=lease_seconds"),
+        ("DeadlineKind.ITEM, (work_item_id,)", "DeadlineKind.ITEM, ('foreign-item',)"),
+        ("record_issued_deadline(conn,", "record_issued_deadline(other_conn,"),
+        ("expires_at=expires_at, window_seconds=lease_seconds", "expires_at=expires_at, window_seconds=999"),
+        ("DeadlineKind.ITEM, (work_item_id,)", "DeadlineKind.SINK_EFFECT, (work_item_id,)"),
+        ("        record_issued_deadline(conn,", "        if unknown_condition:\n            record_issued_deadline(conn,"),
+        ("        record_issued_deadline(conn,", "        return None\n        record_issued_deadline(conn,"),
+        (
+            ".values(lease_expires_at=expires_at, updated_at=database_now)",
+            ".values(**{'lease_expires_at': database_now, 'updated_at': database_now})",
+        ),
+        (".values(lease_expires_at=expires_at, updated_at=database_now)", ".values(**supplied_values)"),
+    ],
+)
+def test_deadline_issuance_requires_locked_sample_and_exact_registration(before: str, after: str) -> None:
+    baseline = _deadline_issuance_fixture()
+    baseline_units = _deadline_fixture_units(baseline)
+    assert _transaction_order_violations(baseline_units, scan_dml_identities(baseline_units)) == ()
+    assert before in baseline.source
+    mutant = _parse_source(baseline.path, baseline.source.replace(before, after))
+    mutant_units = _deadline_fixture_units(mutant)
+    assert any("deadline" in finding for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units)))
+
+
+def test_deadline_issuance_rejects_sampling_before_the_target_lock() -> None:
+    baseline = _deadline_issuance_fixture()
+    before_lock = baseline.source.replace("        database_now = read_landscape_decision_time(conn)\n", "").replace(
+        "        conn.execute(select", "        database_now = read_landscape_decision_time(conn)\n        conn.execute(select"
+    )
+    mutant = _parse_source(baseline.path, before_lock)
+    mutant_units = _deadline_fixture_units(mutant)
+    assert any("deadline" in finding for finding in _transaction_order_violations(mutant_units, scan_dml_identities(mutant_units)))
+
+
+@pytest.mark.parametrize(
+    "variant",
+    [
+        "flag_augassign",
+        "rebound_result",
+        "wrapper_without_registration",
+        "transaction_without_registration",
+        "mapping_without_registration",
+        "executemany_without_registration",
+        "split_stamp",
+        "prelock_eligibility",
+        "foreign_key_factory",
+        "caught_registration_skip",
+    ],
+)
+def test_deadline_registration_rejects_reviewed_provenance_and_control_flow_bypasses(variant):
+    baseline = _deadline_issuance_fixture()
+    registration = "        record_issued_deadline(conn,"
+    missing = baseline.source.split(registration)[0]
+    changes = {
+        "flag_augassign": baseline.source.replace(
+            registration,
+            "        required = True\n        required &= unknown_condition\n        if required:\n            record_issued_deadline(conn,",
+        ),
+        "rebound_result": baseline.source.replace(
+            registration, "        result = foreign\n        if result.rowcount == 1:\n            record_issued_deadline(conn,"
+        ),
+        "wrapper_without_registration": missing.replace("database_now = read_landscape_decision_time(conn)", "database_now = fresh(conn)")
+        + "\ndef fresh(conn):\n    return read_landscape_decision_time(conn)\n",
+        "transaction_without_registration": missing.replace("read_landscape_decision_time", "read_landscape_transaction_time"),
+        "mapping_without_registration": missing.replace(
+            ".values(lease_expires_at=expires_at, updated_at=database_now))",
+            ", {'lease_expires_at': expires_at, 'updated_at': database_now})",
+        ),
+        "executemany_without_registration": missing.replace(
+            ".values(lease_expires_at=expires_at, updated_at=database_now))",
+            ", [{'lease_expires_at': expires_at, 'updated_at': database_now}])",
+        ),
+        "split_stamp": baseline.source.replace("updated_at=database_now", "updated_at=read_landscape_decision_time(conn)"),
+        "prelock_eligibility": baseline.source.replace(
+            "        conn.execute(select", "        eligibility_now = read_landscape_decision_time(conn)\n        conn.execute(select"
+        ).replace(
+            ".values(lease_expires_at", ".where(token_work_items_table.c.lease_expires_at > eligibility_now).values(lease_expires_at"
+        ),
+        "foreign_key_factory": baseline.source.replace(
+            "DeadlineKey(DeadlineKind.ITEM, (work_item_id,))", "key_for(Foreign(work_item_id=work_item_id))"
+        )
+        + "\ndef key_for(token):\n    return DeadlineKey(DeadlineKind.ITEM, (token.work_item_id,))\n",
+        "caught_registration_skip": "",
+    }
+    prefix, body = baseline.source.split("        database_now =", 1)
+    changes["caught_registration_skip"] = (
+        prefix
+        + "        try:\n"
+        + textwrap.indent(
+            ("        database_now =" + body).replace(registration, "        raise RuntimeError('skip')\n" + registration), "    "
+        )
+        + "        except RuntimeError:\n            pass\n"
+    )
+    assert _deadline_issuance_violations(_deadline_fixture_units(baseline)) == ()
+    source = changes[variant]
+    assert source != baseline.source
+    mutant = _parse_source(baseline.path, source)
+    assert _deadline_issuance_violations(_deadline_fixture_units(mutant))
+
+
 def test_transaction_scanner_rejects_nested_decoy_payload_before_fence_and_multi_caller_helper() -> None:
     decoys = _parse_source(
         "src/elspeth/core/landscape/decoys.py",
@@ -11684,9 +15313,11 @@ def test_authority_establishment_exception_is_exact_and_non_release() -> None:
     assert exception.write_counts == (
         ("run_attributions", "insert", 1),
         ("run_coordination", "insert", 1),
+        ("run_coordination", "update", 1),
         ("run_coordination_events", "insert", 2),
         ("run_web_plugin_policy", "insert", 1),
         ("run_workers", "insert", 1),
+        ("run_workers", "update", 1),
         ("runs", "insert", 1),
     )
 
@@ -11964,13 +15595,25 @@ def test_epoch_one_creation_edge_is_the_only_temporary_authority_exception() -> 
 def test_source_resolved_returned_authority(fault, admitted):
     core_path = "src/elspeth/core/landscape/run_coordination_repository.py"
     core_source = (_repo_root() / core_path).read_text()
-    constructor = "return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)"
-    if fault == "factory_forged_run":
-        core_source = core_source.replace(constructor, constructor.replace("run_id=run_id", "run_id='foreign'"))
-    elif fault == "factory_forged_worker":
-        core_source = core_source.replace(constructor, constructor.replace("worker_id=worker_id", "worker_id='foreign'"))
-    elif fault == "factory_forged_epoch":
-        core_source = core_source.replace(constructor, constructor.replace("leader_epoch=new_epoch", "leader_epoch=1"))
+    if fault.startswith("factory_forged_"):
+        function = next(
+            node
+            for node in ast.walk(ast.parse(core_source))
+            if isinstance(node, ast.FunctionDef) and node.name == "_acquire_run_leadership_on"
+        )
+        body = ast.get_source_segment(core_source, function)
+        assert body is not None
+        constructor = "CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)"
+        assert body.count(constructor) == 1
+        field, replacement = {
+            "factory_forged_run": ("run_id=run_id", "run_id='foreign'"),
+            "factory_forged_worker": ("worker_id=worker_id", "worker_id='foreign'"),
+            "factory_forged_epoch": ("leader_epoch=new_epoch", "leader_epoch=1"),
+        }[fault]
+        changed = body.replace(constructor, constructor.replace(field, replacement))
+        assert changed != body
+        assert core_source.count(body) == 1
+        core_source = core_source.replace(body, changed)
     imports = (
         "from elspeth.contracts.coordination import CoordinationToken, mint_worker_id, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS\n"
         "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\n"
@@ -12016,7 +15659,12 @@ def test_source_resolved_returned_authority(fault, admitted):
     core = _parse_source(core_path, core_source)
     producer = _parse_source("src/elspeth/web/authority_relay.py", producer_source)
     consumer = _parse_source("src/elspeth/web/authority_consumer.py", consumer_source)
-    proof = _AuthorityProof((core, producer, consumer))
+    # The real acquisition wrapper returns its token only after finalization;
+    # include the owned admission, clock, registry and lifecycle dependencies.
+    dependencies = tuple(
+        unit for unit in _production_units() if unit.path.startswith("src/elspeth/core/landscape/") and unit.path != core_path
+    )
+    proof = _AuthorityProof((*dependencies, core, producer, consumer))
     call = next(part.value for part in ast.walk(consumer.tree) if isinstance(part, ast.Return))
     assert isinstance(call, ast.Call)
     assert proof.returned_authority(call, _resolver_for_unit(consumer), call, _LEADER_SCOPE) is admitted
@@ -13022,10 +16670,20 @@ def test_claimed_work_item_source_return_controls(fault, admitted):
     elif fault == "unknown_decorator":
         sources[queue] = sources[queue].replace("    def _enqueue_ready_claimed(", "    @unknown\n    def _enqueue_ready_claimed(")
     elif fault == "sql_other_table":
-        _claimed_control_source_change(sources, leases, "claim_ready_row", "select(token_work_items_table)", "select(tokens_table)")
+        _claimed_control_source_change(
+            sources,
+            leases,
+            "claim_ready_row",
+            "claimed = (\n            conn.execute(\n                select(token_work_items_table)",
+            "claimed = (\n            conn.execute(\n                select(tokens_table)",
+        )
     elif fault == "sql_projection":
         _claimed_control_source_change(
-            sources, leases, "claim_ready_row", "select(token_work_items_table)", "select(token_work_items_table.c.work_item_id)"
+            sources,
+            leases,
+            "claim_ready_row",
+            "claimed = (\n            conn.execute(\n                select(token_work_items_table)",
+            "claimed = (\n            conn.execute(\n                select(token_work_items_table.c.work_item_id)",
         )
     elif fault == "nullable_unguarded":
         _claimed_control_source_change(
@@ -13519,3 +17177,74 @@ def test_receiver_body_lookup_proves_runtime_subject_and_method():
         assert _AuthorityProof((unit,)).returned_authority(call, _resolver_for_unit(unit), call, _LEADER_SCOPE) is (name == "baseline"), (
             name
         )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/elspeth/core/landscape/run_coordination_repository.py",
+        "src/elspeth/core/landscape/run_lifecycle_repository.py",
+    ],
+)
+def test_finalization_graph_irrelevant_evidence_has_no_writer_grant(path):
+    units = (_parse_source(path, "def record_coordination_event(conn, *, run_id):\n    pass\n"),)
+    assert _deadline_finalization_caller_violations(units) == ()
+    assert _proven_coordination_deadline_writers(units) == frozenset()
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def use(repo):\n    repo._finalize_leader_registration_on(conn, token, window_seconds=30)\n",
+        "def use(repo):\n    alias = repo._finalize_follower_admission_on\n",
+        "def use(repo):\n    return getattr(repo, '_finalize_' + 'leader_registration_on')\n",
+        "from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository\ndef use(name):\n    return getattr(RunCoordinationRepository, name)\n",
+        "class RunCoordinationRepository:\n    def _acquire_run_leadership_on(self):\n        pass\n",
+        "class RunCoordinationRepository:\n    def acquire_run_leadership(self):\n        return None\n",
+        "class RunCoordinationRepository:\n    def acquire_export_leadership(self):\n        return None\n",
+        "class RunCoordinationRepository:\n    def admit_follower(self):\n        return None\n",
+    ],
+)
+def test_finalization_graph_partial_capability_requires_closed_dependencies(source):
+    units = (_parse_source("src/elspeth/core/landscape/run_coordination_repository.py", source),)
+    assert _deadline_finalization_caller_violations(units)
+    assert not _proven_coordination_deadline_writers(units)
+
+
+def test_finalization_graph_initial_creation_without_finalizer_stays_relevant():
+    unit = _parse_source(
+        "src/elspeth/core/landscape/run_lifecycle_repository.py",
+        "class RunLifecycleRepository:\n    def begin_run(self):\n        return None\n",
+    )
+    assert _deadline_finalization_caller_violations((unit,))
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "_finalize_leader_registration_on",
+        "_finalize_follower_admission_on",
+    ],
+)
+def test_finalization_graph_actual_missing_finalizer_calls_are_rejected(method):
+    units = tuple(unit for unit in _production_units() if unit.path.startswith("src/elspeth/core/landscape/"))
+    assert _deadline_finalization_caller_violations(units) == ()
+    changed = []
+    removed = 0
+    for unit in units:
+        tree = ast.parse(unit.source)
+
+        class RemoveFinalizer(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                nonlocal removed
+                if isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == method:
+                    removed += 1
+                    return ast.copy_location(ast.Pass(), node)
+                return self.generic_visit(node)
+
+        tree = RemoveFinalizer().visit(tree)
+        changed.append(_parse_source(unit.path, ast.unparse(tree)))
+    assert removed > 0
+    violations = _deadline_finalization_caller_violations(tuple(changed))
+    assert any("caller set incomplete: " + method in finding for finding in violations)
+    assert not _proven_coordination_deadline_writers(tuple(changed))
