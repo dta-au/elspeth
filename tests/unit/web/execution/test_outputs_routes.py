@@ -40,6 +40,76 @@ _TEST_USER_ID = "test-user-123"
 _TEST_SESSION_ID = UUID("11111111-1111-4111-8111-111111111111")
 
 
+def _candidate_artifact(path: Path) -> RunOutputArtifact:
+    return RunOutputArtifact(
+        artifact_id="artifact",
+        sink_node_id="sink",
+        producer_kind="node_state",
+        produced_by_state_id="state",
+        sink_effect_id=None,
+        artifact_type="file",
+        path_or_uri=str(path),
+        content_hash="0" * 64,
+        size_bytes=0,
+        publication_performed=True,
+        publication_evidence_kind="legacy_returned",
+        created_at=datetime.now(UTC),
+        exists_now=True,
+        downloadable=True,
+        storage_kind="sink_file",
+    )
+
+
+def test_artifact_path_resolution_fault_is_not_reported_as_allowlist_rejection(monkeypatch, tmp_path) -> None:
+    artifact = _candidate_artifact(tmp_path / "outputs" / "data.csv")
+    failure = OSError("private filesystem detail")
+    monkeypatch.setattr(execution_routes, "allowed_sink_directories", lambda *args, **kwargs: (tmp_path,))
+
+    def fail_resolve(self: Path) -> Path:
+        raise failure
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    with pytest.raises(HTTPException) as caught:
+        execution_routes._resolved_allowed_artifact_paths(
+            artifact,
+            data_dir=tmp_path,
+            session_id=None,
+            object_store_error_type="not_supported",
+        )
+    assert caught.value.status_code == 500
+    assert caught.value.detail == {"error_type": "artifact_path_resolution_failed"}
+    assert caught.value.__cause__ is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preview", [False, True])
+async def test_structural_artifact_error_impostor_is_not_used_for_candidate_fallback(monkeypatch, tmp_path, preview) -> None:
+    artifact = _candidate_artifact(tmp_path / "outputs" / "data.csv")
+    impostor = HTTPException(status_code=500, detail={"error_type": "artifact_purged_or_moved"})
+    monkeypatch.setattr(execution_routes, "_resolved_allowed_artifact_paths", lambda *args, **kwargs: (tmp_path, tmp_path))
+    attempts = []
+
+    async def fail_snapshot(*args, **kwargs):
+        attempts.append(args)
+        raise impostor
+
+    if preview:
+        monkeypatch.setattr(execution_routes, "_verified_artifact_preview_head", fail_snapshot)
+        with pytest.raises(HTTPException) as caught:
+            await execution_routes._verified_artifact_preview_head_from_candidates(artifact, data_dir=tmp_path, session_id=None)
+    else:
+        monkeypatch.setattr(execution_routes, "_verified_artifact_file_snapshot", fail_snapshot)
+        with pytest.raises(HTTPException) as caught:
+            await execution_routes._verified_artifact_file_snapshot_from_candidates(
+                artifact,
+                data_dir=tmp_path,
+                session_id=None,
+                snapshot_dir=tmp_path,
+            )
+    assert caught.value is impostor
+    assert len(attempts) == 1
+
+
 @dataclass
 class _FakeSettings:
     auth_provider: str = "local"

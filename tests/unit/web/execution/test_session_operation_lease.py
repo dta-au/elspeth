@@ -867,6 +867,34 @@ async def test_runtime_shutdown_waits_for_blocked_lease_completion() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [OSError, AuditIntegrityError, FrameworkBugError])
+async def test_done_callback_logger_failure_is_tracked_after_exact_lease_close(error_type: type[Exception]) -> None:
+    service, _session_service, _executor = _execution_service(asyncio.get_running_loop())
+    lease, authority = await _real_lease(_context(uuid4()))
+    authority.release_allowed.set()
+    worker: Future[object] = Future()
+    worker.set_exception(RuntimeError("pipeline failed"))
+    logging_error = error_type("diagnostic unavailable")
+
+    def fail_diagnostic(event: str, **kwargs: object) -> None:
+        if event == "pipeline_done_callback_exception":
+            assert lease.closed
+            raise logging_error
+
+    with patch("elspeth.web.execution.service.slog.error", side_effect=fail_diagnostic):
+        service._on_pipeline_done(cast(Any, worker), session_operation_lease=lease)
+        completion = next(iter(service._lease_completion_futures))
+        with pytest.raises(error_type) as caught:
+            await asyncio.wait_for(asyncio.wrap_future(completion), timeout=2)
+        assert caught.value is logging_error
+        assert authority.release_calls == [lease.context]
+        assert completion in service._lease_completion_futures
+        with pytest.raises(ExceptionGroup) as shutdown_failure:
+            await asyncio.wait_for(service.shutdown(), timeout=2)
+        assert shutdown_failure.value.exceptions == (logging_error,)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, AuditIntegrityError, FrameworkBugError])
 @pytest.mark.parametrize("peer_fails", [False, True])
 async def test_shutdown_preserves_completed_lease_failure_and_joins_peer(error_type: type[Exception], peer_fails: bool) -> None:

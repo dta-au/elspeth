@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Final, TypedDict
 
 from elspeth.core.canonical import stable_hash
@@ -230,19 +231,9 @@ def parse_completion_gates(
     a malformed shape means corruption or writer drift — raise, never skip
     the gate.
 
-    Tier-model adjudication note (R5 ``isinstance()`` below): this function is
-    the ADR-032 parse point for a JSON-round-tripped envelope read back off our
-    own ``composition_states`` row. The membership checks are sentinel probes
-    for keys whose ABSENCE is a legal, meaningful state (`no envelope written`
-    / `no gate withheld`) — never a silent default. Every required field is
-    read in membership form (``d[k] if k in d else None``), so an absent field
-    lands in the same raise as a malformed one, and the two
-    ``isinstance(..., Mapping)`` checks are shape validation that constructs
-    the owned ``CompletionGateFacts`` type, not defensive masking of a code
-    bug. If this function ever stops raising on malformed present values, or
-    starts being fed anything other than the ``composer_meta`` mapping of a
-    ``composition_states`` record, that reasoning is invalid and the
-    suppressions should be withdrawn.
+    Nested envelopes are canonical JSON dicts or the exact MappingProxyType
+    produced by freezing a CompositionStateRecord. Arbitrary Mapping
+    implementations are not part of either owned representation.
     """
     if composer_meta is None:
         return None
@@ -251,8 +242,8 @@ def parse_completion_gates(
     if COMPLETION_GATES_META_KEY not in composer_meta:
         return None
     raw = composer_meta[COMPLETION_GATES_META_KEY]
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"Tier 1: composer_meta.completion_gates is {type(raw).__name__}, expected a mapping")
+    if type(raw) not in (dict, MappingProxyType):
+        raise ValueError(f"Tier 1: composer_meta.completion_gates is {type(raw).__name__}, expected a dict or frozen dict")
     unknown = set(raw) - {_ADVISOR_SIGNOFF_GATE_KEY}
     if unknown:
         raise ValueError(f"Tier 1: composer_meta.completion_gates has unknown gate keys {sorted(unknown)!r}")
@@ -261,13 +252,13 @@ def parse_completion_gates(
     if _ADVISOR_SIGNOFF_GATE_KEY not in raw:
         return CompletionGateFacts(advisor_signoff=None)
     raw_signoff = raw[_ADVISOR_SIGNOFF_GATE_KEY]
-    if not isinstance(raw_signoff, Mapping):
-        raise ValueError(f"Tier 1: completion_gates.advisor_signoff is {type(raw_signoff).__name__}, expected a mapping")
+    if type(raw_signoff) not in (dict, MappingProxyType):
+        raise ValueError(f"Tier 1: completion_gates.advisor_signoff is {type(raw_signoff).__name__}, expected a dict or frozen dict")
     # From here every probe is membership-then-assert: an absent field reads as
     # ``None`` and falls into the same raise as a malformed one, so no absence
     # is ever silently defaulted.
     status = raw_signoff["status"] if "status" in raw_signoff else None
-    if status != _GATE_STATUS_BLOCKED:
+    if type(status) is not str or status != _GATE_STATUS_BLOCKED:
         raise ValueError(f"Tier 1: completion_gates.advisor_signoff.status is {status!r}, expected {_GATE_STATUS_BLOCKED!r}")
     detail = raw_signoff["detail"] if "detail" in raw_signoff else None
     if type(detail) is not str or not detail:

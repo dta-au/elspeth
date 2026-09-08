@@ -246,6 +246,13 @@ class TestWriter:
 
 
 class TestParse:
+    def test_noncanonical_mapping_cannot_supply_a_persisted_signoff(self) -> None:
+        from collections import UserDict
+
+        signoff = UserDict({"status": "blocked", "detail": "d", "for_graph": "f"})
+        with pytest.raises(ValueError, match="expected a dict"):
+            parse_completion_gates({COMPLETION_GATES_META_KEY: {"advisor_signoff": signoff}})
+
     def test_absent_meta_is_none(self) -> None:
         assert parse_completion_gates(None) is None
         assert parse_completion_gates({"repair_turns_used": 0}) is None
