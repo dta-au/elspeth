@@ -7,12 +7,15 @@ from datetime import UTC, datetime
 import pytest
 
 from elspeth.contracts import Artifact
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import sink_effect_members_table, sink_effects_table
+from tests.fixtures.landscape import leader_coordination_token
 
 _HASH = "a" * 64
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -101,28 +104,27 @@ def _factory_with_sink_and_state() -> tuple[LandscapeDB, RecorderFactory, str, s
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     sink = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="csv_sink",
         node_type=NodeType.SINK,
         plugin_version="1.0",
         config={},
         schema_config=_DYNAMIC_SCHEMA,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    _row, token = factory.data_flow.create_row_with_token(
         source_node_id=sink.node_id,
         row_index=0,
         data={"value": 1},
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
     state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=sink.node_id,
-        run_id=run.run_id,
         step_index=0,
         input_data={},
+        member_token=leader_coordination_token(factory, run.run_id).membership,
     )
     return db, factory, run.run_id, sink.node_id, state.state_id
 
@@ -183,29 +185,37 @@ def test_repository_round_trips_legacy_and_effect_producer_links() -> None:
     db, factory, run_id, sink_node_id, state_id = _factory_with_sink_and_state()
     effect_id = _insert_reserved_effect(db, run_id=run_id, sink_node_id=sink_node_id, state_id=state_id)
 
-    legacy = factory.execution.register_artifact(
-        run_id=run_id,
-        state_id=state_id,
-        sink_effect_id=None,
-        sink_node_id=sink_node_id,
-        artifact_type="file",
-        path="/output/legacy.csv",
-        content_hash="3" * 64,
-        size_bytes=3,
-    )
-    effect = factory.execution.register_artifact(
-        run_id=run_id,
-        state_id=None,
-        sink_effect_id=effect_id,
-        sink_node_id=sink_node_id,
-        artifact_type="file",
-        path="/output/effect.csv",
-        content_hash="4" * 64,
-        size_bytes=4,
-        idempotency_key="effect-key",
-        publication_performed=False,
-        publication_evidence_kind="inherited",
-    )
+    with fenced_leader_transaction(
+        db.engine,
+        token=leader_coordination_token(factory, run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="test_artifact_producer_links",
+    ) as conn:
+        legacy = factory.execution.artifacts.register_artifact(
+            run_id=run_id,
+            state_id=state_id,
+            sink_effect_id=None,
+            sink_node_id=sink_node_id,
+            artifact_type="file",
+            path="/output/legacy.csv",
+            content_hash="3" * 64,
+            size_bytes=3,
+            conn=conn,
+        )
+        effect = factory.execution.artifacts.register_artifact(
+            run_id=run_id,
+            state_id=None,
+            sink_effect_id=effect_id,
+            sink_node_id=sink_node_id,
+            artifact_type="file",
+            path="/output/effect.csv",
+            content_hash="4" * 64,
+            size_bytes=4,
+            idempotency_key="effect-key",
+            publication_performed=False,
+            publication_evidence_kind="inherited",
+            conn=conn,
+        )
 
     assert legacy.producer_kind == "node_state"
     assert legacy.sink_effect_id is None
@@ -233,10 +243,21 @@ def test_idempotent_artifact_rejects_divergent_effect_linkage_and_publication_ev
         "publication_performed": True,
         "publication_evidence_kind": "returned",
     }
-    factory.execution.register_artifact(**values)
+    token = leader_coordination_token(factory, run_id)
+    with fenced_leader_transaction(
+        db.engine, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="test_artifact_idempotency"
+    ) as conn:
+        original = factory.execution.artifacts.register_artifact(**values, conn=conn)
 
-    with pytest.raises(LandscapeRecordError, match="publication_evidence_kind"):
-        factory.execution.register_artifact(**(values | {"publication_evidence_kind": "reconciled"}))
+    with (
+        pytest.raises(LandscapeRecordError, match="publication_evidence_kind"),
+        fenced_leader_transaction(
+            db.engine, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="test_artifact_idempotency_refusal"
+        ) as conn,
+    ):
+        factory.execution.artifacts.register_artifact(**(values | {"publication_evidence_kind": "reconciled"}), conn=conn)
+
+    assert factory.execution.get_artifacts(run_id) == [original]
 
 
 def test_effect_linked_sink_operation_round_trips_and_rejects_non_sink_write() -> None:
@@ -244,10 +265,7 @@ def test_effect_linked_sink_operation_round_trips_and_rejects_non_sink_write() -
     effect_id = _insert_reserved_effect(db, run_id=run_id, sink_node_id=sink_node_id, state_id=state_id)
 
     operation = factory.execution.begin_operation(
-        run_id,
-        sink_node_id,
-        "sink_write",
-        sink_effect_id=effect_id,
+        sink_node_id, "sink_write", sink_effect_id=effect_id, coordination_token=leader_coordination_token(factory, run_id)
     )
     assert operation.sink_effect_id == effect_id
     loaded = factory.execution.get_operation(operation.operation_id)
@@ -257,8 +275,5 @@ def test_effect_linked_sink_operation_round_trips_and_rejects_non_sink_write() -
 
     with pytest.raises(ValueError, match="sink_write"):
         factory.execution.begin_operation(
-            run_id,
-            sink_node_id,
-            "source_load",
-            sink_effect_id=effect_id,
+            sink_node_id, "source_load", sink_effect_id=effect_id, coordination_token=leader_coordination_token(factory, run_id)
         )

@@ -1,17 +1,41 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import select
 
 from elspeth.contracts import CallStatus, CallType, FrameworkBugError, NodeType
 from elspeth.contracts.call_data import RawCallPayload
-from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, SchedulerLeaseLostError
 from elspeth.contracts.payload_store import IntegrityError as PayloadIntegrityError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataResult, CallDataState
-from elspeth.core.landscape.schema import operations_table
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
+from elspeth.core.landscape.schema import calls_table, operations_table, run_workers_table, token_work_items_table
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    make_factory,
+    make_landscape_db,
+    make_recorder_with_run,
+    register_test_node,
+)
+from tests.fixtures.stores import MockPayloadStore
+from tests.helpers.state_engine import StateEngineImage, capture_state_engine_image
+
+
+def _claim_state(factory: RecorderFactory, state_id: str, *, member_token: WorkerMembershipToken) -> TokenWorkItem:
+    state = factory.execution.get_node_state(state_id)
+    assert state is not None
+    return claim_test_work_item(
+        factory,
+        member_token=member_token,
+        token_id=state.token_id,
+        node_id=state.node_id,
+        step_index=state.step_index,
+    )
 
 
 class _IntegrityFailingPayloadStore:
@@ -39,9 +63,19 @@ def _setup(*, run_id: str = "run-1") -> tuple[LandscapeDB, RecorderFactory, str]
     setup = make_recorder_with_run(run_id=run_id, source_node_id="source-0", source_plugin_name="csv")
     db, factory, run_id_ = setup.db, setup.factory, setup.run_id
     register_test_node(factory.data_flow, run_id_, "transform-1", plugin_name="transform")
-    factory.data_flow.create_row(run_id_, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    factory.data_flow.create_token("row-1", token_id="tok-1")
-    state = factory.execution.begin_node_state("tok-1", "transform-1", run_id_, 0, {"name": "test"}, state_id="state-1")
+    factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id_),
+        token_id="tok-1",
+    )
+    state = factory.execution.begin_node_state(
+        "tok-1", "transform-1", 0, {"name": "test"}, state_id="state-1", member_token=leader_coordination_token(factory, run_id_).membership
+    )
     return db, factory, state.state_id
 
 
@@ -57,9 +91,19 @@ def _setup_no_store(*, run_id: str = "run-1") -> tuple[LandscapeDB, RecorderFact
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     register_test_node(factory.data_flow, run_id, "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
     register_test_node(factory.data_flow, run_id, "transform-1", plugin_name="transform")
-    factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    factory.data_flow.create_token("row-1", token_id="tok-1")
-    state = factory.execution.begin_node_state("tok-1", "transform-1", run_id, 0, {"name": "test"}, state_id="state-1")
+    factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+        token_id="tok-1",
+    )
+    state = factory.execution.begin_node_state(
+        "tok-1", "transform-1", 0, {"name": "test"}, state_id="state-1", member_token=leader_coordination_token(factory, run_id).membership
+    )
     return db, factory, state.state_id
 
 
@@ -69,7 +113,7 @@ def _setup_with_operation(
 ) -> tuple[LandscapeDB, RecorderFactory, str, str]:
     """Create DB, factory, run, source node, and a source_load operation. Returns (db, factory, state_id, operation_id)."""
     db, factory, state_id = _setup(run_id=run_id)
-    op = factory.execution.begin_operation(run_id, "source-0", "source_load")
+    op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, run_id))
     return db, factory, state_id, op.operation_id
 
 
@@ -79,9 +123,21 @@ class TestAllocateCallIndex:
     def test_sequential_allocation_starts_at_zero(self):
         _db, factory, state_id = _setup()
 
-        idx0 = factory.execution.allocate_call_index(state_id)
-        idx1 = factory.execution.allocate_call_index(state_id)
-        idx2 = factory.execution.allocate_call_index(state_id)
+        idx0 = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
+        idx1 = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
+        idx2 = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         assert idx0 == 0
         assert idx1 == 1
@@ -92,21 +148,65 @@ class TestAllocateCallIndex:
         factory, run_id = setup.factory, setup.run_id
         register_test_node(factory.data_flow, run_id, "transform-1", plugin_name="t1")
         register_test_node(factory.data_flow, run_id, "transform-2", plugin_name="t2")
-        factory.data_flow.create_row(run_id, "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-a")
-        factory.data_flow.create_token("row-1", token_id="tok-b")
-        state_a = factory.execution.begin_node_state("tok-a", "transform-1", run_id, 0, {"x": 1}, state_id="state-a")
-        state_b = factory.execution.begin_node_state("tok-b", "transform-2", run_id, 0, {"x": 1}, state_id="state-b")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
+            token_id="tok-a",
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-b", coordination_token=leader_coordination_token(factory, "run-1"))
+        state_a = factory.execution.begin_node_state(
+            "tok-a", "transform-1", 0, {"x": 1}, state_id="state-a", member_token=leader_coordination_token(factory, run_id).membership
+        )
+        state_b = factory.execution.begin_node_state(
+            "tok-b", "transform-2", 0, {"x": 1}, state_id="state-b", member_token=leader_coordination_token(factory, run_id).membership
+        )
 
-        assert factory.execution.allocate_call_index(state_a.state_id) == 0
-        assert factory.execution.allocate_call_index(state_b.state_id) == 0
-        assert factory.execution.allocate_call_index(state_a.state_id) == 1
-        assert factory.execution.allocate_call_index(state_b.state_id) == 1
+        assert (
+            factory.execution.allocate_call_index(
+                state_a.state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_a.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
+            == 0
+        )
+        assert (
+            factory.execution.allocate_call_index(
+                state_b.state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_b.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
+            == 0
+        )
+        assert (
+            factory.execution.allocate_call_index(
+                state_a.state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_a.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
+            == 1
+        )
+        assert (
+            factory.execution.allocate_call_index(
+                state_b.state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_b.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
+            == 1
+        )
 
     def test_single_allocation(self):
         _db, factory, state_id = _setup()
 
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         assert idx == 0
 
@@ -116,7 +216,11 @@ class TestAllocateCallIndex:
 
         # Record 3 calls with the first factory
         for i in range(3):
-            idx = factory.execution.allocate_call_index(state_id)
+            idx = factory.execution.allocate_call_index(
+                state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
             factory.execution.record_call(
                 state_id,
                 idx,
@@ -124,24 +228,42 @@ class TestAllocateCallIndex:
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"i": i}),
                 response_data=RawCallPayload({"r": i}),
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
             )
 
         # Create a NEW factory on the same DB (simulates resume)
         factory2 = make_factory(db)
 
         # New factory should seed from DB and continue at index 3
-        idx = factory2.execution.allocate_call_index(state_id)
+        idx = factory2.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory2, "run-1").membership,
+            work_item=_claim_state(factory2, state_id, member_token=leader_coordination_token(factory2, "run-1").membership),
+        )
         assert idx == 3
 
-        idx = factory2.execution.allocate_call_index(state_id)
+        idx = factory2.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory2, "run-1").membership,
+            work_item=_claim_state(factory2, state_id, member_token=leader_coordination_token(factory2, "run-1").membership),
+        )
         assert idx == 4
 
     def test_collision_remap_advances_local_state_counter(self):
         """A DB-remapped allocation advances the losing recorder's cache."""
         db, first, state_id = _setup()
         second = make_factory(db)
-        first_index = first.execution.allocate_call_index(state_id)
-        second_index = second.execution.allocate_call_index(state_id)
+        first_index = first.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(first, "run-1").membership,
+            work_item=_claim_state(first, state_id, member_token=leader_coordination_token(first, "run-1").membership),
+        )
+        second_index = second.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(second, "run-1").membership,
+            work_item=_claim_state(second, state_id, member_token=leader_coordination_token(second, "run-1").membership),
+        )
         assert (first_index, second_index) == (0, 0)
 
         first.execution.record_call(
@@ -150,6 +272,8 @@ class TestAllocateCallIndex:
             CallType.HTTP,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"worker": "first"}),
+            member_token=leader_coordination_token(first, "run-1").membership,
+            work_item=_claim_state(first, state_id, member_token=leader_coordination_token(first, "run-1").membership),
         )
         remapped = second.execution.record_call(
             state_id,
@@ -157,10 +281,19 @@ class TestAllocateCallIndex:
             CallType.HTTP,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"worker": "second"}),
+            member_token=leader_coordination_token(second, "run-1").membership,
+            work_item=_claim_state(second, state_id, member_token=leader_coordination_token(second, "run-1").membership),
         )
 
         assert remapped.call_index == 1
-        assert second.execution.allocate_call_index(state_id) == 2
+        assert (
+            second.execution.allocate_call_index(
+                state_id,
+                member_token=leader_coordination_token(second, "run-1").membership,
+                work_item=_claim_state(second, state_id, member_token=leader_coordination_token(second, "run-1").membership),
+            )
+            == 2
+        )
 
     def test_seeds_operation_call_index_on_factory_recreation(self):
         """Simulate resume: new factory seeds operation call indices from DB."""
@@ -174,21 +307,28 @@ class TestAllocateCallIndex:
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"url": "https://example.com"}),
                 response_data=RawCallPayload({"status": 200}),
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
         # Create a NEW factory on the same DB (simulates resume)
         factory2 = make_factory(db)
 
         # New factory should seed from DB and continue at index 2
-        idx = factory2.execution.allocate_operation_call_index(operation_id)
+        idx = factory2.execution.allocate_operation_call_index(
+            operation_id, coordination_token=leader_coordination_token(factory2, "run-1")
+        )
         assert idx == 2
 
     def test_collision_remap_advances_local_operation_counter(self):
         """Operation-call remapping also advances the losing recorder cache."""
         db, first, _state_id, operation_id = _setup_with_operation()
         second = make_factory(db)
-        first_index = first.execution.allocate_operation_call_index(operation_id)
-        second_index = second.execution.allocate_operation_call_index(operation_id)
+        first_index = first.execution.allocate_operation_call_index(
+            operation_id, coordination_token=leader_coordination_token(first, "run-1")
+        )
+        second_index = second.execution.allocate_operation_call_index(
+            operation_id, coordination_token=leader_coordination_token(second, "run-1")
+        )
         assert (first_index, second_index) == (0, 0)
 
         first.execution.record_operation_call(
@@ -197,6 +337,7 @@ class TestAllocateCallIndex:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"worker": "first"}),
             call_index=first_index,
+            coordination_token=leader_coordination_token(first, "run-1"),
         )
         remapped = second.execution.record_operation_call(
             operation_id,
@@ -204,18 +345,35 @@ class TestAllocateCallIndex:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"worker": "second"}),
             call_index=second_index,
+            coordination_token=leader_coordination_token(second, "run-1"),
         )
 
         assert remapped.call_index == 1
-        assert second.execution.allocate_operation_call_index(operation_id) == 2
+        assert (
+            second.execution.allocate_operation_call_index(operation_id, coordination_token=leader_coordination_token(second, "run-1")) == 2
+        )
 
     def test_fresh_state_id_starts_at_zero_with_db_seeding(self):
         """A state_id with no DB entries still starts at 0."""
-        _db, factory, _state_id = _setup()
+        _db, factory, state_id = _setup()
 
-        # Allocate for a state_id that has no recorded calls
-        idx = factory.execution.allocate_call_index("brand-new-state-id")
+        # A real parent state with no recorded calls seeds at zero.
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         assert idx == 0
+
+    def test_missing_state_rejects_allocation_with_valid_claim(self):
+        _db, factory, state_id = _setup()
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = _claim_state(factory, state_id, member_token=member_token)
+
+        with pytest.raises(AuditIntegrityError, match="call parent state"):
+            factory.execution.allocate_call_index("missing-state", member_token=member_token, work_item=work_item)
+
+        assert factory.query.get_calls(state_id) == []
 
 
 class TestRecordCall:
@@ -231,13 +389,19 @@ class TestRecordCall:
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"url": "https://example.com"}),
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
             )
 
         assert factory.query.get_calls(state_id) == []
 
     def test_creates_call_with_request_hash(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         call = factory.execution.record_call(
             state_id,
@@ -247,6 +411,8 @@ class TestRecordCall:
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
             latency_ms=42,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.call_id is not None
@@ -259,7 +425,11 @@ class TestRecordCall:
 
     def test_roundtrip_via_response_hash(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         call = factory.execution.record_call(
             state_id,
@@ -268,6 +438,8 @@ class TestRecordCall:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"url": "https://example.com"}),
             response_data=RawCallPayload({"status": 200}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.response_hash is not None
@@ -276,7 +448,11 @@ class TestRecordCall:
 
     def test_error_call_has_error_json(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         call = factory.execution.record_call(
             state_id,
@@ -286,6 +462,8 @@ class TestRecordCall:
             request_data=RawCallPayload({"prompt": "fail"}),
             error=RawCallPayload({"code": "rate_limit", "message": "Too many requests"}),
             latency_ms=100,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.status == CallStatus.ERROR
@@ -294,7 +472,11 @@ class TestRecordCall:
 
     def test_call_with_refs(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         call = factory.execution.record_call(
             state_id,
@@ -304,6 +486,8 @@ class TestRecordCall:
             request_data=RawCallPayload({"query": "SELECT 1"}),
             request_ref="req-ref-abc",
             response_ref="resp-ref-xyz",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.request_ref == "req-ref-abc"
@@ -311,7 +495,11 @@ class TestRecordCall:
 
     def test_call_without_response_data(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
 
         call = factory.execution.record_call(
             state_id,
@@ -319,6 +507,8 @@ class TestRecordCall:
             CallType.FILESYSTEM,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"path": "/tmp/file.txt"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.response_hash is None
@@ -329,7 +519,11 @@ class TestRecordCall:
 
         calls = []
         for i in range(3):
-            idx = factory.execution.allocate_call_index(state_id)
+            idx = factory.execution.allocate_call_index(
+                state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
             call = factory.execution.record_call(
                 state_id,
                 idx,
@@ -337,6 +531,8 @@ class TestRecordCall:
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"prompt": f"call-{i}"}),
                 response_data=RawCallPayload({"text": f"response-{i}"}),
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
             )
             calls.append(call)
 
@@ -350,7 +546,7 @@ class TestBeginOperation:
     def test_creates_operation_with_open_status(self):
         _db, factory, _state_id = _setup()
 
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
         assert op.operation_id is not None
         assert op.run_id == "run-1"
@@ -363,8 +559,8 @@ class TestBeginOperation:
     def test_generates_unique_ids(self):
         _db, factory, _state_id = _setup()
 
-        op1 = factory.execution.begin_operation("run-1", "source-0", "source_load")
-        op2 = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op1 = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
+        op2 = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
         assert op1.operation_id != op2.operation_id
 
@@ -373,7 +569,7 @@ class TestBeginOperation:
         factory, run_id = setup.factory, setup.run_id
         register_test_node(factory.data_flow, run_id, "sink-0", node_type=NodeType.SINK, plugin_name="csv_sink")
 
-        op = factory.execution.begin_operation(run_id, "sink-0", "sink_write")
+        op = factory.execution.begin_operation("sink-0", "sink_write", coordination_token=leader_coordination_token(factory, run_id))
 
         assert op.operation_type == "sink_write"
         assert op.status == "open"
@@ -381,7 +577,12 @@ class TestBeginOperation:
     def test_operation_with_input_data(self):
         _db, factory, _state_id = _setup()
 
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load", input_data={"path": "/data/input.csv"})
+        op = factory.execution.begin_operation(
+            "source-0",
+            "source_load",
+            input_data={"path": "/data/input.csv"},
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         assert op.operation_id is not None
         assert op.status == "open"
@@ -390,7 +591,7 @@ class TestBeginOperation:
     def test_operation_without_input_data_has_no_hash(self):
         _db, factory, _state_id = _setup()
 
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
         assert op.input_data_hash is None
         assert op.input_data_ref is None
@@ -398,7 +599,9 @@ class TestBeginOperation:
     def test_operation_with_empty_input_data_records_hash(self):
         _db, factory, _state_id = _setup()
 
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load", input_data={})
+        op = factory.execution.begin_operation(
+            "source-0", "source_load", input_data={}, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         assert op.input_data_hash == stable_hash({})
 
@@ -410,7 +613,9 @@ class TestBeginOperation:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
 
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load", input_data={"file": "data.csv"})
+        op = factory.execution.begin_operation(
+            "source-0", "source_load", input_data={"file": "data.csv"}, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         assert op.input_data_hash == stable_hash({"file": "data.csv"})
         assert op.input_data_ref is None  # No payload store → no ref
@@ -426,7 +631,9 @@ class TestCompleteOperation:
     def test_completes_with_status_and_duration(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        factory.execution.complete_operation(op_id, "completed", duration_ms=150)
+        factory.execution.complete_operation(
+            op_id, "completed", duration_ms=150, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         op = factory.execution.get_operation(op_id)
         assert op.status == "completed"
@@ -434,19 +641,17 @@ class TestCompleteOperation:
         assert op.duration_ms == 150
 
     def test_raises_on_invalid_status_from_db(self):
-        _db, factory, _state_id, op_id = _setup_with_operation()
-        factory.execution._ops.execute_update(
-            operations_table.update().where(operations_table.c.operation_id == op_id).values(status="corrupt")
-        )
+        db, factory, _state_id, op_id = _setup_with_operation()
+        with db.write_connection() as conn:
+            conn.execute(operations_table.update().where(operations_table.c.operation_id == op_id).values(status="corrupt"))
 
         with pytest.raises(AuditIntegrityError, match="status"):
             factory.execution.get_operation(op_id)
 
     def test_raises_on_invalid_operation_type_from_db(self):
-        _db, factory, _state_id, op_id = _setup_with_operation()
-        factory.execution._ops.execute_update(
-            operations_table.update().where(operations_table.c.operation_id == op_id).values(operation_type="corrupt")
-        )
+        db, factory, _state_id, op_id = _setup_with_operation()
+        with db.write_connection() as conn:
+            conn.execute(operations_table.update().where(operations_table.c.operation_id == op_id).values(operation_type="corrupt"))
 
         with pytest.raises(AuditIntegrityError, match="operation_type"):
             factory.execution.get_operation(op_id)
@@ -454,7 +659,9 @@ class TestCompleteOperation:
     def test_completes_with_failure(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        factory.execution.complete_operation(op_id, "failed", error="File not found", duration_ms=5)
+        factory.execution.complete_operation(
+            op_id, "failed", error="File not found", duration_ms=5, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         op = factory.execution.get_operation(op_id)
         assert op.status == "failed"
@@ -464,7 +671,13 @@ class TestCompleteOperation:
     def test_completes_with_output_data(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        factory.execution.complete_operation(op_id, "completed", output_data={"rows_loaded": 100}, duration_ms=500)
+        factory.execution.complete_operation(
+            op_id,
+            "completed",
+            output_data={"rows_loaded": 100},
+            duration_ms=500,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         op = factory.execution.get_operation(op_id)
         assert op.status == "completed"
@@ -473,7 +686,9 @@ class TestCompleteOperation:
     def test_completes_with_empty_output_data_records_hash(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        factory.execution.complete_operation(op_id, "completed", output_data={}, duration_ms=500)
+        factory.execution.complete_operation(
+            op_id, "completed", output_data={}, duration_ms=500, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         op = factory.execution.get_operation(op_id)
         assert op.status == "completed"
@@ -482,7 +697,9 @@ class TestCompleteOperation:
     def test_output_hash_none_when_no_output_data(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        factory.execution.complete_operation(op_id, "completed", duration_ms=150)
+        factory.execution.complete_operation(
+            op_id, "completed", duration_ms=150, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         op = factory.execution.get_operation(op_id)
         assert op.output_data_hash is None
@@ -494,9 +711,15 @@ class TestCompleteOperation:
         factory = RecorderFactory(db)  # No payload store
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
-        factory.execution.complete_operation(op.operation_id, "completed", output_data={"count": 42}, duration_ms=100)
+        factory.execution.complete_operation(
+            op.operation_id,
+            "completed",
+            output_data={"count": 42},
+            duration_ms=100,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         fetched = factory.execution.get_operation(op.operation_id)
         assert fetched.output_data_hash == stable_hash({"count": 42})
@@ -506,14 +729,20 @@ class TestCompleteOperation:
         _db, factory, _state_id = _setup()
 
         with pytest.raises(FrameworkBugError):
-            factory.execution.complete_operation("nonexistent-op-id", "completed")
+            factory.execution.complete_operation(
+                "nonexistent-op-id", "completed", coordination_token=leader_coordination_token(factory, "run-1")
+            )
 
     def test_raises_framework_bug_error_for_double_complete(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
-        factory.execution.complete_operation(op_id, "completed", duration_ms=10)
+        factory.execution.complete_operation(
+            op_id, "completed", duration_ms=10, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         with pytest.raises(FrameworkBugError):
-            factory.execution.complete_operation(op_id, "completed", duration_ms=20)
+            factory.execution.complete_operation(
+                op_id, "completed", duration_ms=20, coordination_token=leader_coordination_token(factory, "run-1")
+            )
 
     def test_no_orphaned_payload_on_double_complete(self, tmp_path):
         """Payload must not be stored when operation is already completed."""
@@ -524,10 +753,12 @@ class TestCompleteOperation:
         factory = RecorderFactory(db, payload_store=store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
         # First completion succeeds
-        factory.execution.complete_operation(op.operation_id, "completed", duration_ms=10)
+        factory.execution.complete_operation(
+            op.operation_id, "completed", duration_ms=10, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         # Count payload files before the duplicate attempt
         blobs_before = list(tmp_path.joinpath("payloads").rglob("*"))
@@ -535,7 +766,13 @@ class TestCompleteOperation:
 
         # Second completion with output_data must fail without storing a blob
         with pytest.raises(FrameworkBugError):
-            factory.execution.complete_operation(op.operation_id, "completed", output_data={"leaked": True}, duration_ms=20)
+            factory.execution.complete_operation(
+                op.operation_id,
+                "completed",
+                output_data={"leaked": True},
+                duration_ms=20,
+                coordination_token=leader_coordination_token(factory, "run-1"),
+            )
 
         blobs_after = list(tmp_path.joinpath("payloads").rglob("*"))
         blobs_after = [p for p in blobs_after if p.is_file()]
@@ -554,7 +791,9 @@ class TestCompleteOperation:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
 
         with pytest.raises(FrameworkBugError):
-            factory.execution.complete_operation("nonexistent-op", "completed", output_data={"leaked": True})
+            factory.execution.complete_operation(
+                "nonexistent-op", "completed", output_data={"leaked": True}, coordination_token=leader_coordination_token(factory, "run-1")
+            )
 
         blobs = list(tmp_path.joinpath("payloads").rglob("*"))
         blobs = [p for p in blobs if p.is_file()]
@@ -569,9 +808,15 @@ class TestCompleteOperation:
         factory = RecorderFactory(db, payload_store=store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
-        factory.execution.complete_operation(op.operation_id, "completed", output_data={"rows_loaded": 42}, duration_ms=100)
+        factory.execution.complete_operation(
+            op.operation_id,
+            "completed",
+            output_data={"rows_loaded": 42},
+            duration_ms=100,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         completed = factory.execution.get_operation(op.operation_id)
         assert completed.status == "completed"
@@ -586,9 +831,11 @@ class TestCompleteOperation:
         factory = RecorderFactory(db, payload_store=store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
-        factory.execution.complete_operation(op.operation_id, "completed", output_data={}, duration_ms=100)
+        factory.execution.complete_operation(
+            op.operation_id, "completed", output_data={}, duration_ms=100, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         completed = factory.execution.get_operation(op.operation_id)
         assert completed.output_data_ref is not None
@@ -601,9 +848,9 @@ class TestAllocateOperationCallIndex:
     def test_sequential_allocation_starts_at_zero(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
 
-        idx0 = factory.execution.allocate_operation_call_index(op_id)
-        idx1 = factory.execution.allocate_operation_call_index(op_id)
-        idx2 = factory.execution.allocate_operation_call_index(op_id)
+        idx0 = factory.execution.allocate_operation_call_index(op_id, coordination_token=leader_coordination_token(factory, "run-1"))
+        idx1 = factory.execution.allocate_operation_call_index(op_id, coordination_token=leader_coordination_token(factory, "run-1"))
+        idx2 = factory.execution.allocate_operation_call_index(op_id, coordination_token=leader_coordination_token(factory, "run-1"))
 
         assert idx0 == 0
         assert idx1 == 1
@@ -611,13 +858,33 @@ class TestAllocateOperationCallIndex:
 
     def test_independent_per_operation_id(self):
         _db, factory, _state_id = _setup()
-        op_a = factory.execution.begin_operation("run-1", "source-0", "source_load")
-        op_b = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op_a = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
+        op_b = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
-        assert factory.execution.allocate_operation_call_index(op_a.operation_id) == 0
-        assert factory.execution.allocate_operation_call_index(op_b.operation_id) == 0
-        assert factory.execution.allocate_operation_call_index(op_a.operation_id) == 1
-        assert factory.execution.allocate_operation_call_index(op_b.operation_id) == 1
+        assert (
+            factory.execution.allocate_operation_call_index(
+                op_a.operation_id, coordination_token=leader_coordination_token(factory, "run-1")
+            )
+            == 0
+        )
+        assert (
+            factory.execution.allocate_operation_call_index(
+                op_b.operation_id, coordination_token=leader_coordination_token(factory, "run-1")
+            )
+            == 0
+        )
+        assert (
+            factory.execution.allocate_operation_call_index(
+                op_a.operation_id, coordination_token=leader_coordination_token(factory, "run-1")
+            )
+            == 1
+        )
+        assert (
+            factory.execution.allocate_operation_call_index(
+                op_b.operation_id, coordination_token=leader_coordination_token(factory, "run-1")
+            )
+            == 1
+        )
 
 
 class TestRecordOperationCall:
@@ -625,7 +892,7 @@ class TestRecordOperationCall:
 
     def test_creates_call_linked_to_operation(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
-        factory.execution.allocate_operation_call_index(op_id)
+        factory.execution.allocate_operation_call_index(op_id, coordination_token=leader_coordination_token(factory, "run-1"))
 
         call = factory.execution.record_operation_call(
             op_id,
@@ -634,6 +901,7 @@ class TestRecordOperationCall:
             request_data=RawCallPayload({"url": "https://api.example.com/data"}),
             response_data=RawCallPayload({"rows": 50}),
             latency_ms=200,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         assert call.call_id is not None
@@ -654,6 +922,7 @@ class TestRecordOperationCall:
             request_data=RawCallPayload({"query": "SELECT * FROM missing"}),
             error=RawCallPayload({"code": "table_not_found", "message": "Table does not exist"}),
             latency_ms=3,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         assert call.status == CallStatus.ERROR
@@ -670,6 +939,7 @@ class TestRecordOperationCall:
             request_data=RawCallPayload({"path": "/data/file.csv"}),
             request_ref="req-ref-001",
             response_ref="resp-ref-001",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         assert call.request_ref == "req-ref-001"
@@ -685,6 +955,7 @@ class TestRecordOperationCall:
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"url": f"https://example.com/{i}"}),
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
             calls.append(call)
 
@@ -716,7 +987,9 @@ class TestGetOperation:
 
     def test_reflects_completion(self):
         _db, factory, _state_id, op_id = _setup_with_operation()
-        factory.execution.complete_operation(op_id, "completed", duration_ms=99)
+        factory.execution.complete_operation(
+            op_id, "completed", duration_ms=99, coordination_token=leader_coordination_token(factory, "run-1")
+        )
 
         op = factory.execution.get_operation(op_id)
 
@@ -736,6 +1009,7 @@ class TestGetOperationCalls:
                 CallType.HTTP,
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload({"index": i}),
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
         calls = factory.execution.get_operation_calls(op_id)
@@ -753,19 +1027,26 @@ class TestGetOperationCalls:
 
     def test_does_not_include_state_linked_calls(self):
         _db, factory, state_id, op_id = _setup_with_operation()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         factory.execution.record_call(
             state_id,
             idx,
             CallType.LLM,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "state-call"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
         factory.execution.record_operation_call(
             op_id,
             CallType.HTTP,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"url": "https://example.com"}),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         op_calls = factory.execution.get_operation_calls(op_id)
@@ -779,8 +1060,8 @@ class TestGetOperationsForRun:
 
     def test_returns_all_operations_for_run(self):
         _db, factory, _state_id = _setup()
-        factory.execution.begin_operation("run-1", "source-0", "source_load")
-        factory.execution.begin_operation("run-1", "source-0", "source_load")
+        factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
 
         ops = factory.execution.get_operations_for_run("run-1")
 
@@ -801,8 +1082,8 @@ class TestGetOperationsForRun:
         register_test_node(factory.data_flow, "run-a", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         register_test_node(factory.data_flow, "run-b", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        factory.execution.begin_operation("run-a", "source-0", "source_load")
-        factory.execution.begin_operation("run-b", "source-0", "source_load")
+        factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-a"))
+        factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-b"))
 
         ops_a = factory.execution.get_operations_for_run("run-a")
         ops_b = factory.execution.get_operations_for_run("run-b")
@@ -818,19 +1099,21 @@ class TestGetAllOperationCallsForRun:
 
     def test_returns_all_operation_calls(self):
         _db, factory, _state_id = _setup()
-        op1 = factory.execution.begin_operation("run-1", "source-0", "source_load")
-        op2 = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op1 = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
+        op2 = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
         factory.execution.record_operation_call(
             op1.operation_id,
             CallType.HTTP,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"url": "a"}),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.execution.record_operation_call(
             op2.operation_id,
             CallType.SQL,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"query": "b"}),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         all_calls = factory.execution.get_all_operation_calls_for_run("run-1")
@@ -849,20 +1132,27 @@ class TestGetAllOperationCallsForRun:
 
     def test_does_not_include_state_linked_calls(self):
         _db, factory, state_id = _setup()
-        op = factory.execution.begin_operation("run-1", "source-0", "source_load")
+        op = factory.execution.begin_operation("source-0", "source_load", coordination_token=leader_coordination_token(factory, "run-1"))
         factory.execution.record_operation_call(
             op.operation_id,
             CallType.HTTP,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"url": "op-call"}),
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         factory.execution.record_call(
             state_id,
             idx,
             CallType.LLM,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "state-call"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         all_calls = factory.execution.get_all_operation_calls_for_run("run-1")
@@ -876,7 +1166,11 @@ class TestFindCallByRequestHash:
 
     def test_finds_call_by_hash(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         original = factory.execution.record_call(
             state_id,
             idx,
@@ -884,6 +1178,8 @@ class TestFindCallByRequestHash:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "unique-request"}),
             response_data=RawCallPayload({"text": "response"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         found = factory.execution.find_call_by_request_hash("run-1", CallType.LLM, original.request_hash)
@@ -900,13 +1196,19 @@ class TestFindCallByRequestHash:
 
     def test_returns_none_for_wrong_call_type(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         original = factory.execution.record_call(
             state_id,
             idx,
             CallType.LLM,
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "typed-request"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         found = factory.execution.find_call_by_request_hash("run-1", CallType.HTTP, original.request_hash)
@@ -918,13 +1220,19 @@ class TestFindCallByRequestHash:
         same_request = {"prompt": "identical"}
         calls = []
         for _ in range(3):
-            idx = factory.execution.allocate_call_index(state_id)
+            idx = factory.execution.allocate_call_index(
+                state_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+            )
             call = factory.execution.record_call(
                 state_id,
                 idx,
                 CallType.LLM,
                 CallStatus.SUCCESS,
                 request_data=RawCallPayload(same_request),
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
             )
             calls.append(call)
 
@@ -942,7 +1250,11 @@ class TestGetCallResponseData:
     def test_returns_hash_only_without_payload_store(self):
         """Without a payload store, response_ref is never set but response_hash is — state is HASH_ONLY."""
         _db, factory, state_id = _setup_no_store()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state_id,
             idx,
@@ -950,6 +1262,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         result = factory.execution.get_call_response_data(call.call_id)
@@ -960,7 +1274,11 @@ class TestGetCallResponseData:
 
     def test_returns_never_stored_for_call_without_response(self):
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state_id,
             idx,
@@ -968,6 +1286,8 @@ class TestGetCallResponseData:
             CallStatus.ERROR,
             request_data=RawCallPayload({"prompt": "fail"}),
             error=RawCallPayload({"code": "error"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         result = factory.execution.get_call_response_data(call.call_id)
@@ -980,7 +1300,11 @@ class TestGetCallResponseData:
         """When response_data is provided but no payload store exists,
         response_hash is set but response_ref is NULL — state should be HASH_ONLY."""
         _db, factory, state_id = _setup_no_store()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state_id,
             idx,
@@ -988,6 +1312,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         # Precondition: response_hash is set, response_ref is not
@@ -1004,7 +1330,11 @@ class TestGetCallResponseData:
         """When no response_data is provided at all (e.g., timeout),
         both response_hash and response_ref are NULL — state should be NEVER_STORED."""
         _db, factory, state_id = _setup()
-        idx = factory.execution.allocate_call_index(state_id)
+        idx = factory.execution.allocate_call_index(
+            state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state_id,
             idx,
@@ -1012,6 +1342,8 @@ class TestGetCallResponseData:
             CallStatus.ERROR,
             request_data=RawCallPayload({"prompt": "fail"}),
             error=RawCallPayload({"code": "timeout"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         # Precondition: both response_hash and response_ref are None
@@ -1037,15 +1369,34 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         # Store a JSON array (not a dict) as the response payload
         list_payload = json.dumps([1, 2, 3]).encode("utf-8")
         response_ref = store.store(list_payload)
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1053,7 +1404,9 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
-            response_ref=response_ref,  # Override with our corrupt ref
+            response_ref=response_ref,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         with pytest.raises(AuditIntegrityError, match="expected JSON object"):
@@ -1068,13 +1421,32 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         forged_response_ref = store.store(b'{"text":"forged"}')
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1083,6 +1455,8 @@ class TestGetCallResponseData:
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
             response_ref=forged_response_ref,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.response_hash == stable_hash({"text": "world"})
@@ -1098,13 +1472,32 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         non_finite_response_ref = store.store(b'{"text": NaN}')
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1113,6 +1506,8 @@ class TestGetCallResponseData:
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
             response_ref=non_finite_response_ref,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         with pytest.raises(AuditIntegrityError, match="Corrupt call response payload"):
@@ -1127,13 +1522,32 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         ref_without_audit_hash = store.store(b'{"text":"orphaned"}')
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1141,6 +1555,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_ref=ref_without_audit_hash,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.response_hash is None
@@ -1156,11 +1572,30 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1168,6 +1603,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"blob": b"abc"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         assert call.response_hash == call.response_ref
@@ -1186,11 +1623,30 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1198,6 +1654,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         result = factory.execution.get_call_response_data(call.call_id)
@@ -1218,11 +1676,30 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1230,6 +1707,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         with pytest.raises(AuditIntegrityError, match="Payload integrity check failed for call_id="):
@@ -1245,11 +1724,30 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1257,6 +1755,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         with pytest.raises(AuditIntegrityError) as exc_info:
@@ -1290,11 +1790,30 @@ class TestGetCallResponseData:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        state = factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"name": "test"}, state_id="state-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"name": "test"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        state = factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"name": "test"},
+            state_id="state-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
-        idx = factory.execution.allocate_call_index(state.state_id)
+        idx = factory.execution.allocate_call_index(
+            state.state_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
+        )
         call = factory.execution.record_call(
             state.state_id,
             idx,
@@ -1302,6 +1821,8 @@ class TestGetCallResponseData:
             CallStatus.SUCCESS,
             request_data=RawCallPayload({"prompt": "hello"}),
             response_data=RawCallPayload({"text": "world"}),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_state(factory, state.state_id, member_token=leader_coordination_token(factory, "run-1").membership),
         )
 
         # Verify it's AVAILABLE first
@@ -1317,3 +1838,45 @@ class TestGetCallResponseData:
         result = factory.execution.get_call_response_data(call.call_id)
         assert result.state == CallDataState.PURGED
         assert result.data is None
+
+
+def test_f10_call_payload_refs_refuse_reclaimed_item() -> None:
+    db, factory, state_id = _setup()
+    member = leader_coordination_token(factory, "run-1").membership
+    item = _claim_state(factory, state_id, member_token=member)
+    stored_images: list[StateEngineImage] = []
+
+    class ReclaimedStore(MockPayloadStore):
+        def store(self, content: bytes) -> str:
+            content_ref = super().store(content)
+            with db.write_connection() as conn:
+                conn.execute(
+                    token_work_items_table.update()
+                    .where(token_work_items_table.c.work_item_id == item.work_item_id)
+                    .values(attempt=item.attempt + 1)
+                )
+            stored_images.append(capture_state_engine_image(db, run_id=member.run_id))
+            return content_ref
+
+    factory.execution.calls._payload_store = ReclaimedStore()
+    with pytest.raises(SchedulerLeaseLostError):
+        factory.execution.record_call(
+            state_id,
+            0,
+            CallType.HTTP,
+            CallStatus.SUCCESS,
+            RawCallPayload({"request": 1}),
+            member_token=member,
+            work_item=item,
+        )
+
+    assert len(stored_images) == 1
+    assert capture_state_engine_image(db, run_id=member.run_id) == stored_images[0]
+    with db.read_only_connection() as conn:
+        call = conn.execute(select(calls_table)).one()
+        assert call.request_hash == stable_hash({"request": 1})
+        assert call.request_ref is None
+        assert (
+            conn.execute(select(run_workers_table.c.status).where(run_workers_table.c.worker_id == member.worker_id)).scalar_one()
+            == "active"
+        )

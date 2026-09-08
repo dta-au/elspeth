@@ -858,10 +858,13 @@ class TestNodeStateLoader:
 
         load_source = inspect.getsource(NodeStateLoader.load)
         complete_source = inspect.getsource(NodeStateRepository.complete_node_state)
+        completion_writer_source = inspect.getsource(NodeStateRepository.complete_node_state_on)
 
         assert "validate_node_state_persisted_fields" in load_source
-        assert "validate_node_state_completion_fields" in complete_source
+        assert "self.complete_node_state_on(" in complete_source
+        assert "validate_node_state_completion_fields" in completion_writer_source
         assert "mirror" not in complete_source.lower()
+        assert "mirror" not in completion_writer_source.lower()
 
     # === OPEN variant ===
 

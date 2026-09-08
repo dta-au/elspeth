@@ -24,7 +24,7 @@ from elspeth.core.landscape.schema import (
     transform_errors_table,
     validation_errors_table,
 )
-from tests.fixtures.landscape import make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 
 COMPLETED_AT = datetime(2026, 7, 16, 2, 3, 4, 567890, tzinfo=UTC)
 
@@ -228,15 +228,14 @@ def test_export_enumerations_break_timestamp_ties_by_primary_key() -> None:
         factory = make_factory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = register_test_node(factory.data_flow, run.run_id, "tie-source", node_type=NodeType.SOURCE, plugin_name="source")
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row.row_id)
         tie = COMPLETED_AT
         with db.engine.begin() as writer:
             writer.execute(

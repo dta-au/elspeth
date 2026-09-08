@@ -31,7 +31,13 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
 )
 from elspeth.web.execution.accounting import load_run_accounting_map_from_db
-from tests.fixtures.landscape import make_factory, make_landscape_db, register_test_node, within_one_database_second
+from tests.fixtures.landscape import (
+    leader_coordination_token,
+    make_factory,
+    make_landscape_db,
+    register_test_node,
+    within_one_database_second,
+)
 
 NOW = datetime(2026, 8, 11, 20, 0, 0, tzinfo=UTC)
 RUN_ID = "rm-truth-run"
@@ -53,20 +59,19 @@ def _begin_run(factory: Any, run_id: str, leader: str) -> None:
         openrouter_catalog_source="bundled",
     )
     factory.data_flow.register_node(
-        run_id=run_id,
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         node_id=f"source-{run_id}",
         schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     register_test_node(factory.data_flow, run_id, NODE_ID)
 
 
 def _enqueue(factory: Any, run_id: str, name: str, sequence: int) -> str:
     row, token = factory.data_flow.create_row_with_token(
-        run_id=run_id,
         source_node_id=f"source-{run_id}",
         row_index=sequence,
         data={"name": name},
@@ -74,9 +79,10 @@ def _enqueue(factory: Any, run_id: str, name: str, sequence: int) -> str:
         ingest_sequence=sequence,
         row_id=f"row-{name}",
         token_id=f"token-{name}",
+        coordination_token=leader_coordination_token(factory, run_id),
     )
     item = factory.scheduler.enqueue_ready(
-        run_id=run_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
@@ -522,7 +528,6 @@ def test_rm14_accounting_census_distinguishes_all_token_fates() -> None:
     for index, run_id in enumerate(run_ids):
         _begin_run(factory, run_id, f"worker:{run_id}:leader")
         factory.data_flow.create_row_with_token(
-            run_id=run_id,
             source_node_id=f"source-{run_id}",
             row_index=index,
             data={"run": run_id},
@@ -530,14 +535,16 @@ def test_rm14_accounting_census_distinguishes_all_token_fates() -> None:
             ingest_sequence=index,
             row_id=f"row-{run_id}",
             token_id=f"token-{run_id}",
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
     for run_id in ("fate-decided", "fate-contradiction"):
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=f"token-{run_id}", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-a",
+            coordination_token=leader_coordination_token(factory, run_id),
         )
     with db.engine.begin() as conn:
         for run_id in ("fate-abandoned", "fate-contradiction"):

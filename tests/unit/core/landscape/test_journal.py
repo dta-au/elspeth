@@ -37,6 +37,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.journal import JournalRecord, LandscapeJournal
 from elspeth.core.landscape.schema import sidecar_journal_outbox_table
 from elspeth.core.payload_store import FilesystemPayloadStore
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -996,28 +997,27 @@ class TestPayloadEnrichmentProductionPath:
         schema = SchemaConfig.from_dict({"mode": "observed"})
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=schema,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=node.node_id,
             row_index=0,
             data={"input": "test"},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
             step_index=0,
             input_data={"input": "test"},
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         factory.execution.record_call(
@@ -1027,6 +1027,13 @@ class TestPayloadEnrichmentProductionPath:
             status=CallStatus.SUCCESS,
             request_data=RawCallPayload({"model": "gpt-4", "prompt": "Hi"}),
             response_data=RawCallPayload({"content": "Hello!"}),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=token.token_id,
+                node_id=node.node_id,
+            ),
         )
 
         records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]

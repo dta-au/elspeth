@@ -30,7 +30,7 @@ elspeth-addd3dc41f):
 from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -39,6 +39,7 @@ from sqlalchemy.engine import Connection, RowMapping
 from sqlalchemy.exc import IntegrityError, OperationalError
 
 from elspeth.contracts import NodeType
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
@@ -47,6 +48,7 @@ from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
+    run_workers_table,
     runs_table,
     scheduler_events_table,
     token_work_items_table,
@@ -121,11 +123,22 @@ def _insert_run_node_row_token(db: LandscapeDB, *, now: datetime) -> None:
                 created_at=now,
             )
         )
+        for worker_id in ("owner-a", "owner-b", "owner-rival"):
+            conn.execute(
+                insert(run_workers_table).values(
+                    worker_id=worker_id,
+                    run_id=RUN_ID,
+                    role="follower",
+                    status="active",
+                    registered_at=now,
+                    heartbeat_expires_at=now + timedelta(hours=1),
+                )
+            )
 
 
 def _enqueue_one_ready(repo: TokenSchedulerRepository, *, now: datetime) -> TokenWorkItem:
     return repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"),
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -256,7 +269,7 @@ class _RivalInterposingLeases(SchedulerLeaseRepository):
     ) -> RowMapping | None:
         try:
             self.rival_outcome = self._rival.claim_ready(
-                run_id=run_id,
+                member_token=WorkerMembershipToken(run_id=run_id, worker_id="owner-rival"),
                 lease_owner="owner-rival",
                 lease_seconds=300,
             )
@@ -318,11 +331,15 @@ class TestClaimReadyUnderSecondWriterConnection:
             try:
                 repo_b = TokenSchedulerRepository(db_b.engine)
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
+                claimed_a = repo_a.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"), lease_owner="owner-a", lease_seconds=300
+                )
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
 
-                claimed_b = repo_b.claim_ready(run_id=RUN_ID, lease_owner="owner-b", lease_seconds=300)
+                claimed_b = repo_b.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-b"), lease_owner="owner-b", lease_seconds=300
+                )
                 assert claimed_b is None
 
                 with db_a.engine.connect() as conn:
@@ -372,7 +389,9 @@ class TestClaimReadyUnderSecondWriterConnection:
                 finally:
                     raw.close()
 
-                claimed_a = repo_a.claim_ready(run_id=RUN_ID, lease_owner="owner-a", lease_seconds=300)
+                claimed_a = repo_a.claim_ready(
+                    member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-a"), lease_owner="owner-a", lease_seconds=300
+                )
 
                 assert claimed_a is not None
                 assert claimed_a.lease_owner == "owner-a"
@@ -381,7 +400,14 @@ class TestClaimReadyUnderSecondWriterConnection:
 
                 # Serialized retry after the commit: refused via the READY
                 # filter — clean None, single owner.
-                assert rival.claim_ready(run_id=RUN_ID, lease_owner="owner-rival", lease_seconds=300) is None
+                assert (
+                    rival.claim_ready(
+                        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id="owner-rival"),
+                        lease_owner="owner-rival",
+                        lease_seconds=300,
+                    )
+                    is None
+                )
 
                 with db_a.engine.connect() as conn:
                     item = conn.execute(select(token_work_items_table).where(token_work_items_table.c.run_id == RUN_ID)).mappings().one()

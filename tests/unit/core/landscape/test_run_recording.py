@@ -317,13 +317,13 @@ class TestFinalizeRun:
     def test_finalize_deterministic_run(self) -> None:
         _db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         run = factory.run_lifecycle.finalize_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, "run-1"))
         assert run.status == RunStatus.COMPLETED

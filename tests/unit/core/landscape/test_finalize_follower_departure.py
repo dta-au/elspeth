@@ -22,8 +22,8 @@ import pytest
 from sqlalchemy import insert, select, update
 
 from elspeth.contracts import NodeType, RunStatus
-from elspeth.contracts.coordination import mint_worker_id
-from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.contracts.coordination import WorkerMembershipToken, mint_worker_id
+from elspeth.contracts.errors import AuditIntegrityError, RunMembershipLostError
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape._database_ops import DatabaseOps
 from elspeth.core.landscape.database import LandscapeDB
@@ -341,18 +341,17 @@ class TestEnqueueReadyMembershipFenceRoles:
         run_id: str = RUN_ID,
         token_id: str = "token-1",
         row_id: str = "row-1",
-        worker_id: str | None = None,
+        worker_id: str,
         ingest_sequence: int = 0,
     ) -> None:
         repo.enqueue_ready(
-            run_id=run_id,
+            member_token=WorkerMembershipToken(run_id=run_id, worker_id=worker_id),
             token_id=token_id,
             row_id=row_id,
             node_id="transform-1",
             step_index=1,
             ingest_sequence=ingest_sequence,
             row_payload_json=_row_payload(),
-            worker_id=worker_id,
         )
 
     def _setup_db(self) -> LandscapeDB:
@@ -410,26 +409,26 @@ class TestEnqueueReadyMembershipFenceRoles:
         self._enqueue(repo, worker_id=follower_id, token_id="token-f", row_id="row-f", ingest_sequence=1)
 
     def test_evicted_leader_raises(self) -> None:
-        """An EVICTED leader row is refused (RunWorkerEvictedError)."""
+        """An EVICTED leader row is refused (RunMembershipLostError)."""
         db = self._setup_db()
         leader_id = f"worker:{RUN_ID}:leader-evicted"
         self._seed_worker(db, worker_id=leader_id, role="leader", status="evicted")
 
         repo = self._make_scheduler(db)
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             self._enqueue(repo, worker_id=leader_id)
 
         assert exc_info.value.worker_id == leader_id
         assert exc_info.value.run_id == RUN_ID
 
     def test_evicted_follower_raises(self) -> None:
-        """An EVICTED follower row is refused (RunWorkerEvictedError)."""
+        """An EVICTED follower row is refused (RunMembershipLostError)."""
         db = self._setup_db()
         follower_id = f"worker:{RUN_ID}:follower-evicted"
         self._seed_worker(db, worker_id=follower_id, role="follower", status="evicted")
 
         repo = self._make_scheduler(db)
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             self._enqueue(repo, worker_id=follower_id)
 
         assert exc_info.value.worker_id == follower_id
@@ -441,7 +440,7 @@ class TestEnqueueReadyMembershipFenceRoles:
         self._seed_worker(db, worker_id=follower_id, role="follower", status="departed")
 
         repo = self._make_scheduler(db)
-        with pytest.raises(RunWorkerEvictedError):
+        with pytest.raises(RunMembershipLostError):
             self._enqueue(repo, worker_id=follower_id)
 
     def test_absent_worker_raises(self) -> None:
@@ -450,18 +449,30 @@ class TestEnqueueReadyMembershipFenceRoles:
         absent_id = f"worker:{RUN_ID}:absent-worker"
 
         repo = self._make_scheduler(db)
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(AuditIntegrityError, match="unregistered") as exc_info:
             self._enqueue(repo, worker_id=absent_id)
+        assert absent_id in str(exc_info.value)
 
-        assert exc_info.value.worker_id == absent_id
-
-    def test_no_worker_id_bypasses_fence(self) -> None:
-        """worker_id=None preserves the legacy unfenced path (N=1 / tests)."""
+    def test_missing_member_token_is_rejected(self) -> None:
+        """The public enqueue API has no omitted-authority bypass."""
         db = self._setup_db()
 
         repo = self._make_scheduler(db)
-        # Must not raise even though there are no run_workers rows.
-        self._enqueue(repo, worker_id=None)
+        from elspeth.core.landscape.schema import token_work_items_table
+
+        with db.engine.connect() as conn:
+            before = tuple(conn.execute(select(token_work_items_table)).all())
+        with pytest.raises(TypeError, match="member_token"):
+            repo.enqueue_ready(
+                token_id="token-1",
+                row_id="row-1",
+                node_id="transform-1",
+                step_index=1,
+                ingest_sequence=0,
+                row_payload_json=_row_payload(),
+            )
+        with db.engine.connect() as conn:
+            assert tuple(conn.execute(select(token_work_items_table)).all()) == before
 
     def test_eviction_leaves_zero_ready_rows(self) -> None:
         """An evicted worker's enqueue attempt leaves NO READY row in the DB."""
@@ -472,7 +483,7 @@ class TestEnqueueReadyMembershipFenceRoles:
         self._seed_worker(db, worker_id=follower_id, role="follower", status="evicted")
 
         repo = self._make_scheduler(db)
-        with pytest.raises(RunWorkerEvictedError):
+        with pytest.raises(RunMembershipLostError):
             self._enqueue(repo, worker_id=follower_id)
 
         # The fence fires BEFORE the INSERT — zero mutation.

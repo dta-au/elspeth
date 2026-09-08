@@ -56,13 +56,13 @@ class TestComputeGrade:
     def test_all_deterministic_returns_full(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.FULL_REPRODUCIBLE
@@ -70,7 +70,6 @@ class TestComputeGrade:
     def test_seeded_returns_full(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sampler",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -78,6 +77,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.SEEDED,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.FULL_REPRODUCIBLE
@@ -85,7 +85,6 @@ class TestComputeGrade:
     def test_nondeterministic_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -93,6 +92,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.NON_DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -100,7 +100,6 @@ class TestComputeGrade:
     def test_external_call_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="api",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -108,6 +107,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.EXTERNAL_CALL,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -115,7 +115,6 @@ class TestComputeGrade:
     def test_io_read_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="reader",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -123,6 +122,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.IO_READ,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -130,7 +130,6 @@ class TestComputeGrade:
     def test_io_write_returns_replay(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="writer",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -138,6 +137,7 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.IO_WRITE,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -145,7 +145,6 @@ class TestComputeGrade:
     def test_mixed_deterministic_and_nondeterministic(self) -> None:
         db, factory = _setup()
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -153,9 +152,9 @@ class TestComputeGrade:
             node_id="n1",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -163,6 +162,7 @@ class TestComputeGrade:
             node_id="n2",
             schema_config=_DYNAMIC_SCHEMA,
             determinism=Determinism.NON_DETERMINISTIC,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         grade = compute_grade(db, "run-1")
         assert grade == ReproducibilityGrade.REPLAY_REPRODUCIBLE
@@ -197,7 +197,6 @@ def _create_nondeterministic_call(
 ) -> None:
     """Create a node + node_state + call chain for purge testing."""
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -205,6 +204,7 @@ def _create_nondeterministic_call(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         # Row and token are needed for node_state FK
@@ -275,7 +275,6 @@ def _create_nondeterministic_operation_call(
 ) -> None:
     """Create a source/sink operation call chain for purge downgrade testing."""
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -283,6 +282,7 @@ def _create_nondeterministic_operation_call(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         conn.execute(
@@ -324,7 +324,6 @@ def _create_source_row(
     node_id: str = "source-node",
 ) -> None:
     factory.data_flow.register_node(
-        run_id="run-1",
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -332,6 +331,7 @@ def _create_source_row(
         node_id=node_id,
         schema_config=_DYNAMIC_SCHEMA,
         determinism=determinism,
+        coordination_token=leader_coordination_token(factory, "run-1"),
     )
     with db.write_connection() as conn:
         conn.execute(

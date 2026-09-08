@@ -4,13 +4,10 @@ Design :411: each construct has ONE definition and ONE dedicated unit test —
 the ``blocked_barrier_hold_clause`` hygiene pattern — because the predicates
 appear in many verbs and per-verb hand-rolled copies would drift.
 
-1. ``active_worker_fence_clause`` (schema module, sibling of
-   ``blocked_barrier_hold_clause``): the membership EXISTS predicate that
-   slice 4 compiles into ``claim_ready`` / ``claim_pending_sink`` CAS UPDATEs
-   and ``enqueue_ready``'s INSERT…SELECT. Slice 2 lands the CONSTRUCT and its
-   test ONLY — the negative pin at the bottom proves the claim verbs are NOT
-   yet membership-fenced (no claim-refusal behavior is asserted here; that is
-   slice 4, design :491).
+1. ``active_worker_fence_clause`` and ``claim_verb_fence_clause`` pin the
+   SQL predicates independently, including the latter's internal N=0 arm.
+   Public scheduler writes require explicit registered membership before
+   reaching these predicates: no caller can select an unfenced public path.
 
 2. ``verify_and_extend_leader_fence`` (coordination repository): the leader
    epoch verify-and-extend UPDATE CAS, emitted as the FIRST statement of
@@ -21,6 +18,7 @@ appear in many verbs and per-verb hand-rolled copies would drift.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from inspect import Parameter, signature
 
@@ -28,8 +26,8 @@ import pytest
 from sqlalchemy import CheckConstraint, delete, insert, select, update
 
 from elspeth.contracts import NodeType, PipelineRow, RunStatus, TerminalOutcome, TerminalPath
-from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import RunLeadershipLostError, RunWorkerEvictedError
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.landscape.database import LandscapeDB, begin_write
@@ -123,7 +121,7 @@ def _insert_worker(db: LandscapeDB, *, worker_id: str, run_id: str, status: str)
 
 
 def _seed_ready_item(db: LandscapeDB, run_id: str, *, sequence: int = 0) -> str:
-    """One READY token_work_items row via the production enqueue. Returns work_item_id."""
+    """One READY token_work_items storage seed. Returns work_item_id."""
     token_id = f"token-{run_id}-{sequence}"
     row_id = f"row-{run_id}-{sequence}"
     with db.engine.begin() as conn:
@@ -140,18 +138,29 @@ def _seed_ready_item(db: LandscapeDB, run_id: str, *, sequence: int = 0) -> str:
             )
         )
         conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=run_id, created_at=NOW))
-    repo = TokenSchedulerRepository(db.engine)
-    repo.enqueue_ready(
-        run_id=run_id,
-        token_id=token_id,
-        row_id=row_id,
-        node_id=NODE_ID,
-        step_index=1,
-        ingest_sequence=sequence,
-        row_payload_json=TokenSchedulerRepository.serialize_row_payload(
-            PipelineRow({"id": sequence}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
-        ),
-    )
+    # Storage-level seed preserves the empty-membership predicate cases.
+    # Public enqueue always requires an active registered member.
+    with db.engine.begin() as conn:
+        conn.execute(
+            insert(token_work_items_table).values(
+                work_item_id=f"work-{token_id}",
+                run_id=run_id,
+                token_id=token_id,
+                row_id=row_id,
+                node_id=NODE_ID,
+                step_index=1,
+                ingest_sequence=sequence,
+                row_payload_json=TokenSchedulerRepository.serialize_row_payload(
+                    PipelineRow({"id": sequence}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+                ),
+                status="ready",
+                attempt=1,
+                available_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+                lineage_path_json="[]",
+            )
+        )
     with db.engine.connect() as conn:
         return str(
             conn.execute(select(token_work_items_table.c.work_item_id).where(token_work_items_table.c.token_id == token_id)).scalar_one()
@@ -198,7 +207,6 @@ def _seed_unscheduled_item(db: LandscapeDB, run_id: str, *, sequence: int) -> di
         )
         conn.execute(insert(tokens_table).values(token_id=token_id, row_id=row_id, run_id=run_id, created_at=NOW))
     return {
-        "run_id": run_id,
         "token_id": token_id,
         "row_id": row_id,
         "node_id": NODE_ID,
@@ -216,8 +224,21 @@ def _full_durable_snapshot(db: LandscapeDB) -> dict[str, tuple[tuple[object, ...
     with db.engine.connect() as conn:
         return {
             table.name: tuple(sorted((tuple(row) for row in conn.execute(select(table)).all()), key=repr))
-            for table in metadata.sorted_tables
+            for table in sorted(metadata.tables.values(), key=lambda table: table.name)
         }
+
+
+def _assert_only_member_refusal(db: LandscapeDB, before: dict[str, tuple[tuple[object, ...], ...]], *, verb: str) -> None:
+    after = _full_durable_snapshot(db)
+    for table, rows in before.items():
+        if table != "run_coordination_events":
+            assert after[table] == rows, table
+    added = [row for row in after["run_coordination_events"] if row not in before["run_coordination_events"]]
+    assert len(added) == 1
+    assert len(after["run_coordination_events"]) == len(before["run_coordination_events"]) + 1
+    record = dict(zip(run_coordination_events_table.columns.keys(), added[0], strict=True))
+    assert record["event_type"] == "fence_refusal"
+    assert json.loads(str(record["context_json"])) == {"verb": verb, "fence": "membership"}
 
 
 class TestActiveWorkerFenceClause:
@@ -251,7 +272,7 @@ class TestActiveWorkerFenceClause:
 
 
 class TestClaimVerbFenceClause:
-    """Claim verbs are lenient only for true N=0 registry compatibility."""
+    """Pin the internal claim predicate and strict public authority admission."""
 
     @pytest.mark.parametrize(
         ("registered_worker", "caller", "expected_rowcount"),
@@ -297,9 +318,10 @@ class TestClaimVerbFenceClause:
         work_item_id = _seed_ready_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
 
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60)
-
-        assert claimed is None
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-absent"), lease_owner="worker-absent", lease_seconds=60
+            )
         with db.engine.connect() as conn:
             row = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
         assert row["status"] == TokenWorkStatus.READY.value
@@ -313,9 +335,12 @@ class TestClaimVerbFenceClause:
         work_item_id = _seed_pending_sink_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
 
-        claimed = repo.claim_pending_sink(run_id=RUN_1, lease_owner="worker-absent", lease_seconds=60)
-
-        assert claimed is None
+        with pytest.raises(RunLeadershipLostError):
+            repo.claim_pending_sink(
+                coordination_token=CoordinationToken(run_id=RUN_1, worker_id="worker-absent", leader_epoch=1),
+                lease_owner="worker-absent",
+                lease_seconds=60,
+            )
         with db.engine.connect() as conn:
             row = conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
         assert row["status"] == TokenWorkStatus.PENDING_SINK.value
@@ -359,11 +384,10 @@ class TestClaimVerbFenceClause:
     def test_membership_fence_compiled_into_claim_verbs_in_slice_4(self, db: LandscapeDB) -> None:
         """Slice-4 flip (design :491): the clause IS compiled into
         ``claim_ready``/``claim_pending_sink``/``enqueue_ready`` — an EVICTED
-        worker is refused with ``RunWorkerEvictedError`` for all three verbs.
+        worker is refused with ``RunMembershipLostError`` for both member verbs.
 
         Replaces the slice-2 negative pin (EVICTED worker could claim).
         """
-        from elspeth.contracts.errors import RunWorkerEvictedError
         from elspeth.contracts.scheduler import TokenWorkStatus
 
         _insert_run(db, RUN_1)
@@ -372,8 +396,10 @@ class TestClaimVerbFenceClause:
         repo = TokenSchedulerRepository(db.engine)
 
         # claim_ready: evicted worker is refused
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
-            repo.claim_ready(run_id=RUN_1, lease_owner="worker-evicted", lease_seconds=60)
+        with pytest.raises(RunMembershipLostError) as exc_info:
+            repo.claim_ready(
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-evicted"), lease_owner="worker-evicted", lease_seconds=60
+            )
         assert exc_info.value.worker_id == "worker-evicted"
         assert exc_info.value.run_id == RUN_1
 
@@ -382,12 +408,12 @@ class TestClaimVerbFenceClause:
             status = conn.execute(select(token_work_items_table.c.status).where(token_work_items_table.c.run_id == RUN_1)).scalar_one()
         assert status == TokenWorkStatus.READY.value
 
-        # enqueue_ready: evicted worker is refused (worker_id kwarg carries the fence).
+        # enqueue_ready: the evicted member token is refused.
         # Re-use the same schema seed (different sequence to avoid work_item_id collision).
         _seed_ready_item(db, RUN_1, sequence=1)
-        with pytest.raises(RunWorkerEvictedError):
+        with pytest.raises(RunMembershipLostError):
             repo.enqueue_ready(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-evicted"),
                 token_id="token-new",
                 row_id="row-new",
                 node_id=NODE_ID,
@@ -396,14 +422,12 @@ class TestClaimVerbFenceClause:
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(
                     PipelineRow({"id": 99}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
                 ),
-                worker_id="worker-evicted",
             )
 
-        # An ABSENT worker (no registry row at all) calling enqueue_ready with
-        # worker_id is also refused (absent → fence fails).
-        with pytest.raises(RunWorkerEvictedError) as exc_info2:
+        # An absent registration is an integrity error, before queue mutation.
+        with pytest.raises(AuditIntegrityError, match="unregistered") as exc_info2:
             repo.enqueue_ready(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-absent"),
                 token_id="token-absent",
                 row_id="row-absent",
                 node_id=NODE_ID,
@@ -412,18 +436,19 @@ class TestClaimVerbFenceClause:
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(
                     PipelineRow({"id": 100}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
                 ),
-                worker_id="worker-absent",
             )
-        assert exc_info2.value.worker_id == "worker-absent"
+        assert "worker-absent" in str(exc_info2.value)
 
         # An ACTIVE worker can still claim (positive control).
         _insert_worker(db, worker_id="worker-active", run_id=RUN_1, status="active")
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner="worker-active", lease_seconds=60)
+        claimed = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"), lease_owner="worker-active", lease_seconds=60
+        )
         assert claimed is not None, "active worker must succeed"
 
 
 class TestEnqueueReadyClaimedMembershipFence:
-    """The standalone enqueue-and-claim path is strict; legacy is explicit."""
+    """Standalone enqueue-and-claim requires current registered membership."""
 
     @pytest.mark.parametrize("caller_status", [None, "evicted"], ids=["absent", "evicted"])
     def test_absent_or_evicted_identity_is_refused_with_full_zero_mutation(
@@ -439,19 +464,25 @@ class TestEnqueueReadyClaimedMembershipFence:
         enqueue = _seed_unscheduled_item(db, RUN_1, sequence=10)
         before = _full_durable_snapshot(db)
 
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
-            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner=caller)
-
-        assert exc_info.value.worker_id == caller
-        assert exc_info.value.run_id == RUN_1
-        assert _full_durable_snapshot(db) == before
+        expected_error = AuditIntegrityError if caller_status is None else RunMembershipLostError
+        with pytest.raises(expected_error) as exc_info:
+            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(
+                **enqueue, member_token=WorkerMembershipToken(run_id=RUN_1, worker_id=caller), lease_owner=caller
+            )
+        assert caller in str(exc_info.value)
+        if caller_status is None:
+            assert _full_durable_snapshot(db) == before
+        else:
+            _assert_only_member_refusal(db, before, verb="enqueue_ready_claimed")
 
     def test_active_member_enqueues_claims_and_records_both_events(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-active", run_id=RUN_1, status="active")
         enqueue = _seed_unscheduled_item(db, RUN_1, sequence=11)
 
-        claimed = TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
+        claimed = TokenSchedulerRepository(db.engine).enqueue_ready_claimed(
+            **enqueue, member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"), lease_owner="worker-active"
+        )
 
         assert claimed.status is TokenWorkStatus.LEASED
         assert claimed.lease_owner == "worker-active"
@@ -470,10 +501,15 @@ class TestEnqueueReadyClaimedMembershipFence:
         # one minute into the DATABASE's future, then replay the idempotent
         # enqueue-and-claim: the claim CAS admits a row only once
         # available_at <= database time (ADR-047).
-        ready = repo.enqueue_ready(**{key: value for key, value in enqueue.items() if key != "lease_seconds"})
+        ready = repo.enqueue_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"),
+            **{key: value for key, value in enqueue.items() if key != "lease_seconds"},
+        )
         future = reschedule_work_item(db.engine, ready.work_item_id, seconds_from_now=60)
 
-        scheduled = repo.enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
+        scheduled = repo.enqueue_ready_claimed(
+            **enqueue, member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"), lease_owner="worker-active"
+        )
 
         assert scheduled.status is TokenWorkStatus.READY
         assert scheduled.lease_owner is None
@@ -484,17 +520,17 @@ class TestEnqueueReadyClaimedMembershipFence:
             )
         assert event_types == {SchedulerEventType.ENQUEUE.value}
 
-    def test_explicit_legacy_unfenced_helper_preserves_n0_test_mode(self, db: LandscapeDB) -> None:
+    def test_unregistered_enqueue_and_claim_is_refused_at_n0(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
         enqueue = _seed_unscheduled_item(db, RUN_1, sequence=12)
-
-        claimed = TokenSchedulerRepository(db.engine).enqueue_ready_claimed_legacy_unfenced(
-            **enqueue,
-            lease_owner="legacy-test-owner",
-        )
-
-        assert claimed.status is TokenWorkStatus.LEASED
-        assert claimed.lease_owner == "legacy-test-owner"
+        before = _full_durable_snapshot(db)
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(
+                **enqueue,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="unregistered"),
+                lease_owner="unregistered",
+            )
+        assert _full_durable_snapshot(db) == before
 
     def test_membership_cas_rolls_back_when_member_is_evicted_after_entry_guard(
         self,
@@ -520,7 +556,9 @@ class TestEnqueueReadyClaimedMembershipFence:
         monkeypatch.setattr(queue_module, "insert_work_item_idempotent", evict_then_insert)
 
         with pytest.raises(RunWorkerEvictedError):
-            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
+            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(
+                **enqueue, member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"), lease_owner="worker-active"
+            )
 
         assert _full_durable_snapshot(db) == before
 
@@ -546,7 +584,9 @@ class TestEnqueueReadyClaimedMembershipFence:
         monkeypatch.setattr(queue_module, "insert_work_item_idempotent", delete_member_then_insert)
 
         with pytest.raises(RunWorkerEvictedError) as exc_info:
-            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(**enqueue, lease_owner="worker-active")
+            TokenSchedulerRepository(db.engine).enqueue_ready_claimed(
+                **enqueue, member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-active"), lease_owner="worker-active"
+            )
 
         assert exc_info.value.worker_id == "worker-active"
         assert exc_info.value.run_id == RUN_1
@@ -554,50 +594,27 @@ class TestEnqueueReadyClaimedMembershipFence:
 
 
 class TestHeartbeatLeaseMembershipFence:
-    """Heartbeat callers choose strict membership or explicit legacy N=0."""
+    """Heartbeat callers must carry an explicit registered member token."""
 
-    def test_public_repository_layers_require_explicit_fence_intent(self) -> None:
+    def test_public_repository_layers_require_explicit_membership(self) -> None:
         from elspeth.core.landscape.scheduler.leases import SchedulerLeaseRepository
 
         for heartbeat in (SchedulerLeaseRepository.heartbeat_lease, TokenSchedulerRepository.heartbeat_lease):
-            parameter = signature(heartbeat).parameters["membership_fenced"]
+            parameter = signature(heartbeat).parameters["member_token"]
             assert parameter.default is Parameter.empty
 
     @staticmethod
     def _leased_item(db: LandscapeDB, *, worker_id: str) -> tuple[TokenSchedulerRepository, str]:
         work_item_id = _seed_ready_item(db, RUN_1)
         repo = TokenSchedulerRepository(db.engine)
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60)
+        claimed = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id=worker_id), lease_owner=worker_id, lease_seconds=60
+        )
         assert claimed is not None and claimed.work_item_id == work_item_id
         return repo, work_item_id
 
-    @staticmethod
-    def _durable_state(db: LandscapeDB, *, work_item_id: str, worker_id: str) -> tuple[object, ...]:
-        """Snapshot every surface a refused heartbeat must leave unchanged."""
-        with db.engine.connect() as conn:
-            item = (
-                conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
-            )
-            worker = conn.execute(select(run_workers_table).where(run_workers_table.c.worker_id == worker_id)).mappings().one_or_none()
-            scheduler_events = tuple(
-                conn.execute(
-                    select(scheduler_events_table.c.event_id)
-                    .where(scheduler_events_table.c.run_id == RUN_1)
-                    .order_by(scheduler_events_table.c.event_id)
-                ).scalars()
-            )
-            coordination_events = tuple(
-                conn.execute(
-                    select(run_coordination_events_table.c.event_id)
-                    .where(run_coordination_events_table.c.run_id == RUN_1)
-                    .order_by(run_coordination_events_table.c.event_id)
-                ).scalars()
-            )
-        return dict(item), None if worker is None else dict(worker), scheduler_events, coordination_events
-
     @pytest.mark.parametrize("status", ["evicted", "departed"])
     def test_non_active_owner_is_refused_with_zero_durable_mutation(self, db: LandscapeDB, status: str) -> None:
-        from elspeth.contracts.errors import RunWorkerEvictedError
 
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
@@ -613,41 +630,38 @@ class TestHeartbeatLeaseMembershipFence:
                     evicted_by_worker_id="worker-leader" if status == "evicted" else None,
                 )
             )
-        before = self._durable_state(db, work_item_id=work_item_id, worker_id="worker-a")
+        before = _full_durable_snapshot(db)
 
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             repo.heartbeat_lease(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                membership_fenced=True,
             )
 
         assert exc_info.value.worker_id == "worker-a"
         assert exc_info.value.run_id == RUN_1
-        assert self._durable_state(db, work_item_id=work_item_id, worker_id="worker-a") == before
+        _assert_only_member_refusal(db, before, verb="heartbeat_lease")
 
     def test_deleted_sole_membership_row_is_refused_with_zero_durable_mutation(self, db: LandscapeDB) -> None:
-        from elspeth.contracts.errors import RunWorkerEvictedError
 
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
         with db.engine.begin() as conn:
             conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == "worker-a"))
-        before = self._durable_state(db, work_item_id=work_item_id, worker_id="worker-a")
+        before = _full_durable_snapshot(db)
 
-        with pytest.raises(RunWorkerEvictedError):
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
             repo.heartbeat_lease(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                membership_fenced=True,
             )
 
-        assert self._durable_state(db, work_item_id=work_item_id, worker_id="worker-a") == before
+        assert _full_durable_snapshot(db) == before
 
     def test_active_current_owner_can_extend_lease(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
@@ -656,11 +670,10 @@ class TestHeartbeatLeaseMembershipFence:
 
         before = landscape_database_now(db.engine)
         expires_at = repo.heartbeat_lease(
-            run_id=RUN_1,
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
             work_item_id=work_item_id,
             lease_owner="worker-a",
             lease_seconds=60,
-            membership_fenced=True,
         )
         after = landscape_database_now(db.engine)
 
@@ -675,11 +688,10 @@ class TestHeartbeatLeaseMembershipFence:
 
         before = landscape_database_now(db.engine)
         expires_at = repo.heartbeat_lease(
-            run_id=RUN_1,
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
             work_item_id=work_item_id,
             lease_owner="worker-a",
             lease_seconds=60,
-            membership_fenced=True,
         )
         after = landscape_database_now(db.engine)
 
@@ -696,11 +708,10 @@ class TestHeartbeatLeaseMembershipFence:
 
         with pytest.raises(SchedulerLeaseLostError):
             repo.heartbeat_lease(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-b"),
                 work_item_id=work_item_id,
                 lease_owner="worker-b",
                 lease_seconds=60,
-                membership_fenced=True,
             )
 
     def test_recovered_lease_uses_existing_lease_lost_path_when_membership_active(self, db: LandscapeDB) -> None:
@@ -709,38 +720,34 @@ class TestHeartbeatLeaseMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
-        expire_lease(db.engine, work_item_id)
-        recovered = repo.recover_expired_leases_legacy_unfenced(
-            run_id=RUN_1,
-            caller_owner="worker-reaper",
-        )
+        expire_lease(db.engine, work_item_id, seconds_ago=5)
+        reaper = register_run_leader(RunCoordinationRepository(db.engine), run_id=RUN_1, worker_id="worker-reaper", window_seconds=80)
+        recovered = repo.recover_expired_leases(coordination_token=reaper, stall_budget_seconds=1)
         assert recovered == 1
 
         with pytest.raises(SchedulerLeaseLostError):
             repo.heartbeat_lease(
-                run_id=RUN_1,
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
                 work_item_id=work_item_id,
                 lease_owner="worker-a",
                 lease_seconds=60,
-                membership_fenced=True,
             )
 
-    def test_explicit_unfenced_intent_preserves_direct_harness_n0(self, db: LandscapeDB) -> None:
-        """The required False flag, not registry emptiness, selects legacy mode."""
+    def test_missing_membership_after_claim_cannot_extend_lease(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
+        _insert_worker(db, worker_id="direct-harness", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="direct-harness")
-
-        before = landscape_database_now(db.engine)
-        expires_at = repo.heartbeat_lease(
-            run_id=RUN_1,
-            work_item_id=work_item_id,
-            lease_owner="direct-harness",
-            lease_seconds=60,
-            membership_fenced=False,
-        )
-        after = landscape_database_now(db.engine)
-
-        assert_stamped_between(expires_at, start=before, end=after, offset=timedelta(seconds=60))
+        with db.engine.begin() as conn:
+            conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == "direct-harness"))
+        before = _full_durable_snapshot(db)
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            repo.heartbeat_lease(
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="direct-harness"),
+                work_item_id=work_item_id,
+                lease_owner="direct-harness",
+                lease_seconds=60,
+            )
+        assert _full_durable_snapshot(db) == before
 
 
 class TestVerifyAndExtendLeaderFence:
@@ -812,22 +819,20 @@ class TestVerifyAndExtendLeaderFence:
 
 
 class TestDispositionMembershipFence:
-    """ADR-030 §G parity for DISPOSITION verbs (filigree elspeth-ba7b2cc25d).
+    """Disposition requires active membership and the current item owner.
 
-    ``claim_ready`` / ``claim_pending_sink`` / ``enqueue_ready`` gained the
-    membership fence in slices 4-5; the disposition verbs (``mark_blocked`` /
-    ``mark_terminal`` / ``mark_failed`` / ``mark_pending_sink``) were the lone
-    unfenced exception. When the caller threads ``worker_id``, the LENIENT
-    ``claim_verb_fence_clause`` rides the same UPDATE WHERE: an evicted or
-    departed worker is refused with ``RunWorkerEvictedError`` and ZERO
-    mutation, while the N=0 OR-branch (no registered workers at all) keeps
-    unregistered/unit-test dispositions working.
+    Evicted or departed identities raise RunMembershipLostError before any
+    payload write. Missing registration is an AuditIntegrityError, including
+    when the deleted row was the run's sole member. Omitted authority never
+    selects an unfenced path.
     """
 
     def _leased_item(self, db: LandscapeDB, *, worker_id: str, sequence: int = 0) -> tuple[TokenSchedulerRepository, str]:
         work_item_id = _seed_ready_item(db, RUN_1, sequence=sequence)
         repo = TokenSchedulerRepository(db.engine)
-        claimed = repo.claim_ready(run_id=RUN_1, lease_owner=worker_id, lease_seconds=60)
+        claimed = repo.claim_ready(
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id=worker_id), lease_owner=worker_id, lease_seconds=60
+        )
         assert claimed is not None and claimed.work_item_id == work_item_id
         return repo, work_item_id
 
@@ -851,7 +856,6 @@ class TestDispositionMembershipFence:
         return str(row.status), row.lease_owner
 
     def test_evicted_worker_is_refused_on_every_disposition_verb_with_zero_mutation(self, db: LandscapeDB) -> None:
-        from elspeth.contracts.errors import RunWorkerEvictedError
         from elspeth.contracts.scheduler import TokenWorkStatus
 
         _insert_run(db, RUN_1)
@@ -860,14 +864,22 @@ class TestDispositionMembershipFence:
         self._set_worker_status(db, "worker-a", "evicted")
 
         dispositions = {
-            "mark_terminal": lambda: repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a"),
-            "mark_failed": lambda: repo.mark_failed(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a"),
+            "mark_terminal": lambda: repo.mark_terminal(
+                work_item_id=work_item_id,
+                expected_lease_owner="worker-a",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
+            ),
+            "mark_failed": lambda: repo.mark_failed(
+                work_item_id=work_item_id,
+                expected_lease_owner="worker-a",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
+            ),
             "mark_blocked": lambda: repo.mark_blocked(
                 work_item_id=work_item_id,
                 queue_key=None,
                 barrier_key="barrier-1",
                 expected_lease_owner="worker-a",
-                worker_id="worker-a",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
             ),
             "mark_pending_sink": lambda: repo.mark_pending_sink(
                 work_item_id=work_item_id,
@@ -878,11 +890,11 @@ class TestDispositionMembershipFence:
                 error_hash=None,
                 error_message=None,
                 expected_lease_owner="worker-a",
-                worker_id="worker-a",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
             ),
         }
         for verb, disposition in dispositions.items():
-            with pytest.raises(RunWorkerEvictedError) as exc_info:
+            with pytest.raises(RunMembershipLostError) as exc_info:
                 disposition()
             assert exc_info.value.worker_id == "worker-a", verb
             assert exc_info.value.run_id == RUN_1, verb
@@ -891,26 +903,32 @@ class TestDispositionMembershipFence:
             assert lease_owner == "worker-a", f"{verb} mutated lease_owner after eviction"
 
     def test_departed_worker_is_refused_too(self, db: LandscapeDB) -> None:
-        from elspeth.contracts.errors import RunWorkerEvictedError
 
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
         self._set_worker_status(db, "worker-a", "departed")
-        with pytest.raises(RunWorkerEvictedError):
-            repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a")
+        with pytest.raises(RunMembershipLostError):
+            repo.mark_terminal(
+                work_item_id=work_item_id,
+                expected_lease_owner="worker-a",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
+            )
 
-    def test_fenced_disposition_succeeds_when_run_has_no_workers(self, db: LandscapeDB) -> None:
-        """The LENIENT clause's N=0 OR-branch: a disposition WITH worker_id
-        supplied still succeeds when the run has no registered workers at all
-        (the reason this fence uses claim_verb_fence_clause, NOT the strict
-        active_worker_fence_clause)."""
-        from elspeth.contracts.scheduler import TokenWorkStatus
-
+    def test_fenced_disposition_refuses_when_sole_member_was_deleted(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
+        _insert_worker(db, worker_id="worker-unregistered", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-unregistered")
-        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-unregistered", worker_id="worker-unregistered")
-        assert item.status is TokenWorkStatus.TERMINAL
+        with db.engine.begin() as conn:
+            conn.execute(delete(run_workers_table).where(run_workers_table.c.worker_id == "worker-unregistered"))
+        before = _full_durable_snapshot(db)
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            repo.mark_terminal(
+                work_item_id=work_item_id,
+                expected_lease_owner="worker-unregistered",
+                member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-unregistered"),
+            )
+        assert _full_durable_snapshot(db) == before
 
     def test_active_worker_disposition_succeeds_with_fence(self, db: LandscapeDB) -> None:
         from elspeth.contracts.scheduler import TokenWorkStatus
@@ -918,18 +936,19 @@ class TestDispositionMembershipFence:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
-        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a", worker_id="worker-a")
+        item = repo.mark_terminal(
+            work_item_id=work_item_id,
+            expected_lease_owner="worker-a",
+            member_token=WorkerMembershipToken(run_id=RUN_1, worker_id="worker-a"),
+        )
         assert item.status is TokenWorkStatus.TERMINAL
 
-    def test_unfenced_disposition_keeps_legacy_behavior_when_worker_id_omitted(self, db: LandscapeDB) -> None:
-        """Default ``worker_id=None`` keeps the fence OFF — the processor gates
-        the fence on ``_scheduler_lease_owner_registered``, so legacy/N=0
-        callers that never thread an identity are unaffected."""
-        from elspeth.contracts.scheduler import TokenWorkStatus
-
+    def test_omitted_membership_does_not_bypass_eviction(self, db: LandscapeDB) -> None:
         _insert_run(db, RUN_1)
         _insert_worker(db, worker_id="worker-a", run_id=RUN_1, status="active")
         repo, work_item_id = self._leased_item(db, worker_id="worker-a")
         self._set_worker_status(db, "worker-a", "evicted")
-        item = repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a")
-        assert item.status is TokenWorkStatus.TERMINAL
+        before = _full_durable_snapshot(db)
+        with pytest.raises(TypeError, match="member_token"):
+            repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner="worker-a")
+        assert _full_durable_snapshot(db) == before

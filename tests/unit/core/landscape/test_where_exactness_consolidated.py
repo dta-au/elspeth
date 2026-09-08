@@ -31,7 +31,7 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
-from tests.fixtures.landscape import leader_coordination_token
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 if TYPE_CHECKING:
     from tests.fixtures.multi_run import MultiRunFixture
@@ -54,6 +54,26 @@ def _make_secret_resolution(env_var: str, fingerprint_byte: str = "a") -> Secret
         resolution_latency_ms=1.0,
         fingerprint=fingerprint_byte * 64,
     )
+
+
+def _finish_run_claims(fix: MultiRunFixture, suffix: str) -> None:
+    """Dispose the fixture's decided tokens before testing a successful run stamp."""
+    run = fix.run(suffix)
+    member_token = leader_coordination_token(fix.factory, run.run_id).membership
+    for token in run.tokens:
+        item = claim_test_work_item(
+            fix.factory,
+            member_token=member_token,
+            token_id=token.token_id,
+            node_id=run.transform_node_id,
+            step_index=1,
+        )
+        fix.factory.scheduler.mark_terminal(
+            member_token=member_token,
+            work_item_id=item.work_item_id,
+            expected_lease_owner=member_token.worker_id,
+        )
+    assert fix.factory.scheduler.count_unresolved_work(run_id=run.run_id) == 0
 
 
 # ===========================================================================
@@ -85,6 +105,7 @@ class TestCompleteRunWhereExactness:
 
     def test_completes_only_target_run(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
+        _finish_run_claims(fix, "B")
 
         fix.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(fix.factory, "run-B"))
 
@@ -187,6 +208,7 @@ class TestListRunsWhereExactness:
 
     def test_filters_by_exact_status(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
+        _finish_run_claims(fix, "B")
 
         fix.factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(fix.factory, "run-B"))
 
@@ -416,7 +438,7 @@ class TestValidationErrorsWhereExactness:
         for suffix in ("A", "B", "C"):
             run = fix.run(suffix)
             fix.factory.data_flow.record_validation_error(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(fix.factory, run.run_id),
                 node_id=run.source_node_id,
                 row_data={"bad_field": f"val-{suffix}"},
                 error=f"schema violation in {suffix}",
@@ -446,6 +468,14 @@ class TestTransformErrorsWhereExactness:
                 row_data={"val": f"err-{suffix}"},
                 error_details={"reason": "test_error"},
                 destination="discard",
+                member_token=leader_coordination_token(fix.factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    fix.factory,
+                    member_token=leader_coordination_token(fix.factory, run.run_id).membership,
+                    token_id=tok.token_id,
+                    node_id=run.transform_node_id,
+                    step_index=1,
+                ),
             )
 
         errors = fix.factory.data_flow.get_transform_errors_for_run("run-B")
@@ -617,8 +647,12 @@ class TestGetOperationWhereExactness:
     def test_returns_only_target_operation(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        op_b = fix.factory.execution.begin_operation(fix.run("B").run_id, fix.run("B").source_node_id, "source_load")
-        op_c = fix.factory.execution.begin_operation(fix.run("C").run_id, fix.run("C").source_node_id, "source_load")
+        op_b = fix.factory.execution.begin_operation(
+            fix.run("B").source_node_id, "source_load", coordination_token=leader_coordination_token(fix.factory, fix.run("B").run_id)
+        )
+        op_c = fix.factory.execution.begin_operation(
+            fix.run("C").source_node_id, "source_load", coordination_token=leader_coordination_token(fix.factory, fix.run("C").run_id)
+        )
 
         result = fix.factory.execution.get_operation(op_b.operation_id)
 
@@ -633,7 +667,9 @@ class TestGetOperationCallsWhereExactness:
     def test_returns_only_target_operation_calls(self, multi_run_landscape: MultiRunFixture) -> None:
         fix = multi_run_landscape
 
-        op_b = fix.factory.execution.begin_operation(fix.run("B").run_id, fix.run("B").source_node_id, "source_load")
+        op_b = fix.factory.execution.begin_operation(
+            fix.run("B").source_node_id, "source_load", coordination_token=leader_coordination_token(fix.factory, fix.run("B").run_id)
+        )
         call_b = fix.factory.execution.record_operation_call(
             op_b.operation_id,
             CallType.HTTP,
@@ -641,9 +677,12 @@ class TestGetOperationCallsWhereExactness:
             RawCallPayload({"url": "https://b.example.com"}),
             RawCallPayload({"ok": True}),
             latency_ms=10.0,
+            coordination_token=leader_coordination_token(fix.factory, fix.run("B").run_id),
         )
 
-        op_c = fix.factory.execution.begin_operation(fix.run("C").run_id, fix.run("C").source_node_id, "source_load")
+        op_c = fix.factory.execution.begin_operation(
+            fix.run("C").source_node_id, "source_load", coordination_token=leader_coordination_token(fix.factory, fix.run("C").run_id)
+        )
         fix.factory.execution.record_operation_call(
             op_c.operation_id,
             CallType.HTTP,
@@ -651,6 +690,7 @@ class TestGetOperationCallsWhereExactness:
             RawCallPayload({"url": "https://c.example.com"}),
             RawCallPayload({"ok": True}),
             latency_ms=10.0,
+            coordination_token=leader_coordination_token(fix.factory, fix.run("C").run_id),
         )
 
         calls = fix.factory.execution.get_operation_calls(op_b.operation_id)

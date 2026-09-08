@@ -35,6 +35,7 @@ from sqlalchemy import create_engine, insert, select
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
     CoordinationToken,
+    WorkerMembershipToken,
 )
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -197,7 +198,7 @@ def _seed_leased_item(
     now: datetime,
     lease_seconds: int = 300,
 ) -> str:
-    """Seed a LEASED item row directly (bypassing claim_ready for simplicity)."""
+    """Persist and claim one item as its registered lease owner."""
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 
     row_id = f"row-{token_id}"
@@ -227,7 +228,7 @@ def _seed_leased_item(
         PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
     repo.enqueue_ready(
-        run_id=RUN_ID,
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=lease_owner),
         token_id=token_id,
         row_id=row_id,
         node_id="transform-1",
@@ -235,7 +236,11 @@ def _seed_leased_item(
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    item = repo.claim_ready(run_id=RUN_ID, lease_owner=lease_owner, lease_seconds=lease_seconds)
+    item = repo.claim_ready(
+        member_token=WorkerMembershipToken(run_id=RUN_ID, worker_id=lease_owner),
+        lease_owner=lease_owner,
+        lease_seconds=lease_seconds,
+    )
     assert item is not None
     return item.work_item_id
 

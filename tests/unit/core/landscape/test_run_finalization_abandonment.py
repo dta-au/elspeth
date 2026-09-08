@@ -39,13 +39,8 @@ _LEADER_WORKER_ID = "worker:run-adr038:test"
 
 
 def _leader_token(setup: RecorderSetup) -> CoordinationToken:
-    """The epoch-1 token ``begin_run`` minted for the fixture's leader seat.
-
-    The sweep runs only on the FENCED finalize arm (ADR-038 review finding:
-    token-less finalizes like the web orphan reaper are unfenced and must
-    under-abandon), so every sweep test finalizes with this token.
-    """
-    return CoordinationToken(run_id=setup.run_id, worker_id=_LEADER_WORKER_ID, leader_epoch=1)
+    """Return the registered epoch-one leader authority created by the fixture."""
+    return setup.coordination_token
 
 
 def _setup_run_with_tokens(
@@ -72,12 +67,12 @@ def _setup_run_with_tokens(
     token_ids: list[str] = []
     for index in range(token_count):
         _row, token = setup.factory.data_flow.create_row_with_token(
-            setup.run_id,
             setup.source_node_id,
             index,
             {"value": index},
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         )
         token_ids.append(token.token_id)
     return setup, token_ids
@@ -105,9 +100,9 @@ def _reserve_effect_operation(setup: RecorderSetup, *, token_id: str, suffix: st
     setup.factory.execution.begin_node_state(
         token_id=token_id,
         node_id=sink_node_id,
-        run_id=setup.run_id,
         step_index=0,
         input_data={"effect": suffix},
+        member_token=leader_coordination_token(setup.factory, setup.run_id).membership,
     )
     members = resolve_sink_effect_members(
         setup.factory,
@@ -163,7 +158,12 @@ class TestAbandonmentSweepFires:
     def test_no_source_records_arm(self) -> None:
         setup = make_recorder_with_run(run_id="run-adr038", leader_worker_id=_LEADER_WORKER_ID)
         _row, token = setup.factory.data_flow.create_row_with_token(
-            setup.run_id, setup.source_node_id, 0, {"value": 0}, source_row_index=0, ingest_sequence=0
+            setup.source_node_id,
+            0,
+            {"value": 0},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(setup.factory, setup.run_id),
         )
 
         setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
@@ -186,11 +186,12 @@ class TestAbandonmentSweepFires:
         """A token with a completed outcome is decided — abandonment would contradict it."""
         setup, token_ids = _setup_run_with_tokens(lifecycle_state=RunSourceLifecycleState.LOADING, with_checkpoint=True)
 
-        setup.factory.data_flow.record_token_outcome(
+        setup.factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
+            coordination_token=_leader_token(setup),
         )
 
         setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
@@ -220,11 +221,12 @@ class TestAbandonmentSweepFires:
             with_checkpoint=True,
             token_count=1,
         )
-        setup.factory.data_flow.record_token_outcome(
+        setup.factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="e" * 64,
+            coordination_token=_leader_token(setup),
         )
         operation_id = _reserve_effect_operation(setup, token_id=token_ids[0], suffix="open")
 
@@ -249,12 +251,14 @@ class TestAbandonmentSweepFires:
         failed_id = _reserve_effect_operation(setup, token_id=token_ids[2], suffix="failed")
         pending_id = _reserve_effect_operation(setup, token_id=token_ids[3], suffix="pending")
         effectless_id = setup.factory.execution.begin_operation(
-            setup.run_id,
             setup.source_node_id,
             "source_load",
+            coordination_token=_leader_token(setup),
         ).operation_id
-        setup.factory.execution.complete_operation(completed_id, "completed", duration_ms=1.0)
-        setup.factory.execution.complete_operation(failed_id, "failed", duration_ms=2.0, error="bounded prior failure")
+        setup.factory.execution.complete_operation(completed_id, "completed", duration_ms=1.0, coordination_token=_leader_token(setup))
+        setup.factory.execution.complete_operation(
+            failed_id, "failed", duration_ms=2.0, error="bounded prior failure", coordination_token=_leader_token(setup)
+        )
         pending_at = datetime.now(UTC)
         with setup.db.write_connection() as conn:
             conn.execute(
@@ -308,11 +312,12 @@ class TestAbandonmentSweepFires:
         setup.factory.run_lifecycle.finalize_run(RunStatus.FAILED, coordination_token=_leader_token(setup))
 
         with pytest.raises(AuditIntegrityError, match="decided-plus-abandoned history is forbidden"):
-            setup.factory.data_flow.record_token_outcome(
+            setup.factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=token_ids[0], run_id=setup.run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
                 error_hash="e" * 64,
+                coordination_token=_leader_token(setup),
             )
 
         rows = _abandoned_rows(setup)
