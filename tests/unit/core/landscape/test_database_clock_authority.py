@@ -154,7 +154,10 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "5ea9883f9b58a904ca3a949d15685667bd1902d36b00849c6fe48d86ef088067"
+# +3 identities 2026-09-08 (3ab58f336, `elspeth abandon`): abandon.py's _resume_verdict,
+# abandon_leaderless_run and inspect_leaderless_run compare the leader lease; the literal
+# now holds 93 rows (counted), digest again re-derived by running the gate.
+_CLOCK_BOUNDARY_DIGEST = "fc948f2cbbf6566d2e85acf50cad18eced0450b28aff6fdb38161a65534a6a04"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -308,6 +311,9 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.claim_ready"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.recover_expired_leases"),
+        ("src/elspeth/engine/orchestrator/abandon.py", "_resume_verdict"),
+        ("src/elspeth/engine/orchestrator/abandon.py", "abandon_leaderless_run"),
+        ("src/elspeth/engine/orchestrator/abandon.py", "inspect_leaderless_run"),
         ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator.resume"),
     }
 )
