@@ -213,10 +213,10 @@ def test_new_attempt_state_witness_is_resolved_not_part_of_identity(
     factory.execution.begin_node_state(
         token_id=members[0].token_id,
         node_id=effect.sink_node_id,
-        run_id=effect.run_id,
         step_index=0,
         input_data={"ordinal": 0},
         attempt=1,
+        member_token=leader_coordination_token(factory, effect.run_id).membership,
     )
 
     result = factory.execution.sink_effects.finalize(
@@ -690,9 +690,9 @@ def test_failsink_finalization_requires_and_uses_exact_primary_linkage(
     factory.execution.begin_node_state(
         token_id=members[0].token_id,
         node_id=failsink_id,
-        run_id=primary.run_id,
         step_index=1,
         input_data={"ordinal": 0},
+        member_token=leader_coordination_token(factory, primary.run_id).membership,
     )
     identity = compute_pipeline_effect_identity(
         run_id=primary.run_id,
