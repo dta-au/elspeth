@@ -95,19 +95,23 @@ async def test_reverse_close_never_replaces_stale_retry_or_cancellation(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("two_failures", [False, True])
-async def test_reverse_close_propagates_integrity_after_closing_both_leases(two_failures: bool) -> None:
+async def test_reverse_close_propagates_integrity_after_closing_both_leases(two_failures: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     calls: list[str] = []
     child_error = AuditIntegrityError("child release integrity")
     parent_error = AuditIntegrityError("parent release integrity") if two_failures else OSError("parent release")
     child = _failing_lease("child", calls, child_error)
     parent = _failing_lease("parent", calls, parent_error)
     cancellation = asyncio.CancelledError()
+    logger_error = AuditIntegrityError("diagnostic integrity")
+    diagnostic = MagicMock(side_effect=logger_error)
+    monkeypatch.setattr(sessions, "_log_last_resort_diagnostic", diagnostic)
 
     with pytest.raises(BaseException) as caught:
         await sessions._close_fork_operation_leases(child, parent, cancellation)
 
     assert calls == ["child", "parent"]
     assert child.closed and parent.closed
+    diagnostic.assert_not_called()
     if two_failures:
         assert isinstance(caught.value, BaseExceptionGroup)
         assert caught.value.exceptions == (child_error, parent_error)

@@ -671,13 +671,15 @@ async def _close_fork_operation_leases(
                 primary.add_note(f"Fork lease reverse-close also failed with {type(close_error).__name__}.")
             elif first_close_error is None:
                 first_close_error = close_error
+    # These exceptions are the authoritative failure channel. Fallible logging
+    # must not replace them after both mandatory close attempts have finished.
+    if len(integrity_errors) == 1:
+        if integrity_errors[0] is primary:
+            raise integrity_errors[0]
+        raise integrity_errors[0] from primary
+    if integrity_errors:
+        raise BaseExceptionGroup("Fork lease cleanup integrity failures", integrity_errors) from primary
     try:
-        if len(integrity_errors) == 1:
-            if integrity_errors[0] is primary:
-                raise integrity_errors[0]
-            raise integrity_errors[0] from primary
-        if integrity_errors:
-            raise BaseExceptionGroup("Fork lease cleanup integrity failures", integrity_errors) from primary
         if first_close_error is not None:
             raise first_close_error
     finally:
