@@ -10,7 +10,10 @@ evidence used to repair them.
 This is a living engineering analysis of the 2026-09-08 remediation batch.
 The starting source revision is `e2b91f2a0`. Source links identify the affected
 modules; the named symbols and before/after descriptions remain useful when
-line numbers change. A repair marked pending is not a completed fix.
+line numbers change. Per-defect results below describe focused checks; the
+[final verification section](#final-verification-and-release-decision) records
+the integrated failures, their focused corrections, and the limits of the
+release decision.
 
 ## What the completed review establishes
 
@@ -66,7 +69,7 @@ and the legacy carry-forward branch. Tests now cover corrupt acknowledged
 evidence both with and without live demand, unsupported versions, broken
 artifact binding, and authoring round trips. The lane's final focused run
 passed 785 tests, followed by 53 passing source-demand tests after adding five
-shape-corruption cases. Integrated verification is pending.
+shape-corruption cases. See the final verification section for integration.
 This does not mean every incomplete review becomes an integrity exception:
 existing recognition of an incomplete review or mismatched acknowledgement
 hash can still create an explicit blocking review site. The repaired paths
@@ -94,8 +97,8 @@ admission from cleanup integrity. Independent inspection confirms defaulted
 removal of `registered_pairs`. The lifecycle lane implemented strict revocation
 with explicit `AuditIntegrityError` and preserved cleanup ordering. Its final
 fork/registry/guided-fork-service selection passed 235 tests, and the
-PostgreSQL reversed-pair contention proof passed. Integrated verification is
-pending.
+PostgreSQL reversed-pair contention proof passed. See final verification for
+the integrated PostgreSQL result and its correction.
 
 ### Guided conversion replaced an integrity exception with an HTTP outcome
 
@@ -116,8 +119,8 @@ the signal that the system's integrity policy requires to escape.
 source inspection identify the explicit `AuditIntegrityError` classification
 and replacement path. The repair retains settlement and cleanup while
 re-raising the original fatal exception. The session-routes selection passed
-107 focused tests and seven attribute/envelope tests. Integrated verification
-is pending.
+107 focused tests and seven attribute/envelope tests. See final verification
+for integration.
 
 ### Cleanup logging protected logger failures, not the captured cleanup failure
 
@@ -156,8 +159,8 @@ and must confirm that required peer cleanup still completes. The fork lane
 has implemented propagation after draining both leases; its focused module
 passed six tests, including
 `tests/unit/web/sessions/test_fork_dual_fence_route.py::test_reverse_close_propagates_integrity_after_closing_both_leases`
-with one and two fatal close failures. This is lane-level evidence; integrated
-verification is still pending. The final lifecycle lane also passed 39 guided
+with one and two fatal close failures. This is lane-level evidence; see final
+verification for integration. The final lifecycle lane also passed 39 guided
 cleanup tests and 20 archive secondary-failure tests. These distinguish
 cleanup-origin integrity failures from logger-origin failures and preserve
 both failures when more than one fatal operation fails.
@@ -182,8 +185,8 @@ cleanup failure does not repair that control-flow gap.
 source inspection agree on the `continue` preceding the re-raise. The lifecycle
 lane repaired propagation before retry while retaining lease cleanup and
 refusal to settle with stale authority. Its final 235-test selection includes
-fork cleanup and fence-loss regression coverage. Integrated verification is
-pending.
+fork cleanup and fence-loss regression coverage. See final verification for
+integration.
 
 ### Auto-title provider error handling also swallowed a database timeout
 
@@ -204,7 +207,7 @@ legitimately contain.
 adjacent defect while reviewing the auto-title block. It narrowed the
 provider-error handling to the provider operation and added database-write
 regressions for both `RuntimeError` and `TimeoutError`. The final 107-test
-session-routes selection passed. Integrated verification is pending.
+session-routes selection passed. See final verification for integration.
 
 ### Guided coverage treated a broken component index as unproven coverage
 
@@ -224,8 +227,8 @@ contract and a graph that legitimately does not establish the requirement.
 constructor contract and replaced optional lookup with direct indexing.
 `tests/unit/web/composer/guided/test_block_remediation.py::test_coverage_walk_rejects_missing_owned_component`
 covers success and branch paths. The lane reported 465 focused tests passing,
-then 24 passing tests after strengthening the regressions. Integrated
-verification is pending.
+then 24 passing tests after strengthening the regressions. See final
+verification for integration.
 
 ### Guided wire projection dropped valid schema fields from confirmable proposals
 
@@ -247,8 +250,8 @@ switched projection to the canonical parser.
 checks complete projected fields and confirmability;
 `::test_malformed_wire_field_cannot_make_a_proposal_confirmable` checks that
 invalid fields produce `contract_config_invalid` and prevent confirmation.
-Both are included in the guided lane results above. Integrated verification
-is pending.
+Both are included in the guided lane results above. See final verification
+for integration.
 
 ### Cleanup diagnostics fabricated provenance when exception formatting failed
 
@@ -267,7 +270,8 @@ formatting failed and that raw-message length and digest are unavailable.
 behavior. Its repair records the original and formatting exception classes
 and leaves raw digest and length `None`.
 `tests/unit/engine/orchestrator/test_cleanup_failure_ceremony.py::TestCleanupDoesNotMaskPendingException::test_unrepresentable_exception_records_an_explicit_marker`
-passed in the focused lane run. Broader and integrated verification is pending.
+passed in the focused lane run. The final engine selection passed 762 tests;
+see final verification for integration.
 
 ### A telemetry diagnostic could replace an already-audited LLM result
 
@@ -285,7 +289,8 @@ primary result or expose provider-controlled content through logging.
 **Evidence and repair status:** The engine lane replaced raw formatting with
 exception class and correlation fields.
 `tests/unit/plugins/clients/test_audited_llm_client.py::test_telemetry_failure_is_acknowledged_without_formatting_external_error`
-passed in the focused run. Broader and integrated verification is pending.
+passed in the focused run and is included in the final engine selection. See
+final verification for integration.
 
 ### A fatal final heartbeat could be latched after its last observer
 
@@ -303,8 +308,9 @@ the lifecycle has already passed its final check.
 **Evidence and repair status:** The engine lane added a fatal-latch check after
 mandatory teardown in fresh, resumed, and follower execution.
 `tests/unit/engine/orchestrator/test_cleanup_failure_ceremony.py::TestPartialResultCeremonySurvivesCleanupFailure::test_final_heartbeat_failure_reaches_caller_after_seat_release`
-passed through the real orchestrator. Broader and integrated verification is
-pending.
+passed through the real orchestrator. The final engine selection passed 762
+tests, with three additional resume-owner tests passing. See final
+verification for integration.
 
 ### Database exception containment ran before the live integrity classification
 
@@ -320,7 +326,8 @@ exception can be recognized as fatal elsewhere but suppressed here.
 
 **Evidence and repair status:** The engine lane corrected the ordering.
 `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestHeartbeatDegraded::test_late_registered_database_integrity_failure_is_not_diagnostic_loss`
-passed in the focused run. Broader and integrated verification is pending.
+passed in the focused run and is included in the final engine selection. See
+final verification for integration.
 
 ### Missing profile selection metadata became an unavailable profile
 
@@ -339,7 +346,7 @@ An explicit `None` selection and a missing required entry are different states.
 **Evidence and repair status:** The composer lane verified the paired
 construction and changed to required lookup. Both cases in
 `tests/unit/web/composer/test_planner_authoring_aids.py::test_profile_selection_distinguishes_explicit_none_from_corrupt_snapshot`
-passed. Integrated verification is pending.
+passed. See final verification for integration.
 
 ### Corrupt tool-error state silently erased the error code
 
@@ -357,8 +364,8 @@ not require suppressing corruption in the separate classification accessor.
 **Evidence and repair status:** The composer lane changed corrupt access to
 raise `FrameworkBugError` while retaining safe display behavior. Four cases in
 `tests/unit/web/composer/test_service.py::TestToolArgumentError::test_corrupt_private_code_cannot_silently_erase_audit_classification`
-passed, along with the 51-test protocol selection. Integrated verification is
-pending.
+passed, along with the 51-test protocol selection. See final verification for
+integration.
 
 ### Malformed checkpoint bytes escaped as ordinary decoding errors
 
@@ -379,7 +386,7 @@ the classification gap. The repair raises `AuditIntegrityError` with token/run
 context and preserves the decoding cause. The checkpoint and SQLCipher
 selection passed 125 tests, including
 `tests/unit/core/checkpoint/test_recovery.py::test_reconstruct_token_row_rejects_corrupt_envelope`.
-Integrated verification is pending.
+See final verification for integration.
 
 ### SQLCipher URL booleans silently changed configuration meaning
 
@@ -401,8 +408,8 @@ defect with explicit boolean parsing. Tests reject malformed boolean values
 before database creation and exercise real connection thread enforcement for
 accepted spellings. The 125-test storage result above includes
 `tests/unit/core/landscape/test_database_sqlcipher.py::TestSQLCipherCreateAndRead::test_malformed_boolean_query_rejected_before_database_creation`
-and `test_boolean_query_spelling_matches_sqlalchemy`. Integrated verification
-is pending.
+and `test_boolean_query_spelling_matches_sqlalchemy`. See final verification
+for integration.
 
 ### Core configuration depended upward on plugin implementations
 
@@ -423,7 +430,7 @@ recovered. The core lane independently confirmed the imports. It moved shared
 provider policy into a core-owned module, retained validation in both profile
 and plugin admission, and moved plugin-aware loading orchestration into the
 application layer. The profile/provider selection passed 135 tests; the
-configuration selection passed 390. Integrated verification is pending.
+configuration selection passed 390. See final verification for integration.
 
 ### Failed event persistence still allowed a live broadcast
 
@@ -441,7 +448,8 @@ the authoritative history.
 **Evidence and repair status:** The execution lane independently confirmed the
 path and changed it to propagate the persistence failure before broadcasting.
 `TestEventBusBridge.test_failed_event_persistence_never_broadcasts` passed in
-the initial focused run. Final lane and integrated verification are pending.
+the initial focused run; the final execution selection passed 574 tests. See
+final verification for integration.
 
 ### WebSocket error responses swallowed integrity failures
 
@@ -459,8 +467,8 @@ propagation to the server's failure handling.
 **Evidence and repair status:** The execution lane changed these paths to
 close and unsubscribe, then re-raise the original exception even if logging
 or socket close fails. The updated dangling-foreign-key regression passed;
-additional initial-load, idle-poll, and failing-logger cases are under test.
-Final lane and integrated verification are pending.
+additional initial-load, idle-poll, and failing-logger cases are included in
+the final 574-test execution selection. See final verification for integration.
 
 ### Artifact lookup confused operational failures with ordinary candidate rejection
 
@@ -479,8 +487,8 @@ behavior preserves the actual cause of the failed lookup.
 
 **Evidence and repair status:** The execution lane introduced private nominal
 exception types and made resolution failure an explicit chained
-`artifact_path_resolution_failed` 500 outcome. Final lane and integrated
-verification are pending.
+`artifact_path_resolution_failed` 500 outcome. The final execution selection
+passed 574 tests. See final verification for integration.
 
 ### A malformed present blob reference disappeared from proof resolution
 
@@ -495,8 +503,8 @@ resolution could not use the supplied reference.
 
 **Evidence and repair status:** The execution lane changed the path to raise
 a source-specific `MalformedBlobRefError` before proof processing while
-preserving the existing execution error routing. Final lane and integrated
-verification are pending.
+preserving the existing execution error routing. The final execution selection
+passed 574 tests. See final verification for integration.
 
 ### Session lease joining discarded task failures after cancellation
 
@@ -517,8 +525,8 @@ during coordinator review, not a separately counted original BLOCK. The
 repair propagates the task's original failure with context and groups
 simultaneous body and cleanup failures so neither is discarded. The complete
 51-test lease module passed, including
-`test_close_release_failure_survives_repeated_cancellation`. Integrated
-verification is pending.
+`test_close_release_failure_survives_repeated_cancellation`. See final
+verification for integration.
 
 ### Advisor retry handling masked internal bugs and exposed a tool-audit ordering gap
 
@@ -543,8 +551,8 @@ The original advisor exception now propagates after audit publication.
 `tests/unit/web/composer/test_service.py::TestComposeTimeout::test_early_advisor_internal_failure_preserves_completed_tool_audit`
 uses real SQLite state to check exception identity, persisted assistant/tool
 rows, and the current source state for three internal exception classes. The
-final advisor/service selection passed 254 tests. Integrated verification is
-pending.
+final advisor/service selection passed 254 tests. See final verification for
+integration.
 
 ### Smaller contract and diagnostic repairs
 
@@ -558,13 +566,19 @@ establish additional observed production incidents:
 | `source_inspection._redact_url_candidate` | Malformed URL authority could raise `ValueError` from a redactor documented not to raise. The path now returns an explicit redaction marker. | Source-inspection/tutorial selection: 161 tests passed. |
 | `source_inspection.observed_columns_from_path` | An unused helper swallowed every `OSError` into empty column evidence. The unused helper and its obsolete tests were removed. | Main composer selection: 268 tests passed. |
 | `accept_composition_proposal` | The auto-reject path caught every `ValueError` as an already-terminal proposal race. It now catches only the explicit `ProposalStateConflictError`; unrelated internal errors propagate. | The final 107-test session-routes selection includes terminal-race and internal-`ValueError` regression cases. |
+| Follower heartbeat ownership checks | A fatal heartbeat latch was checked only after coordination loss, permitting continued claims when only the fatal latch was set. Unconditional fatal checks now stop the owner. | Included in the final 762-test engine selection. |
+| Heartbeat thread entry point | Clock or logger failures could escape the daemon thread without reaching the fatal latch. The outer thread boundary now transports those failures to the owner. | Included in the final 762-test engine selection. |
+| Audit-export cleanup | A fatal orphan-marking error could skip private spool closure, and a cleanup diagnostic failure could replace a primary Tier-1 error. Mandatory closure and primary-error preservation now cover both paths. | Included in the final 762-test engine selection. |
+| `parse_completion_gates` | An arbitrary `Mapping` implementation could supply an owned persisted signoff envelope. Admission now accepts only the closed owned `dict`/`MappingProxyType` representations. | `test_noncanonical_mapping_cannot_supply_a_persisted_signoff`, included in the final 574-test execution selection. |
+| Schema-probe cleanup | A failing cleanup logger could replace the primary error. Secondary failures now attach safe exception notes without invoking that fragile logger. | `test_cleanup_failures_are_attached_to_primary_without_calling_a_fragile_logger`, included in the final 574-test execution selection. |
+| Execution `_on_pipeline_done` | Logging could fail before lease closure was scheduled. Diagnostics now run in tracked cleanup after exact lease closure, and shutdown can surface their failure. | `test_done_callback_logger_failure_is_tracked_after_exact_lease_close`, included in the final 574-test execution selection. |
 
 ## Blocks that require evidence or policy correction
 
 Some recovered rationales explicitly stop short of identifying a runtime bug.
 These cases remain distinct from the confirmed failures above:
 
-| Finding | What remains to establish |
+| Finding | Evidence requested by the judge |
 | --- | --- |
 | `CompositionState._validate_with_probe_cache` aggregation exception handling | Whether the blocking aggregation validator runs on every path for which advisory parsing abstains; cite and exercise that path. |
 | `_parse_template_names` and `_validate_prompt_template_variable_bindings` | Whether malformed templates are rejected at admission before the advisory analysis can return no result. |
@@ -578,6 +592,10 @@ These cases remain distinct from the confirmed failures above:
 A weak explanation must be corrected with verifiable source and regression
 evidence. It must not be strengthened by inventing a control, relabeling
 internal data as external, or changing clear code solely to avoid a finding.
+The remediation lanes supplied amended explanations and focused evidence for
+the legitimate cases. Those explanations still await fresh judge adjudication;
+the table records the original evidence request, not a claim that the agent's
+amendment has been approved.
 
 ## Confirmed deferred findings at the end-of-day pause
 
@@ -594,11 +612,45 @@ All three are in
 | `elspeth-4844c270fa` | Lease acquisition/adoption cancellation paths reduce operation errors to notes while propagating cancellation. The operation failure itself is not preserved as a propagated exception. | Deferred; review exception priority and test cancellation combined with acquisition/adoption failure. |
 | `elspeth-fa0e13545b` | `_restore_archive_current` can discard a secondary fatal failure during archive recovery. | Deferred; preserve the original and secondary failures and test the combined path. |
 
-## Verification snapshot at the documentation checkpoint
+## Final verification and release decision
 
-These are completed lane selections, not a deduplicated test total or a claim
-that the integrated release is green. Some selections overlap. A pending
-integrated check below does not negate the focused evidence recorded above.
+The first frozen integrated run at `2aaa38fe7` finished with **48,721 passed,
+21 failed, 79 skipped, and six expected failures** in the default selection
+(exit 1). The full PostgreSQL selection finished with **303 passed and one
+failed** (exit 1). Neither run was green.
+
+The operator then explicitly waived another full-suite run and authorized
+merge after focused correction and verification of every failed case. The
+following corrections changed tests or the test-policy scanner, with no
+production-code changes after the frozen run. Focused counts overlap and must
+not be added to produce a unique test total.
+
+| Failure group | Correction and focused result |
+| --- | --- |
+| Native line-only writer pins | Refreshed 107 writer pins using the native mechanism; 16 focused tests passed. |
+| Configuration-loading parity | The scanner missed six rejection sites moved into `config_loading`; updated scanner coverage and three mock specifications. Twenty-one focused tests passed. |
+| TS02 heartbeat test double | Added the newly required method to the fake heartbeat contract. The failed case passed. |
+| Guided schema fixture | Corrected invalid `mode: declared` to the supported `fixed` mode. Nineteen focused tests passed. |
+| Completion-parser lint expectations | Updated obsolete R5 expectations to the repaired parser. Thirty-four focused tests passed. |
+| PostgreSQL fence-loss expectation | Updated the test to expect the group retaining both fence-loss failures. The coordinator's repeat on the exact integration state passed: one test, exit 0. |
+
+All 21 default-suite failures have therefore been corrected and passed in
+focused selections, and the failed PostgreSQL case passed its integrated
+rerun. The corrections are committed at `aaa9ac065`; production source is
+unchanged from the initial frozen run. The full default and PostgreSQL suites
+have **not** been
+rerun after those corrections. The release decision relies on the completed
+broad runs, the focused correction results, and the operator's explicit
+waiver; it is not a claim that the final tree passed a full-suite rerun.
+
+The all-rules lint inventory changed from 1,834 findings before remediation
+to 1,946 afterward, both exit 1. Most of the increase is signature-binding
+drift from the source changes. The L1 layering findings are gone. No new
+signing was performed, and amended suppression explanations still require
+the operator/judge workflow.
+
+The completed lane checks below provide additional focused evidence. They
+overlap each other and the integrated selections.
 
 | Area | Completed focused evidence |
 | --- | --- |
@@ -610,10 +662,12 @@ integrated check below does not negate the focused evidence recorded above.
 | Session lifecycle and registry | 235 fork/registry/service tests, 39 guided cleanup tests, 20 archive tests, and one PostgreSQL contention proof passed. |
 | Session routes | 107 focused tests and seven attribute/envelope tests passed; boundary gates passed. |
 | Coordinator lease-join repair | 51 tests passed in the lease module. |
+| Engine and plugin cleanup, heartbeat, telemetry | 762 focused tests and three additional resume-owner tests passed. |
+| Execution, artifacts, WebSocket, proof and schema cleanup | 574 focused tests passed. |
 
-Whole-tree integrated tests, the full PostgreSQL selection, and a fresh
-signature-drift census remain coordinator-owned. No proposed replacement
-justification in this document is a fresh judge approval.
+No proposed replacement justification in this document is a fresh judge
+approval. The three deferred findings above remain open regardless of the
+merge decision.
 
 ## What this review adds to ordinary testing
 
