@@ -337,8 +337,6 @@ def test_arg_error_payload_factory_strips_hostile_pydantic_loc_and_message() -> 
 
 
 def test_tool_argument_error_code_still_reads_constructed_instances() -> None:
-    """The redaction-safety fallback (missing slot -> None, ratified by
-    TestToolArgumentError::test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks)
-    must not eat legitimately constructed codes."""
+    """Legitimately constructed audit classifications survive projection."""
     exc = ToolArgumentError(argument="pipeline", expected="a mapping", actual_type="str", code="SCHEMA_VALIDATION")
     assert exc.code == "SCHEMA_VALIDATION"

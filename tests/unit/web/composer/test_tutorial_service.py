@@ -206,6 +206,54 @@ def test_launch_blocker_names_empty_transforms_distinctly() -> None:
     assert "no transform" in detail.lower()
 
 
+@pytest.mark.parametrize("options", [{}, {"profile": None}, {"profile": "other-profile"}])
+def test_launch_blocker_refuses_missing_or_wrong_profile(options: dict[str, object]) -> None:
+    from unittest.mock import MagicMock
+
+    from elspeth.web.catalog.protocol import CatalogService
+    from elspeth.web.composer.state import CompositionState, NodeSpec, OutputSpec, PipelineMetadata, SourceSpec
+    from elspeth.web.dependencies import create_catalog_service
+    from elspeth.web.plugin_policy import WebPluginPolicy
+    from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+    from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+
+    snapshot = PluginAvailabilitySnapshot.for_trained_operator(create_catalog_service())
+    state = CompositionState(
+        sources={"source": SourceSpec(plugin="csv", on_success="in", options={}, on_validation_failure="discard")},
+        nodes=tuple(
+            NodeSpec(
+                id=f"n{index}",
+                node_type="transform",
+                plugin=plugin,
+                input="in",
+                on_success="out",
+                on_error="discard",
+                options=options if plugin == "llm" else {},
+                condition=None,
+                routes=None,
+                fork_to=None,
+                branches=None,
+                policy=None,
+                merge=None,
+            )
+            for index, plugin in enumerate(("web_scrape", "llm", "field_mapper"))
+        ),
+        edges=(),
+        outputs=(OutputSpec(name="out", plugin="json", options={}, on_write_failure="discard"),),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    blocker = _tutorial_launch_blocker(
+        state=state,
+        policy=MagicMock(spec=WebPluginPolicy),
+        snapshot=snapshot,
+        tutorial_profile="tutorial-default",
+        profile_registry=MagicMock(spec=OperatorProfileRegistry),
+        catalog=MagicMock(spec=CatalogService),
+    )
+    assert blocker == ("tutorial_profile_unavailable", "The saved tutorial pipeline does not select the configured tutorial profile.")
+
+
 def test_launch_blocker_admits_this_deployments_control_transforms() -> None:
     """A control-required deployment can still run the tutorial.
 

@@ -60,6 +60,29 @@ def _trained_view() -> tuple[PolicyCatalogView, PluginAvailabilitySnapshot]:
     return PolicyCatalogView.for_trained_operator(catalog, snapshot), snapshot
 
 
+@pytest.mark.parametrize("missing_selection", [False, True])
+def test_profile_selection_distinguishes_explicit_none_from_corrupt_snapshot(tmp_path: Path, missing_selection: bool) -> None:
+    from dataclasses import replace
+
+    from elspeth.web.plugin_policy.models import PluginId
+
+    view, snapshot = _profile_view(tmp_path)
+    llm_id = PluginId("transform", "llm")
+    selections = tuple(
+        (plugin_id, None if plugin_id == llm_id else alias)
+        for plugin_id, alias in snapshot.selected_profile_aliases
+        if not (missing_selection and plugin_id == llm_id)
+    )
+    altered = replace(snapshot, selected_profile_aliases=selections)
+    altered_view = PolicyCatalogView(view._full, altered, view._profiles)
+    if missing_selection:
+        with pytest.raises(KeyError) as caught:
+            planner_authoring_aids._usable_llm_profile_alias(altered_view)
+        assert caught.value.args == (llm_id,)
+    else:
+        assert planner_authoring_aids._usable_llm_profile_alias(altered_view) == dict(snapshot.usable_profile_aliases)[llm_id][0]
+
+
 def _compiler_manager_with_llm_source() -> Any:
     """Required-policy registry while production source discovery stays off."""
     from elspeth.plugins.infrastructure.discovery import create_dynamic_hookimpl

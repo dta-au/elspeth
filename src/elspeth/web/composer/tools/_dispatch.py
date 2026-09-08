@@ -23,6 +23,7 @@ from dataclasses import replace
 from typing import Any, Final, cast
 
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import ValidationError
 from sqlalchemy import Engine
 
 from elspeth.contracts.freeze import deep_freeze, deep_thaw
@@ -444,7 +445,7 @@ def _closed_root_schema(tool_name: str) -> dict[str, Any]:
     return schema
 
 
-def _schema_error_path(error: Any) -> str:
+def _schema_error_path(error: ValidationError) -> str:
     parts = ["arguments"]
     for segment in error.absolute_path:
         if isinstance(segment, int):
@@ -456,19 +457,21 @@ def _schema_error_path(error: Any) -> str:
     return ".".join(parts)
 
 
-def _json_type_label(value: Any) -> str:
+def _json_type_label(value: str | list[str]) -> str:
+    """Render the declared schema's type union without coercing its members."""
     if isinstance(value, str):
         return value
-    if isinstance(value, Iterable):
-        return " or ".join(str(item) for item in value)
-    return str(value)
+    return " or ".join(value)
 
 
-def _schema_error_summary(error: Any) -> str:
+def _schema_error_summary(error: ValidationError) -> str:
     path = _schema_error_path(error)
-    if error.validator == "required" and isinstance(error.instance, Mapping):
-        required = tuple(str(item) for item in error.validator_value)
-        missing = tuple(item for item in required if item not in error.instance)
+    # jsonschema emits a required failure only for an object instance. The
+    # required names come from our meta-validated tool declaration schema.
+    if error.validator == "required":
+        required = tuple(cast(list[str], error.validator_value))
+        instance = cast(Mapping[str, Any], error.instance)
+        missing = tuple(item for item in required if item not in instance)
         if missing:
             missing_paths = tuple(f"{path}.{item}" for item in missing)
             plural = "properties" if len(missing) != 1 else "property"
@@ -476,7 +479,7 @@ def _schema_error_summary(error: Any) -> str:
     if error.validator == "additionalProperties":
         return f"{path} contains unsupported properties"
     if error.validator == "type":
-        return f"{path} must be of type {_json_type_label(error.validator_value)}"
+        return f"{path} must be of type {_json_type_label(cast(str | list[str], error.validator_value))}"
     if error.validator == "enum":
         return f"{path} must be one of the declared values"
     return f"{path} violates schema rule '{error.validator}'"
@@ -486,7 +489,7 @@ def _schema_argument_model_name(tool_name: str) -> str:
     return "".join(part.capitalize() for part in tool_name.split("_")) + "ArgumentsModel"
 
 
-def _schema_tool_argument_error(tool_name: str, error: Any) -> ToolArgumentError:
+def _schema_tool_argument_error(tool_name: str, error: ValidationError) -> ToolArgumentError:
     return ToolArgumentError(
         argument=f"{tool_name} arguments",
         expected=f"object conforming to {_schema_argument_model_name(tool_name)} ({_schema_error_summary(error)})",

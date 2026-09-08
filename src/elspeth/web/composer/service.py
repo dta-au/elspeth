@@ -192,7 +192,7 @@ from elspeth.web.composer.required_controls import wire_required_controls
 from elspeth.web.composer.skills import assert_skill_hash_unchanged_on_disk
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
-    parse_legacy_source_data_contract_fields,
+    parse_source_data_contract_accepted_fields,
     sample_header_for_source,
 )
 from elspeth.web.composer.state import CompositionState, NodeSpec, ValidationSummary
@@ -1774,9 +1774,7 @@ async def _surfaced_evidence_keys(
     the rows bind to is immutable. A pending-only check would therefore read
     an already-resolved site as still owed and recreate it against stale
     historical state — which the writer boundary rejects outright once the
-    placeholder has been consumed. The deliberate exception is a v1
-    source_data_contract card: it proves the old consequence was shown, not
-    the corrected v2 consequence, so migration must surface current evidence.
+    placeholder has been consumed.
     """
 
     events = await sessions_service.list_interpretation_events(
@@ -1788,16 +1786,10 @@ async def _surfaced_evidence_keys(
     for event in events:
         if event.affected_node_id is None or event.user_term is None or event.kind is None:
             continue
-        if (
-            event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
-            and event.llm_draft is not None
-            and parse_legacy_source_data_contract_fields(event.llm_draft) is not None
-        ):
-            # A v1 row is durable evidence that the old card was surfaced, but
-            # it is not evidence that this state's corrected v2 consequence
-            # was shown. Let the repair surfacer supersede a pending v1 card or
-            # mint a current card beside resolved v1 history.
-            continue
+        if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT:
+            if event.llm_draft is None:
+                raise AuditIntegrityError("surfaced source data contract evidence requires its canonical draft")
+            parse_source_data_contract_accepted_fields(event.llm_draft)
         evidence.add((event.affected_node_id, event.user_term, event.kind))
     return frozenset(evidence)
 
@@ -6733,42 +6725,47 @@ class ComposerServiceImpl:
                 # the completed audit prefix.
                 early_advisor_message_count = len(llm_messages)
                 early_checkpoint_deadline_expired = False
-                if (
-                    not _cancellation_requested.is_set()
-                    and dispatch_result.advisor_compose_timeout is None
-                    and dispatch_result.advisor_failure is None
-                ):
-                    try:
-                        await self._maybe_run_early_checkpoint(
-                            state=dispatch_result.state,
-                            prev_state=_state,
-                            session_id=session_id,
-                            llm_messages=llm_messages,
-                            recorder=recorder,
-                            progress=progress,
-                            deadline=deadline,
-                        )
-                    except _AdvisorCheckpointComposeDeadlineExpired:
-                        # P4 still owns publication of the completed tool turn.
-                        # The driver converts this signal after persistence and
-                        # after plugin/cancellation primacy checks.
-                        early_checkpoint_deadline_expired = True
-                early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
-                persist_result = await self._persist_turn_audit(
-                    tool_outcomes=dispatch_result.tool_outcomes,
-                    decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
-                    assistant_message=dispatch_result.assistant_message,
-                    raw_assistant_content=dispatch_result.raw_assistant_content,
-                    assistant_tool_calls=dispatch_result.assistant_tool_calls,
-                    crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
-                    session_id=session_id,
-                    session_operation_context=session_operation_context,
-                    current_state_id=_current_state_id,
-                    persisted_tool_call_turn=_persisted_tool_call_turn,
-                    persisted_assistant_message_id=_persisted_assistant_message_id,
-                    persisted_assistant_content=_persisted_assistant_content,
-                    advisor_repair_context_introduced=_advisor_repair_context_introduced,
-                )
+                try:
+                    if (
+                        not _cancellation_requested.is_set()
+                        and dispatch_result.advisor_compose_timeout is None
+                        and dispatch_result.advisor_failure is None
+                    ):
+                        try:
+                            await self._maybe_run_early_checkpoint(
+                                state=dispatch_result.state,
+                                prev_state=_state,
+                                session_id=session_id,
+                                llm_messages=llm_messages,
+                                recorder=recorder,
+                                progress=progress,
+                                deadline=deadline,
+                            )
+                        except _AdvisorCheckpointComposeDeadlineExpired:
+                            # The driver converts this signal after persistence
+                            # and after plugin/cancellation primacy checks.
+                            early_checkpoint_deadline_expired = True
+                finally:
+                    # The tool batch already ran. Its audit must be persisted
+                    # even when an internal advisor failure unwinds this turn.
+                    # A successful tool remains successful; the separate
+                    # checkpoint failure propagates after this mandatory work.
+                    early_advisor_context_introduced = len(llm_messages) > early_advisor_message_count
+                    persist_result = await self._persist_turn_audit(
+                        tool_outcomes=dispatch_result.tool_outcomes,
+                        decoded_args_by_call_id=dispatch_result.decoded_args_by_call_id,
+                        assistant_message=dispatch_result.assistant_message,
+                        raw_assistant_content=dispatch_result.raw_assistant_content,
+                        assistant_tool_calls=dispatch_result.assistant_tool_calls,
+                        crash_pending=(dispatch_result.plugin_crash is not None or dispatch_result.advisor_failure is not None),
+                        session_id=session_id,
+                        session_operation_context=session_operation_context,
+                        current_state_id=_current_state_id,
+                        persisted_tool_call_turn=_persisted_tool_call_turn,
+                        persisted_assistant_message_id=_persisted_assistant_message_id,
+                        persisted_assistant_content=_persisted_assistant_content,
+                        advisor_repair_context_introduced=_advisor_repair_context_introduced,
+                    )
                 return (
                     dispatch_result,
                     persist_result,
@@ -8179,10 +8176,10 @@ class ComposerServiceImpl:
 
         Reuses :meth:`_call_advisor_with_audit` so the checkpoint shares the
         same audited, model-distinct advisor path as the LLM-initiated hint.
-        The call is retried up to ``attempts`` times; any exception (the call
-        core re-raises typed LLM errors — timeout, auth, transport, malformed)
-        is treated as *unavailable* and converted to a non-raising verdict with
-        ``ok=False``. Callers decide degrade (early) vs fail-closed (end).
+        The call retries declared provider failures (timeout, auth, transport,
+        malformed) up to ``attempts`` times and converts exhaustion to an
+        explicit ``ok=False`` verdict. Internal failures propagate unchanged.
+        Callers decide degrade (early) vs fail-closed (end).
 
         ``blocking`` is True iff the guidance is a FLAGGED sign-off; a leading
         ``CLEAN`` (case-insensitive) is non-blocking. ``session_id`` is part of
@@ -8235,6 +8232,7 @@ class ComposerServiceImpl:
             advisor_review_state=advisor_review_state,
         )
         attempts = 2  # bounded retry; the underlying call wraps its own timeout
+        provider_failures: tuple[type[Exception], ...] = (TimeoutError, ConnectionError, *advisor_provider_failure_types())
         last_exc: Exception | None = None
         last_response_unparseable = False
         call_arguments: dict[str, Any] = arguments
@@ -8265,10 +8263,9 @@ class ComposerServiceImpl:
                         recorder=recorder,
                         timeout=remaining,
                     )
-            except Exception as exc:
-                # Convert-to-verdict (non-raising): the call core re-raises
-                # typed LLM errors (timeout, auth, transport, malformed); a
-                # checkpoint must degrade rather than crash the compose loop.
+            except provider_failures as exc:
+                # Only declared provider failures become retryable verdicts.
+                # Audit failures and defects in controlled code must propagate.
                 # The raw exception is retained only to CLASSIFY the failure
                 # below (transport vs malformed) — never to render user text.
                 last_exc = exc
@@ -8304,12 +8301,12 @@ class ComposerServiceImpl:
         # Bounded retry exhausted. The call core re-raises typed LLM errors, so
         # classify the LAST exception into a failure CLASS (D13/P5.3): a
         # timeout/transport/auth/rate-limit outage is UNAVAILABLE, while a
-        # parse/validation/shape failure (or ANY unrecognised error) is
+        # admitted malformed response or other declared provider failure is
         # MALFORMED. Both classes terminal-block identically — the class is
         # read only to pick honest user-facing WORDING at the END gate and the
         # telemetry verdict label (elspeth-25f7b757e7 A4: an earlier design's
         # audited unavailable "escape" at budget exhaustion no longer exists).
-        # Unknown -> MALFORMED keeps the wording conservative — a
+        # Ambiguous provider failures -> MALFORMED keeps the wording conservative — a
         # goal-pressured model emitting garbage is described as malformed, not
         # as an outage. The raw exception is classified ONLY into
         # ``failure_class`` (an enum-ish literal): ``findings_text`` carries no
@@ -8341,7 +8338,7 @@ class ComposerServiceImpl:
         if last_exc is not None and (isinstance(last_exc, _unavailable_types) or type(last_exc).__name__ in _unavailable_names):
             failure_class = "unavailable"
         else:
-            # Parse/validation/shape errors AND any unrecognised exception class
+            # Malformed responses and other admitted provider exception classes
             # (including last_exc is None, which should be unreachable after a
             # bounded-retry loop) fail closed as MALFORMED.
             failure_class = "malformed"
@@ -9089,7 +9086,7 @@ class AdvisorCheckpointVerdict:
     # pre-scan arm; the reply parser never sets it.
     repair_unactionable: bool = False
     # P5.3/D13: distinguishes the two ``ok=False`` failure CLASSES.
-    # ``_run_advisor_checkpoint`` collapses every exception to ``ok=False``,
+    # ``_run_advisor_checkpoint`` maps declared provider failures to ``ok=False``,
     # so ``(ok, blocking)`` alone cannot tell a malformed/parse failure from
     # a transport outage. Both classes terminal-block identically at the END
     # gate; the class is read in exactly two places, and neither is a gate
@@ -9539,7 +9536,7 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
         if remaining:
             candidate["additional_fields_withheld"] = remaining
         else:
-            candidate.pop("additional_fields_withheld", None)
+            del candidate["additional_fields_withheld"]
         if len(str(candidate)) > _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS:
             break
         projection = candidate
@@ -9556,7 +9553,7 @@ def _render_schema_for_advisor(raw_schema: object) -> str:
             if remaining:
                 candidate[withheld_key] = remaining
             else:
-                candidate.pop(withheld_key, None)
+                del candidate[withheld_key]
             if len(str(candidate)) > _ADVISOR_SUMMARY_SCHEMA_VALUE_MAX_CHARS:
                 break
             projection = candidate

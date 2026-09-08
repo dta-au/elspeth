@@ -913,7 +913,9 @@ def _usable_llm_profile_alias(catalog: PolicyCatalogView, *, kind: PluginKind = 
     )
     if llm_id is None:
         return None
-    selected = dict(snapshot.selected_profile_aliases).get(llm_id)
+    # Availability construction records a selection (possibly None) for
+    # every profiled plugin. A missing pair is an inconsistent snapshot.
+    selected = dict(snapshot.selected_profile_aliases)[llm_id]
     if selected is not None:
         return selected
     return dict(snapshot.usable_profile_aliases)[llm_id][0]

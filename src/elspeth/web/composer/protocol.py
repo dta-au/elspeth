@@ -36,7 +36,7 @@ from elspeth.contracts.composer_audit import ComposerToolInvocation
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.composer_llm_audit import ComposerLLMCall
 from elspeth.contracts.composer_progress import ComposerProgressReason, ComposerProgressSink
-from elspeth.contracts.errors import FailedTurnMetadata
+from elspeth.contracts.errors import FailedTurnMetadata, FrameworkBugError
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.execution.schemas import ValidationResult
 from elspeth.web.secrets.wiring_policy import SecretWiringRuleSettings
@@ -1042,8 +1042,9 @@ class ToolArgumentError(Exception):
     composed on every read from private canonical values. Their data
     descriptors absorb deliberate ``BaseException.__setattr__`` writes
     instead of trusting reflected public storage. Private backing slots
-    are themselves revalidated on every read, with fixed fallbacks when
-    missing, malformed, or outside the closed vocabulary. The class rejects
+    are themselves revalidated on every read. Display text has fixed
+    fallbacks, while corrupt classification codes raise a framework error:
+    omitting a code would lose the failure's audit classification. The class rejects
     subclassing so a hostile override cannot replace those projections.
     Construction never retains an LLM-supplied value. The ``__cause__``
     chain remains available to in-process diagnostics, but serializers
@@ -1193,20 +1194,12 @@ class ToolArgumentError(Exception):
         try:
             value = BaseException.__getattribute__(self, "_safe_code")
         except AttributeError:
-            # Fail-SAFE, not fail-closed, by ratified design: like the sibling
-            # ``argument``/``expected``/``actual_type`` properties, a missing
-            # or tampered backing slot degrades to the fixed safe constant so
-            # a bypass-constructed or attribute-stripped instance can never
-            # render attacker-controllable content — and never turns the
-            # arg-error rendering path into a crash mid-request. Pinned by
-            # TestToolArgumentError::
-            # test_private_backing_missing_or_wrong_typed_uses_fixed_fallbacks.
-            return None
-        return (
-            value
-            if type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _TOOL_ARGUMENT_ERROR_CODES
-            else None
-        )
+            raise FrameworkBugError("ToolArgumentError classification code is missing") from None
+        if value is None or (
+            type(value) is str and len(value) <= _MAX_TOOL_ARGUMENT_DIAGNOSTIC_CHARS and value in _TOOL_ARGUMENT_ERROR_CODES
+        ):
+            return value
+        raise FrameworkBugError("ToolArgumentError classification code is invalid")
 
     @code.setter
     def code(self, value: object) -> None:
