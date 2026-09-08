@@ -1398,6 +1398,23 @@ def _validate_options(value: object, path: str) -> tuple[tuple[str, ...] | None,
     return tuple(option_ids), None
 
 
+@trust_boundary(
+    tier=3,
+    source="one externally derived sample row from an inspect-and-confirm wire payload",
+    source_param="sample",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error for a non-mapping sample or non-JSON contents, and None otherwise; "
+        "accepts frozen replay mappings without coercing a scalar or sequence into a row"
+    ),
+    non_raising=True,
+)
+def _validate_inspect_sample(sample: object, path: str) -> str | None:
+    if not isinstance(sample, Mapping):
+        return f"{path} must be a mapping"
+    return _public_json_error(sample, path)
+
+
 def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
     observed, error = _exact_nested_mapping(payload["observed"], frozenset({"columns", "samples", "warnings"}), "payload.observed")
     if error is not None:
@@ -1410,9 +1427,7 @@ def _validate_inspect_payload(payload: Mapping[str, Any]) -> str | None:
         return error
     assert samples is not None
     for index, sample in enumerate(samples):
-        if not isinstance(sample, Mapping):
-            return f"payload.observed.samples[{index}] must be a mapping"
-        if (error := _public_json_error(sample, f"payload.observed.samples[{index}]")) is not None:
+        if (error := _validate_inspect_sample(sample, f"payload.observed.samples[{index}]")) is not None:
             return error
     return _current_string_sequence(observed["warnings"], "payload.observed.warnings")[1]
 

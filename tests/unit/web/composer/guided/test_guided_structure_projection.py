@@ -429,12 +429,10 @@ _BARRIER_CATALOG_PLUGIN_IDS = {
 _OBSERVED_OUTPUT_OPTIONS: dict[str, Any] = {"schema": {"mode": "observed"}}
 _DECLARED_OUTPUT_OPTIONS: dict[str, Any] = {
     "schema": {
-        "mode": "declared",
-        # BOTH authored field forms in one fixture. ``FieldDefinition.parse``
-        # SKIPS a spec it cannot read (``emitters._wire_schema`` catches the
-        # ValueError and continues), so a fixture authoring only a partial dict
-        # would project ``fields: []`` and prove exactly what the empty
-        # observed block already proves.
+        "mode": "fixed",
+        # Both authored field forms in a valid canonical schema. An invalid
+        # mode or field declaration projects no parsed fields and would make
+        # this round-trip proof vacuous, like the observed block above.
         "fields": [
             {"name": "name", "type": "str", "required": True, "nullable": False},
             "amount: int",

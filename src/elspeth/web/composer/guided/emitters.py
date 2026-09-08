@@ -26,7 +26,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.contracts.schema import FieldDefinition
+from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.catalog.knob_schema import KnobSchema
 from elspeth.web.composer._producer_resolver import source_producer_id
@@ -578,38 +578,37 @@ def build_step_4_wire_turn(
 
 @observation_boundary(
     tier=3,
-    source="composer-authored node/output plugin options (free-form Tier-3 payload, never schema-validated by the composer)",
+    source="composer-authored output plugin options, including an absent or malformed schema declaration",
     source_param="options",
     suppresses=("R1", "R5"),
     invariant=(
-        "observes only; returns the weakest honest business-schema projection "
-        "('observed' mode, empty field/name lists) for any option shape it "
-        "cannot read, and never raises on a malformed options payload"
+        "observes only; projects field definitions through the canonical schema parser and omits the "
+        "field list when schema parsing rejects it; independent CompositionState validation records "
+        "invalid schema declarations as blockers rather than permitting confirmation"
     ),
 )
 def _wire_schema(options: Mapping[str, Any]) -> _WireBusinessSchema:
     """Project only the business schema, never adjacent path/secret options.
 
-    ``options`` is a ``NodeSpec``/``OutputSpec`` ``options`` mapping: free-form
-    plugin configuration authored through the composer (planner tool calls or
-    the schema_form), which the composer stores verbatim and never validates
-    against a plugin schema — the plugin does that at execution time. So every
-    read here is a Tier-3 boundary read, not a defensive read of owned state.
+    The candidate's plugin options remain externally authored, including on
+    invalid proposals. Use the same schema parser as CompositionState's schema
+    syntax validation so supported field spellings cannot disappear from review.
+    Invalid schemas contribute no parsed fields here; the wire turn separately
+    carries validation blockers and derives ``can_confirm`` from that validation.
     """
 
     raw = options.get("schema", options.get("schema_config", {}))
     schema = raw if isinstance(raw, Mapping) else {}
     fields: list[_WireSchemaField] = []
-    raw_fields = schema.get("fields")
-    if isinstance(raw_fields, Sequence) and not isinstance(raw_fields, str | bytes):
-        for field in raw_fields:
-            if not isinstance(field, str | Mapping):
-                continue
-            try:
-                parsed = FieldDefinition.parse(field)
-            except ValueError:
-                continue
-            fields.append(cast(_WireSchemaField, parsed.to_dict()))
+    try:
+        parsed = SchemaConfig.from_dict(schema)
+    except ValueError:
+        # Presentation does not turn a rejected declaration into valid fields.
+        # build_step_4_wire_turn publishes the separate validation failure.
+        pass
+    else:
+        if parsed.fields is not None:
+            fields = [cast(_WireSchemaField, field.to_dict()) for field in parsed.fields]
 
     def names(key: str) -> list[str]:
         value = schema.get(key)
