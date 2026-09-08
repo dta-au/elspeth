@@ -416,18 +416,23 @@ def test_profiled_s3_runtime_uses_private_binding_only_for_boto_call(tmp_path: P
     assert executable_key not in persisted_projection
 
 
-def test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls(tmp_path: Path) -> None:
+def test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls(tmp_path: Path, request: pytest.FixtureRequest) -> None:
     """Custody NFR (ADR-036, elspeth-cd0f6a6cd9): a profiled Textract run must
     persist ZERO call records containing the operator bucket literal."""
     import yaml
 
+    from elspeth.contracts import NodeType
     from elspeth.contracts.call_data import RawCallPayload
+    from elspeth.contracts.coordination import WorkerMembershipToken
     from elspeth.contracts.freeze import deep_thaw
+    from elspeth.contracts.scheduler import TokenWorkItem
     from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
     from elspeth.plugins.transforms.aws.textract_document_analysis import AWSTextractDocumentAnalysis
     from elspeth.testing import make_pipeline_row
     from elspeth.web.plugin_policy.compiler import compile_web_plugin_policy
     from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry, RuntimeWebPluginConfig
+    from tests.fixtures.factories import make_context, make_token_info
+    from tests.fixtures.landscape import claim_test_work_item, make_recorder_with_run, register_test_node
 
     private_bucket = "operator-private-bucket-marker"
     private_prefix = "operator-private-prefix-marker"
@@ -577,14 +582,42 @@ def test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls(tmp_p
         def __init__(self) -> None:
             self.calls: list[dict[str, object]] = []
 
-        def allocate_call_index(self, state_id: str) -> int:
-            del state_id
+        def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+            assert state_id == "state-1"
+            assert member_token == member
+            assert work_item == item
             return len(self.calls)
 
         def record_call(self, **kwargs: object) -> SimpleNamespace:
             self.calls.append(kwargs)
             return SimpleNamespace(id=f"call-{len(self.calls)}")
 
+    setup = make_recorder_with_run(run_id="run-1", source_node_id="source")
+    request.addfinalizer(setup.db.close)
+    register_test_node(setup.data_flow, setup.run_id, "textract_1", node_type=NodeType.TRANSFORM, plugin_name=transform.name)
+    row, token = setup.data_flow.create_row_with_token(
+        "source",
+        0,
+        {"document_key": "invoice.pdf"},
+        source_row_index=0,
+        ingest_sequence=0,
+        token_id="token-1",
+        coordination_token=setup.coordination_token,
+    )
+    member = setup.coordination_token.membership
+    item = claim_test_work_item(setup.factory, member_token=member, token_id=token.token_id, node_id="textract_1")
+    setup.execution.begin_node_state(
+        token.token_id, "textract_1", 0, {"document_key": "invoice.pdf"}, member_token=member, state_id="state-1"
+    )
+    ctx = make_context(
+        run_id=setup.run_id,
+        state_id="state-1",
+        node_id="textract_1",
+        landscape=setup.execution,
+        token=make_token_info(row_id=row.row_id, token_id=token.token_id),
+        member_token=member,
+        work_item=item,
+    )
     recorder = _Recorder()
     telemetry_events: list[object] = []
     head_bucket_sdk = _HeadBucketSDK()
@@ -602,6 +635,7 @@ def test_profiled_textract_runtime_uses_private_binding_only_for_aws_calls(tmp_p
         make_pipeline_row({"document_key": "invoice.pdf"}),
         "state-1",
         token_id="token-1",
+        ctx=ctx,
     )
 
     executable_key = f"{private_prefix}/invoice.pdf"

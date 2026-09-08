@@ -20,6 +20,7 @@ from elspeth.contracts import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.web.execution.outputs import (
     load_run_outputs_for_settings,
     path_or_uri_to_filesystem_path,
@@ -27,6 +28,7 @@ from elspeth.web.execution.outputs import (
 from elspeth.web.execution.outputs import (
     load_run_outputs_from_db as _load_run_outputs_from_db,
 )
+from tests.fixtures.landscape import leader_coordination_token
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _TEST_SESSION_ID = "test-session"
@@ -55,7 +57,7 @@ def _register_node(
     plugin_name: str,
 ) -> None:
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         node_id=node_id,
         plugin_name=plugin_name,
         node_type=node_type,
@@ -76,32 +78,43 @@ def _seed_run_with_artifacts(
     """
     factory = RecorderFactory(db)
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    leader = leader_coordination_token(factory, run_id)
     _register_node(factory, run_id, "src", NodeType.SOURCE, "csv")
     sink_nodes_seen: set[str] = set()
     for i, (artifact_id, path_or_uri, content_hash, size_bytes, sink_node_id) in enumerate(artifacts):
         if sink_node_id not in sink_nodes_seen:
             _register_node(factory, run_id, sink_node_id, NodeType.SINK, "csv")
             sink_nodes_seen.add(sink_node_id)
-        row = factory.data_flow.create_row(run_id, "src", i, {"x": i}, row_id=f"row-{i}", source_row_index=i, ingest_sequence=i)
-        token = factory.data_flow.create_token(row.row_id, token_id=f"tok-{i}")
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            i,
+            {"x": i},
+            row_id=f"row-{i}",
+            token_id=f"tok-{i}",
+            source_row_index=i,
+            ingest_sequence=i,
+            coordination_token=leader,
+        )
         state = factory.execution.begin_node_state(
             token.token_id,
             sink_node_id,
-            run_id,
             1,
             {"x": i},
+            member_token=leader.membership,
             state_id=f"state-{i}",
         )
-        factory.execution.register_artifact(
-            run_id=run_id,
-            state_id=state.state_id,
-            sink_node_id=sink_node_id,
-            artifact_type="file",
-            path=path_or_uri,
-            content_hash=content_hash,
-            size_bytes=size_bytes,
-            artifact_id=artifact_id,
-        )
+        with fenced_leader_transaction(db.engine, token=leader, window_seconds=300, verb="seed_artifact") as conn:
+            factory.execution.artifacts.register_artifact(
+                run_id=run_id,
+                state_id=state.state_id,
+                sink_node_id=sink_node_id,
+                artifact_type="file",
+                path=path_or_uri,
+                content_hash=content_hash,
+                size_bytes=size_bytes,
+                artifact_id=artifact_id,
+                conn=conn,
+            )
 
 
 def test_load_run_outputs_returns_all_artifacts_without_preview_cap(tmp_path: Path) -> None:

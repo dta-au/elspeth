@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.exc import IntegrityError
 
 from elspeth.contracts.audit import _TERMINAL_PAIR_FIELD_CONSTRAINTS
@@ -24,6 +24,7 @@ from elspeth.web.execution.accounting import (
     load_run_accounting_from_db,
     load_run_accounting_map_from_db,
 )
+from tests.fixtures.landscape import leader_coordination_token
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _NOW = datetime(2026, 5, 6, tzinfo=UTC)
@@ -59,11 +60,11 @@ class _SettingsFake:
         return self.landscape_url
 
 
-def _setup_run_with_row(db: LandscapeDB, *, run_id: str, row_id: str = "row-1") -> None:
+def _setup_run_with_row(db: LandscapeDB, *, run_id: str, row_id: str = "row-1", initial_token_id: str = "token-1") -> None:
     factory = RecorderFactory(db)
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         node_id="source",
         plugin_name="text",
         node_type=NodeType.SOURCE,
@@ -71,7 +72,16 @@ def _setup_run_with_row(db: LandscapeDB, *, run_id: str, row_id: str = "row-1") 
         config={},
         schema_config=_OBSERVED_SCHEMA,
     )
-    factory.data_flow.create_row(run_id, "source", 0, {"value": "input"}, row_id=row_id, source_row_index=0, ingest_sequence=0)
+    factory.data_flow.create_row_with_token(
+        "source",
+        0,
+        {"value": "input"},
+        row_id=row_id,
+        token_id=initial_token_id,
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
 
 
 def _setup_empty_run(db: LandscapeDB, *, run_id: str) -> None:
@@ -79,7 +89,14 @@ def _setup_empty_run(db: LandscapeDB, *, run_id: str) -> None:
 
 
 def _insert_tokens(db: LandscapeDB, *, run_id: str, row_id: str, token_ids: list[str]) -> None:
+    """Keep the atomically ingested token and seed only the remaining projection rows."""
     with db.write_connection() as conn:
+        initial = conn.execute(
+            select(tokens_table.c.token_id).where(tokens_table.c.run_id == run_id, tokens_table.c.row_id == row_id)
+        ).scalar_one()
+        assert initial == token_ids[0]
+        if len(token_ids) == 1:
+            return
         conn.execute(
             tokens_table.insert(),
             [
@@ -91,7 +108,7 @@ def _insert_tokens(db: LandscapeDB, *, run_id: str, row_id: str, token_ids: list
                     "step_in_pipeline": 0,
                     "created_at": _NOW,
                 }
-                for token_id in token_ids
+                for token_id in token_ids[1:]
             ],
         )
 
@@ -167,7 +184,7 @@ def _insert_outcome(
 def test_one_source_row_expands_to_many_tokens_and_closes() -> None:
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-1")
+        _setup_run_with_row(db, run_id="run-1", initial_token_id="parent")
         success_token_ids = [f"child-{i}" for i in range(9323)]
         _insert_tokens(db, run_id="run-1", row_id="row-1", token_ids=["parent", *success_token_ids])
         _insert_completed_outcomes(
@@ -208,7 +225,7 @@ def test_source_accounting_projects_named_sources_and_aggregate_total() -> None:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-multi")
         for source_name, source_node_id in (("orders", "source-orders"), ("refunds", "source-refunds")):
             factory.data_flow.register_node(
-                run_id="run-multi",
+                coordination_token=leader_coordination_token(factory, "run-multi"),
                 node_id=source_node_id,
                 plugin_name="csv",
                 node_type=NodeType.SOURCE,
@@ -233,32 +250,32 @@ def test_source_accounting_projects_named_sources_and_aggregate_total() -> None:
                     )
                 )
 
-        factory.data_flow.create_row(
-            "run-multi",
+        factory.data_flow.create_row_with_token(
             "source-orders",
             0,
             {"id": "order-1"},
             row_id="orders-0",
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-multi"),
         )
-        factory.data_flow.create_row(
-            "run-multi",
+        factory.data_flow.create_row_with_token(
             "source-orders",
             1,
             {"id": "order-2"},
             row_id="orders-1",
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-multi"),
         )
-        factory.data_flow.create_row(
-            "run-multi",
+        factory.data_flow.create_row_with_token(
             "source-refunds",
             2,
             {"id": "refund-1"},
             row_id="refunds-0",
             source_row_index=0,
             ingest_sequence=2,
+            coordination_token=leader_coordination_token(factory, "run-multi"),
         )
 
         accounting = load_run_accounting_from_db(db, landscape_run_id="run-multi")
@@ -281,9 +298,30 @@ def test_rows_rejected_counts_only_discard_destination_validation_errors() -> No
     try:
         _setup_run_with_row(db, run_id="run-vr")
         factory = RecorderFactory(db)
-        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "alpha"}, "amount: not an int", "fixed", "discard")
-        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "beta"}, "amount: not an int", "fixed", "discard")
-        factory.data_flow.record_validation_error("run-vr", "source", {"amount": "gamma"}, "amount: not an int", "fixed", "rejects")
+        factory.data_flow.record_validation_error(
+            "source",
+            {"amount": "alpha"},
+            "amount: not an int",
+            "fixed",
+            "discard",
+            coordination_token=leader_coordination_token(factory, "run-vr"),
+        )
+        factory.data_flow.record_validation_error(
+            "source",
+            {"amount": "beta"},
+            "amount: not an int",
+            "fixed",
+            "discard",
+            coordination_token=leader_coordination_token(factory, "run-vr"),
+        )
+        factory.data_flow.record_validation_error(
+            "source",
+            {"amount": "gamma"},
+            "amount: not an int",
+            "fixed",
+            "rejects",
+            coordination_token=leader_coordination_token(factory, "run-vr"),
+        )
 
         accounting = load_run_accounting_from_db(db, landscape_run_id="run-vr")
 
@@ -308,7 +346,7 @@ def test_transform_discards_do_not_feed_source_rows_rejected() -> None:
         _setup_run_with_row(db, run_id="run-te")
         factory = RecorderFactory(db)
         factory.data_flow.register_node(
-            run_id="run-te",
+            coordination_token=leader_coordination_token(factory, "run-te"),
             node_id="transform",
             plugin_name="value_transform",
             node_type=NodeType.TRANSFORM,
@@ -348,7 +386,7 @@ def test_all_rows_rejected_source_still_appears_in_per_source_accounting() -> No
         factory = RecorderFactory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-g01")
         factory.data_flow.register_node(
-            run_id="run-g01",
+            coordination_token=leader_coordination_token(factory, "run-g01"),
             node_id="source-tickets",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
@@ -374,12 +412,12 @@ def test_all_rows_rejected_source_still_appears_in_per_source_accounting() -> No
             )
         for index in range(4):
             factory.data_flow.record_validation_error(
-                "run-g01",
                 "source-tickets",
                 {"amount": f"value-{index}"},
                 "amount: not an int",
                 "fixed",
                 "discard",
+                coordination_token=leader_coordination_token(factory, "run-g01"),
             )
 
         accounting = load_run_accounting_from_db(db, landscape_run_id="run-g01")
@@ -468,7 +506,7 @@ def test_decided_and_abandoned_same_token_is_an_audit_contradiction() -> None:
 def test_batch_loader_returns_accounting_for_requested_runs() -> None:
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-a", row_id="row-a")
+        _setup_run_with_row(db, run_id="run-a", row_id="row-a", initial_token_id="token-a")
         _insert_tokens(db, run_id="run-a", row_id="row-a", token_ids=["token-a"])
         _insert_completed_outcomes(
             db,
@@ -477,7 +515,7 @@ def test_batch_loader_returns_accounting_for_requested_runs() -> None:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
         )
-        _setup_run_with_row(db, run_id="run-b", row_id="row-b")
+        _setup_run_with_row(db, run_id="run-b", row_id="row-b", initial_token_id="token-b")
         _insert_tokens(db, run_id="run-b", row_id="row-b", token_ids=["token-b"])
 
         batch = load_run_accounting_map_from_db(db, ("run-b", "run-a", "run-a"))
@@ -521,7 +559,7 @@ def test_settings_loader_returns_empty_for_missing_sqlite_database(tmp_path: Pat
 def test_routing_subset_classification_counts_completed_terminal_pairs() -> None:
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-3")
+        _setup_run_with_row(db, run_id="run-3", initial_token_id="gate")
         token_ids = ["gate", "error", "quarantine", "discard", "gate-error-discard"]
         _insert_tokens(db, run_id="run-3", row_id="row-1", token_ids=token_ids)
         _insert_completed_outcomes(
@@ -603,7 +641,7 @@ def test_buffered_non_completed_outcomes_do_not_count_as_terminal() -> None:
 def test_duplicate_completed_outcomes_raise_clear_integrity_error() -> None:
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-6")
+        _setup_run_with_row(db, run_id="run-6", initial_token_id="duplicate-token")
         _insert_tokens(db, run_id="run-6", row_id="row-1", token_ids=["duplicate-token", "missing-token"])
         with db.write_connection() as conn:
             conn.execute(text("DROP INDEX ix_token_outcomes_terminal_unique"))
@@ -632,7 +670,7 @@ def test_corrupt_run_is_isolated_and_healthy_runs_remain_available() -> None:
     """One corrupt run must not hide accounting for healthy runs in the same batch (elspeth-d5578ccd98)."""
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-good", row_id="row-good")
+        _setup_run_with_row(db, run_id="run-good", row_id="row-good", initial_token_id="token-good")
         _insert_tokens(db, run_id="run-good", row_id="row-good", token_ids=["token-good"])
         _insert_completed_outcomes(
             db,
@@ -642,7 +680,7 @@ def test_corrupt_run_is_isolated_and_healthy_runs_remain_available() -> None:
             path=TerminalPath.DEFAULT_FLOW,
         )
 
-        _setup_run_with_row(db, run_id="run-bad", row_id="row-bad")
+        _setup_run_with_row(db, run_id="run-bad", row_id="row-bad", initial_token_id="dup-token")
         _insert_tokens(db, run_id="run-bad", row_id="row-bad", token_ids=["dup-token"])
         with db.write_connection() as conn:
             conn.execute(text("DROP INDEX ix_token_outcomes_terminal_unique"))
@@ -964,7 +1002,7 @@ def _count_sqlite_vm_steps(db: LandscapeDB, run_id: str) -> int:
 
 
 def _seed_decided_run(db: LandscapeDB, *, run_id: str, token_count: int) -> None:
-    _setup_run_with_row(db, run_id=run_id)
+    _setup_run_with_row(db, run_id=run_id, initial_token_id="token-0")
     token_ids = [f"token-{index}" for index in range(token_count)]
     _insert_tokens(db, run_id=run_id, row_id="row-1", token_ids=token_ids)
     _insert_completed_outcomes(
@@ -1024,7 +1062,7 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
     """
     db = LandscapeDB.in_memory()
     try:
-        _setup_run_with_row(db, run_id="run-decided", row_id="row-decided")
+        _setup_run_with_row(db, run_id="run-decided", row_id="row-decided", initial_token_id="token-decided")
         _insert_tokens(db, run_id="run-decided", row_id="row-decided", token_ids=["token-decided"])
         _insert_completed_outcomes(
             db,
@@ -1036,7 +1074,7 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
 
         # Three tokens emitted, one outcome recorded — the mixed shape the 60k
         # run left behind when 48,077 of its tokens had no outcome.
-        _setup_run_with_row(db, run_id="run-partial", row_id="row-partial")
+        _setup_run_with_row(db, run_id="run-partial", row_id="row-partial", initial_token_id="token-a")
         _insert_tokens(db, run_id="run-partial", row_id="row-partial", token_ids=["token-a", "token-b", "token-c"])
         _insert_completed_outcomes(
             db,
@@ -1046,7 +1084,7 @@ def test_every_present_run_lands_in_exactly_one_of_accounting_or_corrupt() -> No
             path=TerminalPath.DEFAULT_FLOW,
         )
 
-        _setup_run_with_row(db, run_id="run-corrupt", row_id="row-corrupt")
+        _setup_run_with_row(db, run_id="run-corrupt", row_id="row-corrupt", initial_token_id="token-corrupt")
         _insert_tokens(db, run_id="run-corrupt", row_id="row-corrupt", token_ids=["token-corrupt"])
         _insert_outcome(
             db,

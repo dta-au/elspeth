@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from datetime import UTC, datetime
 
 import pytest
 
@@ -21,7 +20,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import tokens_table, transform_errors_table
+from elspeth.core.landscape.schema import transform_errors_table
 from elspeth.web.execution.failure_samples import (
     KNOWN_ERROR_CATEGORIES,
     NON_CANONICAL_CATEGORY,
@@ -31,6 +30,7 @@ from elspeth.web.execution.failure_samples import (
     format_failure_categories,
     load_top_failure_categories,
 )
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -45,7 +45,7 @@ def _make_run_with_transform(transform_id: str = "fetch") -> tuple[LandscapeDB, 
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -55,7 +55,7 @@ def _make_run_with_transform(transform_id: str = "fetch") -> tuple[LandscapeDB, 
         sequence=0,
     )
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="web_scrape",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -77,26 +77,20 @@ def _record_error(
     row_index: int,
 ) -> None:
     factory = RecorderFactory(db)
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
+        token_id=token_id,
         source_node_id="source_test",
         row_index=row_index,
         data={"url": f"row-{row_index}"},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    with db.write_connection() as conn:
-        conn.execute(
-            tokens_table.insert().values(
-                token_id=token_id,
-                row_id=row.row_id,
-                run_id=run_id,
-                step_in_pipeline=0,
-                created_at=datetime.now(UTC),
-            )
-        )
-        conn.commit()
+    member = leader_coordination_token(factory, run_id).membership
+    work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id=transform_id)
     factory.data_flow.record_transform_error(
+        member_token=member,
+        work_item=work_item,
         ref=TokenRef(token_id=token_id, run_id=run_id),
         transform_id=transform_id,
         row_data={"url": f"row-{row_index}"},
@@ -267,7 +261,7 @@ class TestLoadTopFailureCategories:
         db, run_id, first = _make_run_with_transform("fetch")
         factory = RecorderFactory(db)
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             plugin_name="llm",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

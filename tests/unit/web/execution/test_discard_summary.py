@@ -18,16 +18,16 @@ def test_discard_summary_counts_discard_path_with_no_sink_state_unattributed() -
     ``DiscardSummary`` stage/category balance check would then reject.
     """
     setup = make_recorder_with_run(run_id="discard-summary-run", source_node_id="source-0")
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"id": "drop-me"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
@@ -58,25 +58,25 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
         node_type=NodeType.SINK,
         plugin_name="text",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"llm_response": "line one\nline two"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     node_state = setup.execution.begin_node_state(
         token.token_id,
         sink_id,
-        setup.run_id,
         0,
         {"llm_response": "line one\nline two"},
+        member_token=setup.coordination_token.membership,
     )
     setup.execution.complete_node_state(
         node_state.state_id,
         NodeStateStatus.FAILED,
+        member_token=setup.coordination_token.membership,
         duration_ms=1.0,
         error=ExecutionError(
             exception="Text values cannot contain CR or LF record separators",
@@ -84,7 +84,8 @@ def test_discard_summary_names_the_sink_node_that_discarded() -> None:
             phase="write",
         ),
     )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
@@ -114,15 +115,14 @@ def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> 
     ``DiscardSummary``'s balance check.
     """
     setup = make_recorder_with_run(run_id="sink-discard-fanout-run", source_node_id="source-0")
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"payload": "x"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     for step_index, sink_name in enumerate(("sink_first", "sink_second")):
         sink_id = register_test_node(
             setup.data_flow,
@@ -131,14 +131,18 @@ def test_discard_summary_does_not_double_count_a_token_failed_at_two_sinks() -> 
             node_type=NodeType.SINK,
             plugin_name="text",
         )
-        node_state = setup.execution.begin_node_state(token.token_id, sink_id, setup.run_id, step_index, {"payload": "x"})
+        node_state = setup.execution.begin_node_state(
+            token.token_id, sink_id, step_index, {"payload": "x"}, member_token=setup.coordination_token.membership
+        )
         setup.execution.complete_node_state(
             node_state.state_id,
             NodeStateStatus.FAILED,
+            member_token=setup.coordination_token.membership,
             duration_ms=1.0,
             error=ExecutionError(exception="sink refused the row", exception_type="SinkDiscard", phase="write"),
         )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.SINK_DISCARDED,
@@ -164,32 +168,33 @@ def test_discard_summary_counts_gate_evaluation_error_discard_by_gate_node() -> 
         node_type=NodeType.GATE,
         plugin_name="config_gate",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    _row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"amount": "250.00"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     node_state = setup.execution.begin_node_state(
         token.token_id,
         gate_id,
-        setup.run_id,
         0,
         {"amount": "250.00"},
+        member_token=setup.coordination_token.membership,
     )
     setup.execution.complete_node_state(
         node_state.state_id,
         NodeStateStatus.FAILED,
+        member_token=setup.coordination_token.membership,
         duration_ms=1.0,
         error=ExecutionError(
             exception="gate expression evaluation failed: incompatible runtime types",
             exception_type="ExpressionEvaluationError",
         ),
     )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
+        coordination_token=setup.coordination_token,
         ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.GATE_ERROR_DISCARDED,
@@ -219,15 +224,14 @@ def test_discard_summary_carries_stage_attribution_for_validation_and_transform_
         node_type=NodeType.TRANSFORM,
         plugin_name="url_normalizer",
     )
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, token = setup.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"url": ""},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = setup.data_flow.create_token(row.row_id)
     now = datetime.now(tz=UTC)
     with setup.db.write_connection() as conn:
         conn.execute(

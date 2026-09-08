@@ -59,7 +59,7 @@ from elspeth.core.config import (
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import run_attributions_table, runs_table, tokens_table
+from elspeth.core.landscape.schema import run_attributions_table, runs_table
 from elspeth.telemetry.manager import TelemetryManager
 from elspeth.web.blobs.protocol import (
     BlobFinalizationResult,
@@ -113,6 +113,7 @@ from elspeth.web.sessions.protocol import (
     SessionServiceProtocol,
 )
 from elspeth.web.sessions.telemetry import build_sessions_telemetry, observed_value
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.helpers.session_fences import (
     RecordingSessionOperationAuthority,
     adopt_execute_lease,
@@ -5377,7 +5378,7 @@ def _seed_run_with_node_state(
     if begin_run:
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(factory, run_id),
             node_id="source",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
@@ -5386,7 +5387,7 @@ def _seed_run_with_node_state(
             schema_config=_DIAGNOSTIC_OBSERVED_SCHEMA,
         )
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         node_id=node_id,
         plugin_name="llm_extract",
         node_type=NodeType.TRANSFORM,
@@ -5394,27 +5395,28 @@ def _seed_run_with_node_state(
         config={},
         schema_config=_DIAGNOSTIC_OBSERVED_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id,
+    _row, token = factory.data_flow.create_row_with_token(
         "source",
         ingest_sequence,
         {"html": "<h1>A</h1>"},
         row_id=row_id,
+        token_id=token_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         source_row_index=ingest_sequence,
         ingest_sequence=ingest_sequence,
     )
-    token = factory.data_flow.create_token(row.row_id, token_id=token_id)
     state = factory.execution.begin_node_state(
         token.token_id,
         node_id,
-        run_id,
         1,
         {"html": "<h1>A</h1>"},
         state_id=state_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
     )
     factory.execution.complete_node_state(
         state.state_id,
         status,
+        member_token=leader_coordination_token(factory, run_id).membership,
         output_data={},
         duration_ms=0.0,
         error=(
@@ -10736,7 +10738,7 @@ class TestFailureSampleClientEgress:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         dynamic_schema = SchemaConfig.from_dict({"mode": "observed"})
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -10746,7 +10748,7 @@ class TestFailureSampleClientEgress:
             sequence=0,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="web_scrape",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -10756,28 +10758,21 @@ class TestFailureSampleClientEgress:
             sequence=1,
         )
         for index in range(rows):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
+                token_id=f"canary_tok_{index}",
                 source_node_id="source_test",
                 row_index=index,
                 data={"url": f"row-{index}"},
                 source_row_index=index,
                 ingest_sequence=index,
             )
-            token_id = f"canary_tok_{index}"
-            with db.write_connection() as conn:
-                conn.execute(
-                    tokens_table.insert().values(
-                        token_id=token_id,
-                        row_id=row.row_id,
-                        run_id=run.run_id,
-                        step_in_pipeline=0,
-                        created_at=datetime.now(UTC),
-                    )
-                )
-                conn.commit()
+            member = leader_coordination_token(factory, run.run_id).membership
+            work_item = claim_test_work_item(factory, member_token=member, token_id=token.token_id, node_id=transform_id)
             factory.data_flow.record_transform_error(
-                ref=TokenRef(token_id=token_id, run_id=run.run_id),
+                member_token=member,
+                work_item=work_item,
+                ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 transform_id=transform_id,
                 row_data={"url": f"row-{index}"},
                 error_details={
