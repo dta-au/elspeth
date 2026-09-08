@@ -208,6 +208,26 @@ def claims_for_session(repo: Path, session_id: str) -> list[Claim]:
     return sorted(found, key=lambda c: c.created_at)
 
 
+def withdraw_session(repo: Path, *, session_id: str, reason: str) -> Claim:
+    """Withdraw without a claim: the session did work, is NOT claiming it, and says why. Releases the Stop hook."""
+    repo = repo_root(Path(repo))
+    when = now()
+    digest = hashlib.sha256(f"{session_id}{when.isoformat()}withdraw".encode()).hexdigest()[:8]
+    record = Claim(
+        claim_id=f"{when.strftime('%Y%m%dT%H%M%S')}-{digest}",
+        session_id=session_id,
+        created_at=iso(when),
+        claim="(withdrawn without a claim)",
+        repo=str(repo),
+        branch=_git(repo, "symbolic-ref", "--short", "-q", "HEAD").stdout.strip() or "HEAD",
+        head_sha=_git(repo, "rev-parse", "HEAD").stdout.strip(),
+        assertions=[],
+        withdrawn={"at": iso(when), "reason": reason},
+    )
+    record.save()
+    return record
+
+
 def withdraw_claim(repo: Path, claim_id: str, *, reason: str) -> Claim:
     record = Claim.load(repo_root(Path(repo)), claim_id)
     record.withdrawn = {"at": iso(), "reason": reason}
@@ -375,47 +395,54 @@ def _restore_in_place(repo: Path, snapshot: dict[str, bytes | None]) -> bool:
     return all(((repo / rel).read_bytes() if (repo / rel).exists() else None) == content for rel, content in snapshot.items())
 
 
+def _interpret_red(rc: int | None, tail: str, note: str) -> tuple[bool, str]:
+    """RED means the test FAILED an assertion (exit 1). 0 = not red; other codes = crashed, never ran the assertion."""
+    if rc is None:
+        return False, f"{note}; test could not run ({tail})"
+    if rc == 0:
+        return False, f"{note}; test did not go red (exit 0): the test does not depend on the fix"
+    if rc != 1:
+        return (
+            False,
+            f"{note}; test crashed rather than failed (exit {rc}): RED means a failed assertion (exit 1) — import the fix's modules inside the test body",
+        )
+    return True, f"{note}; test went red (exit 1)"
+
+
 def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) -> AssertionResult:
     command = str(a["command"])
     paths = [str(p) for p in a["paths"]]
     base = a.get("base")
     aid = str(a["id"])
+    text = _describe(a)
     if _uncommitted(repo, paths):
         # Working-directory mode: the fix is uncommitted, so the working directory IS the subject.
         # Only the named paths are touched, from a byte snapshot; nothing else is read or written.
+        pre_rc, pre_tail = _run(command, repo, timeout)
+        if pre_rc != 0:
+            evidence = f"command does not pass on the unmodified working directory (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
+            return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
         snapshot = _revert_in_place(repo, paths)
         try:
             rc, tail = _run(command, repo, timeout)
         finally:
             restored = _restore_in_place(repo, snapshot)
-        note = f"reverted {paths} to HEAD in place from a byte snapshot; restored " + (
+        note = f"passes unmodified (exit 0); reverted {paths} to HEAD in place from a byte snapshot; restored " + (
             "byte-identical" if restored else "WITH DIFFERENCES — inspect"
         )
-        if rc is None:
-            return AssertionResult(aid, "mutation", _describe(a), False, f"{note}; test could not run ({tail})", str(repo))
-        if rc == 0:
-            return AssertionResult(
-                aid,
-                "mutation",
-                _describe(a),
-                False,
-                f"{note}; test did not go red (exit 0): the test does not depend on the fix",
-                str(repo),
-            )
-        return AssertionResult(aid, "mutation", _describe(a), restored, f"{note}; test went red (exit {rc})", str(repo))
+        proven, evidence = _interpret_red(rc, tail, note)
+        return AssertionResult(aid, "mutation", text, proven and restored, evidence, str(repo))
     if not base:
-        return AssertionResult(
-            aid,
-            "mutation",
-            _describe(a),
-            False,
-            "the fix is committed: name the pre-fix base with '@ <base>' so it can be reverted in a fresh worktree",
-            str(repo),
-        )
+        evidence = "the fix is committed: name the pre-fix base with '@ <base>' so it can be reverted in a fresh worktree"
+        return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
     base_sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
     if base_sha.returncode != 0:
-        return AssertionResult(aid, "mutation", _describe(a), False, f"base {base} does not resolve", str(repo))
+        return AssertionResult(aid, "mutation", text, False, f"base {base} does not resolve", str(repo))
     with _fresh_worktree(repo, tip) as tree:
+        pre_rc, pre_tail = _run(command, tree, timeout)
+        if pre_rc != 0:
+            evidence = f"command does not pass on the unmodified tree at {tip[:12]} (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
+            return AssertionResult(aid, "mutation", text, False, evidence, str(tree))
         # The pre-fix state of a path the base never had is ABSENCE: delete it rather than fail the checkout.
         base_commit = base_sha.stdout.strip()
         present = [rel for rel in paths if _git(repo, "cat-file", "-e", f"{base_commit}:{rel}").returncode == 0]
@@ -424,12 +451,7 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
             revert = _git(tree, "checkout", base_commit, "--", *present)
             if revert.returncode != 0:
                 return AssertionResult(
-                    aid,
-                    "mutation",
-                    _describe(a),
-                    False,
-                    f"could not restore {present} from {base}: {revert.stderr.strip()[-300:]}",
-                    str(tree),
+                    aid, "mutation", text, False, f"could not restore {present} from {base}: {revert.stderr.strip()[-300:]}", str(tree)
                 )
         for rel in absent:
             target = tree / rel
@@ -438,14 +460,11 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
             elif target.exists():
                 target.unlink()
         rc, tail = _run(command, tree, timeout)
-        prefix = f"in fresh worktree at {tip[:12]} with {present} restored from {base}" + (
+        note = f"passes unmodified at {tip[:12]} (exit 0); in a fresh worktree with {present} restored from {base}" + (
             f" and {absent} removed (absent at {base})" if absent else ""
         )
-        if rc is None:
-            return AssertionResult(aid, "mutation", _describe(a), False, f"{prefix}: test could not run ({tail})", str(tree))
-        if rc == 0:
-            return AssertionResult(aid, "mutation", _describe(a), False, f"{prefix}: test did not go red (exit 0)", str(tree))
-        return AssertionResult(aid, "mutation", _describe(a), True, f"{prefix}: test went red (exit {rc})", str(tree))
+        proven, evidence = _interpret_red(rc, tail, note)
+        return AssertionResult(aid, "mutation", text, proven, evidence, str(tree))
 
 
 def verify_claim(repo: Path, claim_id: str, *, timeout: int = 1800) -> Verdict:
@@ -592,7 +611,10 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
 
 def _cmd_withdraw(args: argparse.Namespace) -> int:
-    record = withdraw_claim(Path(args.repo), args.claim, reason=args.reason)
+    if args.claim:
+        record = withdraw_claim(Path(args.repo), args.claim, reason=args.reason)
+    else:
+        record = withdraw_session(Path(args.repo), session_id=args.session or session_id_from_env(), reason=args.reason)
     print(json.dumps({"claim_id": record.claim_id, "withdrawn": record.withdrawn}, indent=2))
     return 0
 
@@ -641,9 +663,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--findings", required=True, help="path to the reviewer's findings file, or the findings text")
     p.set_defaults(func=_cmd_review)
 
-    p = sub.add_parser("withdraw", help="withdraw a claim you cannot substantiate (the Stop hook then releases the session)")
-    p.add_argument("--claim", required=True)
+    p = sub.add_parser(
+        "withdraw", help="withdraw a claim you cannot substantiate, or (no --claim) record that this session is not claiming its work"
+    )
+    p.add_argument("--claim", default=None)
     p.add_argument("--reason", required=True)
+    p.add_argument("--session", default=None, help="session id for a claim-less withdrawal (default: $CLAUDE_CODE_SESSION_ID)")
     p.set_defaults(func=_cmd_withdraw)
 
     p = sub.add_parser("status", help="this session's claims and latest verdict")

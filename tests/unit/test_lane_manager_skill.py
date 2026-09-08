@@ -109,13 +109,13 @@ def _ticket(ticket: str = "t1", **overrides: object) -> dict[str, object]:
     return base
 
 
-def _init(repo: Path, *tickets: dict[str, object], run_id: str = "run") -> object:
+def _init(repo: Path, *tickets: dict[str, object], run_id: str = "run", suite_command: str = SUITE_CMD) -> object:
     return lm.init_run(
         lanes_dir=repo / ".lanes",
         run_id=run_id,
         repo=repo,
         base_ref="main",
-        suite_command=SUITE_CMD,
+        suite_command=suite_command,
         tickets=list(tickets) or [_ticket()],
     )
 
@@ -386,6 +386,47 @@ def test_lane_whose_fix_breaks_the_suite_is_not_verified(repo: Path) -> None:
     assert result.suite_exit_code not in (0, None)
     assert result.verified is False
     assert any("suite" in r for r in result.reasons)
+
+
+def test_lane_whose_test_fails_on_the_merged_tree_is_not_verified_even_if_the_suite_passes(repo: Path) -> None:
+    """The GREEN gate stands on its own: a suite that does not select the lane's test must not cover for it (reviewer M11)."""
+    run = _init(repo, suite_command=f"{sys.executable} tests/test_existing.py")
+    lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+    _worker_commits(lane.worktree_path, test_body="import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 3' else 1)\n")
+    result = lm.verify(run, "lane-01-t1")
+    assert result.red_exit_code == 1
+    assert result.green_exit_code == 1
+    assert result.suite_exit_code is None, "the suite is not credited once green is disproved"
+    assert result.verified is False
+    assert any("merged tree" in r for r in result.reasons), result.reasons
+
+
+def test_lane_whose_test_crashes_on_the_base_is_not_verified(repo: Path) -> None:
+    """RED means the test FAILED (exit 1). A test that cannot fail but crashes without the fix must not pass the gate (reviewer R1)."""
+    run = _init(
+        repo,
+        _ticket(
+            "t1",
+            files=["src/target.py", "src/helper.py"],
+            test_command=f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider",
+        ),
+    )
+    lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+    (lane.worktree_path / "tests" / "test_target.py").write_text(
+        "import sys\n\nsys.path.insert(0, 'src')\nimport helper  # noqa: E402,F401\n\n\ndef test_nothing():\n    assert True\n",
+        encoding="utf-8",
+    )
+    _git(lane.worktree_path, "add", "tests/test_target.py")
+    _git(lane.worktree_path, "commit", "-q", "-m", "test: asserts nothing, imports the new helper")
+    (lane.worktree_path / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (lane.worktree_path / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _git(lane.worktree_path, "add", "src")
+    _git(lane.worktree_path, "commit", "-q", "-m", "fix: adds helper")
+    result = lm.verify(run, "lane-01-t1")
+    assert result.red_exit_code not in (0, 1, None), result.red_exit_code
+    assert result.verified is False
+    assert any("crash" in r for r in result.reasons), result.reasons
+    assert result.green_exit_code is None
 
 
 def test_lane_that_never_wrote_a_test_is_not_verified(repo: Path) -> None:

@@ -303,8 +303,8 @@ def render_brief(run: Run, lane: LaneStatus) -> str:
         f"Lane: {lane.lane_id} — {lane.title} (ticket {lane.ticket}). Plan: {lane.plan_path}\n\n"
         f"Goal: {lane.description or lane.title}\n\n"
         "Rules:\n"
-        f"1. Write the FAILING TEST FIRST in {tests}. Run `{lane.expected.test_command}` and confirm it exits non-zero "
-        "BEFORE touching the fix; commit the test on its own.\n"
+        f"1. Write the FAILING TEST FIRST in {tests}. Run `{lane.expected.test_command}` and confirm it FAILS (exit 1, not a crash) "
+        "BEFORE touching the fix; if the fix adds a module, import it inside the test body. Commit the test on its own.\n"
         f"2. Then fix the code in {files}; run the same test command until it exits 0; commit the fix.\n"
         f"3. Commit only to `{lane.branch}` inside {lane.worktree_path}. Never edit or commit in the main checkout.\n"
         f"4. Before each step, run the heartbeat so a crash can be told from slow work:\n   {heartbeat_cmd}\n"
@@ -653,6 +653,11 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
                     reasons.append("test does not fail on the base without the fix: not a failing-first test")
                 elif red_rc is None:
                     reasons.append(f"red run could not complete: {red_tail}")
+                elif red_rc != 1:
+                    reasons.append(
+                        f"test crashed on the base rather than failing (exit {red_rc}): RED means a failed assertion (exit 1); "
+                        "import the fix's modules inside the test body so the assertion runs"
+                    )
     if not reasons and branch_sha is not None:
         with _temp_worktree(repo, base_sha, "lane-green-") as tree:
             merge = _git(tree, "merge", "--no-ff", "--no-commit", branch_sha)

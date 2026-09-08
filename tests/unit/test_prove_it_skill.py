@@ -10,8 +10,10 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -241,6 +243,34 @@ def test_mutation_of_a_committed_new_file_treats_absence_at_base_as_the_pre_fix_
     assert (repo / "src" / "helper.py").is_file(), "the checkout is never touched"
 
 
+def test_mutation_command_that_cannot_run_is_unproven_not_red(repo: Path) -> None:
+    """A non-zero exit is not evidence of RED unless the same command exits 0 on the unmodified tree (reviewer finding)."""
+    _commit_fix(repo)
+    claim = _claim(repo, f"mutation: {sys.executable} -c 'import sys; sys.exit(9)' :: src/target.py @ main")
+    verdict = pi.verify_claim(repo, claim.claim_id)
+    assert verdict.results[0].proven is False
+    assert "unmodified" in verdict.results[0].evidence and "exit 9" in verdict.results[0].evidence
+    # working-directory mode has the same precondition
+    (repo / "src" / "target.py").write_text("VALUE = 2  # wip\n", encoding="utf-8")
+    claim = _claim(repo, f"mutation: {sys.executable} -c 'import sys; sys.exit(5)' :: src/target.py")
+    verdict = pi.verify_claim(repo, claim.claim_id)
+    assert verdict.results[0].proven is False and "unmodified" in verdict.results[0].evidence
+    assert (repo / "src" / "target.py").read_text(encoding="utf-8") == "VALUE = 2  # wip\n"
+
+
+def test_mutation_that_crashes_instead_of_failing_is_unproven(repo: Path) -> None:
+    """RED means the test FAILED an assertion (exit 1); a crash (any other exit) never ran the assertion."""
+    (repo / "tests" / "test_target.py").write_text(
+        "import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 2' else 2)\n", encoding="utf-8"
+    )
+    _git(repo, "commit", "-q", "-am", "test: exits 2 when unhappy")
+    _commit_fix(repo)
+    claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py @ main")
+    verdict = pi.verify_claim(repo, claim.claim_id)
+    assert verdict.results[0].proven is False
+    assert "crashed" in verdict.results[0].evidence and "exit 2" in verdict.results[0].evidence
+
+
 def test_committed_mutation_without_a_base_is_unproven_not_guessed(repo: Path) -> None:
     _commit_fix(repo)
     claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py")
@@ -291,6 +321,13 @@ def test_withdraw_records_the_reason(repo: Path) -> None:
     assert withdrawn.withdrawn is not None and "incomplete" in withdrawn.withdrawn["reason"]
     raw = json.loads((repo / ".verify" / "claims" / f"{claim.claim_id}.json").read_text(encoding="utf-8"))
     assert raw["withdrawn"]["reason"].startswith("could not substantiate")
+
+
+def test_withdraw_without_a_claim_records_a_session_withdrawal(repo: Path) -> None:
+    """A session that did work and wants to report failure must be able to withdraw without inventing a claim."""
+    record = pi.withdraw_session(repo, session_id=SESSION, reason="could not reproduce the bug; nothing to claim")
+    assert record.withdrawn is not None and record.assertions == []
+    assert [c.claim_id for c in pi.claims_for_session(repo, SESSION)] == [record.claim_id]
 
 
 def test_cli_round_trip(repo: Path, tmp_path: Path) -> None:
@@ -397,7 +434,15 @@ def test_hook_lets_a_session_yield_when_its_last_message_claims_nothing(repo: Pa
         "This is complete.",
     ):
         _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=claim)
+        shutil.rmtree(repo / ".verify" / ".hook", ignore_errors=True)  # each phrase is judged on its own, not by the valve
         assert _hook(repo, transcript)[1].get("decision") == "block", claim
+    for honest in (
+        "I could not fix this. The work is NOT done and the test still fails.",
+        "Reporting this as incomplete: the mutation did not go red, so the fix is unverified.",
+        "This is not fixed yet; the pipeline works by reading the manifest but I have changed nothing that matters.",
+    ):
+        _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=honest)
+        assert _hook(repo, transcript)[1].get("decision") != "block", honest
 
 
 def test_hook_blocks_work_with_no_claim_and_names_what_to_do(repo: Path, tmp_path: Path) -> None:
@@ -449,11 +494,24 @@ def test_hook_releases_a_withdrawn_claim_and_ignores_other_sessions(repo: Path, 
     code, out, _ = _hook(repo, transcript)
     assert code == 0 and out.get("decision") != "block"
     assert "withdrawn" in out.get("systemMessage", "").lower()
-    # a different session's open, failing claim never blocks this one
+    # a different session's open, failing claim never blocks this one: own PASS, foreign FAIL, work + completion text
+    sha = _commit_fix(repo)
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})])
+    mine = _claim(repo, f"commit: {sha} on work")
+    pi.verify_claim(repo, mine.claim_id)
+    pi.record_review(repo, mine.claim_id, verdict="PASS", findings="ok")
     other = _claim(repo, "file: missing.txt", session=OTHER_SESSION)
     pi.verify_claim(repo, other.claim_id)
-    _transcript(transcript, [(_iso(-30), "Read", {"file_path": "x"})])
+    assert pi.latest_verdict(repo, session_id=OTHER_SESSION).verdict == pi.VERDICT_FAIL
     assert _hook(repo, transcript)[1].get("decision") != "block"
+    # a claim-less withdrawal releases too
+    time.sleep(1.1)
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"}), (_iso(0), "Write", {"file_path": "src/new.py"})])
+    assert _hook(repo, transcript)[1]["decision"] == "block"
+    time.sleep(1.1)
+    pi.withdraw_session(repo, session_id=SESSION, reason="new.py is a stub; not claiming it")
+    code, out, _ = _hook(repo, transcript)
+    assert code == 0 and out.get("decision") != "block" and "withdrawn" in out.get("systemMessage", "").lower()
 
 
 def test_hook_caps_repeated_blocks_so_a_session_cannot_loop_forever(repo: Path, tmp_path: Path) -> None:
@@ -463,6 +521,16 @@ def test_hook_caps_repeated_blocks_so_a_session_cannot_loop_forever(repo: Path, 
     assert all(d["decision"] == "block" for d in decisions[: pi.MAX_BLOCKS])
     assert decisions[-1].get("decision") != "block"
     assert "NOT verified" in decisions[-1]["systemMessage"]
+    # the valve is per SESSION until a release: a fresh work signal must not re-arm five more blocks
+    _transcript(transcript, [(_iso(-60), "Edit", {"file_path": "src/target.py"}), (_iso(0), "Bash", {"command": "pytest | tee run.log"})])
+    again = _hook(repo, transcript, active=True)[1]
+    assert again.get("decision") != "block" and "NOT verified" in again["systemMessage"]
+    # a withdrawal releases and resets the valve, so later work is gated again
+    time.sleep(1.1)
+    pi.withdraw_session(repo, session_id=SESSION, reason="giving up on this one")
+    assert _hook(repo, transcript)[1].get("decision") != "block"
+    _transcript(transcript, [(_iso(-60), "Edit", {"file_path": "src/target.py"}), (_iso(30), "Edit", {"file_path": "src/later.py"})])
+    assert _hook(repo, transcript)[1]["decision"] == "block"
 
 
 def test_hook_never_crashes_on_a_missing_transcript(repo: Path, tmp_path: Path) -> None:

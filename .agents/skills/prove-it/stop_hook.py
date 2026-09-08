@@ -33,6 +33,12 @@ WORK_RE = re.compile(
     r"|>\s*[\w./-]+\.(py|md|json|toml|yaml|yml|ts|tsx|js|sh)\b"
 )
 SELF_RE = re.compile(r"prove_it\.py|stop_hook\.py")
+NEGATED_RE = re.compile(
+    r"\b(not|isn't|is not|are not|aren't|never|cannot|can't|could not|couldn't|un)\s*-?\s*"
+    r"(done|complete[d]?|fixed|finished|verified|resolved|working|passing|green|merged|committed|implemented|landed|substantiated)\b"
+    r"|\bincomplete\b|\bunverified\b|\bunproven\b|\bstill fails?\b|\bgiving up\b",
+    re.IGNORECASE,
+)
 COMPLETION_RE = re.compile(
     r"\b(complete[ds]?|done|fixed|finished|pass(es|ed|ing)?|green|landed|merged|committed|resolved|implemented|verified|works|shipped"
     r"|ready (for|to) (review|merge|ship)|no longer reproduces|all set)\b",
@@ -109,14 +115,15 @@ def _repo_for(cwd: str) -> Path:
     return Path(os.environ.get("CLAUDE_PROJECT_DIR") or cwd)
 
 
-def _bump_blocks(repo: Path, session_id: str, work_ts: str) -> int:
+def _bump_blocks(repo: Path, session_id: str, release_marker: str) -> int:
+    """Blocks since the session's last release (PASS or withdrawal) — NOT per work signal, so more work cannot re-arm it."""
     path = repo / ".verify" / ".hook" / f"{session_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    state: dict[str, object] = {"work": work_ts, "blocks": 0}
+    state: dict[str, object] = {"since": release_marker, "blocks": 0}
     if path.is_file():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
-            if type(loaded) is dict and loaded.get("work") == work_ts:
+            if type(loaded) is dict and loaded.get("since") == release_marker:
                 state = loaded
         except json.JSONDecodeError:
             pass
@@ -133,8 +140,8 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
     work, last_text = scan_transcript(Path(str(payload.get("transcript_path") or "")))
     if work is None or not session_id:
         return {}
-    if not COMPLETION_RE.search(last_text):
-        return {}  # the user is not being told anything is complete; yielding to wait is not a claim
+    if not COMPLETION_RE.search(last_text) or NEGATED_RE.search(last_text):
+        return {}  # the user is not being told anything is complete (status, or an honest 'not done'); nothing to gate
     script = f"python {HERE / 'prove_it.py'}"
     claims = pi.claims_for_session(repo, session_id)
     verdict = pi.latest_verdict(repo, session_id=session_id)
@@ -181,10 +188,10 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
             )
         else:
             reason = f"prove-it: work newer than the PASS verdict at {current.checked_at}. File a new claim for the new work, verify it, and record the review."
-    blocks = _bump_blocks(repo, session_id, work.isoformat())
+    blocks = _bump_blocks(repo, session_id, newest[0].isoformat() if newest is not None else "none")
     if blocks > pi.MAX_BLOCKS:
         return {
-            "systemMessage": f"prove-it: released after {blocks - 1} blocks without a PASS verdict. The work is NOT verified — say so to the user. Last reason: {reason}"
+            "systemMessage": f"prove-it: released after {pi.MAX_BLOCKS} blocks without a PASS verdict. The work is NOT verified — say so to the user. Last reason: {reason}"
         }
     return {"decision": "block", "reason": reason}
 

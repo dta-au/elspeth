@@ -67,7 +67,11 @@ What it does, and why the working directory is never the instrument:
   ("working directory has N uncommitted changes").
 - `commit:` is `git rev-parse` + `git merge-base --is-ancestor`; a sha that is
   on a different branch, or does not exist, is unproven.
-- `mutation:` reverts the fix and requires the test to go red. An uncommitted
+- `mutation:` first runs the command on the UNMODIFIED tree (it must exit 0:
+  a command that cannot run proves nothing), then reverts the fix and requires
+  the test to FAIL — exit 1. Any other exit is "crashed rather than failed"
+  and is unproven; if the fix adds a module, import it inside the test body so
+  the assertion is what fails. An uncommitted
   fix is reverted **in place for the named paths only**, from a byte snapshot,
   and the snapshot is written back and compared afterwards — unrelated edits
   are never touched, and no `git checkout --` or stash verb runs (this
@@ -126,16 +130,20 @@ your message must say the work is incomplete.
 ## The Stop hook
 
 `stop_hook.py` reads the session transcript for work signals (Edit/Write/
-NotebookEdit; Bash commands that commit, merge, or write files) and, when the
+NotebookEdit; Bash commands that commit, merge, or write files). When the
 final message reads as a completion claim ("done", "fixed", "green",
-"committed", "merged", "complete", "passing" and the like), blocks the stop
+"committed", "merged", "complete", "passing" and the like) it blocks the stop
 unless a PASS verdict or a withdrawal for this session is newer than the
-newest signal. A final message that only reports status ("waiting for the
-gate", "next I will…") is not a claim and is not blocked — the gate is on
-what the user is told, not on yielding. Its block reason names the exact next command. After five
-blocks on the same work it releases the session with a loud "NOT verified"
-message so a stuck session cannot loop forever — that release is a safety
-valve, not a verdict. `$P status` shows this session's claims and verdict.
+newest signal, and its block reason names the exact next command. A final
+message that only reports status ("waiting for the gate", "next I will…"),
+or that says plainly the work is NOT done, is not a claim and is not blocked:
+the gate is on what the user is told, not on yielding or on honesty.
+`withdraw --reason` with no `--claim` records that this session is not
+claiming its work at all. After five blocks since the session's last release
+(a PASS or a withdrawal; doing more work does not re-arm it) the hook
+releases the session with a loud "NOT verified" message so a stuck session
+cannot loop forever — that release is a safety valve, not a verdict.
+`$P status` shows this session's claims and verdict.
 
 ## Rationalizations that produce false completions
 
