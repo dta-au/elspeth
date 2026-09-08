@@ -846,6 +846,8 @@ class ResumeCoordinator:
         with best_effort("Seat release after resume finalize", run_id=run_id):
             factory.run_coordination.release_seat(token=coordination_token)
 
+        heartbeat.raise_fatal_failure()
+
         self._ceremony.emit_run_finished(
             run_id=run_id,
             status=terminal_status,
@@ -1240,7 +1242,10 @@ class ResumeCoordinator:
             try:
                 self._ceremony.safe_flush_telemetry()
             finally:
-                trace_stack.close()
+                try:
+                    trace_stack.close()
+                finally:
+                    _heartbeat.raise_fatal_failure()
 
     def process_resumed_rows(
         self,

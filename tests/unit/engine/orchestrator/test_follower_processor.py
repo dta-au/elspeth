@@ -201,6 +201,7 @@ class _StubHeartbeat:
         self.stop_called = False
         self.stop_final_beats: list[bool] = []
         self.check_calls = 0
+        self.fatal_error: BaseException | None = None
 
     def start(self) -> None:
         self.start_called = True
@@ -223,6 +224,10 @@ class _StubHeartbeat:
 
     def set_evicted(self) -> None:
         self._evicted = True
+
+    def raise_fatal_failure(self) -> None:
+        if self.fatal_error is not None:
+            raise self.fatal_error
 
 
 class _StubRunCoordRepo:
@@ -1211,6 +1216,32 @@ class TestFollowerDepartHygiene:
 class TestFollowerHeartbeatLifecycle:
     """Heartbeat is always stopped in the finally block."""
 
+    @pytest.mark.parametrize("at_claim", [False, True])
+    def test_fatal_heartbeat_stops_work_without_eviction_latch(self, at_claim: bool) -> None:
+        failure = AuditIntegrityError("heartbeat corruption")
+        heartbeat = _StubHeartbeat()
+        heartbeat.fatal_error = None if at_claim else failure
+
+        class ClaimingProcessor(_CountingDrainProcessor):
+            def drain_follower_ready_work(self, ctx: Any, *, before_claim: Any = None) -> list[Any]:
+                self.drain_calls.append({"ctx": ctx})
+                heartbeat.fatal_error = failure
+                before_claim()
+                raise AssertionError("a fatal heartbeat must stop the next claim")
+
+        processor = ClaimingProcessor()
+        follower, _, repo, _, _ = _make_follower(processor=processor)
+        with (
+            patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat),
+            pytest.raises(AuditIntegrityError) as raised,
+        ):
+            follower.run(ctx=_ctx())
+        assert raised.value is failure
+        assert heartbeat.coordination_lost is False
+        assert len(processor.drain_calls) == int(at_claim)
+        assert heartbeat.stop_called
+        assert len(repo.depart_calls) == 1
+
     def test_heartbeat_stopped_on_clean_exit(self) -> None:
         follower, _, _, _, heartbeat = _make_follower(factory=_StubFactory(running=False))
         with patch("elspeth.engine.orchestrator.follower.RunHeartbeatThread", return_value=heartbeat):
@@ -1688,7 +1719,7 @@ class TestBestEffortDepartContainment:
             follower._best_effort_depart()
 
         assert len(repo.depart_calls) == 1
-        assert any("transient DB failure" in record.getMessage() for record in caplog.records)
+        assert any("operational DB failure" in record.getMessage() for record in caplog.records)
 
     def test_integrity_error_propagates(self) -> None:
         """depart_worker's CAS and audit-event insert share one transaction:

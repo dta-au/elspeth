@@ -369,6 +369,31 @@ class TestBusyTolerated:
 
 
 class TestHeartbeatDegraded:
+    def test_late_registered_database_integrity_failure_is_not_diagnostic_loss(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from sqlalchemy.exc import SQLAlchemyError
+
+        from elspeth.contracts import tier_registry
+
+        repo = _StubRepo()
+        repo.side_effect = OperationalError("busy", None, None)
+        thread = _make_thread(repo, degraded_threshold=1)
+        with monkeypatch.context() as isolated:
+            isolated.setattr(tier_registry, "_REGISTRY", list(tier_registry._REGISTRY))
+            isolated.setattr(tier_registry, "_REASONS", dict(tier_registry._REASONS))
+            isolated.setattr(tier_registry, "_FROZEN", False)
+
+            @tier_registry.tier_1_error(reason="test late database integrity registration", caller_module=__name__)
+            class DatabaseIntegrityFailure(SQLAlchemyError):
+                pass
+
+            failure = DatabaseIntegrityFailure("corrupt diagnostic contract")
+            repo.degraded_exception = failure
+            thread._step_beat()
+
+            with pytest.raises(DatabaseIntegrityFailure) as raised:
+                thread.check_and_raise()
+            assert raised.value is failure
+
     @pytest.mark.parametrize("failure", [RuntimeError("broken writer"), pytest.param(None, id="tier1")])
     def test_degraded_failure_is_latched_at_drain_boundary(self, failure: Exception | None) -> None:
         from elspeth.contracts.errors import AuditIntegrityError
@@ -569,6 +594,53 @@ class TestFatalLatchEvicted:
 
 
 class TestLifecycle:
+    def test_background_logger_failure_is_delivered_to_owner(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.engine.orchestrator import heartbeat
+
+        failure = RuntimeError("logging backend failed")
+
+        def fail_log(*args: object, **kwargs: object) -> None:
+            raise failure
+
+        monkeypatch.setattr(heartbeat.logger, "debug", fail_log)
+        repo = _StubRepo()
+        repo.side_effect = OperationalError("busy", None, None)
+        thread = RunHeartbeatThread(repo, member_token=_TOKEN)
+        thread.start()
+        thread.stop()
+
+        assert not thread._thread.is_alive()
+        with pytest.raises(RuntimeError) as raised:
+            thread.raise_fatal_failure()
+        assert raised.value is failure
+
+    @pytest.mark.parametrize("degraded", [False, True])
+    def test_final_beat_fatal_failure_remains_available_after_join(self, degraded: bool) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        failure = AuditIntegrityError("final beat corruption")
+        repo = _StubRepo()
+        repo.side_effect = OperationalError("busy", None, None) if degraded else failure
+        repo.degraded_exception = failure if degraded else None
+        thread = RunHeartbeatThread(repo, member_token=_TOKEN, degraded_threshold=1)
+        thread.start()
+        thread.stop()
+
+        assert not thread._thread.is_alive()
+        with pytest.raises(AuditIntegrityError) as raised:
+            thread.raise_fatal_failure()
+        assert raised.value is failure
+
+    def test_final_membership_departure_is_not_a_fatal_thread_failure(self) -> None:
+        repo = _StubRepo()
+        repo.snapshot = _EVICTED_OUTCOME
+        thread = RunHeartbeatThread(repo, member_token=_TOKEN)
+        thread.start()
+        thread.stop()
+
+        assert thread.coordination_lost
+        thread.raise_fatal_failure()
+
     def test_start_and_stop_no_leak(self) -> None:
         """start() + stop() without any beats completes without thread leak."""
         repo = _StubRepo()

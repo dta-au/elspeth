@@ -342,8 +342,9 @@ class AuditedLLMClient(AuditedClientBase):
         authoritative Landscape record already succeeded (telemetry primacy
         order). This is the single named best-effort path for the LLM client:
         Tier-1 audit-integrity violations and programming errors re-raise (they
-        are bugs in our code and must crash), and only genuine operational
-        telemetry-transport failures fall through to the last-resort logger.
+        are bugs in our code and must crash). Other callback failures are
+        acknowledged through the last-resort logger without changing the
+        already-audited call outcome.
         The telemetry callback is a bare ``Callable`` supplied by the caller, so
         the residual catch cannot be narrowed to a typed telemetry error. Event
         construction — hashing included — happens BEFORE the try: a failure
@@ -377,13 +378,11 @@ class AuditedLLMClient(AuditedClientBase):
             # already holds the authoritative record; telemetry is best-effort.
             logger.warning(
                 "telemetry_emit_failed",
-                error=str(tel_err),
                 error_type=type(tel_err).__name__,
                 run_id=self._run_id,
                 state_id=self._telemetry_state_id(),
                 operation_id=self._telemetry_operation_id(),
                 call_type="llm",
-                exc_info=True,
             )
 
     def chat_completion(

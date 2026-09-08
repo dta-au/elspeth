@@ -617,6 +617,8 @@ class RunLifecycleCoordinator:
             with best_effort("Seat release after finalize", run_id=run.run_id):
                 factory.run_coordination.release_seat(token=coordination_token)
 
+            _heartbeat.raise_fatal_failure()
+
             # Emit RunSummary event with final metrics.  Map the new
             # terminal status onto the CLI exit-code taxonomy via
             # ``cli_completion_for`` so the operator-facing CLI summary
@@ -709,4 +711,7 @@ class RunLifecycleCoordinator:
             try:
                 run_span_stack.__exit__(*sys.exc_info())
             finally:
-                self._ceremony.safe_flush_telemetry()
+                try:
+                    self._ceremony.safe_flush_telemetry()
+                finally:
+                    _heartbeat.raise_fatal_failure()

@@ -118,9 +118,9 @@ class TestCleanupDoesNotMaskPendingException:
                 raise ValueError("bad formatter")
 
         text, digest, length = _safe_cleanup_error_text(BrokenException())
-        assert text == "<unrepresentable BrokenException>"
-        assert length == len(text)
-        assert len(digest) == 16
+        assert text == "<unrepresentable BrokenException: ValueError>"
+        assert length is None
+        assert digest is None
 
     def test_handled_exception_does_not_suppress_cleanup_failure_when_caller_declares_no_pending_exception(
         self,
@@ -312,3 +312,42 @@ class TestPartialResultCeremonySurvivesCleanupFailure:
                     payload_store=MockPayloadStore(),
                     shutdown_event=threading.Event(),
                 )
+
+    def test_final_heartbeat_failure_reaches_caller_after_seat_release(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+
+        failure = AuditIntegrityError("final heartbeat corruption")
+        releases: list[str] = []
+        original_release = RunCoordinationRepository.release_seat
+
+        def fail_heartbeat(self: RunCoordinationRepository, **kwargs: Any) -> None:
+            raise failure
+
+        def release(self: RunCoordinationRepository, **kwargs: Any) -> None:
+            original_release(self, **kwargs)
+            releases.append(kwargs["token"].run_id)
+
+        monkeypatch.setattr(RunCoordinationRepository, "worker_heartbeat", fail_heartbeat)
+        monkeypatch.setattr(RunCoordinationRepository, "release_seat", release)
+        source = ListSource([{"value": 1}], name="source", on_success="default")
+        sink = CollectSink("default")
+        graph = ExecutionGraph.from_plugin_instances(
+            sources={"primary": as_source(source)},
+            source_settings_map={"primary": SourceSettings(plugin=source.name, on_success="default", options={})},
+            transforms=[],
+            sinks={"default": as_sink(sink)},
+            aggregations={},
+            gates=[],
+        )
+        config = PipelineConfig(sources={"primary": as_source(source)}, transforms=[], sinks={"default": as_sink(sink)})
+        event_bus = RecordingEventBus()
+        orchestrator = Orchestrator(LandscapeDB.in_memory(), event_bus=event_bus)
+
+        with pytest.raises(AuditIntegrityError) as raised:
+            orchestrator.run(config, graph=graph, payload_store=MockPayloadStore(), shutdown_event=threading.Event())
+
+        assert raised.value is failure
+        assert releases
+        summaries = [event for event in event_bus.events if isinstance(event, RunSummary)]
+        assert all(summary.status.value != "completed" for summary in summaries)

@@ -359,6 +359,72 @@ def test_cleanup_failure_does_not_mask_primary_export_exception(
         db.close()
 
 
+def test_cleanup_logging_failure_preserves_pending_integrity_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.engine.orchestrator import audit_export_effects
+
+    primary = AuditIntegrityError("primary audit corruption")
+
+    def fail_cleanup() -> None:
+        raise OSError("cleanup failed")
+
+    def fail_logging(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("logging failed")
+
+    monkeypatch.setattr(audit_export_effects.logger, "exception", fail_logging)
+    with pytest.raises(AuditIntegrityError) as raised:
+        try:
+            raise primary
+        except AuditIntegrityError:
+            audit_export_effects._contain_cleanup_failure(fail_cleanup, "test spool", pending_exc=primary)
+            raise
+
+    assert raised.value is primary
+    assert primary.__notes__ == ["Audit-export cleanup failed: test spool; cleanup_error=OSError; diagnostic_error=RuntimeError"]
+
+
+def test_fatal_orphan_marking_still_closes_private_spool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from elspeth.engine.orchestrator import audit_export_effects
+
+    failure = AuditIntegrityError("orphan registry corruption")
+    primary = OSError("object write failed")
+    spools: list[BinaryIO] = []
+    real_temporary_file = audit_export_effects.TemporaryFile
+
+    def tracked_temporary_file(*args: Any, **kwargs: Any) -> BinaryIO:
+        spool = cast(BinaryIO, real_temporary_file(*args, **kwargs))
+        spools.append(spool)
+        return spool
+
+    class FailingStore(_MemoryContentStore):
+        def put_immutable(self, content: bytes, *, candidate_id: str, object_kind: str) -> str:
+            raise primary
+
+        def mark_candidate_orphans(self, candidate_id: str, descriptors: tuple[AuditExportContentDescriptor, ...]) -> None:
+            raise failure
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(audit_export_effects, "TemporaryFile", tracked_temporary_file)
+    db = LandscapeDB(f"sqlite:///{tmp_path / 'orphan-fatal.db'}")
+    try:
+        _insert_terminal_run(db)
+        with pytest.raises(AuditIntegrityError) as raised:
+            prepare_audit_export_snapshot(
+                db,
+                coordination_token=leader_token_for(db, "run-export"),
+                config=_config(),
+                signing_key=None,
+                content_store=FailingStore(),
+            )
+        assert raised.value is failure
+        assert failure.__context__ is primary
+        assert len(spools) == 1
+        assert spools[0].closed
+    finally:
+        for spool in spools:
+            spool.close()
+        db.close()
+
+
 @pytest.mark.parametrize(
     "close_error",
     [OSError("spool close failure"), AuditIntegrityError("spool integrity failed"), FrameworkBugError("spool invariant failed")],
