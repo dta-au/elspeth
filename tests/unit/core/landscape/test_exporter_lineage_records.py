@@ -44,28 +44,42 @@ def test_fork_coalesce_export_round_trips_lineage_path_and_group_records() -> No
     from elspeth.contracts.enums import NodeType
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.core.landscape.exporter import LandscapeExporter
-    from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+    from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run, register_test_node
 
     setup = make_recorder_with_run(run_id="run-export-1", source_node_id="source-0", source_plugin_name="csv")
     db, factory = setup.db, setup.factory
     register_test_node(factory.data_flow, setup.run_id, "fork-0", node_type=NodeType.GATE, plugin_name="gate")
 
-    row = factory.data_flow.create_row(
-        run_id=setup.run_id,
+    authority = leader_coordination_token(factory, setup.run_id)
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=authority,
         source_node_id="source-0",
         row_index=0,
         data={"col": "val"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=authority.membership,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id="fork-0",
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json='{"col":"val"}',
+        lease_owner=authority.worker_id,
+        lease_seconds=300,
+    )
     children, fork_group_id = factory.data_flow.fork_token(
+        member_token=authority.membership,
+        work_item=work_item,
         parent_ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         row_id=row.row_id,
         branches=["a", "b"],
     )
     minimal_contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
     factory.data_flow.coalesce_tokens(
+        coordination_token=authority,
         parent_refs=[TokenRef(token_id=c.token_id, run_id=setup.run_id) for c in children],
         row_id=row.row_id,
         merged_payload={"merged": True},
@@ -96,22 +110,24 @@ def test_collect_release_export_carries_the_written_release_fact() -> None:
     from elspeth.contracts.audit import TokenRef
     from elspeth.contracts.schema_contract import SchemaContract
     from elspeth.core.landscape.exporter import LandscapeExporter
-    from tests.fixtures.landscape import make_recorder_with_run
+    from tests.fixtures.landscape import leader_coordination_token, make_recorder_with_run
 
     setup = make_recorder_with_run(run_id="run-export-2", source_node_id="source-0", source_plugin_name="csv")
     db, factory = setup.db, setup.factory
-    row = factory.data_flow.create_row(
-        run_id=setup.run_id, source_node_id="source-0", row_index=0, data={"col": "val"}, source_row_index=0, ingest_sequence=0
+    authority = leader_coordination_token(factory, setup.run_id)
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=authority, source_node_id="source-0", row_index=0, data={"col": "val"}, source_row_index=0, ingest_sequence=0
     )
-    token = factory.data_flow.create_token(row.row_id)
     contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
     members, expand_group_id = factory.data_flow.expand_token(
+        member_token=authority.membership,
         parent_ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
         row_id=row.row_id,
         child_payloads=[{"i": 0}, {"i": 1}],
         output_contract=contract,
     )
     committed = factory.data_flow.collect_tokens(
+        coordination_token=authority,
         member_refs=[TokenRef(token_id=m.token_id, run_id=setup.run_id) for m in members],
         group_id=expand_group_id,
         collector_node_id="collector-0",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 
@@ -10,15 +11,18 @@ from sqlalchemy.exc import OperationalError
 
 from elspeth.contracts import AggregationParentDisposition, NodeStateStatus, NodeType, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.identity import LineageFrame, path_branch_name, path_expand_group_id, path_fork_group_id
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
-from elspeth.core.landscape import LandscapeDB
+from elspeth.core.landscape import LandscapeDB, run_coordination_repository
 from elspeth.core.landscape.errors import LandscapeRecordError
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     batches_table,
     group_records_table,
@@ -29,7 +33,14 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    make_factory,
+    make_landscape_db,
+    make_recorder_with_run,
+    register_test_node,
+)
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -47,7 +58,7 @@ def _setup(*, run_id: str = "run-1") -> tuple[LandscapeDB, RecorderFactory]:
 def _make_batch(factory: RecorderFactory, *, run_id: str = "run-1", batch_id: str = "batch-1") -> str:
     """Helper to create a batch and return its batch_id."""
     batch = factory.execution.create_batch(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         aggregation_node_id="agg-0",
         batch_id=batch_id,
     )
@@ -56,16 +67,25 @@ def _make_batch(factory: RecorderFactory, *, run_id: str = "run-1", batch_id: st
 
 def _make_row(factory: RecorderFactory, *, run_id: str = "run-1", row_index: int = 0):
     """Helper to create a row and its initial token."""
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    return factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
         source_node_id="source-0",
         row_index=row_index,
         data={"col": f"value-{row_index}"},
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    token = factory.data_flow.create_token(row.row_id)
-    return row, token
+
+
+def _add_batch_member(factory: RecorderFactory, batch_id: str, token_id: str, ordinal: int) -> None:
+    authority = leader_coordination_token(factory, "run-1")
+    with fenced_leader_transaction(
+        factory.data_flow._db.engine,
+        token=authority,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="test_add_batch_member",
+    ) as conn:
+        add_batch_member_guarded(conn, batch_id=batch_id, token_id=token_id, ordinal=ordinal, expected_run_id=authority.run_id)
 
 
 def _record_completed_sink_state_with_artifact(
@@ -86,41 +106,49 @@ def _record_completed_sink_state_with_artifact(
     state = factory.execution.begin_node_state(
         token_id=token_id,
         node_id=sink_node_id,
-        run_id=run_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
         step_index=0,
         input_data={},
     )
     factory.execution.complete_node_state(
+        member_token=leader_coordination_token(factory, run_id).membership,
         state_id=state.state_id,
         status=NodeStateStatus.COMPLETED,
         output_data={"written": True},
         duration_ms=1.0,
     )
-    artifact = factory.execution.register_artifact(
-        run_id=run_id,
-        state_id=state.state_id,
-        sink_node_id=sink_node_id,
-        artifact_type="test",
-        path=f"memory://unit/{token_id}",
-        content_hash="deadbeef" * 8,
-        size_bytes=0,
-    )
+    with fenced_leader_transaction(
+        factory.data_flow._db.engine,
+        token=leader_coordination_token(factory, run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="test_register_artifact",
+    ) as conn:
+        artifact = factory.execution.artifacts.register_artifact(
+            run_id=run_id,
+            state_id=state.state_id,
+            sink_node_id=sink_node_id,
+            artifact_type="test",
+            path=f"memory://unit/{token_id}",
+            content_hash="deadbeef" * 8,
+            size_bytes=0,
+            conn=conn,
+        )
     return artifact.artifact_id
 
 
 class TestCreateRow:
-    """Tests for DataFlowRepository.create_row."""
+    """Row properties of the atomic DataFlowRepository.create_row_with_token."""
 
     def test_creates_row_with_generated_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         assert row.row_id is not None
         assert row.run_id == "run-1"
         assert row.source_node_id == "source-0"
@@ -128,80 +156,80 @@ class TestCreateRow:
 
     def test_creates_row_with_explicit_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             row_id="custom-row-id",
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         assert row.row_id == "custom-row-id"
 
     def test_stores_source_data_hash(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         assert row.source_data_hash is not None
         assert len(row.source_data_hash) > 0
 
     def test_deterministic_hash_for_same_data(self):
         _db, factory = _setup()
-        row_a = factory.data_flow.create_row(
-            run_id="run-1",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        row_b = factory.data_flow.create_row(
-            run_id="run-1",
+        )[0]
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=1,
             data={"name": "Alice"},
             source_row_index=1,
             ingest_sequence=1,
-        )
+        )[0]
         assert row_a.source_data_hash == row_b.source_data_hash
 
     def test_different_hash_for_different_data(self):
         _db, factory = _setup()
-        row_a = factory.data_flow.create_row(
-            run_id="run-1",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        row_b = factory.data_flow.create_row(
-            run_id="run-1",
+        )[0]
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=1,
             data={"name": "Bob"},
             source_row_index=1,
             ingest_sequence=1,
-        )
+        )[0]
         assert row_a.source_data_hash != row_b.source_data_hash
 
     def test_roundtrip_via_get_row(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"name": "Alice"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         fetched = factory.query.get_row(row.row_id)
         assert fetched is not None
         assert fetched.row_id == row.row_id
@@ -212,27 +240,27 @@ class TestCreateRow:
 
     def test_created_at_is_set(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         assert row.created_at is not None
 
     def test_multiple_rows_get_unique_ids(self):
         _db, factory = _setup()
         rows = [
-            factory.data_flow.create_row(
-                run_id="run-1",
+            factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, "run-1"),
                 source_node_id="source-0",
                 row_index=i,
                 data={"i": i},
                 source_row_index=i,
                 ingest_sequence=i,
-            )
+            )[0]
             for i in range(5)
         ]
         row_ids = [r.row_id for r in rows]
@@ -244,29 +272,31 @@ class TestCreateToken:
 
     def test_creates_token_with_generated_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token = factory.data_flow.create_token(row.row_id)
+        )[0]
+        token = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id))
         assert token.token_id is not None
         assert token.row_id == row.row_id
 
     def test_creates_token_with_explicit_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
+        )[0]
+        token = factory.data_flow.create_token(
+            row.row_id, token_id="custom-token-id", coordination_token=leader_coordination_token(factory, row.run_id)
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="custom-token-id")
         assert token.token_id == "custom-token-id"
 
     def test_rejects_empty_string_join_group_id(self):
@@ -274,85 +304,93 @@ class TestCreateToken:
         carrier, not a lineage-path frame — so it has no LineageFrame constructor to
         catch an empty value on its behalf; create_token is the only write path)."""
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         with pytest.raises(AuditIntegrityError, match="join_group_id must be None or non-empty"):
-            factory.data_flow.create_token(row.row_id, join_group_id="")
+            factory.data_flow.create_token(row.row_id, join_group_id="", coordination_token=leader_coordination_token(factory, row.run_id))
 
     def test_creates_token_with_branch_name(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         token = factory.data_flow.create_token(
-            row.row_id, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path-a"),)
+            row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path-a"),),
+            coordination_token=leader_coordination_token(factory, row.run_id),
         )
         assert path_branch_name(token.lineage_path) == "path-a"
         assert path_fork_group_id(token.lineage_path) == "fg-1"
 
     def test_creates_token_with_fork_group_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         token = factory.data_flow.create_token(
-            row.row_id, lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="b"),)
+            row.row_id,
+            lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="b"),),
+            coordination_token=leader_coordination_token(factory, row.run_id),
         )
         assert path_fork_group_id(token.lineage_path) == "fg-1"
 
     def test_creates_token_with_join_group_id(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
+        )[0]
+        token = factory.data_flow.create_token(
+            row.row_id, join_group_id="jg-1", coordination_token=leader_coordination_token(factory, row.run_id)
         )
-        token = factory.data_flow.create_token(row.row_id, join_group_id="jg-1")
         assert token.join_group_id == "jg-1"
 
     def test_created_at_is_set(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token = factory.data_flow.create_token(row.row_id)
+        )[0]
+        token = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id))
         assert token.created_at is not None
 
     def test_multiple_tokens_for_same_row(self):
         _db, factory = _setup()
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "val"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        tokens = [factory.data_flow.create_token(row.row_id) for _ in range(3)]
+        )[0]
+        tokens = [
+            factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id)) for _ in range(3)
+        ]
         token_ids = [t.token_id for t in tokens]
         assert len(set(token_ids)) == 3
         assert all(t.row_id == row.row_id for t in tokens)
@@ -368,6 +406,10 @@ class TestForkToken:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b", "path-c"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert len(children) == 3
         branch_names = [path_branch_name(c.lineage_path) for c in children]
@@ -382,6 +424,10 @@ class TestForkToken:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert fork_group_id is not None
         assert all(path_fork_group_id(c.lineage_path) == fork_group_id for c in children)
@@ -393,6 +439,10 @@ class TestForkToken:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert all(c.row_id == row.row_id for c in children)
 
@@ -403,6 +453,10 @@ class TestForkToken:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         outcome = factory.data_flow.get_token_outcome(token.token_id)
         assert outcome is not None
@@ -423,6 +477,10 @@ class TestForkToken:
                 parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 row_id=row.row_id,
                 branches=[],
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_children_have_unique_token_ids(self):
@@ -432,6 +490,10 @@ class TestForkToken:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b", "path-c"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         token_ids = [c.token_id for c in children]
         assert len(set(token_ids)) == 3
@@ -444,6 +506,10 @@ class TestForkToken:
             row_id=row.row_id,
             branches=["path-a", "path-b"],
             step_in_pipeline=3,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert all(c.step_in_pipeline == 3 for c in children)
 
@@ -455,6 +521,10 @@ class TestForkToken:
             row_id=row.row_id,
             branches=["path-a", "path-b"],
             step_in_pipeline=3,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
 
         replayed_children, replayed_group = factory.data_flow.fork_token(
@@ -462,6 +532,10 @@ class TestForkToken:
             row_id=row.row_id,
             branches=["path-a", "path-b"],
             step_in_pipeline=3,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
 
         assert replayed_group == first_group
@@ -486,6 +560,10 @@ class TestForkToken:
             row_id=row.row_id,
             branches=["path-a", "path-b"],
             step_in_pipeline=3,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
 
         with pytest.raises(AuditIntegrityError, match="divergent fork replay"):
@@ -494,6 +572,10 @@ class TestForkToken:
                 row_id=row.row_id,
                 branches=["path-b", "path-a"],
                 step_in_pipeline=3,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
         parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
@@ -515,9 +597,15 @@ def _make_coalesce_parents(factory: RecorderFactory, row_id: str, branches: list
     group_records row fails closed); never weaken the closer to accommodate
     a fixture that models something a real fork never produces.
     """
-    parent = factory.data_flow.create_token(row_id)
+    parent = factory.data_flow.create_token(row_id, coordination_token=leader_coordination_token(factory, run_id))
     children, _fork_group_id = factory.data_flow.fork_token(
-        parent_ref=TokenRef(token_id=parent.token_id, run_id=run_id), row_id=row_id, branches=branches
+        parent_ref=TokenRef(token_id=parent.token_id, run_id=run_id),
+        row_id=row_id,
+        branches=branches,
+        member_token=leader_coordination_token(factory, run_id).membership,
+        work_item=claim_test_work_item(
+            factory, member_token=leader_coordination_token(factory, run_id).membership, token_id=parent.token_id, node_id=None
+        ),
     )
     return children
 
@@ -534,6 +622,7 @@ class TestCoalesceTokens:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert merged.token_id is not None
         assert merged.row_id == row.row_id
@@ -547,6 +636,7 @@ class TestCoalesceTokens:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert merged.join_group_id is not None
 
@@ -563,6 +653,7 @@ class TestCoalesceTokens:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert merged.token_id is not None
         assert merged.join_group_id is not None
@@ -577,6 +668,7 @@ class TestCoalesceTokens:
             merged_payload={"merged": True},
             step_in_pipeline=5,
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert merged.step_in_pipeline == 5
 
@@ -592,6 +684,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(4)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert len(children) == 4
         assert expand_group_id is not None
@@ -604,6 +697,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(3)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert all(path_expand_group_id(c.lineage_path) == expand_group_id for c in children)
 
@@ -615,6 +709,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": 1}, {"item": 2}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert all(c.row_id == row.row_id for c in children)
 
@@ -626,6 +721,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(3)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         outcome = factory.data_flow.get_token_outcome(token.token_id)
         assert outcome is not None
@@ -645,13 +741,14 @@ class TestExpandToken:
                 row_id=row.row_id,
                 child_payloads=[],
                 output_contract=_MINIMAL_CONTRACT,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_batch_expansion_consumes_parent_atomically_and_reconciles_exact_replay(self):
         _db, factory = _setup()
         batch_id = _make_batch(factory, batch_id="batch-expand")
         row, token = _make_row(factory)
-        factory.execution.add_batch_member(batch_id, token.token_id, 0)
+        _add_batch_member(factory, batch_id, token.token_id, 0)
         children, expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
@@ -659,6 +756,7 @@ class TestExpandToken:
             output_contract=_MINIMAL_CONTRACT,
             parent_path=TerminalPath.BATCH_CONSUMED,
             parent_batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         outcome = factory.data_flow.get_token_outcome(token.token_id)
@@ -674,6 +772,7 @@ class TestExpandToken:
             output_contract=_MINIMAL_CONTRACT,
             parent_path=TerminalPath.BATCH_CONSUMED,
             parent_batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert replayed_group_id == expand_group_id
         assert [child.token_id for child in replayed_children] == [child.token_id for child in children]
@@ -686,6 +785,7 @@ class TestExpandToken:
                 output_contract=_MINIMAL_CONTRACT,
                 parent_path=TerminalPath.BATCH_CONSUMED,
                 parent_batch_id=batch_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
         with _db.connection() as conn:
@@ -705,8 +805,8 @@ class TestExpandToken:
         batch_id = _make_batch(factory, batch_id="batch-expand-once")
         first_row, first_parent = _make_row(factory, row_index=0)
         second_row, second_parent = _make_row(factory, row_index=1)
-        factory.execution.add_batch_member(batch_id, first_parent.token_id, 0)
-        factory.execution.add_batch_member(batch_id, second_parent.token_id, 1)
+        _add_batch_member(factory, batch_id, first_parent.token_id, 0)
+        _add_batch_member(factory, batch_id, second_parent.token_id, 1)
 
         children, expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
@@ -715,6 +815,7 @@ class TestExpandToken:
             output_contract=_MINIMAL_CONTRACT,
             parent_path=TerminalPath.BATCH_CONSUMED,
             parent_batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         first_outcome = factory.data_flow.get_token_outcome(first_parent.token_id)
@@ -730,6 +831,7 @@ class TestExpandToken:
                 output_contract=_MINIMAL_CONTRACT,
                 parent_path=TerminalPath.BATCH_CONSUMED,
                 parent_batch_id=batch_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
         with _db.connection() as conn:
@@ -749,8 +851,8 @@ class TestExpandToken:
         batch_id = _make_batch(factory, batch_id="batch-expand-rollback")
         first_row, first_parent = _make_row(factory, row_index=0)
         _second_row, second_parent = _make_row(factory, row_index=1)
-        factory.execution.add_batch_member(batch_id, first_parent.token_id, 0)
-        factory.execution.add_batch_member(batch_id, second_parent.token_id, 1)
+        _add_batch_member(factory, batch_id, first_parent.token_id, 0)
+        _add_batch_member(factory, batch_id, second_parent.token_id, 1)
         dispositions = (
             AggregationParentDisposition(
                 parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
@@ -764,17 +866,21 @@ class TestExpandToken:
                 error_hash="quarantined-test-hash",
             ),
         )
-        original_record = factory.data_flow.outcomes.record_token_outcome
-        calls = 0
+        original_record = factory.data_flow.outcomes.record_parent_outcomes_on
 
-        def fail_second(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise LandscapeRecordError("injected second disposition failure")
-            return original_record(*args, **kwargs)
+        def fail_second(
+            conn: Connection,
+            *,
+            run_id: str,
+            dispositions: Sequence[AggregationParentDisposition],
+            batch_id: str | None = None,
+        ) -> None:
+            assert len(dispositions) == 2
+            original_record(conn, run_id=run_id, dispositions=dispositions[:1], batch_id=batch_id)
+            assert conn.execute(select(token_outcomes_table.c.outcome_id)).one()
+            raise LandscapeRecordError("injected second disposition failure")
 
-        monkeypatch.setattr(factory.data_flow.outcomes, "record_token_outcome", fail_second)
+        monkeypatch.setattr(factory.data_flow.outcomes, "record_parent_outcomes_on", fail_second)
         with pytest.raises(LandscapeRecordError, match="injected second disposition failure"):
             factory.data_flow.expand_token(
                 parent_ref=TokenRef(token_id=first_parent.token_id, run_id="run-1"),
@@ -784,6 +890,7 @@ class TestExpandToken:
                 parent_path=TerminalPath.BATCH_CONSUMED,
                 parent_batch_id=batch_id,
                 aggregation_parent_dispositions=dispositions,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
         with db.connection() as conn:
@@ -810,6 +917,7 @@ class TestExpandToken:
                 output_contract=_MINIMAL_CONTRACT,
                 parent_path=TerminalPath.BATCH_CONSUMED,
                 parent_batch_id=batch_id,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_children_have_unique_token_ids(self):
@@ -820,6 +928,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(5)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         token_ids = [c.token_id for c in children]
         assert len(set(token_ids)) == 5
@@ -833,6 +942,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}],
             step_in_pipeline=7,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert all(c.step_in_pipeline == 7 for c in children)
 
@@ -846,6 +956,7 @@ class TestExpandToken:
             child_payloads=payloads,
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=7,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         replayed_children, replayed_group = factory.data_flow.expand_token(
@@ -854,6 +965,7 @@ class TestExpandToken:
             child_payloads=payloads,
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=7,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert replayed_group == first_group
@@ -885,6 +997,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}],
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=7,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with pytest.raises(AuditIntegrityError, match="divergent expansion replay"):
@@ -894,6 +1007,7 @@ class TestExpandToken:
                 child_payloads=[{"item": 1}, {"item": 3}],
                 output_contract=_MINIMAL_CONTRACT,
                 step_in_pipeline=7,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
         parent_path = factory.data_flow.load_lineage_paths("run-1", [token.token_id])[token.token_id]
@@ -917,6 +1031,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}],
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=7,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         with db.write_connection() as conn:
@@ -929,6 +1044,7 @@ class TestExpandToken:
                 child_payloads=[{"item": 1}, {"item": 2}],
                 output_contract=_MINIMAL_CONTRACT,
                 step_in_pipeline=7,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_expand_count_one(self):
@@ -939,6 +1055,7 @@ class TestExpandToken:
             row_id=row.row_id,
             child_payloads=[{"item": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert len(children) == 1
         assert expand_group_id is not None
@@ -970,6 +1087,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}, {"item": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
 
@@ -979,6 +1097,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"combined": True}],
             output_contracts=[_MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert len(committed.children) == 1
         assert committed.release_group_id != group_id
@@ -1000,6 +1119,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}, {"item": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
 
@@ -1009,6 +1129,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"combined": True}],
             output_contracts=[_MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         replayed = factory.data_flow.collect_tokens(
             member_refs=member_refs,
@@ -1016,6 +1137,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"combined": True}],
             output_contracts=[_MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert replayed.release_group_id == first.release_group_id
         assert [c.token_id for c in replayed.children] == [c.token_id for c in first.children]
@@ -1033,6 +1155,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}, {"item": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
 
@@ -1042,6 +1165,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"combined": True}],
             output_contracts=[_MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         with pytest.raises(AuditIntegrityError, match="divergent collect replay"):
@@ -1051,6 +1175,7 @@ class TestCollectTokens:
                 collector_node_id="collector-1",
                 output_payloads=[{"combined": False}],
                 output_contracts=[_MINIMAL_CONTRACT],
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
         with db.connection() as conn:
@@ -1076,6 +1201,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}, {"item": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
 
@@ -1085,6 +1211,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"row": 0}, {"row": 1}, {"row": 2}],
             output_contracts=[_MINIMAL_CONTRACT, _MINIMAL_CONTRACT, _MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert len(committed.children) == 3
         assert len({c.token_id for c in committed.children}) == 3  # every child token_id distinct
@@ -1095,6 +1222,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[{"row": 0}, {"row": 1}, {"row": 2}],
             output_contracts=[_MINIMAL_CONTRACT, _MINIMAL_CONTRACT, _MINIMAL_CONTRACT],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         # Replay reconciliation zips (children, output_data_refs) in the SAME
         # order they were minted — an ordinal-ordering bug here would surface
@@ -1119,12 +1247,17 @@ class TestCollectTokens:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         (member,), expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=branch.token_id, run_id="run-1"),
             row_id=row.row_id,
             child_payloads=[{"item": 0}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         # member's mint frames are (FORK, EXPAND) — non-empty remaining path
         # once the collector pops its own EXPAND closer frame.
@@ -1142,6 +1275,7 @@ class TestCollectTokens:
                     LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id),
                 )
             },
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         child_id = committed.children[0].token_id
         child_path = factory.data_flow.load_lineage_paths("run-1", [child_id])[child_id]
@@ -1164,6 +1298,7 @@ class TestCollectTokens:
                     LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id),
                 )
             },
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert replayed.children[0].token_id == child_id
 
@@ -1184,6 +1319,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member = members[0]
         member_expand_frame = LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=member.token_id)
@@ -1192,6 +1328,10 @@ class TestCollectTokens:
             row_id=row.row_id,
             branches=["path-a"],
             parent_lineage_path=(member_expand_frame,),
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=member.token_id, node_id=None
+            ),
         )
         _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=branch.token_id)
         released_path = (member_expand_frame,)  # mint (EXPAND, FORK) minus the popped FORK frame
@@ -1206,6 +1346,7 @@ class TestCollectTokens:
                 collector_node_id="collector-1",
                 output_payloads=[{"combined": True}],
                 output_contracts=[_MINIMAL_CONTRACT],
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
         committed = factory.data_flow.collect_tokens(
@@ -1215,6 +1356,7 @@ class TestCollectTokens:
             output_payloads=[{"combined": True}],
             output_contracts=[_MINIMAL_CONTRACT],
             member_lineage_paths={branch.token_id: released_path},
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert len(committed.children) == 1
         child_id = committed.children[0].token_id
@@ -1234,6 +1376,7 @@ class TestCollectTokens:
             row_id=row.row_id,
             child_payloads=[{"item": 0}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         member_refs = [TokenRef(token_id=m.token_id, run_id="run-1") for m in members]
 
@@ -1243,6 +1386,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[],
             output_contracts=[],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert committed.children == ()
         record = _group_record(_db, committed.release_group_id)
@@ -1255,6 +1399,7 @@ class TestCollectTokens:
             collector_node_id="collector-1",
             output_payloads=[],
             output_contracts=[],
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert replayed.release_group_id == committed.release_group_id
         assert replayed.children == ()
@@ -1266,6 +1411,7 @@ class TestCollectTokens:
                 collector_node_id="collector-1",
                 output_payloads=[{"combined": True}],
                 output_contracts=[_MINIMAL_CONTRACT],
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
 
@@ -1286,6 +1432,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_completed_accepts_sink_name(self):
@@ -1296,6 +1446,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1307,6 +1461,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_routed_accepts_sink_name(self):
@@ -1317,6 +1475,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.GATE_ROUTED,
             sink_name="reject-sink",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1330,6 +1492,10 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1341,6 +1507,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_failed_accepts_error_hash(self):
@@ -1351,6 +1521,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="abc123",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1362,6 +1536,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_quarantined_accepts_error_hash(self):
@@ -1372,6 +1550,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="abc123",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1384,6 +1566,10 @@ class TestValidateOutcomeFields:
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="abc123",
             sink_name="quarantine",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1395,6 +1581,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.BATCH_CONSUMED,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_consumed_in_batch_accepts_batch_id(self):
@@ -1406,6 +1596,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1420,6 +1614,10 @@ class TestValidateOutcomeFields:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1430,6 +1628,10 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1443,6 +1645,10 @@ class TestValidateOutcomeFields:
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.EXPAND_PARENT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1455,6 +1661,10 @@ class TestValidateOutcomeFields:
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
                 error_hash="abc123",
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_diverted_requires_error_hash(self):
@@ -1466,6 +1676,10 @@ class TestValidateOutcomeFields:
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
                 sink_name="failsink",
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_diverted_accepts_sink_name_and_error_hash(self):
@@ -1485,6 +1699,10 @@ class TestValidateOutcomeFields:
             sink_node_id="sink-0",
             artifact_id=artifact_id,
             error_hash="abc123",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1496,6 +1714,10 @@ class TestValidateOutcomeFields:
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=None,
                 path=TerminalPath.BUFFERED,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_buffered_accepts_batch_id(self):
@@ -1507,6 +1729,10 @@ class TestValidateOutcomeFields:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1522,6 +1748,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -1533,6 +1763,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert isinstance(outcome_id, str)
         assert len(outcome_id) > 0
@@ -1545,6 +1779,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1563,6 +1801,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="err-hash-abc",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1579,6 +1821,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="quarantine-hash",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1594,6 +1840,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.GATE_ROUTED,
             sink_name="reject",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1610,6 +1860,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1626,6 +1880,10 @@ class TestRecordTokenOutcome:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1642,6 +1900,10 @@ class TestRecordTokenOutcome:
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
             context={"reason": "all good"},
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1655,6 +1917,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -1670,6 +1936,8 @@ class TestRecordTokenOutcomeAtomicity:
     ) -> None:
         _db, factory = _setup()
         _row, token = _make_row(factory)
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = claim_test_work_item(factory, member_token=member_token, token_id=token.token_id, node_id=None)
         outcomes = factory.data_flow.outcomes
         ownership_connections: list[Connection | None] = []
         invariant_connections: list[Connection | None] = []
@@ -1711,6 +1979,8 @@ class TestRecordTokenOutcomeAtomicity:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=member_token,
+            work_item=work_item,
         )
 
         assert ownership_connections == invariant_connections
@@ -1723,11 +1993,13 @@ class TestRecordTokenOutcomeAtomicity:
     ) -> None:
         db, factory = _setup()
         _row, token = _make_row(factory)
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = claim_test_work_item(factory, member_token=member_token, token_id=token.token_id, node_id=None)
         register_test_node(factory.data_flow, "run-1", "sink-atomic", node_type=NodeType.SINK, plugin_name="sink")
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="sink-atomic",
-            run_id="run-1",
+            member_token=leader_coordination_token(factory, "run-1").membership,
             step_index=0,
             input_data={},
         )
@@ -1760,13 +2032,8 @@ class TestRecordTokenOutcomeAtomicity:
                 .where(node_states_table.c.state_id == state.state_id)
                 .values(status=NodeStateStatus.COMPLETED.value)
             )
-            if conn is None:
-                # This is the pre-fix shape: validation runs outside the
-                # outcome transaction, so its side effect commits independently.
-                with db.write_connection() as separate_conn:
-                    separate_conn.execute(mutation)
-            else:
-                conn.execute(mutation)
+            assert conn is not None
+            conn.execute(mutation)
             raise RuntimeError("injected after cross-table validation")
 
         monkeypatch.setattr(outcomes, "_validate_cross_table_invariants", fail_after_validation_write)
@@ -1777,6 +2044,8 @@ class TestRecordTokenOutcomeAtomicity:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                member_token=member_token,
+                work_item=work_item,
             )
 
         with db.read_only_connection() as conn:
@@ -1824,8 +2093,16 @@ class TestRecordTokenOutcomeAtomicity:
 
         monkeypatch.setattr(outcomes, "_validate_cross_table_invariants", capture_invariants)
 
-        with pytest.raises(RuntimeError, match="outer transaction rollback"), db.write_connection() as caller_conn:
-            factory.data_flow.record_token_outcome(
+        with (
+            pytest.raises(RuntimeError, match="outer transaction rollback"),
+            fenced_leader_transaction(
+                db.engine,
+                token=leader_coordination_token(factory, "run-1"),
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="test_outcome_outer_rollback",
+            ) as caller_conn,
+        ):
+            factory.data_flow.outcomes.record_token_outcome_on(
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
@@ -1845,16 +2122,18 @@ class TestRecordTokenOutcomeAtomicity:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        db, factory = _setup()
+        _db, factory = _setup()
         _row, token = _make_row(factory)
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = claim_test_work_item(factory, member_token=member_token, token_id=token.token_id, node_id=None)
         opened_transactions: list[bool] = []
-        original_write_connection = db.write_connection
+        original_begin_write = run_coordination_repository.begin_write
 
-        def track_write_connection():
+        def track_begin_write(engine):
             opened_transactions.append(True)
-            return original_write_connection()
+            return original_begin_write(engine)
 
-        monkeypatch.setattr(db, "write_connection", track_write_connection)
+        monkeypatch.setattr(run_coordination_repository, "begin_write", track_begin_write)
 
         with pytest.raises(ValueError, match="Cannot canonicalize non-finite float"):
             factory.data_flow.record_token_outcome(
@@ -1863,6 +2142,8 @@ class TestRecordTokenOutcomeAtomicity:
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
                 context={"invalid": float("nan")},
+                member_token=member_token,
+                work_item=work_item,
             )
 
         assert opened_transactions == []
@@ -1884,9 +2165,14 @@ class TestRecordTokenOutcomeAtomicity:
 
         monkeypatch.setattr(outcomes._ownership, "validate_token_run_ownership", capture_ownership)
 
-        with db.write_connection() as caller_conn:
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, "run-1"),
+            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+            verb="test_outcome_context_validation",
+        ) as caller_conn:
             with pytest.raises(ValueError, match="Cannot canonicalize non-finite float"):
-                factory.data_flow.record_token_outcome(
+                factory.data_flow.outcomes.record_token_outcome_on(
                     ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                     outcome=TerminalOutcome.SUCCESS,
                     path=TerminalPath.DEFAULT_FLOW,
@@ -1905,15 +2191,17 @@ class TestRecordTokenOutcomeAtomicity:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        db, factory = _setup()
+        _db, factory = _setup()
         _row, token = _make_row(factory)
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = claim_test_work_item(factory, member_token=member_token, token_id=token.token_id, node_id=None)
 
         @contextmanager
-        def fail_begin():
+        def fail_begin(engine):
             raise OperationalError("BEGIN IMMEDIATE", {}, RuntimeError("injected begin failure"))
             yield  # pragma: no cover - contextmanager shape only
 
-        monkeypatch.setattr(db, "write_connection", fail_begin)
+        monkeypatch.setattr(run_coordination_repository, "begin_write", fail_begin)
 
         with pytest.raises(LandscapeRecordError, match=r"transaction boundary.*OperationalError") as exc_info:
             factory.data_flow.record_token_outcome(
@@ -1921,6 +2209,8 @@ class TestRecordTokenOutcomeAtomicity:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                member_token=member_token,
+                work_item=work_item,
             )
 
         assert isinstance(exc_info.value.__cause__, OperationalError)
@@ -1930,17 +2220,19 @@ class TestRecordTokenOutcomeAtomicity:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        db, factory = _setup()
+        _db, factory = _setup()
         _row, token = _make_row(factory)
-        original_write_connection = db.write_connection
+        member_token = leader_coordination_token(factory, "run-1").membership
+        work_item = claim_test_work_item(factory, member_token=member_token, token_id=token.token_id, node_id=None)
+        original_begin_write = run_coordination_repository.begin_write
 
         @contextmanager
-        def fail_commit():
-            with original_write_connection() as conn:
+        def fail_commit(engine):
+            with original_begin_write(engine) as conn:
                 yield conn
                 raise OperationalError("COMMIT", {}, RuntimeError("injected commit failure"))
 
-        monkeypatch.setattr(db, "write_connection", fail_commit)
+        monkeypatch.setattr(run_coordination_repository, "begin_write", fail_commit)
 
         with pytest.raises(LandscapeRecordError, match=r"transaction boundary.*OperationalError") as exc_info:
             factory.data_flow.record_token_outcome(
@@ -1948,6 +2240,8 @@ class TestRecordTokenOutcomeAtomicity:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                member_token=member_token,
+                work_item=work_item,
             )
 
         assert isinstance(exc_info.value.__cause__, OperationalError)
@@ -1959,7 +2253,12 @@ class TestRecordTokenOutcomeAtomicity:
 
         @contextmanager
         def caller_transaction_with_commit_failure():
-            with db.write_connection() as conn:
+            with fenced_leader_transaction(
+                db.engine,
+                token=leader_coordination_token(factory, "run-1"),
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="test_outcome_caller_commit_failure",
+            ) as conn:
                 yield conn
                 raise OperationalError("COMMIT", {}, RuntimeError("caller-owned commit failure"))
 
@@ -1967,7 +2266,7 @@ class TestRecordTokenOutcomeAtomicity:
             pytest.raises(OperationalError, match="caller-owned commit failure"),
             caller_transaction_with_commit_failure() as caller_conn,
         ):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.outcomes.record_token_outcome_on(
                 ref=TokenRef(token_id=token.token_id, run_id="run-1"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
@@ -1996,6 +2295,10 @@ class TestGetTokenOutcome:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         # Then record terminal
         factory.data_flow.record_token_outcome(
@@ -2003,6 +2306,10 @@ class TestGetTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -2019,6 +2326,10 @@ class TestGetTokenOutcome:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -2036,6 +2347,10 @@ class TestGetTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         # Then record non-terminal
         factory.data_flow.record_token_outcome(
@@ -2043,6 +2358,10 @@ class TestGetTokenOutcome:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         fetched = factory.data_flow.get_token_outcome(token.token_id)
         assert fetched is not None
@@ -2063,18 +2382,26 @@ class TestGetTokenOutcomesForRow:
     def test_returns_all_outcomes_for_row(self):
         _db, factory = _setup()
         row, token_a = _make_row(factory, row_index=0)
-        token_b = factory.data_flow.create_token(row.row_id)
+        token_b = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id))
         factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token_a.token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token_a.token_id, node_id=None
+            ),
         )
         factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token_b.token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.GATE_ROUTED,
             sink_name="reject",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token_b.token_id, node_id=None
+            ),
         )
         outcomes = factory.data_flow.get_token_outcomes_for_row(run_id="run-1", row_id=row.row_id)
         assert len(outcomes) == 2
@@ -2091,12 +2418,20 @@ class TestGetTokenOutcomesForRow:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token_a.token_id, node_id=None
+            ),
         )
         factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token_b.token_id, run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="err-hash",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token_b.token_id, node_id=None
+            ),
         )
         outcomes_a = factory.data_flow.get_token_outcomes_for_row(run_id="run-1", row_id=row_a.row_id)
         assert len(outcomes_a) == 1
@@ -2117,12 +2452,20 @@ class TestGetTokenOutcomesForRow:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch_id,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         outcomes = factory.data_flow.get_token_outcomes_for_row(run_id="run-1", row_id=row.row_id)
         assert len(outcomes) == 2
@@ -2135,6 +2478,10 @@ class TestGetTokenOutcomesForRow:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory_a, "run-A").membership,
+            work_item=claim_test_work_item(
+                factory_a, member_token=leader_coordination_token(factory_a, "run-A").membership, token_id=token_a.token_id, node_id=None
+            ),
         )
         # Query with a different run_id
         outcomes = factory_a.data_flow.get_token_outcomes_for_row(run_id="run-B", row_id=row_a.row_id)
@@ -2154,7 +2501,7 @@ def _setup_two_runs() -> tuple[LandscapeDB, RecorderFactory]:
     # Run A
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-A")
     factory.data_flow.register_node(
-        run_id="run-A",
+        coordination_token=leader_coordination_token(factory, "run-A"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2163,7 +2510,7 @@ def _setup_two_runs() -> tuple[LandscapeDB, RecorderFactory]:
         schema_config=_DYNAMIC_SCHEMA,
     )
     factory.data_flow.register_node(
-        run_id="run-A",
+        coordination_token=leader_coordination_token(factory, "run-A"),
         plugin_name="count_agg",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
@@ -2175,7 +2522,7 @@ def _setup_two_runs() -> tuple[LandscapeDB, RecorderFactory]:
     # Run B
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
     factory.data_flow.register_node(
-        run_id="run-B",
+        coordination_token=leader_coordination_token(factory, "run-B"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2184,7 +2531,7 @@ def _setup_two_runs() -> tuple[LandscapeDB, RecorderFactory]:
         schema_config=_DYNAMIC_SCHEMA,
     )
     factory.data_flow.register_node(
-        run_id="run-B",
+        coordination_token=leader_coordination_token(factory, "run-B"),
         plugin_name="count_agg",
         node_type=NodeType.AGGREGATION,
         plugin_version="1.0",
@@ -2209,38 +2556,48 @@ class TestCrossRunContaminationPrevention:
         _db, factory = _setup_two_runs()
 
         # Create row and token in run-A
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         # Attempt to record outcome under run-B -- must crash
-        with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
+        with pytest.raises(AuditIntegrityError, match="token reference does not belong to the claimed work item"):
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token_a.token_id, run_id="run-B"),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                member_token=leader_coordination_token(factory, token_a.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, token_a.run_id).membership,
+                    token_id=token_a.token_id,
+                    node_id=None,
+                ),
             )
+
+        with _db.read_only_connection() as conn:
+            assert conn.execute(select(token_outcomes_table.c.outcome_id)).all() == []
 
     def test_record_token_outcome_accepts_correct_run_id(self):
         """record_token_outcome must succeed when run_id matches token ownership."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         # Recording with the correct run_id should succeed
         outcome_id = factory.data_flow.record_token_outcome(
@@ -2248,6 +2605,10 @@ class TestCrossRunContaminationPrevention:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_coordination_token(factory, "run-A").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-A").membership, token_id=token_a.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -2255,70 +2616,90 @@ class TestCrossRunContaminationPrevention:
         """fork_token must crash if parent token belongs to a different run."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
             factory.data_flow.fork_token(
                 parent_ref=TokenRef(token_id=token_a.token_id, run_id="run-B"),
                 row_id=row_a.row_id,
                 branches=["path-a", "path-b"],
+                member_token=leader_coordination_token(factory, token_a.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, token_a.run_id).membership,
+                    token_id=token_a.token_id,
+                    node_id=None,
+                ),
             )
+
+        with _db.read_only_connection() as conn:
+            assert conn.execute(select(token_parents_table.c.token_id)).all() == []
+            assert conn.execute(select(group_records_table.c.group_id)).all() == []
+            assert conn.execute(select(token_outcomes_table.c.outcome_id)).all() == []
 
     def test_fork_token_rejects_wrong_row_id(self):
         """fork_token must crash if parent token belongs to a different row."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value-a"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        row_b = factory.data_flow.create_row(
-            run_id="run-A",
+        )[0]
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=1,
             data={"col": "value-b"},
             source_row_index=1,
             ingest_sequence=1,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         with pytest.raises(AuditIntegrityError, match="Cross-row lineage"):
             factory.data_flow.fork_token(
                 parent_ref=TokenRef(token_id=token_a.token_id, run_id="run-A"),
                 row_id=row_b.row_id,
                 branches=["path-a"],
+                member_token=leader_coordination_token(factory, "run-A").membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_coordination_token(factory, "run-A").membership, token_id=token_a.token_id, node_id=None
+                ),
             )
 
     def test_fork_token_accepts_correct_ownership(self):
         """fork_token must succeed when run_id and row_id match parent token."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         children, fg = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=token_a.token_id, run_id="run-A"),
             row_id=row_a.row_id,
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-A").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-A").membership, token_id=token_a.token_id, node_id=None
+            ),
         )
         assert len(children) == 2
         assert fg is not None
@@ -2327,15 +2708,15 @@ class TestCrossRunContaminationPrevention:
         """expand_token must crash if parent token belongs to a different run."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         with pytest.raises(AuditIntegrityError, match="Cross-run contamination"):
             factory.data_flow.expand_token(
@@ -2343,29 +2724,30 @@ class TestCrossRunContaminationPrevention:
                 row_id=row_a.row_id,
                 child_payloads=[{"item": i} for i in range(3)],
                 output_contract=_MINIMAL_CONTRACT,
+                member_token=leader_coordination_token(factory, "run-B").membership,
             )
 
     def test_expand_token_rejects_wrong_row_id(self):
         """expand_token must crash if parent token belongs to a different row."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value-a"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        row_b = factory.data_flow.create_row(
-            run_id="run-A",
+        )[0]
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=1,
             data={"col": "value-b"},
             source_row_index=1,
             ingest_sequence=1,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         with pytest.raises(AuditIntegrityError, match="Cross-row lineage"):
             factory.data_flow.expand_token(
@@ -2373,27 +2755,29 @@ class TestCrossRunContaminationPrevention:
                 row_id=row_b.row_id,
                 child_payloads=[{"item": 1}, {"item": 2}],
                 output_contract=_MINIMAL_CONTRACT,
+                member_token=leader_coordination_token(factory, "run-A").membership,
             )
 
     def test_expand_token_accepts_correct_ownership(self):
         """expand_token must succeed when run_id and row_id match parent token."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         children, eg = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=token_a.token_id, run_id="run-A"),
             row_id=row_a.row_id,
             child_payloads=[{"item": i} for i in range(3)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-A").membership,
         )
         assert len(children) == 3
         assert eg is not None
@@ -2402,25 +2786,25 @@ class TestCrossRunContaminationPrevention:
         """coalesce_tokens must crash if parent tokens belong to different runs."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value-a"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
-        row_b = factory.data_flow.create_row(
-            run_id="run-B",
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-B"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value-b"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_b = factory.data_flow.create_token(row_b.row_id)
+        )[0]
+        token_b = factory.data_flow.create_token(row_b.row_id, coordination_token=leader_coordination_token(factory, row_b.run_id))
 
         # token_a belongs to run-A, token_b belongs to run-B
         # coalesce requires row_id match, so this will fail on row ownership first
@@ -2430,30 +2814,31 @@ class TestCrossRunContaminationPrevention:
                 row_id=row_a.row_id,
                 merged_payload={"merged": True},
                 merged_contract=_MINIMAL_CONTRACT,
+                coordination_token=leader_coordination_token(factory, "run-A"),
             )
 
     def test_coalesce_tokens_rejects_wrong_row_id(self):
         """coalesce_tokens must crash if parent token belongs to a different row."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value-a"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        row_b = factory.data_flow.create_row(
-            run_id="run-A",
+        )[0]
+        row_b = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=1,
             data={"col": "value-b"},
             source_row_index=1,
             ingest_sequence=1,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
-        token_b = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
+        token_b = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         # Both tokens belong to row_a, but we say row_b
         with pytest.raises(AuditIntegrityError, match="Cross-row lineage"):
@@ -2462,20 +2847,21 @@ class TestCrossRunContaminationPrevention:
                 row_id=row_b.row_id,
                 merged_payload={"merged": True},
                 merged_contract=_MINIMAL_CONTRACT,
+                coordination_token=leader_coordination_token(factory, "run-A"),
             )
 
     def test_coalesce_tokens_accepts_correct_ownership(self):
         """coalesce_tokens must succeed when all parents belong to the same row/run."""
         _db, factory = _setup_two_runs()
 
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
+        )[0]
         token_a, token_b = _make_coalesce_parents(factory, row_a.row_id, ["a", "b"], run_id="run-A")
 
         merged = factory.data_flow.coalesce_tokens(
@@ -2483,6 +2869,7 @@ class TestCrossRunContaminationPrevention:
             row_id=row_a.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-A"),
         )
         assert merged.token_id is not None
         assert merged.run_id == "run-A"
@@ -2498,22 +2885,22 @@ class TestTokenRunIdConsistency:
     def test_create_token_stores_run_id(self):
         """create_token must derive and store run_id from the row's run."""
         _db, factory = _setup(run_id="run-1")
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token = factory.data_flow.create_token(row.row_id)
+        )[0]
+        token = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id))
         assert token.run_id == "run-1"
 
     def test_create_token_for_nonexistent_row_crashes(self):
         """create_token must crash if the row_id does not exist (Tier 1 violation)."""
         _db, factory = _setup(run_id="run-1")
         with pytest.raises(AuditIntegrityError, match="does not exist"):
-            factory.data_flow.create_token("nonexistent-row-id")
+            factory.data_flow.create_token("nonexistent-row-id", coordination_token=leader_coordination_token(factory, "run-1"))
 
     def test_fork_children_have_run_id(self):
         """Forked child tokens must inherit run_id from parent."""
@@ -2523,6 +2910,10 @@ class TestTokenRunIdConsistency:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         assert all(c.run_id == "run-1" for c in children)
 
@@ -2535,6 +2926,7 @@ class TestTokenRunIdConsistency:
             row_id=row.row_id,
             child_payloads=[{"item": i} for i in range(3)],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         assert all(c.run_id == "run-1" for c in children)
 
@@ -2548,21 +2940,22 @@ class TestTokenRunIdConsistency:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert merged.run_id == "run-1"
 
     def test_token_roundtrip_preserves_run_id(self):
         """Token run_id should survive DB roundtrip via get_token."""
         _db, factory = _setup(run_id="run-1")
-        row = factory.data_flow.create_row(
-            run_id="run-1",
+        row = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-1"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token = factory.data_flow.create_token(row.row_id)
+        )[0]
+        token = factory.data_flow.create_token(row.row_id, coordination_token=leader_coordination_token(factory, row.run_id))
         fetched = factory.query.get_token(token.token_id)
         assert fetched is not None
         assert fetched.run_id == "run-1"
@@ -2584,7 +2977,7 @@ class TestTokenRunIdConsistency:
         # Set up run-A with row + token
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-A")
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -2592,20 +2985,20 @@ class TestTokenRunIdConsistency:
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
         )
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         # Set up run-B (but don't create any tokens in it)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
         factory.data_flow.register_node(
-            run_id="run-B",
+            coordination_token=leader_coordination_token(factory, "run-B"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -2649,7 +3042,7 @@ class TestTokenRunIdConsistency:
         # Set up run-A with row + token
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-A")
         factory.data_flow.register_node(
-            run_id="run-A",
+            coordination_token=leader_coordination_token(factory, "run-A"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -2657,20 +3050,20 @@ class TestTokenRunIdConsistency:
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
         )
-        row_a = factory.data_flow.create_row(
-            run_id="run-A",
+        row_a = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, "run-A"),
             source_node_id="source-0",
             row_index=0,
             data={"col": "value"},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token_a = factory.data_flow.create_token(row_a.row_id)
+        )[0]
+        token_a = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
 
         # Set up run-B with its own node (but no tokens)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
         factory.data_flow.register_node(
-            run_id="run-B",
+            coordination_token=leader_coordination_token(factory, "run-B"),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -2729,6 +3122,10 @@ class TestUnifiedLineageWriters:
             row_id=parent.row_id,
             branches=["a", "b"],
             step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=parent.token_id, node_id=None
+            ),
         )
         for child, branch in zip(children, ["a", "b"], strict=True):
             assert _frames_for(db, child.token_id) == [(0, "fork", fork_group_id, branch)]
@@ -2744,6 +3141,10 @@ class TestUnifiedLineageWriters:
             row_id=root.row_id,
             branches=["a", "b"],
             step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=root.token_id, node_id=None
+            ),
         )
         children, expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=branch_child.token_id, run_id="run-1"),
@@ -2751,6 +3152,7 @@ class TestUnifiedLineageWriters:
             child_payloads=[{"v": 1}, {"v": 2}],
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=2,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         for child in children:
             assert _frames_for(db, child.token_id) == [
@@ -2766,9 +3168,25 @@ class TestUnifiedLineageWriters:
         _row, parent = _make_row(factory)
         ref = TokenRef(token_id=parent.token_id, run_id="run-1")
         _children, fork_group_id = factory.data_flow.fork_token(
-            parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1
+            parent_ref=ref,
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, ref.run_id).membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, ref.run_id).membership, token_id=ref.token_id, node_id=None
+            ),
         )
-        replayed, replay_group = factory.data_flow.fork_token(parent_ref=ref, row_id=parent.row_id, branches=["a", "b"], step_in_pipeline=1)
+        replayed, replay_group = factory.data_flow.fork_token(
+            parent_ref=ref,
+            row_id=parent.row_id,
+            branches=["a", "b"],
+            step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, ref.run_id).membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, ref.run_id).membership, token_id=ref.token_id, node_id=None
+            ),
+        )
         assert replay_group == fork_group_id
         with db.engine.connect() as conn:
             count = conn.execute(select(func.count()).select_from(group_records_table)).scalar()
@@ -2783,6 +3201,10 @@ class TestUnifiedLineageWriters:
             row_id=parent.row_id,
             branches=["a", "b"],
             step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=parent.token_id, node_id=None
+            ),
         )
         merged = factory.data_flow.coalesce_tokens(
             parent_refs=[TokenRef(token_id=c.token_id, run_id="run-1") for c in children],
@@ -2791,13 +3213,14 @@ class TestUnifiedLineageWriters:
             merged_contract=_MINIMAL_CONTRACT,
             coalesce_node_id="agg-0",
             step_in_pipeline=2,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         assert _frames_for(db, merged.token_id) == []  # depth-1 fork popped to empty path
 
     def test_coalesce_refuses_parents_without_fork_frames(self) -> None:
         _db, factory = _setup()
         row_a, tok_a = _make_row(factory, row_index=0)
-        tok_b = factory.data_flow.create_token(row_a.row_id)
+        tok_b = factory.data_flow.create_token(row_a.row_id, coordination_token=leader_coordination_token(factory, row_a.run_id))
         with pytest.raises(AuditIntegrityError, match="innermost FORK"):
             factory.data_flow.coalesce_tokens(
                 parent_refs=[TokenRef(token_id=tok_a.token_id, run_id="run-1"), TokenRef(token_id=tok_b.token_id, run_id="run-1")],
@@ -2806,6 +3229,7 @@ class TestUnifiedLineageWriters:
                 merged_contract=_MINIMAL_CONTRACT,
                 coalesce_node_id="agg-0",
                 step_in_pipeline=2,
+                coordination_token=leader_coordination_token(factory, "run-1"),
             )
 
     def test_create_token_lineage_frames_seam_for_crafted_tokens(self) -> None:
@@ -2814,6 +3238,7 @@ class TestUnifiedLineageWriters:
         crafted = factory.data_flow.create_token(
             row.row_id,
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-crafted", member_key="a"),),
+            coordination_token=leader_coordination_token(factory, row.run_id),
         )
         assert _frames_for(db, crafted.token_id) == [(0, "fork", "fg-crafted", "a")]
 
@@ -2821,8 +3246,11 @@ class TestUnifiedLineageWriters:
         db, factory = _setup()
         _row, parent = _make_row(factory)
         ref = TokenRef(token_id=parent.token_id, run_id="run-1")
-        group_id = factory.data_flow.record_empty_expansion(ref)
-        assert factory.data_flow.record_empty_expansion(ref) == group_id  # re-driven claim
+        group_id = factory.data_flow.record_empty_expansion(ref, member_token=leader_coordination_token(factory, ref.run_id).membership)
+        assert (
+            factory.data_flow.record_empty_expansion(ref, member_token=leader_coordination_token(factory, ref.run_id).membership)
+            == group_id
+        )  # re-driven claim
         record = _group_record(db, group_id)
         assert record is not None
         assert (record.kind, record.opener_token_id, record.member_count) == ("expand", parent.token_id, 0)
@@ -2837,9 +3265,10 @@ class TestUnifiedLineageWriters:
             child_payloads=[{"v": 1}],
             output_contract=_MINIMAL_CONTRACT,
             step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, ref.run_id).membership,
         )
         with pytest.raises(AuditIntegrityError, match="divergent empty-expansion"):
-            factory.data_flow.record_empty_expansion(ref)
+            factory.data_flow.record_empty_expansion(ref, member_token=leader_coordination_token(factory, ref.run_id).membership)
 
 
 def _craft_row_union_release_witness(db: LandscapeDB, *, run_id: str, row_id: str, token_id: str) -> None:
@@ -2892,6 +3321,10 @@ class TestAssertParentLineageRuling27Relief:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         with pytest.raises(AuditIntegrityError, match="parent lineage divergence"):
             factory.data_flow.expand_token(
@@ -2900,6 +3333,7 @@ class TestAssertParentLineageRuling27Relief:
                 child_payloads=[{"v": 1}],
                 output_contract=_MINIMAL_CONTRACT,
                 parent_lineage_path=(),
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_accepts_popped_parent_path_with_row_union_witness(self) -> None:
@@ -2911,6 +3345,10 @@ class TestAssertParentLineageRuling27Relief:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=child.token_id)
 
@@ -2920,6 +3358,7 @@ class TestAssertParentLineageRuling27Relief:
             child_payloads=[{"v": 1}],
             output_contract=_MINIMAL_CONTRACT,
             parent_lineage_path=(),
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [grandchild.token_id])
         assert grandchild_paths[grandchild.token_id] == (
@@ -2936,12 +3375,17 @@ class TestAssertParentLineageRuling27Relief:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         (grandchild,), _eg = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
             row_id=row.row_id,
             child_payloads=[{"v": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         # grandchild's mint frames are now (FORK, EXPAND) — 2 frames.
         _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
@@ -2953,6 +3397,7 @@ class TestAssertParentLineageRuling27Relief:
                 child_payloads=[{"v": 2}],
                 output_contract=_MINIMAL_CONTRACT,
                 parent_lineage_path=(),
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
 
     def test_accepts_popped_parent_path_with_buried_fork_frame(self) -> None:
@@ -2970,12 +3415,17 @@ class TestAssertParentLineageRuling27Relief:
             parent_ref=TokenRef(token_id=token.token_id, run_id="run-1"),
             row_id=row.row_id,
             branches=["path-a"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_coordination_token(factory, "run-1").membership, token_id=token.token_id, node_id=None
+            ),
         )
         (grandchild,), expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=child.token_id, run_id="run-1"),
             row_id=row.row_id,
             child_payloads=[{"v": 1}],
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         # grandchild's mint frames are (FORK, EXPAND) — FORK is buried, not innermost.
         _craft_row_union_release_witness(db, run_id="run-1", row_id=row.row_id, token_id=grandchild.token_id)
@@ -2986,6 +3436,7 @@ class TestAssertParentLineageRuling27Relief:
             child_payloads=[{"v": 2}],
             output_contract=_MINIMAL_CONTRACT,
             parent_lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id=expand_group_id, member_key=grandchild.token_id),),
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         great_grandchild_paths = factory.data_flow.load_lineage_paths("run-1", [great_grandchild.token_id])
         assert great_grandchild_paths[great_grandchild.token_id] == (

@@ -26,6 +26,7 @@ from elspeth.contracts.payload_store import (
     PayloadNotFoundError,
     PayloadStore,
 )
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape import LandscapeDB, QueryRepository
@@ -42,12 +43,43 @@ from elspeth.core.landscape.model_loaders import (
 )
 from elspeth.core.landscape.row_data import RowDataResult, RowDataState
 from elspeth.core.landscape.run_status_projection import AuditRunStatusProjection
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    make_factory,
+    make_landscape_db,
+    make_recorder_with_run,
+    register_test_node,
+)
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
+
+
+def _claim_for_token(factory: RecorderFactory, ref: TokenRef) -> TokenWorkItem:
+    return claim_test_work_item(
+        factory,
+        member_token=leader_coordination_token(factory, ref.run_id).membership,
+        token_id=ref.token_id,
+        node_id="transform-1",
+        step_index=0,
+    )
+
+
+def _claim_for_state(factory: RecorderFactory, state_id: str) -> TokenWorkItem:
+    state = factory.execution.get_node_state(state_id)
+    assert state is not None
+    token = factory.query.get_token(state.token_id)
+    assert token is not None
+    return claim_test_work_item(
+        factory,
+        member_token=leader_coordination_token(factory, token.run_id).membership,
+        token_id=state.token_id,
+        node_id=state.node_id,
+        step_index=state.step_index,
+    )
 
 
 class _PayloadStoreStub:
@@ -93,10 +125,28 @@ def _setup(*, run_id: str = "run-1") -> tuple[LandscapeDB, RecorderFactory]:
 def _setup_full(*, run_id: str = "run-1"):
     """Build a full environment with nodes, edge, row, token, state."""
     db, factory = _setup(run_id=run_id)
-    factory.data_flow.register_edge(run_id, "source-0", "transform-1", "continue", RoutingMode.MOVE, edge_id="edge-1")
-    factory.data_flow.create_row(run_id, "source-0", 0, {"name": "test"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-    factory.data_flow.create_token("row-1", token_id="tok-1")
-    factory.execution.begin_node_state("tok-1", "transform-1", run_id, 0, {"name": "test"}, state_id="state-1")
+    factory.data_flow.register_edge(
+        "source-0",
+        "transform-1",
+        "continue",
+        RoutingMode.MOVE,
+        edge_id="edge-1",
+        coordination_token=leader_coordination_token(factory, run_id),
+    )
+    factory.data_flow.create_row_with_token(
+        "source-0",
+        0,
+        {"name": "test"},
+        row_id="row-1",
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_coordination_token(factory, run_id),
+        token_id="tok-1",
+    )
+
+    factory.execution.begin_node_state(
+        "tok-1", "transform-1", 0, {"name": "test"}, state_id="state-1", member_token=leader_coordination_token(factory, run_id).membership
+    )
     return db, factory
 
 
@@ -124,9 +174,33 @@ class TestGetRows:
 
     def test_returns_rows_ordered_by_index(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 2, {"c": 3}, row_id="row-c", source_row_index=2, ingest_sequence=2)
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-a", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-b", source_row_index=1, ingest_sequence=1)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            2,
+            {"c": 3},
+            row_id="row-c",
+            source_row_index=2,
+            ingest_sequence=2,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-a",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-b",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         rows = factory.query.get_rows("run-1")
 
@@ -138,23 +212,23 @@ class TestGetRows:
         """Read-side row contracts must distinguish source-local order from ingest order."""
         _db, factory = _setup()
         register_test_node(factory.data_flow, "run-1", "source-1", node_type=NodeType.SOURCE, plugin_name="csv")
-        factory.data_flow.create_row(
-            "run-1",
+        factory.data_flow.create_row_with_token(
             "source-0",
             50,
             {"order_id": "o-1"},
             row_id="row-orders",
             source_row_index=0,
             ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row(
-            "run-1",
+        factory.data_flow.create_row_with_token(
             "source-1",
             99,
             {"refund_id": "r-1"},
             row_id="row-refunds",
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         rows = factory.query.get_rows("run-1")
@@ -173,7 +247,15 @@ class TestGetRows:
 
     def test_single_row(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         rows = factory.query.get_rows("run-1")
 
@@ -186,26 +268,42 @@ class TestGetRows:
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-a",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-a", "src-a", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "src-a",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+        )
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+        )
 
         rows_a = factory.query.get_rows("run-a")
         rows_b = factory.query.get_rows("run-b")
@@ -221,9 +319,18 @@ class TestGetTokens:
 
     def test_returns_tokens_for_row(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+
+        factory.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(factory, "run-1"))
 
         tokens = factory.query.get_tokens("row-1")
 
@@ -240,8 +347,16 @@ class TestGetTokens:
 
     def test_single_token(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         tokens = factory.query.get_tokens("row-1")
 
@@ -251,10 +366,26 @@ class TestGetTokens:
 
     def test_tokens_scoped_to_row(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-a", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-b", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-a", token_id="tok-a")
-        factory.data_flow.create_token("row-b", token_id="tok-b")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-a",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-a",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-b",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-b",
+        )
 
         tokens_a = factory.query.get_tokens("row-a")
         tokens_b = factory.query.get_tokens("row-b")
@@ -272,15 +403,22 @@ class TestGetNodeStatesForToken:
         _, factory = _setup_full()
         # state-1 already exists at step_index=0
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="transform2",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="transform-2",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.execution.begin_node_state("tok-1", "transform-2", "run-1", 1, {"name": "test"}, state_id="state-2")
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-2",
+            1,
+            {"name": "test"},
+            state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         states = factory.query.get_node_states_for_token("tok-1")
 
@@ -297,11 +435,11 @@ class TestGetNodeStatesForToken:
         factory.execution.begin_node_state(
             "tok-1",
             "transform-1",
-            "run-1",
             0,
             {"name": "test"},
             state_id="state-retry",
             attempt=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         states = factory.query.get_node_states_for_token("tok-1")
@@ -335,7 +473,15 @@ class TestGetRow:
 
     def test_roundtrip(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"field": "value"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"field": "value"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         row = factory.query.get_row("row-1")
 
@@ -374,15 +520,23 @@ class TestGetRowData:
         factory = RecorderFactory(db)  # No payload store
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         # With no store, create_row produces no source_data_ref
         row = factory.query.get_row("row-1")
@@ -400,15 +554,23 @@ class TestGetRowData:
         factory = RecorderFactory(db, payload_store=payload_store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         # Query through a repo WITHOUT a payload store
         ops = DatabaseOps(db)
@@ -454,7 +616,15 @@ class TestGetRowDataReprFallback:
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
 
         # Create the row, then patch the source_data_ref to point to our sentinel
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         from sqlalchemy import update
 
@@ -497,7 +667,15 @@ class TestGetRowDataReprFallback:
         factory = RecorderFactory(db, payload_store=store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "source-0", node_type=NodeType.SOURCE, plugin_name="csv")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         from sqlalchemy import update
 
@@ -529,8 +707,16 @@ class TestGetToken:
 
     def test_roundtrip(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         token = factory.query.get_token("tok-1")
 
@@ -549,16 +735,24 @@ class TestGetToken:
         _, factory = _setup(run_id="run-a")
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
 
         unscoped_token = factory.query.get_token("tok-b1")
         scoped_miss = factory.query.get_token_for_run("run-a", "tok-b1")
@@ -576,10 +770,27 @@ class TestGetTokensByIds:
 
     def _setup_tokens(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-a", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-b", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-a", token_id="tok-a")
-        factory.data_flow.create_token("row-b", token_id="tok-b")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-a",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-a",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-b",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-b",
+        )
+
         return factory
 
     def test_preserves_input_order_and_ignores_missing_tokens(self):
@@ -609,8 +820,16 @@ class TestGetTokenParents:
 
     def test_empty_when_no_parents(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         parents = factory.query.get_token_parents("tok-1")
 
@@ -623,6 +842,8 @@ class TestGetTokenParents:
             parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
             row_id="row-1",
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_token(factory, TokenRef(token_id="tok-1", run_id="run-1")),
         )
 
         # Each child should have tok-1 as parent
@@ -641,6 +862,8 @@ class TestGetTokenParents:
             parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
             row_id="row-1",
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_token(factory, TokenRef(token_id="tok-1", run_id="run-1")),
         )
 
         merged = factory.data_flow.coalesce_tokens(
@@ -648,6 +871,7 @@ class TestGetTokenParents:
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         parents = factory.query.get_token_parents(merged.token_id)
@@ -674,9 +898,7 @@ class TestGetRoutingEvents:
     def test_returns_events_for_state(self):
         _, factory = _setup_full()
         factory.execution.record_routing_event(
-            state_id="state-1",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+            state_id="state-1", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         events = factory.query.get_routing_events("state-1")
@@ -689,21 +911,27 @@ class TestGetRoutingEvents:
         _, factory = _setup_full()
         # Register additional infrastructure for second event
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             node_id="sink-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.register_edge("run-1", "transform-1", "sink-0", "route_to_sink", RoutingMode.MOVE, edge_id="edge-2")
+        factory.data_flow.register_edge(
+            "transform-1",
+            "sink-0",
+            "route_to_sink",
+            RoutingMode.MOVE,
+            edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
         factory.execution.record_routing_events(
             "state-1",
-            [
-                RoutingSpec(edge_id="edge-2", mode=RoutingMode.MOVE),
-                RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE),
-            ],
+            [RoutingSpec(edge_id="edge-2", mode=RoutingMode.MOVE), RoutingSpec(edge_id="edge-1", mode=RoutingMode.MOVE)],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
 
         events = factory.query.get_routing_events("state-1")
@@ -733,6 +961,8 @@ class TestGetCalls:
             request_data=RawCallPayload({"model": "gpt-4", "prompt": "Hello"}),
             response_data=RawCallPayload({"completion": "Hi"}),
             latency_ms=100.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
 
         calls = factory.query.get_calls("state-1")
@@ -752,6 +982,8 @@ class TestGetCalls:
             request_data=RawCallPayload({"prompt": "second"}),
             response_data=RawCallPayload({"out": "b"}),
             latency_ms=50.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
         factory.execution.record_call(
             state_id="state-1",
@@ -761,6 +993,8 @@ class TestGetCalls:
             request_data=RawCallPayload({"url": "https://example.com"}),
             response_data=RawCallPayload({"body": "ok"}),
             latency_ms=75.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
 
         calls = factory.query.get_calls("state-1")
@@ -783,18 +1017,30 @@ class TestGetRoutingEventsForStates:
     def test_batch_query_returns_events(self):
         _, factory = _setup_full()
         # Create a second state
-        factory.data_flow.create_row("run-1", "source-0", 1, {"name": "test2"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"name": "test2"}, state_id="state-2")
-        factory.execution.record_routing_event(
-            state_id="state-1",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "test2"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-2",
+            "transform-1",
+            0,
+            {"name": "test2"},
+            state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
         factory.execution.record_routing_event(
-            state_id="state-2",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+            state_id="state-1", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        factory.execution.record_routing_event(
+            state_id="state-2", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         events = factory.query.get_routing_events_for_states(["state-1", "state-2"])
@@ -813,9 +1059,7 @@ class TestGetRoutingEventsForStates:
     def test_single_state_id(self):
         _, factory = _setup_full()
         factory.execution.record_routing_event(
-            state_id="state-1",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+            state_id="state-1", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         events = factory.query.get_routing_events_for_states(["state-1"])
@@ -829,9 +1073,25 @@ class TestGetCallsForStates:
 
     def test_batch_query_returns_calls(self):
         _, factory = _setup_full()
-        factory.data_flow.create_row("run-1", "source-0", 1, {"name": "test2"}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"name": "test2"}, state_id="state-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"name": "test2"},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-2",
+            "transform-1",
+            0,
+            {"name": "test2"},
+            state_id="state-2",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
         factory.execution.record_call(
             state_id="state-1",
             call_index=0,
@@ -840,6 +1100,8 @@ class TestGetCallsForStates:
             request_data=RawCallPayload({"prompt": "a"}),
             response_data=RawCallPayload({"out": "x"}),
             latency_ms=50.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
         factory.execution.record_call(
             state_id="state-2",
@@ -849,6 +1111,8 @@ class TestGetCallsForStates:
             request_data=RawCallPayload({"url": "https://example.com"}),
             response_data=RawCallPayload({"body": "ok"}),
             latency_ms=75.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-2"),
         )
 
         calls = factory.query.get_calls_for_states(["state-1", "state-2"])
@@ -874,6 +1138,8 @@ class TestGetCallsForStates:
             request_data=RawCallPayload({"prompt": "test"}),
             response_data=RawCallPayload({"out": "ok"}),
             latency_ms=100.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
 
         calls = factory.query.get_calls_for_states(["state-1"])
@@ -887,11 +1153,28 @@ class TestGetAllTokensForRun:
 
     def test_returns_all_tokens_across_rows(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-1", token_id="tok-2")
-        factory.data_flow.create_token("row-2", token_id="tok-3")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-3",
+        )
+
+        factory.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(factory, "run-1"))
 
         tokens = factory.query.get_all_tokens_for_run("run-1")
 
@@ -911,28 +1194,45 @@ class TestGetAllTokensForRun:
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-a",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-a", "src-a", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-a1", token_id="tok-a1")
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
+        factory.data_flow.create_row_with_token(
+            "src-a",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+            token_id="tok-a1",
+        )
+
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
 
         tokens_a = factory.query.get_all_tokens_for_run("run-a")
         tokens_b = factory.query.get_all_tokens_for_run("run-b")
@@ -953,28 +1253,45 @@ class TestGetAllTokensForRun:
         factory = make_factory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="shared-source",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="shared-source",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-a", "shared-source", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-a1", token_id="tok-a1")
-        factory.data_flow.create_row("run-b", "shared-source", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
+        factory.data_flow.create_row_with_token(
+            "shared-source",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+            token_id="tok-a1",
+        )
+
+        factory.data_flow.create_row_with_token(
+            "shared-source",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
 
         tokens_a = factory.query.get_all_tokens_for_run("run-a")
         tokens_b = factory.query.get_all_tokens_for_run("run-b")
@@ -991,9 +1308,20 @@ class TestGetAllNodeStatesForRun:
     def test_returns_all_states(self):
         _, factory = _setup_full()
         # state-1 already exists
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"b": 2}, state_id="state-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-2", "transform-1", 0, {"b": 2}, state_id="state-2", member_token=leader_coordination_token(factory, "run-1").membership
+        )
 
         states = factory.query.get_all_node_states_for_run("run-1")
 
@@ -1014,49 +1342,71 @@ class TestGetAllNodeStatesForRun:
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-a",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="tx",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="tx-a",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
-        factory.data_flow.create_row("run-a", "src-a", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-a1", token_id="tok-a1")
-        factory.execution.begin_node_state("tok-a1", "tx-a", "run-a", 0, {"v": 1}, state_id="state-a1")
+        factory.data_flow.create_row_with_token(
+            "src-a",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+            token_id="tok-a1",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-a1", "tx-a", 0, {"v": 1}, state_id="state-a1", member_token=leader_coordination_token(factory, "run-a").membership
+        )
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="tx",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="tx-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
-        factory.execution.begin_node_state("tok-b1", "tx-b", "run-b", 0, {"v": 2}, state_id="state-b1")
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-b1", "tx-b", 0, {"v": 2}, state_id="state-b1", member_token=leader_coordination_token(factory, "run-b").membership
+        )
 
         states_a = factory.query.get_all_node_states_for_run("run-a")
         states_b = factory.query.get_all_node_states_for_run("run-b")
@@ -1077,49 +1427,71 @@ class TestGetAllNodeStatesForRun:
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="shared-source",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="tx",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="shared-tx",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
-        factory.data_flow.create_row("run-a", "shared-source", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-a1", token_id="tok-a1")
-        factory.execution.begin_node_state("tok-a1", "shared-tx", "run-a", 0, {"v": 1}, state_id="state-a1")
+        factory.data_flow.create_row_with_token(
+            "shared-source",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+            token_id="tok-a1",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-a1", "shared-tx", 0, {"v": 1}, state_id="state-a1", member_token=leader_coordination_token(factory, "run-a").membership
+        )
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="shared-source",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="tx",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             node_id="shared-tx",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-b", "shared-source", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
-        factory.execution.begin_node_state("tok-b1", "shared-tx", "run-b", 0, {"v": 2}, state_id="state-b1")
+        factory.data_flow.create_row_with_token(
+            "shared-source",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-b1", "shared-tx", 0, {"v": 2}, state_id="state-b1", member_token=leader_coordination_token(factory, "run-b").membership
+        )
 
         states_a = factory.query.get_all_node_states_for_run("run-a")
         states_b = factory.query.get_all_node_states_for_run("run-b")
@@ -1135,18 +1507,25 @@ class TestGetAllRoutingEventsForRun:
 
     def test_returns_all_events(self):
         _, factory = _setup_full()
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"b": 2}, state_id="state-2")
-        factory.execution.record_routing_event(
-            state_id="state-1",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-2", "transform-1", 0, {"b": 2}, state_id="state-2", member_token=leader_coordination_token(factory, "run-1").membership
         )
         factory.execution.record_routing_event(
-            state_id="state-2",
-            edge_id="edge-1",
-            mode=RoutingMode.MOVE,
+            state_id="state-1", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        factory.execution.record_routing_event(
+            state_id="state-2", edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
         )
 
         events = factory.query.get_all_routing_events_for_run("run-1")
@@ -1175,9 +1554,20 @@ class TestGetAllCallsForRun:
 
     def test_returns_all_calls(self):
         _, factory = _setup_full()
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"b": 2}, state_id="state-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.execution.begin_node_state(
+            "tok-2", "transform-1", 0, {"b": 2}, state_id="state-2", member_token=leader_coordination_token(factory, "run-1").membership
+        )
         factory.execution.record_call(
             state_id="state-1",
             call_index=0,
@@ -1186,6 +1576,8 @@ class TestGetAllCallsForRun:
             request_data=RawCallPayload({"prompt": "a"}),
             response_data=RawCallPayload({"out": "x"}),
             latency_ms=50.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-1"),
         )
         factory.execution.record_call(
             state_id="state-2",
@@ -1195,6 +1587,8 @@ class TestGetAllCallsForRun:
             request_data=RawCallPayload({"url": "https://example.com"}),
             response_data=RawCallPayload({"body": "ok"}),
             latency_ms=75.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_state(factory, "state-2"),
         )
 
         calls = factory.query.get_all_calls_for_run("run-1")
@@ -1227,6 +1621,8 @@ class TestGetAllTokenParentsForRun:
             parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
             row_id="row-1",
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_token(factory, TokenRef(token_id="tok-1", run_id="run-1")),
         )
 
         parents = factory.query.get_all_token_parents_for_run("run-1")
@@ -1246,8 +1642,16 @@ class TestGetAllTokenParentsForRun:
 
     def test_empty_when_no_forks(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         parents = factory.query.get_all_token_parents_for_run("run-1")
 
@@ -1263,6 +1667,8 @@ class TestGetAllTokenParentsForRun:
             parent_ref=TokenRef(token_id="tok-1", run_id="run-1"),
             row_id="row-1",
             branches=["path-a", "path-b"],
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_token(factory, TokenRef(token_id="tok-1", run_id="run-1")),
         )
 
         merged = factory.data_flow.coalesce_tokens(
@@ -1270,6 +1676,7 @@ class TestGetAllTokenParentsForRun:
             row_id="row-1",
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         # get_all_token_parents_for_run returns every token_parents row in the
@@ -1289,7 +1696,15 @@ class TestExplainRow:
 
     def test_returns_row_lineage(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 12, {"field": "value"}, row_id="row-1", source_row_index=3, ingest_sequence=7)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            12,
+            {"field": "value"},
+            row_id="row-1",
+            source_row_index=3,
+            ingest_sequence=7,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         lineage = factory.query.explain_row("run-1", "row-1")
 
@@ -1310,7 +1725,15 @@ class TestExplainRow:
 
     def test_raises_for_wrong_run_id(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         with pytest.raises(AuditIntegrityError, match="Row row-1 belongs to run run-1, not wrong-run"):
             factory.query.explain_row("wrong-run", "row-1")
@@ -1322,15 +1745,23 @@ class TestExplainRow:
         factory = RecorderFactory(db)  # No payload store
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         lineage = factory.query.explain_row("run-1", "row-1")
 
@@ -1339,7 +1770,15 @@ class TestExplainRow:
 
     def test_source_data_hash_present(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"key": "val"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"key": "val"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         lineage = factory.query.explain_row("run-1", "row-1")
 
@@ -1350,7 +1789,15 @@ class TestExplainRow:
 
     def test_created_at_present(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         lineage = factory.query.explain_row("run-1", "row-1")
 
@@ -1364,15 +1811,23 @@ class TestExplainRow:
         factory = RecorderFactory(db)  # No payload store
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         lineage = factory.query.explain_row("run-1", "row-1")
 
@@ -1399,19 +1854,63 @@ class TestRoutingEventsOrderedByExecution:
         factory = setup.factory
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="t1")
         register_test_node(factory.data_flow, "run-1", "transform-2", plugin_name="t2")
-        factory.data_flow.register_edge("run-1", "source-0", "transform-1", "continue", RoutingMode.MOVE, edge_id="edge-1")
-        factory.data_flow.register_edge("run-1", "transform-1", "transform-2", "continue", RoutingMode.MOVE, edge_id="edge-2")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.register_edge(
+            "source-0",
+            "transform-1",
+            "continue",
+            RoutingMode.MOVE,
+            edge_id="edge-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.register_edge(
+            "transform-1",
+            "transform-2",
+            "continue",
+            RoutingMode.MOVE,
+            edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         # State IDs chosen to sort OPPOSITE to execution order:
         # zzz > bbb > aaa lexicographically, but execution order is aaa, bbb, zzz
         # step=0, attempt=0 → state_id="zzz..." (sorts LAST lexicographically)
-        factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"x": 1}, state_id="zzz-state-first-exec")
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"x": 1},
+            state_id="zzz-state-first-exec",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
         # step=0, attempt=1 (retry) → state_id="bbb..." (sorts MIDDLE)
-        factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"x": 1}, state_id="bbb-state-retry", attempt=1)
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"x": 1},
+            state_id="bbb-state-retry",
+            attempt=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
         # step=1, attempt=0 → state_id="aaa..." (sorts FIRST lexicographically)
-        factory.execution.begin_node_state("tok-1", "transform-2", "run-1", 1, {"x": 1}, state_id="aaa-state-second-step")
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-2",
+            1,
+            {"x": 1},
+            state_id="aaa-state-second-step",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         return factory
 
@@ -1419,7 +1918,9 @@ class TestRoutingEventsOrderedByExecution:
         factory = self._setup_three_states()
         state_ids = ["zzz-state-first-exec", "bbb-state-retry", "aaa-state-second-step"]
         for sid in state_ids:
-            factory.execution.record_routing_event(state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE)
+            factory.execution.record_routing_event(
+                state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
+            )
 
         events = factory.query.get_routing_events_for_states(state_ids)
 
@@ -1433,7 +1934,9 @@ class TestRoutingEventsOrderedByExecution:
         factory = self._setup_three_states()
         state_ids = ["zzz-state-first-exec", "bbb-state-retry", "aaa-state-second-step"]
         for sid in state_ids:
-            factory.execution.record_routing_event(state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE)
+            factory.execution.record_routing_event(
+                state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
+            )
 
         events = factory.query.get_all_routing_events_for_run("run-1")
 
@@ -1455,15 +1958,59 @@ class TestCallsOrderedByExecution:
         factory = setup.factory
         register_test_node(factory.data_flow, "run-1", "transform-1", plugin_name="t1")
         register_test_node(factory.data_flow, "run-1", "transform-2", plugin_name="t2")
-        factory.data_flow.register_edge("run-1", "source-0", "transform-1", "continue", RoutingMode.MOVE, edge_id="edge-1")
-        factory.data_flow.register_edge("run-1", "transform-1", "transform-2", "continue", RoutingMode.MOVE, edge_id="edge-2")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.register_edge(
+            "source-0",
+            "transform-1",
+            "continue",
+            RoutingMode.MOVE,
+            edge_id="edge-1",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.register_edge(
+            "transform-1",
+            "transform-2",
+            "continue",
+            RoutingMode.MOVE,
+            edge_id="edge-2",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
 
         # Same strategy: state_ids sort opposite to execution order
-        factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"x": 1}, state_id="zzz-state-first-exec")
-        factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"x": 1}, state_id="bbb-state-retry", attempt=1)
-        factory.execution.begin_node_state("tok-1", "transform-2", "run-1", 1, {"x": 1}, state_id="aaa-state-second-step")
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"x": 1},
+            state_id="zzz-state-first-exec",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-1",
+            0,
+            {"x": 1},
+            state_id="bbb-state-retry",
+            attempt=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
+        factory.execution.begin_node_state(
+            "tok-1",
+            "transform-2",
+            1,
+            {"x": 1},
+            state_id="aaa-state-second-step",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
 
         return factory
 
@@ -1479,6 +2026,8 @@ class TestCallsOrderedByExecution:
                 request_data=RawCallPayload({"prompt": f"call-{i}"}),
                 response_data=RawCallPayload({"out": f"resp-{i}"}),
                 latency_ms=50.0,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_for_state(factory, sid),
             )
 
         calls = factory.query.get_calls_for_states(state_ids)
@@ -1501,6 +2050,8 @@ class TestCallsOrderedByExecution:
                 request_data=RawCallPayload({"prompt": f"call-{i}"}),
                 response_data=RawCallPayload({"out": f"resp-{i}"}),
                 latency_ms=50.0,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_for_state(factory, sid),
             )
 
         calls = factory.query.get_all_calls_for_run("run-1")
@@ -1525,11 +2076,25 @@ class TestChunkedQueryMethods:
             row_id = f"row-chunk-{i}"
             token_id = f"tok-chunk-{i}"
             state_id = f"state-chunk-{i}"
-            factory.data_flow.create_row(
-                run_id, "source-0", 100 + i, {"idx": i}, row_id=row_id, source_row_index=100 + i, ingest_sequence=100 + i
+            factory.data_flow.create_row_with_token(
+                "source-0",
+                100 + i,
+                {"idx": i},
+                row_id=row_id,
+                source_row_index=100 + i,
+                ingest_sequence=100 + i,
+                coordination_token=leader_coordination_token(factory, run_id),
+                token_id=token_id,
             )
-            factory.data_flow.create_token(row_id, token_id=token_id)
-            factory.execution.begin_node_state(token_id, "transform-1", run_id, 100 + i, {"idx": i}, state_id=state_id)
+
+            factory.execution.begin_node_state(
+                token_id,
+                "transform-1",
+                100 + i,
+                {"idx": i},
+                state_id=state_id,
+                member_token=leader_coordination_token(factory, run_id).membership,
+            )
             state_ids.append(state_id)
         return state_ids
 
@@ -1543,9 +2108,7 @@ class TestChunkedQueryMethods:
         # Record a routing event for each state
         for sid in state_ids:
             factory.execution.record_routing_event(
-                state_id=sid,
-                edge_id="edge-1",
-                mode=RoutingMode.MOVE,
+                state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
             )
 
         events = factory.query.get_routing_events_for_states(state_ids)
@@ -1570,6 +2133,8 @@ class TestChunkedQueryMethods:
                 request_data=RawCallPayload({"prompt": f"call-{sid}"}),
                 response_data=RawCallPayload({"out": "ok"}),
                 latency_ms=50.0,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_for_state(factory, sid),
             )
 
         calls = factory.query.get_calls_for_states(state_ids)
@@ -1587,9 +2152,7 @@ class TestChunkedQueryMethods:
 
         for sid in state_ids:
             factory.execution.record_routing_event(
-                state_id=sid,
-                edge_id="edge-1",
-                mode=RoutingMode.MOVE,
+                state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
             )
 
         # Force tiny chunk size to exercise merging
@@ -1610,9 +2173,7 @@ class TestChunkedQueryMethods:
 
         for sid in state_ids:
             factory.execution.record_routing_event(
-                state_id=sid,
-                edge_id="edge-1",
-                mode=RoutingMode.MOVE,
+                state_id=sid, edge_id="edge-1", mode=RoutingMode.MOVE, member_token=leader_coordination_token(factory, "run-1").membership
             )
 
         with (
@@ -1640,6 +2201,8 @@ class TestChunkedQueryMethods:
                 request_data=RawCallPayload({"prompt": f"call-{sid}"}),
                 response_data=RawCallPayload({"out": "ok"}),
                 latency_ms=50.0,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_for_state(factory, sid),
             )
 
         # Force tiny chunk size to exercise merging
@@ -1666,6 +2229,8 @@ class TestChunkedQueryMethods:
                 request_data=RawCallPayload({"prompt": f"call-{sid}"}),
                 response_data=RawCallPayload({"out": "ok"}),
                 latency_ms=50.0,
+                member_token=leader_coordination_token(factory, "run-1").membership,
+                work_item=_claim_for_state(factory, sid),
             )
 
         with (
@@ -1726,15 +2291,23 @@ class TestDirectQueryRepositoryConstruction:
         factory = RecorderFactory(db, payload_store=payload_store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         # Create a QueryRepository WITHOUT a payload store, same DB
         ops = DatabaseOps(db)
@@ -1760,15 +2333,23 @@ class TestDirectQueryRepositoryConstruction:
         factory = RecorderFactory(db, payload_store=payload_store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"key": "value"}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"key": "value"},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         ops = DatabaseOps(db)
         repo = QueryRepository(
@@ -1806,15 +2387,23 @@ class TestGetRowDataErrorHandling:
         factory = RecorderFactory(db, payload_store=payload_store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
         # QueryRepository with SAME mock store — so retrieval hits our mock
         ops = DatabaseOps(db)
         return QueryRepository(
@@ -1903,15 +2492,23 @@ class TestExplainRowErrorHandling:
         factory = RecorderFactory(db, payload_store=payload_store)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
         factory.data_flow.register_node(
-            run_id="run-1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="source-0",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
         ops = DatabaseOps(db)
         return QueryRepository(
             ops,
@@ -1979,7 +2576,15 @@ class TestExplainRowErrorHandling:
         """H3: Cross-run mismatch is a caller bug, not a normal 'not found'."""
         payload_store = _PayloadStoreStub()
         _db, repo, factory = _make_repo(payload_store=payload_store)
-        factory.data_flow.create_row("run-1", "source-0", 0, {"x": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"x": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
 
         with pytest.raises(AuditIntegrityError, match="Row row-1 belongs to run run-1, not wrong-run"):
             repo.explain_row("wrong-run", "row-1")
@@ -2000,21 +2605,40 @@ class TestGetAllTokenOutcomesForRun:
 
     def test_happy_path_multiple_outcomes(self):
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-2", token_id="tok-2")
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-2", run_id="run-1"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash="abc123",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         outcomes = factory.query.get_all_token_outcomes_for_run("run-1")
@@ -2031,40 +2655,60 @@ class TestGetAllTokenOutcomesForRun:
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-a")
         factory.data_flow.register_node(
-            run_id="run-a",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-a",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
-        factory.data_flow.create_row("run-a", "src-a", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-a1", token_id="tok-a1")
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.create_row_with_token(
+            "src-a",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+            token_id="tok-a1",
+        )
+
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-a1", run_id="run-a"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            coordination_token=leader_coordination_token(factory, "run-a"),
         )
 
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-b")
         factory.data_flow.register_node(
-            run_id="run-b",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             node_id="src-b",
             schema_config=_DYNAMIC_SCHEMA,
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-b1", token_id="tok-b1")
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+            token_id="tok-b1",
+        )
+
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-b1", run_id="run-b"),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.UNROUTED,
             error_hash="err-hash-1",
+            coordination_token=leader_coordination_token(factory, "run-b"),
         )
 
         outcomes_a = factory.query.get_all_token_outcomes_for_run("run-a")
@@ -2085,21 +2729,32 @@ class TestGetAllTokenOutcomesForRun:
     def test_ordering_by_token_id_then_recorded_at(self):
         """Results must be ordered by (token_id, recorded_at)."""
         _, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-aaa",
+        )
         # Create tokens with IDs that sort in known order
-        factory.data_flow.create_token("row-1", token_id="tok-aaa")
-        factory.data_flow.create_token("row-1", token_id="tok-zzz")
-        factory.data_flow.record_token_outcome(
+
+        factory.data_flow.create_token("row-1", token_id="tok-zzz", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-zzz", run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-aaa", run_id="run-1"),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         outcomes = factory.query.get_all_token_outcomes_for_run("run-1")
@@ -2112,10 +2767,11 @@ class TestGetAllTokenOutcomesForRun:
         """A token can have multiple outcomes (e.g., fork then complete children)."""
         _, factory = _setup_full()
         # First outcome: FORKED
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="tok-1", run_id="run-1"),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
 
         outcomes = factory.query.get_all_token_outcomes_for_run("run-1")
@@ -2149,18 +2805,29 @@ class TestAuditRunStatusProjection:
     def _setup_coalesce(self, *, run_id: str = "run-1"):
         db, factory = _setup(run_id=run_id)
         register_test_node(factory.data_flow, run_id, "coalesce-1", node_type=NodeType.COALESCE, plugin_name="coalesce")
-        factory.data_flow.create_row(run_id, "source-0", 0, {"value": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"value": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
         return db, factory
 
     def _fail_state(
         self, factory, *, token_id: str, node_id: str, state_id: str, reason: str = "quorum_not_met_at_timeout", run_id: str = "run-1"
     ) -> None:
-        factory.execution.begin_node_state(token_id, node_id, run_id, 0, {"value": 1}, state_id=state_id)
+        factory.execution.begin_node_state(
+            token_id, node_id, 0, {"value": 1}, state_id=state_id, member_token=leader_coordination_token(factory, run_id).membership
+        )
         factory.execution.complete_node_state(
             state_id=state_id,
             status=NodeStateStatus.FAILED,
             error=_coalesce_failure(reason),
             duration_ms=0.0,
+            member_token=leader_coordination_token(factory, run_id).membership,
         )
 
     def test_granularity_one_barrier_per_node_row_pair_not_per_branch_token(self):
@@ -2168,8 +2835,8 @@ class TestAuditRunStatusProjection:
         branch token, same row) but counts as ONE failed barrier — the naive
         per-state (or per-token-outcome) tally over-reports it as 2."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-branch-a")
-        factory.data_flow.create_token("row-1", token_id="tok-branch-b")
+        factory.data_flow.create_token("row-1", token_id="tok-branch-a", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.data_flow.create_token("row-1", token_id="tok-branch-b", coordination_token=leader_coordination_token(factory, "run-1"))
         self._fail_state(factory, token_id="tok-branch-a", node_id="coalesce-1", state_id="cs-a")
         self._fail_state(factory, token_id="tok-branch-b", node_id="coalesce-1", state_id="cs-b")
 
@@ -2178,26 +2845,33 @@ class TestAuditRunStatusProjection:
     def test_row_union_failed_node_state_counts_as_failed_barrier(self):
         _db, factory = _setup(run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
-        factory.data_flow.create_row(
-            "run-1",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"value": 1},
             row_id="row-1",
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-branch-a",
         )
-        factory.data_flow.create_token("row-1", token_id="tok-branch-a")
-        factory.execution.begin_node_state("tok-branch-a", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-a")
+
+        factory.execution.begin_node_state(
+            "tok-branch-a",
+            "row-union-1",
+            0,
+            {"value": 1},
+            state_id="rus-a",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
         factory.execution.complete_node_state(
             state_id="rus-a",
             status=NodeStateStatus.FAILED,
             error=RowUnionFailureReason(
-                failure_reason="row_union_timeout",
-                expected_branches=("branch_a", "branch_b"),
-                branches_arrived=("branch_a",),
+                failure_reason="row_union_timeout", expected_branches=("branch_a", "branch_b"), branches_arrived=("branch_a",)
             ),
             duration_ms=0.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 1
@@ -2205,26 +2879,33 @@ class TestAuditRunStatusProjection:
     def test_row_union_late_arrival_after_release_is_not_a_failed_barrier(self):
         _db, factory = _setup(run_id="run-1")
         register_test_node(factory.data_flow, "run-1", "row-union-1", node_type=NodeType.ROW_UNION, plugin_name="row_union")
-        factory.data_flow.create_row(
-            "run-1",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"value": 1},
             row_id="row-1",
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-late",
         )
-        factory.data_flow.create_token("row-1", token_id="tok-late")
-        factory.execution.begin_node_state("tok-late", "row-union-1", "run-1", 0, {"value": 1}, state_id="rus-late")
+
+        factory.execution.begin_node_state(
+            "tok-late",
+            "row-union-1",
+            0,
+            {"value": 1},
+            state_id="rus-late",
+            member_token=leader_coordination_token(factory, "run-1").membership,
+        )
         factory.execution.complete_node_state(
             state_id="rus-late",
             status=NodeStateStatus.FAILED,
             error=RowUnionFailureReason(
-                failure_reason="late_arrival_after_release",
-                expected_branches=("branch_a", "branch_b"),
-                branches_arrived=(),
+                failure_reason="late_arrival_after_release", expected_branches=("branch_a", "branch_b"), branches_arrived=()
             ),
             duration_ms=0.0,
+            member_token=leader_coordination_token(factory, "run-1").membership,
         )
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
@@ -2233,7 +2914,7 @@ class TestAuditRunStatusProjection:
         """The anchor is nodes.node_type='coalesce': an ordinary transform
         failure must not register as a coalesce barrier failure."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-1")
+        factory.data_flow.create_token("row-1", token_id="tok-1", coordination_token=leader_coordination_token(factory, "run-1"))
         self._fail_state(factory, token_id="tok-1", node_id="transform-1", state_id="ts-1")
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
@@ -2241,9 +2922,18 @@ class TestAuditRunStatusProjection:
     def test_distinct_rows_count_as_distinct_barriers(self):
         """Two rows failing at the same coalesce node are two failed barriers."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_row("run-1", "source-0", 1, {"value": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-1", token_id="tok-r1")
-        factory.data_flow.create_token("row-2", token_id="tok-r2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"value": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-r2",
+        )
+        factory.data_flow.create_token("row-1", token_id="tok-r1", coordination_token=leader_coordination_token(factory, "run-1"))
+
         self._fail_state(factory, token_id="tok-r1", node_id="coalesce-1", state_id="cs-r1")
         self._fail_state(factory, token_id="tok-r2", node_id="coalesce-1", state_id="cs-r2")
 
@@ -2254,7 +2944,7 @@ class TestAuditRunStatusProjection:
         successful quorum merge) is not a barrier failure: counting it would
         report a coalesce-failure for a row whose coalesce SUCCEEDED."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-late")
+        factory.data_flow.create_token("row-1", token_id="tok-late", coordination_token=leader_coordination_token(factory, "run-1"))
         self._fail_state(factory, token_id="tok-late", node_id="coalesce-1", state_id="cs-late", reason="late_arrival_after_merge")
 
         assert factory.run_status_projection.count_failed_coalesce_barrier_rows("run-1") == 0
@@ -2263,8 +2953,8 @@ class TestAuditRunStatusProjection:
         """A failed barrier followed by a late straggler still counts exactly
         once — the DISTINCT pair collapse absorbs the straggler state."""
         _db, factory = self._setup_coalesce()
-        factory.data_flow.create_token("row-1", token_id="tok-branch-a")
-        factory.data_flow.create_token("row-1", token_id="tok-late")
+        factory.data_flow.create_token("row-1", token_id="tok-branch-a", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.data_flow.create_token("row-1", token_id="tok-late", coordination_token=leader_coordination_token(factory, "run-1"))
         self._fail_state(factory, token_id="tok-branch-a", node_id="coalesce-1", state_id="cs-a")
         self._fail_state(factory, token_id="tok-late", node_id="coalesce-1", state_id="cs-late", reason="late_arrival_after_merge")
 
@@ -2306,7 +2996,15 @@ class TestIterRowsForRun:
         _db, factory = _setup()
         # Insert out of ingest order to prove ordering comes from the query.
         for i in reversed(range(count)):
-            factory.data_flow.create_row("run-1", "source-0", i, {"v": i}, row_id=f"row-{i}", source_row_index=i, ingest_sequence=i)
+            factory.data_flow.create_row_with_token(
+                "source-0",
+                i,
+                {"v": i},
+                row_id=f"row-{i}",
+                source_row_index=i,
+                ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, "run-1"),
+            )
         return factory
 
     def test_batches_partition_get_rows_order(self):
@@ -2350,16 +3048,32 @@ class TestIterRowsForRun:
         for run_id, src in (("run-a", "src-a"), ("run-b", "src-b")):
             factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
             factory.data_flow.register_node(
-                run_id=run_id,
                 plugin_name="csv",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
                 config={},
                 node_id=src,
                 schema_config=_DYNAMIC_SCHEMA,
+                coordination_token=leader_coordination_token(factory, run_id),
             )
-        factory.data_flow.create_row("run-a", "src-a", 0, {"v": 1}, row_id="row-a1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-b", "src-b", 0, {"v": 2}, row_id="row-b1", source_row_index=0, ingest_sequence=0)
+        factory.data_flow.create_row_with_token(
+            "src-a",
+            0,
+            {"v": 1},
+            row_id="row-a1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-a"),
+        )
+        factory.data_flow.create_row_with_token(
+            "src-b",
+            0,
+            {"v": 2},
+            row_id="row-b1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-b"),
+        )
 
         batches = list(factory.query.iter_rows_for_run("run-a", batch_size=10))
 
@@ -2371,13 +3085,30 @@ class TestGetTokensForRows:
 
     def _setup_tokens(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-a", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-b", source_row_index=1, ingest_sequence=1)
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-a",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-a2",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-b",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-b2",
+        )
         # Interleave creation across rows so per-row order is not insert order.
-        factory.data_flow.create_token("row-b", token_id="tok-b2")
-        factory.data_flow.create_token("row-a", token_id="tok-a2")
-        factory.data_flow.create_token("row-b", token_id="tok-b1")
-        factory.data_flow.create_token("row-a", token_id="tok-a1")
+
+        factory.data_flow.create_token("row-b", token_id="tok-b1", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.data_flow.create_token("row-a", token_id="tok-a1", coordination_token=leader_coordination_token(factory, "run-1"))
         return factory
 
     def test_per_row_grouping_matches_per_row_getter(self):
@@ -2424,13 +3155,24 @@ class TestGetTokenParentsForTokens:
 
     def _setup_fork(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        parent = factory.data_flow.create_token("row-1", token_id="tok-parent")
+        _, parent = factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-parent",
+        )
+
         children, _ = factory.data_flow.fork_token(
             TokenRef(token_id=parent.token_id, run_id="run-1"),
             "row-1",
             ["left", "right"],
             step_in_pipeline=1,
+            member_token=leader_coordination_token(factory, "run-1").membership,
+            work_item=_claim_for_token(factory, TokenRef(token_id=parent.token_id, run_id="run-1")),
         )
         return factory, [child.token_id for child in children]
 
@@ -2467,13 +3209,28 @@ class TestGetNodeStatesForTokens:
         # node_states is UNIQUE on (token_id, node_id, attempt), so a token's
         # two states must sit on different nodes.
         register_test_node(factory.data_flow, "run-1", "transform-2", plugin_name="transform")
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-1", token_id="tok-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+
+        factory.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(factory, "run-1"))
         # Insert out of step order to prove ordering comes from the query.
-        factory.execution.begin_node_state("tok-1", "transform-2", "run-1", 2, {"a": 1}, state_id="st-1-late")
-        factory.execution.begin_node_state("tok-2", "transform-1", "run-1", 0, {"a": 1}, state_id="st-2")
-        factory.execution.begin_node_state("tok-1", "transform-1", "run-1", 0, {"a": 1}, state_id="st-1-early")
+        factory.execution.begin_node_state(
+            "tok-1", "transform-2", 2, {"a": 1}, state_id="st-1-late", member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        factory.execution.begin_node_state(
+            "tok-2", "transform-1", 0, {"a": 1}, state_id="st-2", member_token=leader_coordination_token(factory, "run-1").membership
+        )
+        factory.execution.begin_node_state(
+            "tok-1", "transform-1", 0, {"a": 1}, state_id="st-1-early", member_token=leader_coordination_token(factory, "run-1").membership
+        )
         return factory
 
     def test_states_grouped_match_per_token_getter(self):
@@ -2509,17 +3266,31 @@ class TestGetTokenOutcomesForTokens:
 
     def _setup_outcomes(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-1", token_id="tok-2")
-        factory.data_flow.record_token_outcome(
-            TokenRef(token_id="tok-1", run_id="run-1"), TerminalOutcome.SUCCESS, TerminalPath.DEFAULT_FLOW, sink_name="out"
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
         )
-        factory.data_flow.record_token_outcome(
+
+        factory.data_flow.create_token("row-1", token_id="tok-2", coordination_token=leader_coordination_token(factory, "run-1"))
+        factory.data_flow.record_token_outcome_leader(
+            TokenRef(token_id="tok-1", run_id="run-1"),
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            sink_name="out",
+            coordination_token=leader_coordination_token(factory, "run-1"),
+        )
+        factory.data_flow.record_token_outcome_leader(
             TokenRef(token_id="tok-2", run_id="run-1"),
             TerminalOutcome.FAILURE,
             TerminalPath.UNROUTED,
             error_hash="0" * 64,
+            coordination_token=leader_coordination_token(factory, "run-1"),
         )
         return factory
 
@@ -2557,20 +3328,37 @@ class TestGetSchedulerEventsForTokens:
 
     def _setup_events(self):
         _db, factory = _setup()
-        factory.data_flow.create_row("run-1", "source-0", 0, {"a": 1}, row_id="row-1", source_row_index=0, ingest_sequence=0)
-        factory.data_flow.create_row("run-1", "source-0", 1, {"b": 2}, row_id="row-2", source_row_index=1, ingest_sequence=1)
-        factory.data_flow.create_token("row-1", token_id="tok-1")
-        factory.data_flow.create_token("row-2", token_id="tok-2")
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            0,
+            {"a": 1},
+            row_id="row-1",
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-1",
+        )
+        factory.data_flow.create_row_with_token(
+            "source-0",
+            1,
+            {"b": 2},
+            row_id="row-2",
+            source_row_index=1,
+            ingest_sequence=1,
+            coordination_token=leader_coordination_token(factory, "run-1"),
+            token_id="tok-2",
+        )
+
         payload = factory.scheduler.serialize_row_payload(PipelineRow({"id": 1}, _MINIMAL_CONTRACT))
         for token_id, row_id, ingest in (("tok-1", "row-1", 0), ("tok-2", "row-2", 1)):
             factory.scheduler.enqueue_ready(
-                run_id="run-1",
                 token_id=token_id,
                 row_id=row_id,
                 node_id="transform-1",
                 step_index=1,
                 ingest_sequence=ingest,
                 row_payload_json=payload,
+                member_token=leader_coordination_token(factory, "run-1").membership,
             )
         return factory
 
