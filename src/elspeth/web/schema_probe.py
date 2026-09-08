@@ -9,7 +9,6 @@ from enum import Enum
 from types import MappingProxyType
 from typing import TypedDict
 
-import structlog
 from sqlalchemy import Connection, Engine, inspect, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import OperationalError
@@ -36,7 +35,6 @@ from elspeth.web.sessions.schema import (
     probe_current_schema,
 )
 
-_slog = structlog.get_logger(__name__)
 _LOCK_TARGET = "elspeth_schema_init"
 _LOCK_TIMEOUT = "5s"
 _TARGET_ERROR = "PostgreSQL database target cannot be proven safe from static URL configuration."
@@ -212,10 +210,8 @@ def _invalidate_uncertain(conn: Connection, *, original: BaseException) -> None:
     try:
         conn.invalidate()
     except BaseException as invalidation_error:
-        _slog.error(
-            "schema_connection_invalidation_failed",
-            original_exc_class=type(original).__name__,
-            invalidation_exc_class=type(invalidation_error).__name__,
+        original.add_note(
+            f"Schema connection invalidation also failed with {type(invalidation_error).__name__}; connection disposal was not verified."
         )
 
 
@@ -225,13 +221,9 @@ def _finish_lock_cleanup(
     cleanup_error: BaseException,
     earlier: BaseException | None,
 ) -> None:
-    _invalidate_uncertain(conn, original=cleanup_error)
+    _invalidate_uncertain(conn, original=cleanup_error if earlier is None else earlier)
     if earlier is not None:
-        _slog.error(
-            "schema_lock_cleanup_unverified",
-            original_exc_class=type(earlier).__name__,
-            cleanup_exc_class=type(cleanup_error).__name__,
-        )
+        earlier.add_note(f"Schema lock cleanup was not verified: {type(cleanup_error).__name__}.")
         return
     raise SchemaLockCleanupError(
         "Schema initialization may have completed but lock cleanup was not verified; investigate and rerun."
@@ -306,6 +298,9 @@ def _run_locked(
                 except BaseException as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
+                    else:
+                        note_target = cleanup_error if earlier is None else earlier
+                        note_target.add_note(f"Final schema rollback also failed with {type(exc).__name__}.")
 
                 if cleanup_error is not None:
                     _finish_lock_cleanup(conn, cleanup_error=cleanup_error, earlier=earlier)

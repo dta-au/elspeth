@@ -384,7 +384,10 @@ class TestWebSocketIDOR:
             broadcaster=broadcaster,
         )
         ticket = _issue_ws_ticket(app, "run-1", user=user)
-        websocket = await _call_websocket(app, "run-1", ticket=ticket)
+        websocket = FakeWebSocket(app)
+        with pytest.raises(RunSessionIntegrityError) as caught:
+            await _websocket_endpoint(app)(websocket, "run-1", ticket=ticket)
+        assert caught.value is svc.ownership
         assert websocket.accepted is True
         assert websocket.close_code == 1011
         assert "not found" not in (websocket.close_reason or "").lower()
@@ -392,6 +395,40 @@ class TestWebSocketIDOR:
 
 class TestWebSocketTimeoutRecovery:
     """Timeout path must probe authoritative status, not send ad-hoc payloads."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["seed", "idle_recheck"])
+    @pytest.mark.parametrize("logger_fails", [False, True])
+    async def test_accounting_corruption_escapes_after_internal_error_close(self, phase: str, logger_fails: bool) -> None:
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        corruption = routes._RunStatusIntegrityError("private accounting evidence")
+        initial = routes._LoadedRunStatus(
+            response=RunStatusResponse(
+                run_id=run_id,
+                status="running",
+                started_at=datetime.now(tz=UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=None,
+            ),
+            record=FakeRunRecord(),
+        )
+        outcomes = [corruption] if phase == "seed" else [initial, corruption]
+        with (
+            patch.object(routes, "_load_run_status_snapshot_with_accounting", new=AsyncMock(side_effect=outcomes)),
+            patch.object(routes.asyncio, "wait_for", new=AsyncMock(side_effect=TimeoutError())),
+            patch.object(routes.slog, "error", side_effect=OSError("logger unavailable") if logger_fails else None),
+            pytest.raises(routes._RunStatusIntegrityError) as caught,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert caught.value is corruption
+        assert websocket.close_code == 1011
+        assert websocket.sent_json == []
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
 
     @staticmethod
     def _make_authed_app(execution_service: FakeExecutionService) -> FastAPI:

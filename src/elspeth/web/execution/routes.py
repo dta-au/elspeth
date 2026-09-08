@@ -197,12 +197,20 @@ class _ByteRange:
         return self.end_inclusive - self.start + 1
 
 
+class _ArtifactContentDriftError(HTTPException):
+    """An artifact candidate differs from its recorded content identity."""
+
+
+class _ArtifactPurgedOrMovedError(HTTPException):
+    """An artifact candidate no longer exists at its recorded location."""
+
+
 def _artifact_content_drift_http(
     artifact: RunOutputArtifact,
     *,
     actual_size_bytes: int,
 ) -> HTTPException:
-    return HTTPException(
+    return _ArtifactContentDriftError(
         status_code=409,
         detail={
             "error_type": "artifact_content_drift",
@@ -228,20 +236,13 @@ def _reject_artifact_content_drift(
 
 
 def _artifact_purged_or_moved_http(artifact: RunOutputArtifact) -> HTTPException:
-    return HTTPException(
+    return _ArtifactPurgedOrMovedError(
         status_code=410,
         detail={
             "error_type": "artifact_purged_or_moved",
             "path_or_uri": artifact.path_or_uri,
         },
     )
-
-
-def _artifact_error_type(exc: HTTPException) -> str | None:
-    if not isinstance(exc.detail, Mapping):
-        return None
-    error_type = exc.detail.get("error_type")
-    return error_type if isinstance(error_type, str) else None
 
 
 def _resolved_allowed_artifact_paths(
@@ -267,8 +268,11 @@ def _resolved_allowed_artifact_paths(
     for fs_path in fs_paths:
         try:
             resolved = fs_path.resolve()
-        except OSError:
-            continue
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail={"error_type": "artifact_path_resolution_failed"},
+            ) from exc
         if resolved in seen_paths:
             continue
         if any(resolved.is_relative_to(base) for base in allowed):
@@ -502,15 +506,12 @@ async def _verified_artifact_file_snapshot_from_candidates(
                 artifact,
                 snapshot_dir=snapshot_dir,
             )
-        except HTTPException as exc:
-            error_type = _artifact_error_type(exc)
-            if error_type == "artifact_purged_or_moved":
-                purged_error = exc
-                continue
-            if error_type == "artifact_content_drift":
-                drift_error = exc
-                continue
-            raise
+        except _ArtifactPurgedOrMovedError as exc:
+            purged_error = exc
+            continue
+        except _ArtifactContentDriftError as exc:
+            drift_error = exc
+            continue
         return resolved, snapshot
 
     if drift_error is not None:
@@ -537,15 +538,12 @@ async def _verified_artifact_preview_head_from_candidates(
     for resolved in candidates:
         try:
             snapshot = await _verified_artifact_preview_head(resolved, artifact)
-        except HTTPException as exc:
-            error_type = _artifact_error_type(exc)
-            if error_type == "artifact_purged_or_moved":
-                purged_error = exc
-                continue
-            if error_type == "artifact_content_drift":
-                drift_error = exc
-                continue
-            raise
+        except _ArtifactPurgedOrMovedError as exc:
+            purged_error = exc
+            continue
+        except _ArtifactContentDriftError as exc:
+            drift_error = exc
+            continue
         return resolved, snapshot
 
     if drift_error is not None:
@@ -1574,14 +1572,18 @@ def create_execution_router() -> APIRouter:
             # operator channel (CLAUDE.md logging policy: audit-system
             # failure). Close 1011 (internal error), mirroring the seed-snapshot
             # integrity handling below.
-            slog.error(
-                "websocket_run_ownership_session_integrity_error",
-                run_id=run_id,
-                session_id=integrity_exc.session_id,
-                error=str(integrity_exc),
-            )
-            await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
-            return
+            try:
+                slog.error(
+                    "websocket_run_ownership_session_integrity_error",
+                    run_id=run_id,
+                    session_id=integrity_exc.session_id,
+                    exc_class=type(integrity_exc).__name__,
+                )
+            finally:
+                try:
+                    await websocket.close(code=1011, reason="Run ownership check failed internal integrity validation")
+                finally:
+                    raise integrity_exc
         except ValueError:
             await websocket.close(code=4004, reason="Run not found")
             return
@@ -1607,14 +1609,18 @@ def create_execution_router() -> APIRouter:
                 # diagnose the divergence — Landscape carries the run audit,
                 # not this projection failure, so slog is the only channel
                 # (CLAUDE.md logging policy: audit-system failure).
-                slog.error(
-                    "websocket_run_status_integrity_error",
-                    run_id=run_id,
-                    phase="seed",
-                    error=str(integrity_exc),
-                )
-                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
-                return
+                try:
+                    slog.error(
+                        "websocket_run_status_integrity_error",
+                        run_id=run_id,
+                        phase="seed",
+                        exc_class=type(integrity_exc).__name__,
+                    )
+                finally:
+                    try:
+                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                    finally:
+                        raise integrity_exc
             current = current_snapshot.response
             max_replayed_sequence = 0
             replayed_terminal = False
@@ -1649,14 +1655,18 @@ def create_execution_router() -> APIRouter:
                         # path, on the idle-timeout recheck. Record the detail
                         # before signalling internal-error close (see seed
                         # handler above for the logging-channel rationale).
-                        slog.error(
-                            "websocket_run_status_integrity_error",
-                            run_id=run_id,
-                            phase="idle_recheck",
-                            error=str(integrity_exc),
-                        )
-                        await websocket.close(code=1011, reason="Run status failed internal accounting validation")
-                        break
+                        try:
+                            slog.error(
+                                "websocket_run_status_integrity_error",
+                                run_id=run_id,
+                                phase="idle_recheck",
+                                exc_class=type(integrity_exc).__name__,
+                            )
+                        finally:
+                            try:
+                                await websocket.close(code=1011, reason="Run status failed internal accounting validation")
+                            finally:
+                                raise integrity_exc
                     current = current_snapshot.response
                     if current.status in RUN_STATUS_TERMINAL_VALUES:
                         terminal_event = _build_terminal_run_event(current, cancelled_run_record=current_snapshot.record)

@@ -972,18 +972,18 @@ class ExecutionServiceImpl:
                     claimed_sentinel_blob_ids.add(binding.blob_ref)
 
         expected_paths_by_blob_id: dict[str, set[str]] = {}
-        for source in state.sources.values():
+        for source_name, source in state.sources.items():
             if "blob_ref" not in source.options:
                 continue
             raw_blob_id = source.options["blob_ref"]
             if type(raw_blob_id) is not str:
-                continue
+                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
             try:
                 parsed_blob_id = UUID(raw_blob_id)
-            except ValueError:
-                continue
+            except ValueError as exc:
+                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a UUID") from exc
             if str(parsed_blob_id) != raw_blob_id:
-                continue
+                raise MalformedBlobRefError(f"sources.{source_name}.blob_ref must be a canonical UUID string")
             paths = {
                 value
                 for key in SOURCE_LOCAL_PATH_OPTION_KEYS
@@ -1006,14 +1006,9 @@ class ExecutionServiceImpl:
             if self._blob_service is None or session_id is None or blob_id not in expected_paths_by_blob_id:
                 resolved_by_blob_id[blob_id] = _unresolved(blob_id)
                 return resolved_by_blob_id[blob_id]
-            try:
-                parsed_blob_id = UUID(blob_id)
-            except ValueError:
-                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
-                return resolved_by_blob_id[blob_id]
-            if str(parsed_blob_id) != blob_id:
-                resolved_by_blob_id[blob_id] = _unresolved(blob_id)
-                return resolved_by_blob_id[blob_id]
+            # Membership above proves this is a canonical UUID admitted while
+            # building expected_paths_by_blob_id; a second parse cannot fail.
+            parsed_blob_id = UUID(blob_id)
             try:
                 record = self._call_async(self._blob_service.get_blob(parsed_blob_id, session_operation_context=session_operation_context))
             except BlobNotFoundError:
@@ -3416,32 +3411,19 @@ class ExecutionServiceImpl:
         session_operation_lease: SessionOperationLease,
     ) -> BroadcastResult:
         session_operation_context = session_operation_lease.context
-        try:
-            session_operation_lease.guard_external_effect()
-            record = self._call_async(
-                self._session_service.append_run_event(
-                    run_id=UUID(run_id),
-                    timestamp=run_event.timestamp,
-                    event_type=run_event.event_type,
-                    data=run_event.data.model_dump(mode="json"),
-                    session_operation_context=session_operation_context,
-                )
-            )
-            run_event = run_event.with_event_sequence(record.sequence)
-        except (OSError, SQLAlchemyError) as exc:
-            # Transport/IO fault on the run_events write only. run_events is a
-            # secondary websocket-replay/inspection stream — authoritative run
-            # lifecycle state persists on the separate must-succeed
-            # update_run_status path — so a transient disk/DB fault degrades to
-            # broadcast-without-sequence rather than aborting live progress.
-            # Tier-1 breaches (AuditIntegrityError, ValueError "Run not found")
-            # are NOT in this tuple and propagate.
-            slog.error(
-                "run_event_persist_failed",
-                run_id=run_id,
+        # A live event must have durable replay identity before it is exposed.
+        # Database/IO failures cannot turn an unrecorded event into success.
+        session_operation_lease.guard_external_effect()
+        record = self._call_async(
+            self._session_service.append_run_event(
+                run_id=UUID(run_id),
+                timestamp=run_event.timestamp,
                 event_type=run_event.event_type,
-                exc_class=type(exc).__name__,
+                data=run_event.data.model_dump(mode="json"),
+                session_operation_context=session_operation_context,
             )
+        )
+        run_event = run_event.with_event_sequence(record.sequence)
         session_operation_lease.guard_external_effect()
         return self._broadcaster.broadcast(run_id, run_event)
 
@@ -3572,17 +3554,6 @@ class ExecutionServiceImpl:
             exc = future.exception()
         except FutureCancelledError:
             exc = None
-        if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            # _run_pipeline's except block logs via slog when the status
-            # update itself fails.  If we reach here with an exception,
-            # it means _run_pipeline re-raised — the slog call may or
-            # may not have succeeded.  One extra last-resort log line is
-            # acceptable to ensure the failure is never invisible.
-            slog.error(
-                "pipeline_done_callback_exception",
-                exc_type=type(exc).__name__,
-                exc_class_chain=_exception_class_chain(exc),
-            )
 
         async def _finish_execution_authority() -> None:
             try:
@@ -3591,6 +3562,15 @@ class ExecutionServiceImpl:
                     await asyncio.gather(loss_watcher, return_exceptions=True)
             finally:
                 await session_operation_lease.close()
+            if exc is not None and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                # Diagnose only after mandatory authority release. A logger
+                # failure belongs to this tracked completion future so that
+                # shutdown observes it without abandoning the lease.
+                slog.error(
+                    "pipeline_done_callback_exception",
+                    exc_type=type(exc).__name__,
+                    exc_class_chain=_exception_class_chain(exc),
+                )
 
         scheduled_completion = asyncio.run_coroutine_threadsafe(
             _finish_execution_authority(),

@@ -5149,16 +5149,19 @@ class TestB7ExceptionHandling:
         # finally must have removed the event
         assert run_id not in service._shutdown_events
 
-    def test_done_callback_logs_last_resort_on_exception(self, service: ExecutionServiceImpl) -> None:
+    def test_done_callback_logs_last_resort_on_exception(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """Callback logs a last-resort diagnostic when the pipeline future
         carries an exception.  This covers the edge case where _run_pipeline's
         own except block failed (e.g. update_run_status raised).
         """
         future: Future[None] = Future()
         future.set_exception(RuntimeError("unhandled"))
+        service._loop = real_loop
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
             service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             mock_slog.error.assert_called_once()
             call_kwargs = mock_slog.error.call_args
             assert call_kwargs[0][0] == "pipeline_done_callback_exception"
@@ -5172,7 +5175,7 @@ class TestB7ExceptionHandling:
             assert "exc_msg" not in call_kwargs[1]
             assert call_kwargs[1]["exc_class_chain"] == ["RuntimeError"]
 
-    def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl) -> None:
+    def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """Chained exceptions surface as a class-name chain — no payloads.
 
         Regression: ``exc_msg=str(exc)[:200]`` leaked truncated-but-still-
@@ -5188,8 +5191,11 @@ class TestB7ExceptionHandling:
             future: Future[None] = Future()
             future.set_exception(outer)
 
+        service._loop = real_loop
         with patch("elspeth.web.execution.service.slog") as mock_slog:
             service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             call_kwargs = mock_slog.error.call_args[1]
             assert call_kwargs["exc_type"] == "RuntimeError"
             assert call_kwargs["exc_class_chain"] == ["RuntimeError", "ValueError"]
@@ -5199,13 +5205,16 @@ class TestB7ExceptionHandling:
                     assert "secret" not in value
                     assert "deadbeef" not in value
 
-    def test_done_callback_noop_on_success(self, service: ExecutionServiceImpl) -> None:
+    def test_done_callback_noop_on_success(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """done_callback does not log on successful completion."""
         future: Future[None] = Future()
         future.set_result(None)
+        service._loop = real_loop
 
         with patch("elspeth.web.execution.service.slog") as mock_slog:
             service._on_pipeline_done(future, session_operation_lease=_execute_lease())
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
             mock_slog.error.assert_not_called()
 
     @patch("elspeth.web.execution.service.open_landscape_db")
@@ -7476,6 +7485,22 @@ class TestBlobRefPreValidation:
     """Malformed blob_ref must raise BEFORE create_run() to avoid
     orphaning a pending run that blocks future executions."""
 
+    @pytest.mark.parametrize("blob_ref", [None, 42, "not-a-uuid", "AAAAAAAA-1111-4111-8111-111111111111"])
+    def test_proof_resolver_rejects_malformed_present_binding(self, service: ExecutionServiceImpl, blob_ref: object) -> None:
+        from dataclasses import replace
+
+        from elspeth.web.execution.errors import MalformedBlobRefError
+
+        state = _proof_gate_state(source_path=Path("/tmp/source.csv"), blob_id=None)
+        source = state.sources["source"]
+        state = replace(state, sources={"source": replace(source, options={**source.options, "blob_ref": blob_ref})})
+        with pytest.raises(MalformedBlobRefError, match=r"sources\.source\.blob_ref"):
+            service._authoritative_proof_blob_resolver(
+                state,
+                session_id=uuid4(),
+                session_operation_context=_execute_lease().context,
+            )
+
     @pytest.mark.asyncio
     async def test_malformed_blob_ref_raises_before_run_creation(
         self,
@@ -8024,6 +8049,33 @@ class TestOneActiveRun:
 class TestEventBusBridge:
     """Verify that ProgressEvent from the Orchestrator's EventBus
     is translated to RunEvent and broadcast via the ProgressBroadcaster."""
+
+    @pytest.mark.parametrize("error_type", [OSError, SQLAlchemyError])
+    def test_failed_event_persistence_never_broadcasts(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        error_type: type[Exception],
+    ) -> None:
+        from elspeth.contracts.cli import ProgressEvent
+
+        failure = error_type("event storage unavailable")
+        mock_session_service.append_run_event.side_effect = failure
+        progress = ProgressEvent(
+            rows_processed=1,
+            rows_succeeded=1,
+            rows_failed=0,
+            rows_quarantined=0,
+            rows_routed_success=0,
+            rows_routed_failure=0,
+            elapsed_seconds=1.0,
+        )
+        run_id = str(uuid4())
+        event = service._to_run_event(run_id, progress)
+        with patch.object(service._broadcaster, "broadcast") as broadcast, pytest.raises(error_type) as caught:
+            service._persist_and_broadcast_run_event(run_id, event, session_operation_lease=_execute_lease())
+        assert caught.value is failure
+        broadcast.assert_not_called()
 
     def test_progress_event_translated_to_run_event(self, service: ExecutionServiceImpl) -> None:
         """_to_run_event maps ProgressEvent fields to RunEvent.data.

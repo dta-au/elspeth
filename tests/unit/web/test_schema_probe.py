@@ -50,12 +50,14 @@ class _FakeConnection:
         unlock_error: BaseException | None = None,
         unlock_value: object = True,
         rollback_fail_at: int | None = None,
+        invalidation_error: BaseException | None = None,
     ) -> None:
         self.dialect = SimpleNamespace(name="postgresql")
         self.acquisition_error = acquisition_error
         self.unlock_error = unlock_error
         self.unlock_value = unlock_value
         self.rollback_fail_at = rollback_fail_at
+        self.invalidation_error = invalidation_error
         self.transaction_active = False
         self.rollback_calls = 0
         self.invalidated = False
@@ -91,6 +93,8 @@ class _FakeConnection:
 
     def invalidate(self) -> None:
         self.invalidated = True
+        if self.invalidation_error is not None:
+            raise self.invalidation_error
 
 
 class _FakeEngine:
@@ -440,6 +444,32 @@ def test_locked_body_and_verify_share_the_same_connection() -> None:
 def _earlier_body(conn: Any) -> None:
     conn.transaction_active = True
     raise KeyboardInterrupt(_SENTINEL)
+
+
+def test_cleanup_failures_are_attached_to_primary_without_calling_a_fragile_logger(monkeypatch: pytest.MonkeyPatch) -> None:
+    import structlog
+
+    primary = KeyboardInterrupt("primary schema failure")
+    conn = _FakeConnection(rollback_fail_at=1, invalidation_error=OSError(_SENTINEL))
+
+    def broken_logger(*args: object, **kwargs: object) -> None:
+        raise OSError("logger unavailable")
+
+    monkeypatch.setattr(structlog.stdlib.BoundLogger, "error", broken_logger)
+
+    def fail_body(candidate: Any) -> None:
+        candidate.transaction_active = True
+        raise primary
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _run_fake(conn, body=fail_body)
+    assert caught.value is primary
+    assert conn.invalidated
+    assert primary.__notes__ == [
+        "Schema connection invalidation also failed with OSError; connection disposal was not verified.",
+        "Schema lock cleanup was not verified: RuntimeError.",
+    ]
+    _assert_redacted(primary.__notes__)
 
 
 @pytest.mark.parametrize("with_earlier", [False, True])
