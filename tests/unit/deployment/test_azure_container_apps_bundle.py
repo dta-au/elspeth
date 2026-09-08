@@ -857,7 +857,8 @@ def test_acceptance_driver_routes_every_platform_call_through_protected_capture(
         assert f"{helper}() {{" in script, helper
     for stage in ("stage_environment", "stage_image", "stage_jobs", "stage_workload", "stage_probes", "stage_evidence", "stage_cleanup"):
         assert f"{stage}()" in script, stage
-    assert 'test "$acr_digest" = "$CANDIDATE_IMAGE_DIGEST"' in script
+    # Digest preservation is exercised by test_driver.py's
+    # test_digest_mismatch_stops_before_jobs, without pinning shell-local names.
     assert "docker buildx imagetools create" in script
     assert "sha256sum" in script
 

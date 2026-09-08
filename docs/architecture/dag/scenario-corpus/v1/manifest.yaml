@@ -183,8 +183,8 @@ evidence:
     stages: [runtime, audit]
   - id: runtime-disposition-drains-03
     kind: pytest
-    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced
-    claim: Non-sink terminal work drains and unregistered construction remains explicit.
+    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_uses_membership_derived_from_leader
+    claim: Non-sink terminal work drains with membership derived from the registered leader when no lease owner is supplied.
     stages: [runtime, audit]
   - id: runtime-disposition-drains-04
     kind: pytest
@@ -255,12 +255,12 @@ evidence:
     stages: [runtime, audit, recovery]
   - id: direct-contention-fencing-04
     kind: pytest
-    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy
+    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_uses_registered_membership_for_explicit_and_derived_owner
     claim: Initial enqueue selects strict registered-worker routing explicitly.
     stages: [runtime, audit]
   - id: direct-contention-fencing-05
     kind: pytest
-    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned
+    locator: tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_requires_member_and_has_no_legacy_production_references
     claim: Initial enqueue routing and legacy references remain pinned.
     stages: [runtime, audit]
 

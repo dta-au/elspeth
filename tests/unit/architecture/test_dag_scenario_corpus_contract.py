@@ -376,7 +376,7 @@ EXPECTED_ASSESSMENT_LOCATORS = {
     "runtime-disposition-drains": (
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_sink_bound_result_parks_pending_sink_with_fenced_owner_and_tags_result",
         "tests/unit/engine/test_scheduler_drain_characterization.py::test_claimed_token_failure_marks_failed_with_fence",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_marks_terminal_and_unregistered_build_is_unfenced",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_non_sink_terminal_uses_membership_derived_from_leader",
         "tests/unit/engine/test_processor.py::TestDurableSchedulerResumeDrain::test_aggregation_buffering_leaves_scheduler_work_blocked",
     ),
     "focused-crash-restart": (
@@ -394,8 +394,8 @@ EXPECTED_ASSESSMENT_LOCATORS = {
         "tests/integration/engine/test_two_process_scheduler_contention.py",
         "tests/integration/engine/test_multi_source_chaos.py::test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_owner",
         "tests/e2e/recovery/test_suspended_winner_fences.py",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routes_registered_worker_to_strict_and_unregistered_to_explicit_legacy",
-        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_routing_ast_and_legacy_production_references_are_pinned",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_uses_registered_membership_for_explicit_and_derived_owner",
+        "tests/unit/engine/test_scheduler_drain_characterization.py::test_immediate_enqueue_requires_member_and_has_no_legacy_production_references",
     ),
     "conditional-routing-destination-negatives": (
         "tests/integration/core/dag/test_dag_scenario_production_path.py::test_b1_conditional_routing_rejects_missing_boolean_gate_destination",
@@ -465,7 +465,8 @@ EXPECTED_ASSESSMENT_EVIDENCE = tuple(
 # verified against pre-migration HEAD b5b92c2b5 (WS2 Task 6 BASE); new
 # manifest verified against this commit's harness run (real observed
 # projection_sha256/counts captured via the corpus harness, never hand-computed).
-EXPECTED_EVIDENCE_REGISTRY_SHA256 = "68837dc46eb087e82e00191d178f05781ab9f0a5016aaede9839d9dce0b19764"
+# Current scheduler authority test names; scenario and runtime oracle bytes are unchanged.
+EXPECTED_EVIDENCE_REGISTRY_SHA256 = "0f3531ad1646c08033700e0e82edde11dc2c1e7cc33bdc51e5e2823d80fe8da2"
 # Digests the FULL case content, so it moves whenever a pinned expected
 # projection does — including a plugin ``source_file_hash`` refresh reaching the
 # corpus manifest. Rotated 2026-08-05 for the json_explode PH3 refresh
