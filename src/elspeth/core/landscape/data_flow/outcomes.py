@@ -487,19 +487,26 @@ class TokenOutcomeRepository:
         """Record an item outcome only while the worker still owns its claim."""
         if ref.run_id != member_token.run_id or ref.token_id != work_item.token_id:
             raise AuditIntegrityError("record_token_outcome: token reference does not belong to the claimed work item")
-        with fenced_item_transaction(self._db.engine, member_token=member_token, work_item=work_item, verb="record_token_outcome") as conn:
-            return self.record_token_outcome_on(
-                ref,
-                outcome,
-                path,
-                conn=conn,
-                sink_name=sink_name,
-                sink_node_id=sink_node_id,
-                artifact_id=artifact_id,
-                batch_id=batch_id,
-                error_hash=error_hash,
-                context=context,
-            )
+        self._validate_outcome_fields(outcome, path, sink_name=sink_name, batch_id=batch_id, error_hash=error_hash)
+        context_json = canonical_json(context) if context is not None else None
+        try:
+            with fenced_item_transaction(
+                self._db.engine, member_token=member_token, work_item=work_item, verb="record_token_outcome"
+            ) as conn:
+                return self._record_prepared_token_outcome_on(
+                    ref,
+                    outcome,
+                    path,
+                    conn=conn,
+                    sink_name=sink_name,
+                    sink_node_id=sink_node_id,
+                    artifact_id=artifact_id,
+                    batch_id=batch_id,
+                    error_hash=error_hash,
+                    context_json=context_json,
+                )
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(f"record_token_outcome transaction boundary failed: {type(exc).__name__}") from exc
 
     def record_token_outcome_leader(
         self,
@@ -518,24 +525,29 @@ class TokenOutcomeRepository:
         """Record a finalization outcome under the leader epoch fence."""
         if ref.run_id != coordination_token.run_id:
             raise AuditIntegrityError("record_token_outcome_leader: token reference does not belong to the authority's run")
-        with fenced_leader_transaction(
-            self._db.engine,
-            token=coordination_token,
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="record_token_outcome_leader",
-        ) as conn:
-            return self.record_token_outcome_on(
-                ref,
-                outcome,
-                path,
-                conn=conn,
-                sink_name=sink_name,
-                sink_node_id=sink_node_id,
-                artifact_id=artifact_id,
-                batch_id=batch_id,
-                error_hash=error_hash,
-                context=context,
-            )
+        self._validate_outcome_fields(outcome, path, sink_name=sink_name, batch_id=batch_id, error_hash=error_hash)
+        context_json = canonical_json(context) if context is not None else None
+        try:
+            with fenced_leader_transaction(
+                self._db.engine,
+                token=coordination_token,
+                window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+                verb="record_token_outcome_leader",
+            ) as conn:
+                return self._record_prepared_token_outcome_on(
+                    ref,
+                    outcome,
+                    path,
+                    conn=conn,
+                    sink_name=sink_name,
+                    sink_node_id=sink_node_id,
+                    artifact_id=artifact_id,
+                    batch_id=batch_id,
+                    error_hash=error_hash,
+                    context_json=context_json,
+                )
+        except SQLAlchemyError as exc:
+            raise LandscapeRecordError(f"record_token_outcome_leader transaction boundary failed: {type(exc).__name__}") from exc
 
     def record_token_outcome_on(
         self,
@@ -592,7 +604,40 @@ class TokenOutcomeRepository:
         # Canonicalization can fail; prepare the context before the dependent
         # audit INSERT so malformed data cannot leave a partial outcome.
         context_json = canonical_json(context) if context is not None else None
+        return self._record_prepared_token_outcome_on(
+            ref,
+            outcome,
+            path,
+            conn=conn,
+            sink_name=sink_name,
+            sink_node_id=sink_node_id,
+            artifact_id=artifact_id,
+            batch_id=batch_id,
+            error_hash=error_hash,
+            context_json=context_json,
+            dependencies_prelocked=dependencies_prelocked,
+        )
 
+    def _record_prepared_token_outcome_on(
+        self,
+        ref: TokenRef,
+        outcome: TerminalOutcome | None,
+        path: TerminalPath,
+        *,
+        sink_name: str | None,
+        sink_node_id: str | None,
+        artifact_id: str | None,
+        batch_id: str | None,
+        error_hash: str | None,
+        context_json: str | None,
+        conn: Connection,
+        dependencies_prelocked: bool = False,
+    ) -> str:
+        """Persist validated outcome fields and prepared context on the fenced connection.
+
+        Public writers prepare context before opening their own transaction;
+        composed callers retain ownership of their transaction boundary.
+        """
         # Every Tier-1 read and the dependent insert use the caller's exact
         # fenced transaction, which holds SQLite's writer slot.
         # Outcome inserts acquire a token FK lock even for pairs without a
