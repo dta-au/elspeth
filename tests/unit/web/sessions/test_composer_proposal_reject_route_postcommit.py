@@ -163,6 +163,24 @@ def test_committed_reject_survives_cleanup_and_logger_failures(test_client: Test
     assert response.json()["status"] == "rejected"
 
 
+def test_committed_reject_propagates_cleanup_integrity_failure(test_client: TestClient, monkeypatch) -> None:
+    session, proposal = _create_ordinary_proposal(test_client)
+    original_close = SessionOperationLease.close
+    failure = AuditIntegrityError("cleanup integrity failed")
+
+    async def close_then_fail(lease: SessionOperationLease) -> None:
+        await original_close(lease)
+        raise failure
+
+    monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
+    with pytest.raises(AuditIntegrityError) as caught:
+        test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+    assert caught.value is failure
+    monkeypatch.undo()
+    replay = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/reject", json={})
+    assert replay.status_code == 409
+
+
 def test_committed_preferences_survive_telemetry_and_logger_failures(test_client: TestClient, monkeypatch) -> None:
     session = test_client.post("/api/sessions", json={"title": "preferences telemetry"}).json()
     calls: list[str] = []
@@ -320,7 +338,10 @@ async def test_cancellation_after_ordinary_accept_commit_drains_lease_cleanup(
     assert persisted.row.status == "committed"
 
 
-def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_client: TestClient, monkeypatch) -> None:
+@pytest.mark.parametrize("rejection_fault", ["none", "terminal_race", "internal_value_error"])
+def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_client: TestClient, monkeypatch, rejection_fault: str) -> None:
+    from elspeth.web.sessions.protocol import ProposalStateConflictError
+
     session, proposal = _create_ordinary_proposal(
         test_client,
         arguments_json={
@@ -351,6 +372,15 @@ def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_clien
     async def observe_context(self: object, **kwargs: object) -> object:
         context = cast(SessionOperationContext, kwargs["session_operation_context"])
         seen_kinds.append(context.operation_kind)
+        if rejection_fault == "internal_value_error":
+            raise ValueError("invalid database record")
+        if rejection_fault == "terminal_race":
+            await original_reject(self, **kwargs)
+            # A second writer loses the pending-state CAS after the first
+            # transition is durable. Exercise the real service discriminator.
+            with pytest.raises(ProposalStateConflictError):
+                await original_reject(self, **kwargs)
+            return await original_reject(self, **kwargs)
         return await original_reject(self, **kwargs)
 
     async def close_then_fail(lease: SessionOperationLease) -> None:
@@ -359,6 +389,10 @@ def test_validation_failure_auto_reject_cleanup_fault_cannot_mask_422(test_clien
 
     monkeypatch.setattr(type(service), "reject_composition_proposal", observe_context)
     monkeypatch.setattr(SessionOperationLease, "close", close_then_fail)
+    if rejection_fault == "internal_value_error":
+        with pytest.raises(ValueError, match="invalid database record"):
+            test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/accept")
+        return
     response = test_client.post(f"/api/sessions/{session['id']}/proposals/{proposal.id}/accept")
 
     assert response.status_code == 422

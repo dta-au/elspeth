@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -468,7 +469,8 @@ async def test_auto_title_programmer_error_propagates(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_auto_title_title_write_failure_propagates(monkeypatch) -> None:
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+async def test_auto_title_title_write_failure_propagates(monkeypatch, error_type) -> None:
     counter = _FakeCounter()
     monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
 
@@ -484,11 +486,11 @@ async def test_auto_title_title_write_failure_propagates(monkeypatch) -> None:
             session_operation_context: SessionOperationContext,
         ) -> None:
             del session_id, title, session_operation_context
-            raise RuntimeError("database unavailable")
+            raise error_type("database unavailable")
 
     monkeypatch.setattr(_auto_title, "_litellm_acompletion", _completion_response)
 
-    with pytest.raises(RuntimeError, match="database unavailable"):
+    with pytest.raises(error_type, match="database unavailable"):
         await _auto_title.maybe_auto_title_session(
             service=_FailingService(),
             session_id=uuid4(),
@@ -500,3 +502,27 @@ async def test_auto_title_title_write_failure_propagates(monkeypatch) -> None:
         )
 
     assert counter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_auto_title_cancellation_propagates_after_accounting(monkeypatch) -> None:
+    counter = _FakeCounter()
+    monkeypatch.setattr(_auto_title, "_AUTO_TITLE_FAILED_COUNTER", counter)
+    cancellation = asyncio.CancelledError()
+
+    async def cancelled_provider(**kwargs: object) -> object:
+        raise cancellation
+
+    monkeypatch.setattr(_auto_title, "_litellm_acompletion", cancelled_provider)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await _auto_title.maybe_auto_title_session(
+            service=_TitleService(),
+            session_id=uuid4(),
+            user_message="Build a CSV pipeline",
+            model="openai/test",
+            temperature=None,
+            seed=None,
+            session_operation_context=_TEST_CONTEXT,
+        )
+    assert caught.value is cancellation
+    assert counter.calls == [(1, {"exception_class": "CancelledError"}, None)]

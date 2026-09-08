@@ -274,8 +274,8 @@ async def maybe_auto_title_session(
     """Generate and persist an auto-title for ``session_id``.
 
     One-shot LLM completion (no tools, operator-set sampling).
-    Provider errors, timeouts, and cancellation are recorded on
-    operational telemetry and return without poisoning the chat response.
+    Provider errors and timeouts are recorded on operational telemetry and
+    return without poisoning the chat response. Cancellation propagates.
     Programmer bugs and DB write failures propagate to the caller awaiting
     the task; swallowing those would hide regressions in the auto-title path.
 
@@ -302,25 +302,26 @@ async def maybe_auto_title_session(
     try:
         response = await _litellm_acompletion(**kwargs)
         admitted = _admit_auto_title_completion(response)
-        if admitted.content is None:
-            return
-        candidate = _admit_title_candidate(admitted.content)
-        if isinstance(candidate, _RejectedTitle):
-            # Counted, not raised: the provider answered successfully but
-            # the content is not a title (elspeth-308d1e0831). The
-            # finish_reason label discriminates "model ran long" from
-            # "model answered the question" for triage.
-            _record_auto_title_rejection(candidate.rejection_class, admitted.finish_reason)
-            return
-        await service.update_session_title(
-            session_id,
-            candidate,
-            session_operation_context=session_operation_context,
-        )
-    except (LiteLLMAPIError, TimeoutError, asyncio.CancelledError, _MalformedAutoTitleResponseError) as exc:
+    except asyncio.CancelledError as exc:
+        _record_auto_title_failure(exc)
+        raise
+    except (LiteLLMAPIError, TimeoutError, _MalformedAutoTitleResponseError) as exc:
         # Auto-titling is best-effort UI metadata for expected provider/
         # scheduling failures, but those failures still need an operational
         # signal so "provider declined" does not look identical to "feature
         # silently broke."
         _record_auto_title_failure(exc)
         return
+    if admitted.content is None:
+        return
+    candidate = _admit_title_candidate(admitted.content)
+    if isinstance(candidate, _RejectedTitle):
+        _record_auto_title_rejection(candidate.rejection_class, admitted.finish_reason)
+        return
+    # Persistence is outside the provider recovery boundary: a database
+    # timeout is a failed write, not an unavailable model response.
+    await service.update_session_title(
+        session_id,
+        candidate,
+        session_operation_context=session_operation_context,
+    )

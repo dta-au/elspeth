@@ -281,14 +281,16 @@ class TestConvertFreeformWithWork:
         _seed_freeform_state_with_work(client, session_id)
         service = client.app.state.session_service
 
-        with patch.object(
-            service,
-            "_insert_prepared_guided_audit_rows_on_connection",
-            side_effect=RuntimeError("injected audit insert failure"),
+        with (
+            pytest.raises(RuntimeError, match="injected audit insert failure"),
+            patch.object(
+                service,
+                "_insert_prepared_guided_audit_rows_on_connection",
+                side_effect=RuntimeError("injected audit insert failure"),
+            ),
         ):
-            response = _convert_raw(client, session_id)
+            _convert_raw(client, session_id)
 
-        assert response.status_code == 500
         versions = asyncio.run(service.get_state_versions(UUID(session_id)))
         assert [version.version for version in versions] == [1]
         assert asyncio.run(service.get_messages(UUID(session_id), limit=None)) == []
@@ -560,27 +562,25 @@ class TestConvertEmptySession:
         session_id = _create_session(client)
         operation_id = str(uuid4())
 
-        with patch(
-            "elspeth.web.sessions.routes.composer.guided._build_get_guided_turn",
-            side_effect=InvariantError("tier-3 diagnostic must not escape"),
+        with (
+            pytest.raises(InvariantError),
+            patch(
+                "elspeth.web.sessions.routes.composer.guided._build_get_guided_turn",
+                side_effect=InvariantError("tier-3 diagnostic must not escape"),
+            ),
         ):
-            first = _convert_raw(client, session_id, operation_id=operation_id)
+            _convert_raw(client, session_id, operation_id=operation_id)
         replay = _convert_raw(client, session_id, operation_id=operation_id)
 
-        assert first.status_code == 500
         assert replay.status_code == 500
-        assert (
-            first.json()
-            == replay.json()
-            == {
-                "detail": {
-                    "error_type": "guided_operation_terminal_failure",
-                    "failure_code": "operation_failed",
-                    "detail": "The operation failed.",
-                }
+        assert replay.json() == {
+            "detail": {
+                "error_type": "guided_operation_terminal_failure",
+                "failure_code": "operation_failed",
+                "detail": "The operation failed.",
             }
-        )
-        assert "tier-3 diagnostic" not in first.text
+        }
+        assert "tier-3 diagnostic" not in replay.text
 
     def test_audit_integrity_failure_is_settled_without_swallowing_diagnostic(
         self,
@@ -591,79 +591,54 @@ class TestConvertEmptySession:
         operation_id = str(uuid4())
         service = client.app.state.session_service
 
-        from structlog.testing import capture_logs
-
+        failure = AuditIntegrityError("diagnostic retained for audit")
         with (
-            capture_logs() as cap_logs,
+            pytest.raises(AuditIntegrityError) as caught,
             patch.object(
                 service,
                 "save_state_for_guided_operation",
-                side_effect=AuditIntegrityError("diagnostic retained for audit"),
+                side_effect=failure,
             ),
         ):
-            first = _convert_raw(client, session_id, operation_id=operation_id)
+            _convert_raw(client, session_id, operation_id=operation_id)
 
+        assert caught.value is failure
         replay = _convert_raw(client, session_id, operation_id=operation_id)
-        assert first.status_code == replay.status_code == 500
-        assert (
-            first.json()
-            == replay.json()
-            == {
-                "detail": {
-                    "error_type": "guided_operation_terminal_failure",
-                    "failure_code": "integrity_error",
-                    "detail": "The operation failed an integrity check.",
-                }
+        assert replay.status_code == 500
+        assert replay.json() == {
+            "detail": {
+                "error_type": "guided_operation_terminal_failure",
+                "failure_code": "integrity_error",
+                "detail": "The operation failed an integrity check.",
             }
-        )
-        events = [entry for entry in cap_logs if entry.get("event") == "guided.operation_terminal_failure"]
-        assert len(events) == 1
-        assert events[0]["exc_class"] == "AuditIntegrityError"
-        assert events[0]["site"] == "post_guided_convert"
-        assert events[0]["frames"]
-        # R2-F16b: the correlation field is always emitted (None here — this
-        # app carries no RequestIdMiddleware).
-        assert "request_id" in events[0]
-        assert "diagnostic retained for audit" not in repr(events[0])
+        }
+        assert "diagnostic retained for audit" not in replay.text
 
     def test_unclassified_failure_is_recorded_with_its_failure_code_and_frames(
         self,
         composer_test_client: TestClient,
     ) -> None:
-        """A first-party bug settles AND leaves a server-side record.
-
-        The durable row and the replayable coded response say only THAT the
-        operation failed. Before the diagnostic widened past the integrity
-        arm, an unclassified defect discarded its traceback entirely, so the
-        one 500 an operator had to work from named no site, no class and no
-        frames. The response contract is deliberately unchanged — settlement
-        succeeded, so the coded answer stays exactly replayable.
-        """
+        """A first-party bug settles and propagates with its traceback intact."""
         client = composer_test_client
         session_id = _create_session(client)
         operation_id = str(uuid4())
 
-        from structlog.testing import capture_logs
-
+        failure = InvariantError("tier-3 diagnostic must not escape")
         with (
-            capture_logs() as cap_logs,
+            pytest.raises(InvariantError) as caught,
             patch(
                 "elspeth.web.sessions.routes.composer.guided._build_get_guided_turn",
-                side_effect=InvariantError("tier-3 diagnostic must not escape"),
+                side_effect=failure,
             ),
         ):
-            first = _convert_raw(client, session_id, operation_id=operation_id)
+            _convert_raw(client, session_id, operation_id=operation_id)
 
-        assert first.status_code == 500
-        assert first.json()["detail"]["failure_code"] == "operation_failed"
-        events = [entry for entry in cap_logs if entry.get("event") == "guided.operation_terminal_failure"]
-        assert len(events) == 1
-        assert events[0]["exc_class"] == "InvariantError"
-        assert events[0]["failure_code"] == "operation_failed"
-        assert events[0]["site"] == "post_guided_convert"
-        assert events[0]["frames"]
-        # The widened log carries frames, never the exception's own text.
-        assert "tier-3 diagnostic" not in repr(events[0])
+        assert caught.value is failure
+        assert caught.value.__traceback__ is not None
+        replay = _convert_raw(client, session_id, operation_id=operation_id)
+        assert replay.status_code == 500
+        assert replay.json()["detail"]["failure_code"] == "operation_failed"
+        assert "tier-3 diagnostic" not in replay.text
 
     def test_settlement_conflict_is_not_logged_as_a_terminal_failure(
         self,

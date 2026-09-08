@@ -23,8 +23,14 @@ from elspeth.web.sessions.pending_interpretation import (
     _patch_structured_interpretation_prompt,
     _require_mapping,
     _reviewed_content_identity,
+    _SessionPendingInterpretationPlanner,
 )
-from elspeth.web.sessions.protocol import CompositionStateRecord, InterpretationPlaceholderConsumedError
+from elspeth.web.sessions.protocol import (
+    CompositionStateRecord,
+    InterpretationPlaceholderConsumedError,
+    SessionPendingInterpretationCommand,
+    SessionPendingInterpretationSnapshot,
+)
 
 
 def _llm_node(options: dict[str, object]) -> dict[str, object]:
@@ -157,3 +163,32 @@ def test_reviewed_content_identity_rejects_malformed_requirements() -> None:
             user_term="recent",
             context="ctx",
         )
+
+
+def test_pending_interpretation_plan_rejects_malformed_requirements() -> None:
+    state = _state_record([_llm_node({"interpretation_requirements": "not-a-list"})])
+    command = SessionPendingInterpretationCommand(
+        event_id=uuid4(),
+        opt_out_marker_event_id=uuid4(),
+        composition_state_id=state.id,
+        affected_node_id="n1",
+        tool_call_id="call_1",
+        user_term="recent",
+        kind=InterpretationKind.VAGUE_TERM,
+        llm_draft="last 30 days",
+        model_identifier="composer-model",
+        model_version="composer-model",
+        provider="composer",
+        composer_skill_hash="a" * 64,
+        created_at=datetime(2026, 8, 31, 12, 0, 0, tzinfo=UTC),
+    )
+    snapshot = SessionPendingInterpretationSnapshot(
+        anchor_state=state, live_state=state, pending_sites=(), review_disabled=False, opt_out_marker_exists=False
+    )
+
+    class UnreachableValidator:
+        def validate(self, candidate):
+            pytest.fail("malformed requirements must be rejected before validation")
+
+    with pytest.raises(InterpretationPlaceholderConsumedError):
+        _SessionPendingInterpretationPlanner.plan(command, snapshot, UnreachableValidator())
