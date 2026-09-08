@@ -81,6 +81,139 @@ def test_freeze_guards_reports_isinstance_self_guard() -> None:
 
 
 @pytest.mark.parametrize(
+    "predicate",
+    [
+        "not isinstance(self.data, tuple)",
+        "not isinstance(self.data, (tuple, frozenset))",
+        "not isinstance(self.data, tuple) or len(self.data) != expected or any(not isinstance(part, str) or not part for part in self.data)",
+        "not isinstance(self.data, tuple) or not all(isinstance(part, str) for part in self.data if part)",
+    ],
+)
+def test_freeze_guards_accepts_unconditional_carrier_validation(predicate: str) -> None:
+    findings = _analyze_freeze_guards(
+        f"""
+        @dataclass(frozen=True)
+        class Example:
+            data: tuple[str, ...]
+            def __post_init__(self):
+                expected = 3
+                if {predicate}:
+                    raise ValueError("invalid carrier")
+        """
+    )
+    assert findings == []
+
+
+@pytest.mark.parametrize(
+    "predicate",
+    [
+        'not isinstance(self.data, tuple) or freeze_fields(self, "data")',
+        "not isinstance(self.data, tuple) or helper(self.data)",
+        "not isinstance(self.data, tuple) or len(deep_freeze(self.data))",
+        "not isinstance(self.data, tuple) or any(helper(part) for part in self.data)",
+        "not isinstance(self.data, tuple) or any(part for part in self.data if helper(part))",
+        "not isinstance(self.data, tuple) or any(part for part in helper(self.data))",
+        "not isinstance(self.data, tuple) or any(part for self.data in self.data)",
+        "not isinstance(self.data, tuple) or any([part for part in self.data])",
+        "not isinstance(self.data, tuple) or (changed := self.data)",
+        'not isinstance(self.data, tuple) or (lambda: freeze_fields(self, "data"))()',
+        "not isinstance(self.data, tuple) or builtins.len(self.data)",
+        "not isinstance(self.data, tuple) or len(*self.data)",
+    ],
+)
+def test_freeze_guards_keeps_unknown_or_effectful_predicates_flagged(predicate: str) -> None:
+    findings = _analyze_freeze_guards(
+        f"""
+        class Example:
+            def __post_init__(self):
+                if {predicate}:
+                    raise ValueError("invalid carrier")
+        """
+    )
+    assert [finding.rule_id for finding in findings] == ["FG2"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "if not isinstance(self.data, tuple):\n    return",
+        'if not isinstance(self.data, tuple):\n    freeze_fields(self, "data")',
+        'if not isinstance(self.data, tuple):\n    raise ValueError()\nelse:\n    freeze_fields(self, "data")',
+        "try:\n    if not isinstance(self.data, tuple):\n        raise ValueError()\nexcept ValueError:\n    pass",
+        "if self.enabled:\n    if not isinstance(self.data, tuple):\n        raise ValueError()",
+        'if not isinstance(self.data, tuple):\n    freeze_fields(self, "data")\n    raise ValueError()',
+    ],
+)
+def test_freeze_guards_requires_direct_raise_only_rejection(body: str) -> None:
+    source = "class Example:\n    def __post_init__(self):\n" + textwrap.indent(body, "        ")
+    findings = _analyze_freeze_guards(source)
+    assert [finding.rule_id for finding in findings] == ["FG2"]
+
+
+@pytest.mark.parametrize(
+    "prefix, parameter, local",
+    [
+        ("isinstance = helper", "", ""),
+        ("tuple = ForeignType", "", ""),
+        ("len = helper", "", ""),
+        ("from foreign import any", "", ""),
+        ("from foreign import *", "", ""),
+        ("import foreign as all", "", ""),
+        ("def str(): pass", "", ""),
+        ("class tuple: pass", "", ""),
+        ("", ", any=helper", ""),
+        ("", "", "len = helper"),
+        ('__builtins__["len"] = helper', "", ""),
+        ('globals()["len"] = helper', "", ""),
+        ('import builtins\nbuiltins.__setattr__("len", helper)', "", ""),
+    ],
+)
+def test_freeze_guards_rejects_shadowed_validation_builtins(prefix: str, parameter: str, local: str) -> None:
+    predicate = "not isinstance(self.data, tuple) or len(self.data) != 1 or any(not isinstance(part, str) for part in self.data) or not all(isinstance(part, str) for part in self.data)"
+    baseline = f'class Example:\n    def __post_init__(self):\n        if {predicate}:\n            raise ValueError("invalid carrier")\n'
+    assert _analyze_freeze_guards(baseline) == []
+    source = prefix + "\nclass Example:\n"
+    source += f"    def __post_init__(self{parameter}):\n"
+    if local:
+        source += f"        {local}\n"
+    source += f"        if {predicate}:\n"
+    source += '            raise ValueError("invalid carrier")\n'
+    findings = _analyze_freeze_guards(source)
+    assert [finding.rule_id for finding in findings] == ["FG2"]
+
+
+def test_freeze_guards_validation_does_not_satisfy_fg3_or_hide_later_freeze_guard() -> None:
+    findings = _analyze_freeze_guards(
+        """
+        @dataclass(frozen=True)
+        class Example:
+            data: tuple[dict[str, object], ...]
+            def __post_init__(self):
+                if not isinstance(self.data, tuple):
+                    raise ValueError("invalid carrier")
+                if isinstance(self.data, tuple):
+                    pass
+        """
+    )
+    assert [finding.rule_id for finding in findings] == ["FG3", "FG2"]
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        "async def __post_init__(self):\n    if not isinstance(self.data, tuple):\n        raise ValueError()",
+        "def __post_init__(self):\n    if not isinstance(self.data, tuple):\n        raise ValueError()\n    yield self",
+        "def __post_init__(self):\n    return\n    if not isinstance(self.data, tuple):\n        raise ValueError()",
+        "@catch_errors\ndef __post_init__(self):\n    if not isinstance(self.data, tuple):\n        raise ValueError()",
+    ],
+)
+def test_freeze_guards_does_not_trust_skipped_or_wrapped_validation(method: str) -> None:
+    source = "class Example:\n" + textwrap.indent(method, "    ")
+    findings = _analyze_freeze_guards(source)
+    assert [finding.rule_id for finding in findings] == ["FG2"]
+
+
+@pytest.mark.parametrize(
     "source",
     [
         """
