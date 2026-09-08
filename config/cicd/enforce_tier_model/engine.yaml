@@ -173,25 +173,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[19]/body[3]/body[1]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:143ccd4e02862a60589d9b538dc8f3aea500544ca685147cca603ba3d28e38ed'
-- key: engine/orchestrator/cleanup.py:R4:_safe_cleanup_error_text:fp=f678cf61a66db302
-  owner: john
-  reason: |-
-    `engine/orchestrator/cleanup.py:66-77` is a prescribed Tier-3/plugin-boundary diagnostic wrapper, not a Tier-1 audit-data suppression. The finding is the `except Exception:` around `raw_text = str(error)` in `_safe_cleanup_error_text`; that function is only formatting a plugin cleanup exception for scrubbed public reporting. The caller at `engine/orchestrator/cleanup.py:134-147` immediately logs and records the cleanup failure using the scrubbed text, digest, and raw length. Tier-1 corruption is not downgraded here: `run_hook` explicitly has `except contract_errors.TIER_1_ERRORS: raise` at `engine/orchestrator/cleanup.py:160-161` before the plugin-boundary `except Exception as exc:` at `engine/orchestrator/cleanup.py:162-163`. This suppression remains valid only while the broad catch is limited to unrepresentable exception text from plugin cleanup errors, i.e. `raw_text = str(error)` followed by `raw_text = f"<unrepresentable {type(error).__name__}>"`.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:14:02.851835+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The broad except wraps only `str(error)` on a plugin-supplied exception object whose `__str__` we do not control — a Tier-3 external boundary where a misbehaving `__str__` (raising arbitrary exceptions) must not crash the cleanup diagnostic path. The handler substitutes an honest `<unrepresentable {type_name}>` marker (recording absence rather than fabricating content), and the caller preserves Tier-1 integrity by re-raising `TIER_1_ERRORS` before this plugin-boundary catch. The suppressed scope is minimal (one line producing a diagnostic string) and the rationale ties directly to the R4 concern.
-  judge_signature_version: 2
-  scope_fingerprint: 5fa80fdba4180d9733b9260e5e8bbdf600ffdcf8cc9ccba9327dfac494f9a5a6
-  judge_transport: openrouter
-  ast_path: 'body[16]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8087d3c0312cdbc788d452d186bac2b48d1e0b85a4bf6a271d85d8aca34e44ef'
 - key: engine/orchestrator/cleanup.py:R4:cleanup_plugins:run_hook:fp=f191e624a372b2ab
   owner: john
   reason: |-
@@ -465,25 +446,25 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[7]/body[4]/body[5]/body[0]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:4639d3a107943bf651361fdff74189437deb1274ff91598fb17f35956e0d6a98'
-- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_beat_once:fp=857ff718a5962c0c
+- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_beat_once:fp=52a845e1b2314960
   owner: john
   reason: |-
-    engine/orchestrator/heartbeat.py:346 `except Exception as exc:` is the LAST arm of a three-tier split in _beat_once (a thread that by contract 'NEVER raises on its own stack', docstring 248-267). Tier-1 audit-integrity/framework-invariant failures are caught FIRST at 317 `except contract_errors.TIER_1_ERRORS` and fail closed via the fatal latch (self._fatal_exc = exc; self._fatal_event.set(), 325-326) for check_and_raise() to re-raise at the next drain boundary; SQLITE_BUSY OperationalError is handled at 333. The broad catch at 346 can therefore only receive non-Tier-1, non-BUSY exceptions (design category 5: programming error / repository-contract regression), reclassified as liveness-unknown: _consecutive_busy += 1, logger.warning(..., exc_info=exc) (traceback, not a silent swallow), and _emit_degraded() past threshold. The wrapped work is a liveness snapshot READ, not audit reconstruction, so a swallowed contract error signals 'liveness unknown', it does not fabricate or persist Tier-1 state. Termination path for real corruption: engine/orchestrator/heartbeat.py:317-326 (Tier-1 fatal latch -> check_and_raise). INVALIDATED IF: the `except TIER_1_ERRORS` arm at 317 is removed or reordered below 346, or the 346 arm stops logging/counting (becoming a true silent swallow).
+    This broad catch transports an unexpected heartbeat failure to its owning thread, rather than declaring heartbeat success. RunHeartbeatThread._capture_fatal publishes the first exception before setting its event; raise_fatal_failure and check_and_raise raise the same object. FollowerProcessor._drain_loop now checks fatal state unconditionally before every drain and before_claim, independent of the separate eviction latch. Fresh-run and resume finalizers consume the fatal latch after joining and required cleanup, and before successful summary emission. This closes the previously unconsumed final-beat path. Tests: tests/unit/engine/orchestrator/test_follower_processor.py::TestFollowerHeartbeatLifecycle::test_fatal_heartbeat_stops_work_without_eviction_latch; tests/unit/engine/orchestrator/test_cleanup_failure_ceremony.py::TestPartialResultCeremonySurvivesCleanupFailure::test_final_heartbeat_failure_reaches_caller_after_seat_release; tests/unit/engine/orchestrator/test_resume_bound_group_backstop.py::test_resume_final_heartbeat_failure_survives_release_and_flush. The separate OperationalError handler remains a documented liveness-unknown outcome; it is not evidence of successful membership renewal.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:19:09.843465+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-09-08T10:37:21.545631+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. This is a background heartbeat thread that contractually must not raise on its own stack; Tier-1 integrity errors are caught FIRST at line 317 and latched into a fatal event for check_and_raise() to re-raise at the next drain boundary, and SQLITE_BUSY is handled at 333. The broad catch at 346 is therefore the residual arm for unexpected programming/repository-contract errors, and it does not silently swallow: it increments the degraded counter, logs at WARNING with exc_info (full traceback), and escalates to _emit_degraded() past threshold — i.e. treats the failure as liveness-unknown on a read path, not audit fabrication. The rationale correctly identifies the routing structure (Tier-1 peels off before the broad arm) and the code visibly confirms it. R4 is not in the decorator's suppressible set {R1, R5}, so no decorator nudge applies.
+    PRESCRIBED FORM — the broad catch does not suppress the unexpected failure: `_beat_once` passes it to `_capture_fatal` (heartbeat.py:383), which stores the exception before publishing the event (heartbeat.py:271), and `raise_fatal_failure` re-raises that same object (heartbeat.py:239). The named control is verified in `FollowerProcessor._drain_loop`, which checks fatal state at each loop and before each claim (follower.py:375), while follower teardown checks it after departure (follower.py:327) and resume checks it after heartbeat shutdown and seat release but before success emission (resume.py:841). The claimed fresh-run and resume final-beat tests verify exception identity, cleanup/release completion, and absence of a successful summary (test_cleanup_failure_ceremony.py:316 and test_resume_bound_group_backstop.py:160), consistently establishing transport to the owning thread rather than silent recovery.
   judge_signature_version: 2
-  scope_fingerprint: d7a98ed29978325a22083757a9b9eafa6ed1e45569a4335ab8915db886c5d627
-  judge_transport: openrouter
-  ast_path: 'body[17]/body[7]/body[1]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:156db557fe8949f8db5635cff4f4910c99260b5cfb8c1c2dc0479d75dfe3573c'
+  scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[9]/body[1]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:3df473de18d09e791926efdef8c783e0be62ca36315d44627ac10ea8e98e88d3'
 - key: engine/orchestrator/ceremony.py:R5:RunCeremony:emit_run_summary:fp=aeaa5c7dcc807850
   owner: john
   reason: |-
@@ -1577,7 +1558,7 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 25
       redacted_hash: 8efc9ea678cbf6b0
-- key: engine/orchestrator/heartbeat.py:R5:RunHeartbeatThread:_beat_once:fp=d50b0208b8802968
+- key: engine/orchestrator/heartbeat.py:R5:RunHeartbeatThread:_beat_once:fp=d2bd0a36f7ad0650
   owner: john
   reason: |-
     RULE MISFIRES: isinstance(snapshot, WorkerMembershipLost) is nominal discrimination of the two declared first-party worker_heartbeat outcomes, CoordinationSnapshot | WorkerMembershipLost. Both concrete classes are ELSPETH-owned in contracts/coordination.py, and _HeartbeatRepository.worker_heartbeat and RunCoordinationRepository.worker_heartbeat declare the union. The refusal arm logs membership loss, sets _coordination_lost_event and returns; check_and_raise converts that latch into RunWorkerEvictedError at the drain boundary. Only the snapshot arm reads worker_role and leader_worker_id. There is no coercion, fabricated snapshot, or external-input shape guessing. The check is the ADR-032 internal-union dispatch form, not a parameter-rooted Tier-3 boundary. Verified tests: tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestFatalLatchEvicted::test_check_and_raise_raises_after_eviction and TestBeatsCorrectly::test_healthy_beat_does_not_set_latch. Both are in the passing heartbeat module selection.
@@ -1585,21 +1566,21 @@ allow_hits:
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T05:38:52.279838+00:00'
+  judge_recorded_at: '2026-09-08T10:39:24.888938+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: this `isinstance` is nominal dispatch over the declared first-party return union `CoordinationSnapshot | WorkerMembershipLost`, not defensive revalidation or concealment of a contract violation; the concrete owned outcomes are defined at `src/elspeth/contracts/coordination.py:132` and `:160`, and `RunCoordinationRepository.worker_heartbeat` constructs only those outcomes at `src/elspeth/core/landscape/run_coordination_repository.py:1078-1146`. The refusal branch records the membership-loss state and returns, while any undeclared return type falls through and fails on direct snapshot attribute access rather than being coerced or silently accepted. The named downstream control `RunHeartbeatThread.check_and_raise` was verified at `src/elspeth/engine/orchestrator/heartbeat.py:216-242`, and its membership-loss behavior is pinned by `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestFatalLatchEvicted::test_check_and_raise_raises_after_eviction` at line 549; the healthy-arm test also exists at line 182. The decorator contract is inapplicable because `_beat_once` has no external-data parameter and the checked value is a first-party repository result, not parameter-rooted Tier-3 data.
+    RULE MISFIRES: this is nominal dispatch over the declared first-party union `CoordinationSnapshot | WorkerMembershipLost`, not defensive revalidation or external-data shape guessing. `RunCoordinationRepository.worker_heartbeat` explicitly returns those owned outcomes at run_coordination_repository.py:1078-1146, while `WorkerMembershipLost` and `CoordinationSnapshot` are concrete frozen dataclasses at contracts/coordination.py:132-183. The named control is verified: `RunHeartbeatThread.check_and_raise` converts the membership-loss latch into `RunWorkerEvictedError` at heartbeat.py:216-237, and the cited eviction and healthy-path tests exercise that behavior at test_run_heartbeat_thread.py:182-191 and 563-583. `_beat_once` has no external-data parameter, so this is not a parameter-rooted Tier-3 boundary eligible for the decorator.
   judge_signature_version: 2
   scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[8]/body[1]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:d5b1f22ce4eb3c95f7b5335e457169d97aeee0272798ffe4649d31ad548aa438'
+  ast_path: 'body[15]/body[9]/body[1]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:e085fff29a1b7f2e0db4c6609953b819f0bfc522a7533fcb87508f877d9f6d4d'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 18
-      redacted_hash: 62c2701cc3ad1304
+      redacted_hash: 9c42b26cdc3e2897
 - key: engine/processor.py:R5:RowProcessor:__init__:fp=523a4df2d20b0d30
   owner: john
   reason: |-
@@ -1649,3 +1630,230 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 20
       redacted_hash: efc46f87ca8e643f
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=45e8ae9cfa58abcc
+  owner: john
+  reason: |-
+    R5 fires on `elif isinstance(current, NodeStateFailed):`, the already-finalized arm of the same dispatch. It exists to make idempotent reconciliation safe without weakening the audit: rather than accepting a FAILED anchor silently, it fetches the routing events and asserts the anchor was finalized by *this* diversion — exactly one event, on `failsink_edge_id`, in `RoutingMode.DIVERT` — and raises `AuditIntegrityError` otherwise. The dispatch is exhaustive and fail-closed: the trailing `else` raises `AuditIntegrityError` for any state that is neither OPEN nor FAILED, so no unexpected variant is quietly tolerated. Invalidated if the evidence assertion is relaxed, or if the `else` stops raising.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:47:51.824601+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — contracts/audit.py:400-401 defines `NodeState` as a discriminated union of concrete lifecycle variants, so the flagged `isinstance` is state-variant dispatch rather than defensive revalidation of a fixed concrete contract. At engine/executors/sink.py:1141-1179, the OPEN arm performs finalization, the FAILED arm permits idempotent reconciliation only after verifying exactly one matching DIVERT routing event, and every other variant raises `AuditIntegrityError`; no malformed state is coerced, defaulted, or silently accepted. This fail-closed handling preserves Tier-1 audit integrity and directly addresses R5's masking concern.
+  judge_signature_version: 2
+  scope_fingerprint: 72a7eeca42b42525c42538d24d8f9673ffe6f1874b8d624293862e2cbf460319
+  judge_transport: codex_cli
+  ast_path: 'body[43]/body[15]/body[22]/body[3]/orelse[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:0b9a2b3971c8a9b9dbe865bcb9aac8a9509d286fc44675113d3b3af60dc7314a'
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=68591a72b15c414e
+  owner: john
+  reason: |-
+    RULE MISFIRES: the same declared-union narrowing as the comprehension just above it, but over a different anchor set, and the two are deliberately not merged. This one closes the still-open PRIMARY divert anchors whose rows never completed their diversion; the preceding one closes the failsink quarantine states. `primary_divert_states` is declared `list[tuple[TokenInfo, int, NodeState]]` - the wide union `NodeStateOpen | NodeStatePending | NodeStateCompleted | NodeStateFailed` from `contracts/audit.py` - while the consumer `_complete_states_failed` is typed to accept `NodeStateOpen` only, so the `isinstance` is the narrowing that bridges the two signatures. `NodeStateOpen` is a concrete frozen dataclass ELSPETH declares, giving ADR-032 nominal discrimination rather than a structural probe. The filter is required rather than cosmetic: these anchors are retrieved pre-opened before the partition phase and can be reused from an interrupted effect call, so an entry may already be terminal, and re-completing a terminal node state is an audit-integrity violation. The handler then records the boundary-failure outcomes and operation and re-raises; nothing is swallowed or defaulted.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:45:58.450398+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES: `primary_divert_states` has a declared union-valued state element, so the concrete `NodeStateOpen` check discriminates an authorized variant rather than defensively revalidating a guaranteed `NodeStateOpen` contract. The visible code uses that narrowing only to pass still-open states to `_complete_states_failed`, while terminal states are deliberately excluded and the caught boundary violation is re-raised after failure recording; nothing is coerced, fabricated, defaulted, or swallowed. This is nominal discrimination against an ELSPETH-owned concrete dataclass, not a structural Protocol or duck-typed presence probe, and the subject is not shown as rooted in an external function parameter eligible for the Tier-3 decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 72a7eeca42b42525c42538d24d8f9673ffe6f1874b8d624293862e2cbf460319
+  judge_transport: codex_cli
+  ast_path: 'body[43]/body[15]/body[11]/handlers[0]/body[2]/value/keywords[0]/value/generators[0]/ifs[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:9490b8f565ecb78869805bf146a2715d19afb73611680423cfd264982b50775e'
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=ae6bb116ebbb0eb0
+  owner: john
+  reason: |-
+    R5 fires on `if isinstance(current, NodeStateOpen):` in the linked-failsink reconciliation loop, dispatching on the freshly re-read state of each primary divert anchor. This is the OPEN arm of a three-way nominal dispatch over ELSPETH's own audit state union, and it is the arm that does the work: it records the DIVERT routing event and completes the anchor FAILED with the operator-disclosable diversion reason. The state is re-read from `self._execution.get_node_state(...)` rather than trusted from the earlier tuple precisely because a concurrent effect may already have finalized it, so the type of what comes back is the dispatch fact. Invalidated if the node-state union gains another non-terminal variant, since the `else` below would then raise on a legitimate state.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:45:54.219633+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    RULE MISFIRES — the visible code uses `isinstance` for nominal variant dispatch over the first-party node-state union returned by `self._execution.get_node_state`, not to defensively revalidate or conceal a contract violation. The `NodeStateOpen` arm performs the open-state transition, while the immediately following `NodeStateFailed` arm confirms that the current state determines behavior after the durable re-read. This is fixed-contract state discrimination rather than a Tier-3 boundary, so the decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 72a7eeca42b42525c42538d24d8f9673ffe6f1874b8d624293862e2cbf460319
+  judge_transport: codex_cli
+  ast_path: 'body[43]/body[15]/body[22]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:1c25640043d574b779ab2cb459ffafd1b0983803acb0bac5886b513d9e6defb2'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 41
+      redacted_hash: b62d65aad50f1b2a
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=fb3db49868c33763
+  owner: john
+  reason: |-
+    RULE MISFIRES: this is variant narrowing across a declared union at a call boundary whose two static types genuinely differ, not a defensive re-check. `NodeState` is the closed union `NodeStateOpen | NodeStatePending | NodeStateCompleted | NodeStateFailed` declared in `contracts/audit.py`, and `NodeStateOpen` is a concrete frozen dataclass ELSPETH defines - so this is ADR-032 nominal discrimination against an owned type, not a structural `Protocol` check an impostor could satisfy. The producer `_open_or_reuse_effect_states` returns the WIDE union by design: its stated job is to reuse the exact current state set left by an interrupted effect call, so an entry can be a state recovered from the durable record and already terminal. The consumer `_complete_states_failed` is typed to take `NodeStateOpen` only. The comprehension is what bridges those two signatures. Dropping it would re-complete an already-terminal node state, which is an audit-integrity violation, not a tolerated no-op. The filter narrows nothing else: the handler still terminalizes every genuinely open quarantine anchor opened for the failsink write, records the boundary-failure outcomes and operation, and then re-raises the violation.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:47:52.593675+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: this `isinstance` performs nominal variant narrowing within a declared closed union, not defensive revalidation or structural duck typing. `contracts/audit.py:280` defines `NodeStateOpen` as a concrete frozen dataclass and `contracts/audit.py:400` defines `NodeState` as the four-state union; `engine/executors/sink.py:599` confirms `_open_or_reuse_effect_states` returns that wide union and may recover the exact current state, while `engine/executors/sink.py:203` confirms `_complete_states_failed` accepts only `NodeStateOpen`. The filter therefore excludes legitimate terminal variants before the state-transition call rather than concealing a contract violation. The decorator contract does not apply because the subject is the locally produced `failsink_states`, not data rooted at an external function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: 72a7eeca42b42525c42538d24d8f9673ffe6f1874b8d624293862e2cbf460319
+  judge_transport: codex_cli
+  ast_path: 'body[43]/body[15]/body[11]/handlers[0]/body[1]/value/keywords[0]/value/generators[0]/ifs[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:f9193029df7519963c6d1d948253577919f50ba13cca02207adf1a329dc6a71b'
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:__init__:fp=5a28727c62356eaa
+  owner: john
+  reason: |-
+    R5 fires on `isinstance(clock, SystemClock)` in `SinkEffectCoordinator.__init__`, computing `self._wait_on_shutdown_event`. `SystemClock` is a concrete class ELSPETH declares in `engine/clock.py`, so this is ADR-032 nominal discrimination, not structural typing — and it is a capability question rather than a contract probe: only the real wall clock may block on a `threading.Event`, because that primitive advances with wall time. Under a controlled clock the flag must be `False` so the worker falls through to `_check_wait_interruptions` at the next poll and the test's clock can advance deterministically instead of the worker parking on an event that no simulated time will ever fire. Invalidated if `SystemClock` gains subclasses that are not wall-clock backed, or if shutdown waiting stops being a wall-clock primitive.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:45:56.269456+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance(clock, SystemClock)` expression is nominal capability discrimination against an ELSPETH concrete class, not a defensive shape re-check or an attempt to mask a contract violation. The visible comments establish that the result selects between wall-clock `threading.Event` waiting and deterministic controlled-clock polling, while the supplied `sleep` override independently disables the event wait. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`, so no decorator nudge applies.
+  judge_signature_version: 2
+  scope_fingerprint: 75c47491da8496df78d298aa0a67fb8fb2e0e893996f7ccb6f0dd6890d94d5e0
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[1]/body[14]/value/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:1b4db8b30ec07331f45d43ba8cc7af3f0a0a0d1602a6dc22b1e9cdb0a2e183c6'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 26
+      redacted_hash: 876506cc9e2ad46b
+    - pattern: dotenv_secret_assignment
+      byte_count: 31
+      redacted_hash: 805cb6893627b20c
+    - pattern: dotenv_secret_assignment
+      byte_count: 31
+      redacted_hash: 805cb6893627b20c
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:__init__:fp=6380aa704818a5e7
+  owner: john
+  reason: |-
+    isinstance(factory, RecorderFactory) is the ADR-032 case-1 internal boundary: RecorderFactory is a concrete class ELSPETH defines, and the coordinator reaches its entire authority through it - the durable sink-effect store, the payload store, lease ownership and the artifact register. An impostor accepted here forges the audit trail, which is exactly the internal-masquerade threat nominal typing is the control for. isinstance rather than the exact-type form used two lines below for lease_ttl because subclassing an owned repository facade is a supported extension and the resume/quarantine suites legitimately pass MagicMock(spec=RecorderFactory) doubles, which satisfy isinstance and would be rejected by an exact-type test. The three sibling scalar checks in this constructor were converted to the exact-type form in this pass; this one is the case where the class identity, not the exact type, is the credential.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:48:41.707592+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM — the flagged `isinstance` is an offensive nominal check against the ELSPETH-owned concrete `RecorderFactory` class defined at `src/elspeth/core/landscape/factory.py:308`, followed immediately by a meaningful `TypeError`. The visible constructor then relies on that validated factory for audit-critical repository access, so this is the policy-authorized internal unknown-type boundary form rather than silent recovery, coercion, or structural duck typing. This is not a Tier-3 parameter-rooted boundary eligible for `@trust_boundary`.
+  judge_signature_version: 2
+  scope_fingerprint: 75c47491da8496df78d298aa0a67fb8fb2e0e893996f7ccb6f0dd6890d94d5e0
+  judge_transport: codex_cli
+  ast_path: 'body[37]/body[1]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:7eb35a7e3549008ad6c4a952356dc8256e3f9bd6d772ac43f83a81b868e56756'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 26
+      redacted_hash: 876506cc9e2ad46b
+- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_emit_degraded:fp=641a8d26ae2b549c
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: the residual arm of `_emit_degraded`, and it transports the failure rather than absorbing it. `contract_errors.TIER_1_ERRORS` is caught first and `SQLAlchemyError` second, so what reaches this arm is neither audit corruption nor DB availability - it is an unexpected failure of the diagnostic writer itself, or of the injected `now_fn` clock evaluated in the call arguments. Those are programming or owned-contract faults, and the handler makes them authoritative: `_capture_fatal(exc)` publishes the exception into `_fatal_exc` and sets `_fatal_event`, with `logger.error(..., exc_info=exc)` preserving the traceback. Re-raising would be strictly worse, not safer: this method is invoked from inside `_beat_once`'s `OperationalError` handler, so a raise would unwind past the beat loop and stop liveness updates entirely, while the owner learns the same fact either way through `raise_fatal_failure`. Containment here keeps the thread beating AND surfaces the failure. `FollowerProcessor._drain_loop` consumes the latch at every iteration; the fresh-run and resume finalizers consume it after joining the thread and before emitting a successful summary.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:53:30.789593+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM: the broad residual handler transports unexpected owned-code failures through `RunHeartbeatThread._capture_fatal` instead of suppressing them. The authoritative gate is `RunHeartbeatThread.raise_fatal_failure`, which re-raises the stored exception verbatim (heartbeat.py:239-251), after `_capture_fatal` publishes it before setting the event (heartbeat.py:271-280). Its reachability is verified at every follower drain iteration and before each claim (follower.py:375-380), after heartbeat shutdown and before successful fresh-run and resume summaries (run_lifecycle.py:608-628; resume.py:841-860), with finalizer checks covering other exits (run_lifecycle.py:706-717). The behavioral test `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestHeartbeatDegraded::test_degraded_failure_is_latched_at_drain_boundary` verifies that diagnostic-writer failures are re-raised with their identity preserved (test_run_heartbeat_thread.py:433-446). Thus R4's suppression concern does not materialize here, and R4 is not eligible for the trust-boundary decorator.
+  judge_signature_version: 2
+  scope_fingerprint: d02604bdd5d7162dfd9a499a65a823b31f0d01c684c07932cac27049470353d3
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[10]/body[1]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:d5b9d7e138961e3e025580c7c157e4bafb3a9999391aa1e2d09e7ed5e06e51dd'
+- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_run:fp=fe7e74c15a231daa
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: this is the thread-entry transport arm of a daemon thread whose documented contract is that it never raises on its own stack. Everything inside the loop already has typed handlers in `_beat_once`, so what reaches this arm is a failure OUTSIDE them: the injected `wait_fn` clock, or the last-resort `logger` call inside one of those handlers. It catches `BaseException` rather than `Exception` because an uncaught daemon-thread exception is consumed by `threading.excepthook` and disappears, leaving `_fatal_event` clear while `raise_fatal_failure` reports the thread healthy - a silent false negative on liveness. The handler does not swallow: `_capture_fatal` publishes the exception object into `_fatal_exc` before setting `_fatal_event`, and `raise_fatal_failure` re-raises that same object unchanged, with `OrchestrationInvariantError` as the fail-closed backstop for a bare latch. The latch is consumed unconditionally: `FollowerProcessor._drain_loop` calls `raise_fatal_failure` at the top of every iteration and again in `ensure_leader_live_before_claim`, and `FollowerProcessor._run_bound` calls it in the `finally` after departure. Re-raising here is not an option - there is no caller frame on this stack to receive it.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:53:29.102603+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM: the broad catch transports a daemon-thread failure rather than suppressing it: `_capture_fatal` stores the original exception before setting the latch at heartbeat.py:278-280, and `raise_fatal_failure` re-raises that same object at heartbeat.py:246-251. The named controls are verified: `FollowerProcessor._drain_loop` and `ensure_leader_live_before_claim` poll the latch at follower.py:375-380, while `FollowerProcessor._run_bound` polls it after teardown at follower.py:327-341. The other production owners also consume it on every exit through finally blocks in `RunLifecycleCoordinator.run` at run_lifecycle.py:706-717 and `ResumeCoordinator.resume` at resume.py:1238-1249, so the visible control flow supports the rationale's fail-closed transport semantics rather than a silent false-negative.
+  judge_signature_version: 2
+  scope_fingerprint: 6691f64664948f8e8cc02d3d894b682c620964a33049cb6058b88eb27ee05233
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[7]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:f84e426b7b9ba4a4df10976eed0f7bd9eebfdcc3ed3f5c710dac0a09bde18ea4'
+- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_beat_once:fp=f2de67e306c5becc
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: the latch-and-defer shape for a Tier-1 failure detected on a thread that structurally cannot raise to the run. `_beat_once` is documented as never raising; a Tier-1 integrity failure from `worker_heartbeat` (e.g. the `run_workers` row vanished, which that verb classifies as `AuditIntegrityError` rather than a coordination outcome) is corruption, not the DB contention the swallow-and-continue doctrine covers. The handler therefore fails closed rather than silently: `_capture_fatal` stores the exception in `_fatal_exc` and sets `_fatal_event`, and `logger.error(..., exc_info=exc)` keeps the traceback. `check_and_raise` re-raises the stored object FIRST, ahead of the coordination-lost latch, so audit corruption outranks eviction semantics; `raise_fatal_failure` is the same re-raise without the eviction arm. Every path that reaches the latch consumes it: `FollowerProcessor._drain_loop` calls `raise_fatal_failure` at the top of each iteration and in `ensure_leader_live_before_claim`, and `_run_bound`'s `finally` calls it after `_best_effort_depart`. The exception identity is preserved, not reclassified.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:53:41.927366+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM: the R6 handler is explicit cross-thread exception transport, not silent suppression. The flagged arm records the original Tier-1 exception through `RunHeartbeatThread._capture_fatal` (heartbeat.py:355), which stores it before setting the event (heartbeat.py:271), and `raise_fatal_failure` re-raises that same object (heartbeat.py:239). I verified the named follower controls at follower.py:327 and follower.py:375, as well as the other heartbeat-owner teardown gates at resume.py:1238 and run_lifecycle.py:706, all of which surface the fatal latch after joining the thread. R6 is not eligible for `@trust_boundary`, and the logging is diagnostic rather than the integrity control.
+  judge_signature_version: 2
+  scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[9]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:3a5dfd95380e1b7b7eeba20cc8890bcc9b6f59dcc5414483ae434d2674a31392'
+- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_emit_degraded:fp=99d5c6723d1a37b4
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: the Tier-1 arm of `_emit_degraded`, and its ORDER is the point. `record_heartbeat_degraded` writes a forensic `heartbeat_degraded` coordination event; the arm below it catches `SQLAlchemyError` to contain a DB fault on that best-effort write. Placing `contract_errors.TIER_1_ERRORS` first is what stops an audit-integrity type that also derives from `SQLAlchemyError` from being downgraded into that DB-availability arm and lost. It is read as a live module attribute, so the PEP 562 `__getattr__` in `elspeth.contracts.errors` re-materialises the tuple on every access and a type registered after import is still caught here - a from-import would have snapshotted an empty tuple and silently reopened the hole. The handler does not swallow: `_capture_fatal` publishes the exception into `_fatal_exc` and sets `_fatal_event`, and `logger.error(..., exc_info=exc)` keeps the traceback. Re-raising is not available - this method runs inside `_beat_once`'s `OperationalError` handler on the beat thread, which has no frame to receive it. `raise_fatal_failure` re-raises the stored object at the owner's next boundary.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:52:24.905317+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: this handler transports the Tier-1 failure across the heartbeat-thread boundary rather than swallowing it. `_capture_fatal` stores the exception and publishes `_fatal_event`, while the verified `RunHeartbeatThread.raise_fatal_failure` control re-raises that same object at heartbeat.py:239-251; owner paths invoke the control through `check_and_raise` at run_lifecycle.py:498-500 and unconditionally after teardown at run_lifecycle.py:706-717. The ordering and live lookup are pinned by `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestHeartbeatDegraded::test_late_registered_database_integrity_failure_is_not_diagnostic_loss`, which registers a Tier-1 `SQLAlchemyError` subclass after import and verifies it is re-raised unchanged. R6 therefore mistakes explicit cross-thread fatal propagation for silent suppression.
+  judge_signature_version: 2
+  scope_fingerprint: d02604bdd5d7162dfd9a499a65a823b31f0d01c684c07932cac27049470353d3
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[10]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:e9783a09d4f7f5b84a469e88295251a87b0c9c36233622e16b3bfa869b4cb451'
+- key: engine/processor.py:R5:RowProcessor:_execute_transform_with_retry:is_retryable:fp=8e823b590bd4a7b6
+  owner: john
+  reason: |-
+    RULE MISFIRES: exception classification is what this function IS, and `isinstance` is the only mechanism Python offers for it. `is_retryable` is handed to `RetryManager.execute_with_retry`, which declares it `Callable[[BaseException], bool]`; a predicate whose sole parameter is `BaseException` has no narrower static type to dispatch on, and `e` is whatever a transform raised, so nothing here guarantees a shape that this check could be redundantly re-verifying. The union is nominal against concrete classes - `ConnectionError` and `TimeoutError` are the runtime's canonical transient network failures beneath provider SDKs, and `CapacityError` is an ELSPETH-owned class that contract-declares itself retryable - never a structural `Protocol` an impostor could satisfy. The check is offensively NARROW, not defensively wide: the in-line comment records that bare `OSError` is deliberately excluded because it spans plugin bug classes such as `FileNotFoundError` and `PermissionError` that must crash rather than retry. The failure direction is safe - an unmatched exception is not retried and propagates to the row's error routing, so a false negative fails closed.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:50:19.729851+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `e` is declared only as `BaseException`, and the flagged `isinstance` performs nominal exception classification for retry policy rather than defensively rechecking a shape guaranteed by a narrower contract. The visible code checks concrete exception classes, deliberately excludes broad `OSError`, and returns false for unmatched exceptions so they propagate instead of being suppressed, coerced, or fabricated. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; the subject is an exception signal classified by the retry predicate.
+  judge_signature_version: 2
+  scope_fingerprint: d5d8ae6c5b4e92d271afba20e31babe135dbd3578fdfa0e1b9612d56b95aeb04
+  judge_transport: codex_cli
+  ast_path: 'body[78]/body[35]/body[5]/body[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:cc1d6c31f473531e51762b9d6bc5e93669facad48ab9ce701310ed22eaca99b4'

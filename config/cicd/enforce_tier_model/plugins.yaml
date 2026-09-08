@@ -2530,3 +2530,60 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[13]/body[3]/body[11]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:064b07aead5e639a135f0f0c22e428843afd35c984cedfb5ead162259ad36b2a'
+- key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_release_loop:fp=09c11af121e2e010
+  owner: john
+  reason: |-
+    RULE MISFIRES: `TimeoutError` here is a documented poll sentinel, not an error. The `try` wraps exactly one call - `self._batch_buffer.wait_for_next_release(timeout=1.0)` - and `RowReorderBuffer.wait_for_next_release` declares exactly two raise types, `TimeoutError` when the deadline lapses with no entry ready and `ShutdownError` when the buffer is shut down. So this handler can only ever see the one-second poll window expiring, which is the normal condition under low load and carries no failure information. `continue` is the correct response: the loop must keep polling because it deliberately does NOT consult `_batch_shutdown` and exits only on the buffer's own shutdown signal, so re-raising would kill the release thread and strand every row still waiting on the output port. R6's premise - an error vanishing without a re-raise or an explicit error result - does not apply, because no error occurred. Genuine failures in this loop are handled by the separate `try` below over result unpacking and emission, which re-raises on a pre-unpack invariant violation, wraps output-port failures as an `ExceptionResult` delivered to the row's waiter, and re-raises `TIER_1_ERRORS`.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:55:13.964655+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the caught `TimeoutError` is a documented polling sentinel rather than a lost failure. I verified `RowReorderBuffer.wait_for_next_release` in `src/elspeth/plugins/infrastructure/batching/row_reorder_buffer.py:271`; it raises `TimeoutError` at line 344 only when the supplied deadline expires without a releasable entry, while shutdown has a distinct `ShutdownError` path at line 338. The flagged `try` in `src/elspeth/plugins/infrastructure/batching/mixin.py:377` contains only that call with `timeout=1.0`, so `continue` preserves the intended polling loop and does not suppress a genuine error.
+  judge_signature_version: 2
+  scope_fingerprint: df80169c368c520e42167ba9baded0690060133c0b717ea7e346a5e302c4c881
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[25]/body[1]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:52ec50377ffa1b9d8961ec5c8bce82450aacc861228fab8b4b9c4f5aeecbbacf'
+- key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_release_loop:fp=c40e79808bfe6605
+  owner: john
+  reason: |-
+    RULE MISFIRES: `ShutdownError` is a first-party typed control-flow signal, not an operational failure. It is a `RuntimeError` subclass declared in `row_reorder_buffer.py` and raised by our own `RowReorderBuffer.shutdown()`; catching it to `break` is this dedicated thread's only clean-exit path, since the loop deliberately does not consult `_batch_shutdown`. No completed work is lost on that exit: `wait_for_next_release` checks for a ready entry BEFORE it checks the shutdown flag, so every drainable entry is returned and emitted before the signal can be raised, and `shutdown_batch_processing` orders the teardown to match - signal, wait for the worker pool, shut the buffer, then join this thread. The narrow scope is deliberate and load-bearing: the `try` wraps only the wait call, so an output-side failure of this same type still reaches the row's waiter through the emission handler below instead of silently ending the loop. R6's concern does not reach a typed wakeup used as loop termination.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:54:20.599587+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `ShutdownError` is a dedicated first-party loop-termination signal, and the narrow handler wraps only `RowReorderBuffer.wait_for_next_release`, so output-side exceptions remain handled by the separate emission path. I verified that `RowReorderBuffer.wait_for_next_release` returns ready entries before checking shutdown at `src/elspeth/plugins/infrastructure/batching/row_reorder_buffer.py:292`, while `RowReorderBuffer.shutdown` preserves completed entries at line 397. I also verified that `BatchTransformMixin.shutdown_batch_processing` waits for workers, shuts down the buffer, and joins the release thread at `src/elspeth/plugins/infrastructure/batching/mixin.py:501`; therefore the `break` is the intended clean-exit control flow rather than silent loss of an operational failure.
+  judge_signature_version: 2
+  scope_fingerprint: df80169c368c520e42167ba9baded0690060133c0b717ea7e346a5e302c4c881
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[25]/body[1]/body[0]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:cb429d8a32216719f4d8c988a403ef5c694f2de2ffaf0884759a1ce2bb517402'
+- key: plugins/transforms/aws/guardrails_live_check.py:R6:run_guardrail_live_check:fp=30edf86dd8252657
+  owner: john
+  reason: |-
+    The R6 handler catches only the botocore BotoCoreError/ClientError family returned by _bedrock_provider_exception_types while closing an SDK client created by run_guardrail_live_check. A borrowed client is not closed. The safe/blocked cases and sanitized receipt/error have already been determined; a declared provider close error is acknowledged through guardrail_sdk_client_close_failed with exception class only, without raw provider text. Exceptions outside that provider family propagate, including ELSPETH integrity failures. Test tests/unit/plugins/transforms/aws/test_guardrails_live_check.py::test_owned_sdk_provider_close_failure_does_not_replace_success_receipt and ::test_owned_sdk_close_failure_does_not_replace_sanitized_provider_error exercise both outcomes. Independent source review found no defect in this exact catch; authoritative judge BLOCK rationale was unavailable, so this is a newly evidenced rationale for re-adjudication, not a claim that the BLOCK was overturned.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:55:29.275501+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES — the handler at src/elspeth/plugins/transforms/aws/guardrails_live_check.py:113 suppresses only an ancillary close failure after the live-check outcome has been determined, records a bounded exception-class warning, and allows non-provider exceptions to propagate. The caught family is verified at src/elspeth/plugins/transforms/aws/guardrails_client.py:613 as exactly BotoCoreError and ClientError, while tests/unit/plugins/transforms/aws/test_guardrails_live_check.py:227 and :283 pin preservation of both the successful receipt and the sanitized primary error; the propagation test at :256 independently confirms first-party close bugs still crash. This is therefore not silent loss of the live-check integrity control, and R6 is not one of the decorator-supported rules.
+  judge_signature_version: 2
+  scope_fingerprint: af09a88f6d803d516c335f0b1d07f365f17f511c2dfe7de67d93f229720991fc
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[6]/finalbody[0]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:ad8c39f1c4aa9f7385cf669822e1225b715e548759e3f327decf5951ac9f5ea9'

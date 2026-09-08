@@ -1427,25 +1427,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[47]/body[9]/body[11]/body[1]/body[0]/value'
   judge_metadata_signature: 'hmac-sha256:v2:9c80a7ec340c7d281a56716b169114a90b1caf54eb40b190a6c4327fb68465c5'
-- key: core/checkpoint/recovery.py:R5:RecoveryManager:reconstruct_token_row:fp=6f9c0dca9c9b97c2
+- key: core/checkpoint/recovery.py:R5:RecoveryManager:reconstruct_token_row:fp=8b3cd6d67a5933ed
   owner: john
   reason: |-
-    Prescribed Tier-1 audit-corruption reification, not a defensive fallback. In `core/checkpoint/recovery.py:849-855`, `RecoveryManager.reconstruct_token_row` reads an engine-owned checkpoint payload from `payload_store.retrieve(spec.token_data_ref)`, deserializes it with `checkpoint_loads(...)`, and immediately crashes on a malformed envelope: `if not isinstance(envelope, dict) or "data" not in envelope or "contract" not in envelope:` followed by `raise AuditIntegrityError(...)` with the message `audit data corruption (Tier-1 violation)`. The check is site-specific to the `{data, contract}` checkpoint envelope required before `SchemaContract.from_checkpoint(envelope["contract"])` and `PipelineRow(envelope["data"], contract)`. It does not coerce, default, skip, or continue; future drift that changes this to tolerate missing keys or return a fallback would invalidate this suppression.
+    PRESCRIBED FORM: RecoveryManager.reconstruct_token_row reads a persisted token_data_ref through PayloadStore.retrieve, then checkpoint_loads restores engine-owned serialized audit data. The dict and required-key guard is an offensive corruption check: a non-object or absent data/contract immediately raises AuditIntegrityError naming the token and run. No fallback row is returned on this path. The source_row return is separate and applies only when token_data_ref is explicitly absent, as declared by IncompleteTokenSpec. UTF-8 and JSON decode failures are also promoted to AuditIntegrityError with their original cause. On the admitted envelope path, SchemaContract.from_checkpoint reads required contract fields and verifies version_hash before PipelineRow construction from the stored data. Tests test_reconstruct_token_row_rejects_corrupt_envelope in tests/unit/core/checkpoint/test_recovery.py cover bad UTF8, invalid JSON, list/null roots and each missing required envelope key; test_reconstruct_token_row_restores_persisted_token_envelope verifies the stored token row and contract are restored instead of substituting source_row. This is Tier-1 deserialization followed by immediate corruption failure, not a Tier-3 parameter boundary or a permissive guard.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:10:02.716237+00:00'
+  judge_recorded_at: '2026-09-08T10:23:17.516970+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the Tier-1 checkpoint envelope remains first-party audit data after serialization, and the visible code offensively detects corruption and raises a specifically typed AuditIntegrityError. The check neither coerces nor fabricates data, supplies defaults, suppresses the failure, or continues with a malformed envelope; successful execution proceeds through direct access to envelope["contract"] and envelope["data"]. The rationale is site-specific and consistent with the excerpt, and the decorator is inapplicable because this is not Tier-3 data rooted in an external-data parameter.
+    PRESCRIBED FORM: The persisted envelope is Tier-1, and the flagged `isinstance` guard does not suppress, coerce, or fabricate; it immediately raises a contextual `AuditIntegrityError` when the owned audit payload has the wrong root shape or lacks required keys. The named corruption test verifies invalid UTF-8/JSON, non-dict roots, and missing envelope keys all raise (`tests/unit/core/checkpoint/test_recovery.py:1699`), while the restoration test proves persisted token data replaces `source_row` on the admitted path (`tests/unit/core/checkpoint/test_recovery.py:1715`). `SchemaContract.from_checkpoint` directly reads required fields and raises on missing keys or a version-hash mismatch (`src/elspeth/contracts/schema_contract.py:397`), confirming crash-on-corruption semantics rather than defensive recovery. This is not a Tier-3 parameter boundary eligible for `@trust_boundary`, so the allowlist exemption is justified.
   judge_signature_version: 2
-  scope_fingerprint: 2382b832b6d7501c000bc6be47d8f56404bf234b7f80f01b80b1651becf0805c
+  scope_fingerprint: aa44e44e86f595f79421ba7435ebdfd9bedc394b5f43e33e279a5c79d1f5ebd7
   judge_transport: codex_cli
-  ast_path: 'body[48]/body[12]/body[4]/test/values[0]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:3b9fe747941b1272aa58b480ae9e81e1d1987f6e53361ed2caf4590ecbcecbda'
+  ast_path: 'body[47]/body[12]/body[4]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:7a5cc0da35d1f88b1b4fd84be47a804821379a0b46337f42c88f944004aa7180'
 - key: core/landscape/execution/node_states.py:R5:NodeStateRepository:complete_node_state:fp=b95125493bc11b9d
   owner: john
   reason: |-
@@ -1799,22 +1799,22 @@ allow_hits:
 - key: core/landscape/database.py:R9:LandscapeDB:_create_sqlcipher_engine:fp=6904b3780f868ab3
   owner: john
   reason: |-
-    This is a legitimate boundary normalization of optional SQLite URI parameters, not a Tier-1 audit-data read. In `core/landscape/database.py:829`, `_create_sqlcipher_engine` parses the caller-provided URL with `parsed = make_url(url)`, then copies unknown query keys into `uri_params` at `core/landscape/database.py:863-876`. In the `read_only` branch, the code deliberately overrides the URI mode and removes an optional caller-supplied SQLite URI flag: `uri_params["mode"] = "ro"` followed by `uri_params.pop("immutable", None)` at `core/landscape/database.py:878-880`. Absence of `"immutable"` is an expected valid URL shape, not corruption. Crashing when no `immutable` query parameter was supplied would reject ordinary read-only encrypted SQLite URLs, so the defaulted `pop` is the prescribed optional-boundary form here.
+    RULE MISFIRES: `uri_params` is not a fixed-contract record and this is not a read at all - it is a conditional REMOVAL. The dict is built in the preceding loop from whatever leftover query keys the operator's URL carried that are not SQLite connect kwargs, so every one of its keys is optional by construction and most URLs supply none of them. In the read-only branch the code asserts its own storage mode with `uri_params['mode'] = 'ro'` and then guarantees the absence of a conflicting `immutable` flag, which would otherwise tell SQLite the file cannot change beneath a connection opened against a live audit database. Absence of that key is the overwhelmingly common valid input, so subscripting or `del` would raise on ordinary read-only encrypted URLs; the `None` default is the idiomatic ensure-absent and discards nothing an operator authored elsewhere. Nothing is fabricated and no Tier-1 field is being defaulted: no value is read out of the pop, and the result is never stored - it is dropped so the file URI rendered below cannot carry the flag.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
   expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T00:07:18.560159+00:00'
+  judge_recorded_at: '2026-09-08T10:32:05.403756+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — The excerpt shows `uri_params` being assembled from caller-supplied URL query parameters, so this is normalization of Tier-3 configuration rather than a defensive read of Tier-1 audit data or a fixed Tier-2 schema. In the `read_only` branch, `mode` is authoritatively set to `"ro"` and the optional `immutable` setting is removed if present; `pop("immutable", None)` neither fabricates a value nor conceals a required-key failure because absence is an equally valid state for that optional input. R9 is not eligible for the `@trust_boundary` decorator mechanism, which covers only R1 and R5.
+    RULE MISFIRES: `uri_params` is a locally constructed collection of optional, operator-authored URI parameters, and `pop("immutable", None)` is used to ensure that an optional key is absent rather than to read or default a required value. The visible loop shows that `immutable` exists only if supplied in the external URL, while the read-only branch deliberately removes it before rendering the SQLite URI, so an absent key is valid and no missing-key bug, Tier-1 field default, or fabricated value is concealed. R9 is not decorator-suppressible, so the structural `@trust_boundary` alternative does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 9d7ccfd5610666da00e02cd63438cf6aa47be6be5f48be2eb2d60d09ffcd6709
+  scope_fingerprint: 740674f96626447f9c9c24da3bea2ab010bc749b6b5792b00b4bc249dcd2055c
   judge_transport: codex_cli
   ast_path: 'body[66]/body[5]/body[12]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:392332df6ed26a8b962361c2dfcdd1ca53144b43cc54b18b2346c0e4064f4e14'
+  judge_metadata_signature: 'hmac-sha256:v2:2a7d86135984d2c3660e2b6bc56b431fc6758102586120d6f11c8a81953dead1'
 - key: core/landscape/execution/node_states.py:R1:_validate_transform_success_reason:fp=fef8223c7ed48bac
   owner: john
   reason: |-
@@ -3016,117 +3016,98 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[53]/body[5]/body[9]/body[1]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:ab012930656199ccd1a22019421ebe57c2f8ad97713d51dc2ba21b1472ac1225'
-- key: core/config.py:R5:_plugin_bearing_sections:fp=dbcf6f2bb1cea994
-  owner: john
-  reason: |-
-    R5 `isinstance(element, type)` guarding `issubclass(element, BaseModel)`: `element` is a typing-level object pulled from `get_args()` of an `ElspethSettings` field annotation — for `dict[str, SourceSettings]` it is a class, but for other fields it can be a `typing` construct (`Literal[...]`, `Annotated[...]`, a union) on which `issubclass` raises TypeError. The check is what lets the section discovery be DERIVED from the settings model instead of a hand-written tuple (the docstring records the two omissions that tuple caused, elspeth-bc1b2c2959 / elspeth-8f0a6b3391). Not a Tier-3 boundary: it inspects ELSPETH's own model metadata. Invalidated if the discovery were re-keyed on a hand-listed set of section names, or if a non-class element could legitimately denote a plugin-bearing entry.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T22:54:39.309696+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — `element` comes from heterogeneous typing metadata returned by `get_args(annotation)`, and the visible branches do not establish that every such element is a class. The `isinstance(element, type)` check therefore safely discriminates class objects before `issubclass`, rather than masking a violation of a fixed runtime data contract; non-class annotations are intentionally irrelevant to plugin-bearing section discovery. This is not an R1/R5 parameter-rooted Tier-3 boundary function, so the decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: bc86da508ab980f304bdfca8ee8209668cb064f10dea04b649689049cee63da3
-  judge_transport: codex_cli
-  ast_path: 'body[84]/body[2]/body[4]/test/operand/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:43c302e3f19a8630af47edceea4207635328496243271205e2da1066c63fb76f'
-- key: core/config.py:R5:_sanitize_dsn:fp=259a0e25fc32e1f2
+- key: core/config.py:R5:_sanitize_dsn:fp=3cac3487208dd746
   owner: john
   reason: |-
     R5 `value if isinstance(value, tuple) else (value,)`: normalises the `odbc_connect` parameter to a tuple so every repeated connection string is scrubbed by `_scrub_odbc_connect_value`, not just the first. `parsed` is the `sqlalchemy.engine.URL` returned by `make_url(url)`; SQLAlchemy documents `URL.query` as `Mapping[str, str | tuple[str, ...]]` — repeated query parameters arrive as a tuple, single ones as str. The check is a closed two-member library type envelope, not a Tier-3 shape guess, and `url` itself is not derivable through the `make_url` call for a decorator. Invalidated if SQLAlchemy changed the `URL.query` value type, or if the code stopped normalising both forms (a tuple-valued password param must still be scrubbed and fingerprinted from its first element).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T22:54:55.656626+00:00'
+  judge_recorded_at: '2026-09-08T10:24:11.979861+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(value, tuple)` expression discriminates between the two documented members of SQLAlchemy `URL.query`'s closed `str | tuple[str, ...]` contract so both single and repeated `odbc_connect` values can be processed without changing their meaning. The visible code preserves the original cardinality after scrubbing and does not suppress, fabricate, or recover from a contract violation. A decorator nudge is inappropriate because the excerpt does not show the function declaration or its decorators, and the flagged subject is reached through `make_url(url)` rather than the decorator's stated parameter-rooted propagation forms.
+    RULE MISFIRES — the `isinstance(value, tuple)` check discriminates the two documented members of SQLAlchemy `URL.query`’s declared `str | tuple[str, ...]` value contract; it does not defensively re-check a shape that the contract promises will always be singular. The visible code preserves each supplied value while normalising iteration, scrubs every repeated `odbc_connect` string, and restores the original scalar-versus-tuple representation, so it neither hides a contract violation nor fabricates data. The excerpt does not show the function definition or its decorators, and the finding is rooted in `parsed.query` after `make_url(url)`, so the structural decorator conditions are not visibly established.
   judge_signature_version: 2
   scope_fingerprint: 4e92d7b5830a1efa8acdc1c22fb0d6a4638fc4b4f2f091c1381f30c67120d2f6
   judge_transport: codex_cli
-  ast_path: 'body[90]/body[10]/body[0]/orelse[0]/body[0]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:f3f810d71413a3326eba672d9ec9efdf9d248e1e7e01f44cfc1fcb8dd7879b46'
+  ast_path: 'body[87]/body[10]/body[0]/orelse[0]/body[0]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:f38b93b6b22accce80e23c7d313d514a8e4661b5ad18552c9d0d83d8350fbec9'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 26
-      redacted_hash: 588d50da5f2e99ce
-- key: core/config.py:R5:_sanitize_dsn:fp=086926d1d88456d6
+      redacted_hash: dfc124a820cb0160
+- key: core/config.py:R5:_sanitize_dsn:fp=b72d9f1b20b225a5
   owner: john
   reason: |-
     R5 `value if isinstance(value, str) else value[0]`: picks the password source for fingerprinting from a `password`/`pwd`/`passwd`/`pass` query parameter, taking the first element when the driver URL repeated the parameter. `parsed` is the `sqlalchemy.engine.URL` returned by `make_url(url)`; SQLAlchemy documents `URL.query` as `Mapping[str, str | tuple[str, ...]]` — repeated query parameters arrive as a tuple, single ones as str. The check is a closed two-member library type envelope, not a Tier-3 shape guess, and `url` itself is not derivable through the `make_url` call for a decorator. Invalidated if SQLAlchemy changed the `URL.query` value type, or if the code stopped normalising both forms (a tuple-valued password param must still be scrubbed and fingerprinted from its first element).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T22:55:18.294118+00:00'
+  judge_recorded_at: '2026-09-08T10:23:44.800775+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES — the R5 check discriminates between the two shapes explicitly guaranteed by SQLAlchemy's `URL.query` contract, `str` and `tuple[str, ...]`; it is not a defensive re-check hiding an ELSPETH contract violation. The visible loop over `parsed.query.items()` and the parallel tuple handling for repeated `odbc_connect` parameters are consistent with that closed union and with selecting the first repeated password solely for scrubbing and fingerprinting. The excerpt does not show the function declaration or its decorators, so the decorator alternative cannot be safely recommended.
+    RULE MISFIRES — the `isinstance(value, str)` check discriminates SQLAlchemy's documented closed return envelope `str | tuple[str, ...]`; it is not a defensive re-check that hides a violation of a single-shape contract. The visible `parsed.query` iteration, tuple annotation, and repeated-parameter comments independently support the site-specific rationale that both representations are legitimate and require distinct extraction. Because the excerpt does not show the function definition or its decorators, the decorator caveat requires `should_use_decorator` to remain null.
   judge_signature_version: 2
   scope_fingerprint: 4e92d7b5830a1efa8acdc1c22fb0d6a4638fc4b4f2f091c1381f30c67120d2f6
   judge_transport: codex_cli
-  ast_path: 'body[90]/body[10]/body[0]/body[1]/body[0]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:01a09ce866451ab23538eeedd3816885cbc9e6f3c73906305da6fcc3fe6a052d'
+  ast_path: 'body[87]/body[10]/body[0]/body[1]/body[0]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:231d5310b8b580e464c647b651c1f5747d0c2b7bb7a02659567082c944a5300a'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 26
-      redacted_hash: 588d50da5f2e99ce
-- key: core/config.py:R5:_sanitize_dsn:fp=d08096ec1d016e21
+      redacted_hash: dfc124a820cb0160
+- key: core/config.py:R5:_sanitize_dsn:fp=b5b01a837220a2b0
   owner: john
   reason: |-
     R5 `tuple(scrubbed_values) if isinstance(value, tuple) else scrubbed_values[0]`: writes the scrubbed `odbc_connect` back in the same cardinality it arrived with, so `URL.create` re-encodes a repeated parameter as repeated and a single one as single. `parsed` is the `sqlalchemy.engine.URL` returned by `make_url(url)`; SQLAlchemy documents `URL.query` as `Mapping[str, str | tuple[str, ...]]` — repeated query parameters arrive as a tuple, single ones as str. The check is a closed two-member library type envelope, not a Tier-3 shape guess, and `url` itself is not derivable through the `make_url` call for a decorator. Invalidated if SQLAlchemy changed the `URL.query` value type, or if the code stopped normalising both forms (a tuple-valued password param must still be scrubbed and fingerprinted from its first element).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T22:55:31.904434+00:00'
+  judge_recorded_at: '2026-09-08T10:24:52.640229+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(value, tuple)` discriminates between the two documented members of SQLAlchemy `URL.query`’s declared `str | tuple[str, ...]` value contract; neither branch treats an out-of-contract type as valid or conceals a contract failure. The assignment preserves the parsed parameter’s cardinality after scrubbing, and the visible loop and annotations are consistent with that site-specific rationale. Because the excerpt does not show the function declaration or its decorators, the structural decorator test cannot be established here.
+    RULE MISFIRES — the `isinstance(value, tuple)` expression discriminates between the two documented members of SQLAlchemy `URL.query`'s `str | tuple[str, ...]` contract; it neither revalidates an unexpectedly broad shape nor hides a contract failure. The visible loop and assignment preserve the incoming query-parameter cardinality after scrubbing, and both branches remain within the declared `scrubbed_query` value type. Although the original URL may be externally authored, this finding is on a post-parse closed-union branch, and the excerpt does not show the function declaration or decorators, so a `@trust_boundary` recommendation is not justified.
   judge_signature_version: 2
   scope_fingerprint: 4e92d7b5830a1efa8acdc1c22fb0d6a4638fc4b4f2f091c1381f30c67120d2f6
   judge_transport: codex_cli
-  ast_path: 'body[90]/body[10]/body[0]/orelse[0]/body[4]/body[1]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:77b2cc54c3efca80f8f47ddbb2660b4cc2a57f6e75266b675ef7a7cf12661f71'
+  ast_path: 'body[87]/body[10]/body[0]/orelse[0]/body[4]/body[1]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:6f84ecefdc4fe110e52625c46049562b1edc47615c1971d01ad52a2e7770c157'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 26
-      redacted_hash: 588d50da5f2e99ce
-- key: core/config.py:R6:_sanitize_dsn:fp=72f90a78ed5967d8
+      redacted_hash: dfc124a820cb0160
+- key: core/config.py:R6:_sanitize_dsn:fp=58f8087f94a95981
   owner: john
   reason: |-
     R6 `except ValueError: have_key = False` around `get_fingerprint_key()`, reached only after the URL has been proven to carry a password. As in `_fingerprint_secrets`, `get_fingerprint_key` raises ValueError solely for an unset/empty `ELSPETH_FINGERPRINT_KEY`, and the handler's named result `have_key = False` is consumed immediately below: `fail_if_no_key=True` raises `SecretFingerprintError('Database URL contains a password but ELSPETH_FINGERPRINT_KEY is not set ...')`; `fail_if_no_key=False` (dev mode, `ELSPETH_ALLOW_RAW_SECRETS=true`) removes the password without a fingerprint and reports `had_password=True` so the caller records `url_password_redacted`. The password is never passed through in either branch. Invalidated if `get_fingerprint_key` acquired another ValueError cause, or if a `have_key=False` path could return the URL with its password intact.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T22:57:12.070338+00:00'
+  judge_recorded_at: '2026-09-08T10:28:04.452572+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the caught ValueError is converted into an explicit `have_key` state that immediately yields either a typed `SecretFingerprintError` or the documented non-raising result `(sanitized_url, None, True)`; `core/config.py:3102-3135` shows that every returning path reconstructs the URL with `password=None`. The control claim is verified: `contracts/security.py:57-85` shows `get_fingerprint_key` raises ValueError only when `ELSPETH_FINGERPRINT_KEY` is absent or empty. The consumer `_sanitize_dsn_option_for_audit` at `core/config.py:3206-3215` uses the returned `had_password` result to record `url_password_redacted` in non-strict mode, so the exception is neither silently lost nor used to pass through the password.
+    RULE MISFIRES — this handler converts a closed-set key-absence signal into explicit control flow rather than silently suppressing an unknown failure. `get_fingerprint_key` raises `ValueError` only for a missing or empty environment key (src/elspeth/contracts/security.py:57), while `_sanitize_dsn` either raises `SecretFingerprintError` when `fail_if_no_key` is true or returns a password-free URL with `password_fingerprint=None` and `had_password=True` (src/elspeth/core/config.py:2927). The visible reconstruction always sets `password=None` and uses the already-scrubbed query, so neither branch passes the credential through.
   judge_signature_version: 2
   scope_fingerprint: 4e92d7b5830a1efa8acdc1c22fb0d6a4638fc4b4f2f091c1381f30c67120d2f6
   judge_transport: codex_cli
-  ast_path: 'body[90]/body[15]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:9581a07a3c885aac3fcd046e9281fc680ae367b5423f53f4bf53834fba11cc23'
+  ast_path: 'body[87]/body[15]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:a30960c792424a4f09704cf10fd8d2d4b0d495b50ce182481c1ea8d9cb3a42c6'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 26
-      redacted_hash: 588d50da5f2e99ce
+      redacted_hash: dfc124a820cb0160
 - key: core/expression_parser.py:R5:ExpressionParser:_is_non_routable_node:fp=b944731ddf5a829c
   owner: john
   reason: |-
@@ -3735,25 +3716,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[24]/body[8]/body[2]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:118239859b5ce8a8e146acd40819f1f6a5d7e85af7bc9e9365a2f0dd9987d0d3'
-- key: core/expression_parser.py:R5:_ExpressionValidator:visit_Compare:fp=dc3aacc20f6f3847
-  owner: john
-  reason: |-
-    R5 `isinstance(op, ast.Is | ast.IsNot)` in `visit_Compare`, reached only in the `elif` after the operator has been confirmed to be in `_COMPARISON_OPS`. It selects the two operators that get an EXTRA restriction the others do not: identity comparison is permitted only against None. That restriction exists because `is` over row data compares object identity, which for interned or boxed values is an implementation detail and would make a gate's routing depend on CPython's caching rather than on the data. Note the deliberate mix of styles in this method — `type(op) not in _COMPARISON_OPS` for exact membership above, `isinstance` here where subclass matching is wanted. Invalidated if identity comparison is permitted against further sentinels, or forbidden outright.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:24:05.346153+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is semantic dispatch among AST operator variants, not a defensive shape check that masks a contract violation. The preceding exact-membership check guarantees that `op` is an allowed comparison operator, while the flagged branch imposes the additional policy that `ast.Is` and `ast.IsNot` may compare only with `None`. Because `op` is already structured by the Python AST contract rather than raw Tier-3 data, this is not a function-scoped Tier-3 boundary case for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 68f8683d34995fab6ff8e10831dc0c3a9cb054a18441f431da969f7c1f9cb14d
-  judge_transport: codex_cli
-  ast_path: 'body[23]/body[9]/body[2]/body[0]/orelse[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:e4617b2a174f9765bbdae917a7337e3af3dc1b4d4ebccff70017cf2553e9e676'
 - key: core/landscape/database.py:R5:LandscapeDB:_create_sqlcipher_engine:fp=5dc624d8f4c8467b
   owner: john
   reason: |-
@@ -4065,25 +4027,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[35]/body[30]/body[7]/test'
   judge_metadata_signature: 'hmac-sha256:v2:80bcbb19004d4c7b4673038a898e110069b41dc790e75f7782bacc434ce0eb2e'
-- key: core/landscape/run_lifecycle_repository.py:R5:RunLifecycleRepository:begin_run:fp=28950f944e58869e
+- key: core/landscape/run_lifecycle_repository.py:R5:RunLifecycleRepository:begin_run:fp=b5c73a1053ecf082
   owner: john
   reason: |-
-    R5 `isinstance(web_plugin_policy_evidence, WebPluginPolicyEvidence)` in `begin_run`, guarding the optional epoch-23 evidence argument before it reaches `_insert_web_plugin_policy_evidence`. This is nominal typing against a concrete frozen dataclass ELSPETH defines (`contracts/plugin_policy_audit.py`) - the exact mechanism ADR-032 Decision(1) prescribes for what ELSPETH owns - and it must be nominal rather than structural because the insert reads eleven attributes straight onto the `run_web_plugin_policy` audit table (`schema_version`, `policy_hash`, `snapshot_hash`, `binding_generation_fingerprint`, plus seven `canonical_json` columns). Any duck-typed object carrying those attribute names would be persisted as authentic policy evidence while bypassing `WebPluginPolicyEvidence.__post_init__`, which is where the sha256 digest shape, the kind-qualified plugin-id shape, the canonical sorted-unique ordering, and the `available_plugin_ids` subset-of `authorized_plugin_ids` invariant are actually enforced. So this is an admission gate on an audit table, not a shape guard hiding a caller bug: it raises `AuditIntegrityError` and fails the run closed at the write, and the `is not None` operand ahead of it keeps the CLI path (which passes None) out of scope. Honest gap to record: unlike the four `_parse_field_resolution_mapping` sites below, no test drives the raising branch - every caller in tests passes either None or a real `WebPluginPolicyEvidence` (tests/unit/engine/orchestrator/test_landscape_registration.py:78, tests/integration/test_adr_019_sweep_durability.py:185). It stops being right if the evidence insert stops reading attributes off a caller-supplied object - if `begin_run` took the already-validated column values, or reconstructed an owned `WebPluginPolicyEvidence` inside the repository, the construction becomes the gate and this line becomes redundant.
+    PRESCRIBED FORM: RunLifecycleRepository.begin_run accepts optional WebPluginPolicyEvidence, a concrete owned frozen dataclass defined in contracts/plugin_policy_audit.py. When non-None, the nominal check rejects any other type with AuditIntegrityError before constructing the Run or opening the write transaction. The admitted object is passed to _insert_web_plugin_policy_evidence in the same transaction as the run, attribution and leader rows; required evidence fields are read directly. None is the explicit CLI absence contract, not a fabricated policy. tests/unit/core/landscape/test_run_lifecycle_repository.py::TestBeginRunDirect::test_begin_run_rejects_unowned_policy_evidence_before_any_insert exercises the raising arm and proves no run, coordination or policy row is inserted. The existing test_begin_run_records_optional_web_plugin_policy_evidence covers real evidence, and test_web_policy_insert_rolls_back_run_attribution_and_leader_rows covers transactional insert failure. This is ADR-032 nominal internal admission with a loud failure, not Tier-3 parsing or defensive recovery.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:34:48.159996+00:00'
+  judge_recorded_at: '2026-09-08T10:33:34.197434+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this is an unenforced-annotation runtime-enforcement point for the concrete ELSPETH-owned `WebPluginPolicyEvidence` type, not a defensive shape check that masks malformed Tier-2 data. `begin_run` annotates the parameter with that nominal type and raises `AuditIntegrityError` on mismatch at run_lifecycle_repository.py:284 and :341-342, before `_insert_web_plugin_policy_evidence` directly persists its attributes at :433-455; the dataclass invariants invoked by the rationale are confirmed in plugin_policy_audit.py:33-111. The check therefore fails closed before admission to Tier-1 audit storage, and the acknowledged absence of a test for this branch does not contradict the visible prescribed behavior. The decorator does not apply because this parameter carries an already-sanitized ELSPETH-owned contract value rather than Tier-3 external data.
+    PRESCRIBED FORM: RunLifecycleRepository.begin_run nominally rejects a non-None value of the wrong concrete owned type with AuditIntegrityError before constructing the Run or opening the transaction (src/elspeth/core/landscape/run_lifecycle_repository.py:355). WebPluginPolicyEvidence is a frozen, slotted ELSPETH contract with constructor-enforced invariants, and the insert reads its required attributes directly (src/elspeth/contracts/plugin_policy_audit.py:33; src/elspeth/core/landscape/run_lifecycle_repository.py:448). The named pinning test verifies rejection before run, coordination, or policy inserts, while the transaction code confirms admitted evidence is written atomically with the run and leader records (tests/unit/core/landscape/test_run_lifecycle_repository.py:299; src/elspeth/core/landscape/run_lifecycle_repository.py:395). This is informative offensive enforcement without suppression, coercion, or fabrication, and the decorator is inapplicable because the checked value is an ELSPETH-owned concrete contract rather than Tier-3 data rooted in an external parameter.
   judge_signature_version: 2
-  scope_fingerprint: f4eafdd8f3b134028b83fa4299b7e8c1cff066463e116ba98b4eba3b40085f02
+  scope_fingerprint: 92b121972bf386e8af1b8f02a123797aa1c30f2964a39b80778476fb9824875b
   judge_transport: codex_cli
-  ast_path: 'body[51]/body[5]/body[4]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:7be4792036471f270efa2a9434a01dc3b24b086023c0b39e30b658cc65176c72'
+  ast_path: 'body[52]/body[5]/body[4]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:c123b0f2db5e12ddf3325838e9ccbe8fcd5af679c7d26d55ad0e5d61cbe94194'
 - key: core/landscape/scheduler/dispositions.py:R6:SchedulerDispositionRepository:mark_pending_sink_terminal:fp=6a6f0063636e6512
   owner: john
   reason: |-
@@ -6269,25 +6231,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[44]/body[8]/body[2]/body[0]/body[0]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:af39b99a016b14ee687b9eee1da665af2ae42a23afb5d0a2e659c487bca3c0ba'
-- key: core/config.py:R5:load_settings:fp=08023f562b578fc6
-  owner: john
-  reason: |-
-    `yaml.safe_load` returns unowned YAML data, and this is its Tier-3 admission check. Only an exact mapping continues; every other non-empty YAML document raises `ValueError` before key filtering or environment expansion. The check closes the former falsy-value `or {}` fail-open and constructs the owned settings model only after validation.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:30:41.563725+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — `_yaml_loaded` is unowned Tier-3 content returned by `yaml.safe_load`, and the flagged `isinstance` is the admission check that promotes only mapping-shaped content for further processing. The visible code treats only an empty YAML document (`None`) as having no keys and raises `ValueError` for every other non-mapping before key filtering, environment expansion, or construction of `ElspethSettings`, so it does not silently suppress a contract violation. The decorator alternative does not apply because the checked YAML value is produced by reading the file inside the function rather than being rooted in an external-data parameter suitable as `source_param`.
-  judge_signature_version: 2
-  scope_fingerprint: 1788de336ac4ff2d994c2aa47c44210df2544bce0e676a61e113816387d582a6
-  judge_transport: codex_cli
-  ast_path: 'body[96]/body[9]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:328e64f1cc8317b996f14504a91544e2d42225e9e103afc4b26d82f6e022b624'
 - key: core/schema_shape.py:R5:_proven_pg_catalog_text_builtin_calls:fp=7d9a5c717a246c24
   owner: john
   reason: |-
@@ -6577,3 +6520,41 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[24]/body[17]/body[8]/orelse[0]/orelse[0]/test'
   judge_metadata_signature: 'hmac-sha256:v2:62408498d09da198c754698ed1f53f3cd035f1df2b975573b3dc92abb8f1a513'
+- key: core/expression_parser.py:R5:ExpressionParser:is_constant_expression:fp=968a55fa85ddc87a
+  owner: john
+  reason: |-
+    RULE MISFIRES: the whole method body is now a single `return isinstance(body, ast.Constant)`, so the flagged expression IS the classification, not a guard placed in front of some other use. `body` is `self._ast.body`, where `self._ast` comes from `ast.parse(expression, mode='eval')`; its static type is `ast.expr`, and `ast.Constant` is a declared variant of that hierarchy. Discriminating variants of Python's own AST union is the only mechanism the `ast` API offers - there is no attribute to read directly and let breakage raise - so this is variant discrimination, not a defensive re-check of a shape ELSPETH already guarantees. The result is diagnosis only, and both consumers confirm it: `_find_gate_fan_out_advisories` raises a non-blocking advisory, and the planner's stated-threshold check uses it to nudge a candidate whose every gate is constant. A constant condition is legal - it is the documented fan-out idiom - so this predicate is never a security control or a blocking gate. `_validate_gate_expression` is what rejects illegal conditions. The method takes no parameter, so the flagged subject is rooted at `self`, not at external data, and the `@trust_boundary` alternative is inapplicable.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:44:59.418450+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: the visible method uses `isinstance(body, ast.Constant)` as the returned predicate itself, classifying a declared Python AST variant rather than guarding a later operation or masking a fixed-contract violation. `body` is obtained directly from `self._ast.body`, and no fallback, coercion, fabrication, or swallowed failure occurs. The method takes no external-data parameter, so the structural `@trust_boundary` alternative does not apply; the excerpt’s diagnostic documentation independently supports acceptance without relying on the rationale’s unverified claims about other consumers or `_validate_gate_expression`.
+  judge_signature_version: 2
+  scope_fingerprint: a5afd00e2601017938fb25c5c56a93da51c2b70ecbd75ed505fb74f5493465ce
+  judge_transport: codex_cli
+  ast_path: 'body[30]/body[5]/body[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:a419a1376c7afa28a8051a331d66371b15ee3a749b0dd5a4b291a03ef394b97b'
+- key: core/templates.py:R1:_row_object_container_access_matches:fp=b7d0c94df7a977f8
+  owner: john
+  reason: |-
+    RULE MISFIRES: `row_container_aliases` is a deliberately sparse analyzer index, not a fixed-contract record whose keys must exist. It starts empty and is populated by `setdefault` only for names the field extractor has already PROVEN carry row-object containers, while `base_name` is destructured from `_row_api_container_access_path(node)` over an arbitrary user-authored Jinja AST. Most template expressions are not row-container aliases, so a key miss is the predicate's ordinary negative, not a schema break: R1's premise that a KeyError would signal a contract violation is simply false here. Subscripting instead would raise on nearly every normal template expression the analyzer is built to walk. The `frozenset()` default is meaning-preserving rather than a fabricated value - it is the empty iteration domain for the enclosing `any(...)`, so the generator yields nothing and the predicate answers False, which is the correct answer for an untracked name. `_carrier_path_matches_pattern` then does the real work of comparing a tracked carrier path against the observed path. The subject is rooted at a caller-built internal index, not at Tier-3 data, so the decorator does not apply.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:45:50.193263+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `row_container_aliases` is a sparse internal index whose absent keys represent names with no proven row-container paths, rather than missing required fields in a fixed contract. The visible code uses the empty `frozenset` solely as the iteration domain for `any(...)`, so an untracked `base_name` produces the intended `False` result without coercing or fabricating data. This is not Tier-3 parameter-rooted data, so the `@trust_boundary` decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 1c16f04d99bdbb31156f1521a64e9efa53fa55b0bc749a73125472e0f2ac7426
+  judge_transport: codex_cli
+  ast_path: 'body[83]/body[1]/body[2]/value/args[0]/generators[0]/iter'
+  judge_metadata_signature: 'hmac-sha256:v2:81689b5d6e892bfa9e059922864c38bd7c3b0115ee201e9dcdc1b8b3fdba7956'

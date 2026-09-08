@@ -1,0 +1,20 @@
+allow_hits:
+- key: config_loading.py:R5:_plugin_bearing_sections:fp=5a85102586297c28
+  owner: john
+  reason: |-
+    RULE MISFIRES: the flagged `isinstance(element, type)` is not a trust check on data, it is the operand-legality precondition for the `issubclass(element, BaseModel)` it is and-ed with. `element` comes from `get_args()` over `ElspethSettings.model_fields[...].annotation` — an arbitrary typing object, not an ELSPETH-owned value — and `issubclass` raises TypeError when its first argument is not a class. `_plugin_bearing_sections` DERIVES the plugin-bearing section set from `ElspethSettings` rather than listing it, because the previous hand-written tuple kept omitting whichever section was added last. Measured on the current tree, every dict/list-annotated settings field already carries a BaseModel element, so the guard is the precondition and not a live filter; without it one `dict[str, Any]`-shaped field would turn section discovery into a TypeError that aborts every config load. Nothing is coerced, defaulted or fabricated — the arm only `continue`s, and a surviving section must still declare both `plugin` and `options`. Pinned by tests/unit/core/test_config.py::TestEnvPlaceholderGuardIsDerived::test_guard_walks_every_plugin_bearing_section, which calls the function and asserts the derived set.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T12:40:44.597545+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: the `isinstance(element, type)` expression is an operand-legality guard for the immediately conjoined `issubclass(element, BaseModel)`, not a defensive revalidation of pipeline data or a suppression of a fixed-contract failure. The visible function intentionally classifies heterogeneous typing annotations obtained through `get_args()` and skips non-model container elements without coercing, defaulting, or fabricating any value; surviving elements must additionally expose the declared `plugin` and `options` model fields. The finding is not rooted in an external function parameter, so the `@trust_boundary` structural alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: bc86da508ab980f304bdfca8ee8209668cb064f10dea04b649689049cee63da3
+  judge_transport: codex_cli
+  ast_path: 'body[9]/body[2]/body[4]/test/operand/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:796f9233232efd84d25e0e2481deea6d9f98a6be53bbb2ac6a2d50184a974274'
