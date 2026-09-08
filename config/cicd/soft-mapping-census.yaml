@@ -18,6 +18,9 @@ files:
     dict[str, Any]: 10
   src/elspeth/composer_mcp/session.py:
     dict[str, Any]: 2
+  src/elspeth/config_loading.py:
+    Mapping[str, object]: 1
+    boundary: 1
   src/elspeth/contracts/audit.py:
     Mapping[str, object]: 3
     dict[str, Any]: 1
@@ -77,6 +80,7 @@ files:
     Mapping[str, object]: 2
   src/elspeth/contracts/plugin_context.py:
     Mapping[str, Any]: 4
+    Mapping[str, object]: 1
     dict[str, Any]: 4
   src/elspeth/contracts/plugin_protocols.py:
     Mapping[str, object]: 2
@@ -117,8 +121,8 @@ files:
   src/elspeth/core/checkpoint/serialization.py:
     dict[str, object]: 2
   src/elspeth/core/config.py:
-    Mapping[str, object]: 5
-    boundary: 4
+    Mapping[str, object]: 4
+    boundary: 3
     dict[str, Any]: 17
     dict[str, object]: 3
   src/elspeth/core/dag/builder.py:
@@ -1005,9 +1009,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 866
-  Mapping[str, object]: 283
+  Mapping[str, object]: 284
   MutableMapping[str, Any]: 13
   boundary: 63
   dict[str, Any]: 1141
   dict[str, object]: 389
-  soft: 2692
+  soft: 2693

@@ -185,7 +185,7 @@ class TestDeaggregationAuditTrail:
         Returns:
             Tuple of (run_id, LandscapeDB instance)
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
         from elspeth.core.dag import ExecutionGraph
         from elspeth.core.landscape import LandscapeDB
         from elspeth.engine import Orchestrator, PipelineConfig

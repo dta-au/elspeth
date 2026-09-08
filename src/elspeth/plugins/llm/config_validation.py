@@ -7,6 +7,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import CatalogValueSource, DerivedFromSiblingValueSource, ValueSource
+from elspeth.core.llm_provider_validation import (
+    GATEWAY_LOOPBACK_HOST,
+    GATEWAY_SUPPORTED_CAPABILITIES,
+    GATEWAY_SUPPORTED_CONTRACT_MAJORS,
+    GATEWAY_VERSIONED_BASE,
+    validate_bedrock_model,
+    validate_gateway_capabilities,
+    validate_gateway_contract_major,
+    validate_gateway_endpoint,
+)
 from elspeth.core.url_validation import validate_credential_safe_https_url
 from elspeth.plugins.llm.model_catalog import MODEL_CATALOG_OPENROUTER
 
@@ -35,14 +45,10 @@ BEDROCK_REGION_MAX_LENGTH = 64
 BEDROCK_REGION_PATTERN = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 BEDROCK_VALUE_SOURCES: tuple[ValueSource, ...] = ()
 
-GATEWAY_VERSIONED_BASE = "/v1"
-GATEWAY_LOOPBACK_HOST = "127.0.0.1"
-GATEWAY_SUPPORTED_CAPABILITIES = frozenset({"text", "tools", "json_object", "json_schema", "seed", "usage"})
 #: The capability a ``response_format="structured"`` query consumes. Standard
 #: mode asks only for ``json_object``; structured mode sends an API-native
 #: JSON Schema the gateway must be able to enforce.
 GATEWAY_STRUCTURED_OUTPUT_CAPABILITY = "json_schema"
-GATEWAY_SUPPORTED_CONTRACT_MAJORS = frozenset({1})
 GATEWAY_MODEL_MIN_LENGTH = 1
 GATEWAY_MODEL_MAX_LENGTH = 512
 GATEWAY_TIMEOUT_MIN_EXCLUSIVE = 0
@@ -190,56 +196,6 @@ def validate_openrouter_base_url(value: str) -> str:
     """Validate and normalize an OpenRouter-compatible bearer endpoint."""
     validated = validate_credential_safe_https_url(value, field_name="base_url", allow_http_loopback=True)
     return normalize_openrouter_base_url(validated)
-
-
-def validate_bedrock_model(value: str) -> str:
-    """Validate the LiteLLM Bedrock model identifier convention."""
-    if value != value.strip() or not value.startswith("bedrock/") or not value.removeprefix("bedrock/"):
-        raise ValueError("Bedrock model must be a non-empty LiteLLM 'bedrock/<model-id>' value without surrounding whitespace")
-    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
-        raise ValueError("Bedrock model must not contain control characters")
-    return value
-
-
-def validate_gateway_endpoint(value: str) -> str:
-    """Validate the gateway's credential-safe endpoint and versioned path."""
-    validated = validate_credential_safe_https_url(value, field_name="endpoint", allow_http_loopback=True)
-    parsed = urlsplit(validated)
-    try:
-        _ = parsed.port
-    except ValueError as exc:
-        raise ValueError(f"endpoint must have a valid port: {exc}") from exc
-    if parsed.scheme == "http" and parsed.hostname != GATEWAY_LOOPBACK_HOST:
-        raise ValueError(f"endpoint must use HTTPS unless targeting the literal {GATEWAY_LOOPBACK_HOST} loopback host")
-    if parsed.query:
-        raise ValueError("endpoint must not contain a query string")
-    if parsed.fragment:
-        raise ValueError("endpoint must not contain a fragment")
-    path_segments = parsed.path.split("/")
-    if any(segment in ("", ".", "..") for segment in path_segments[1:]):
-        raise ValueError("endpoint path must not contain empty, '.', or '..' segments")
-    if not parsed.path.endswith(GATEWAY_VERSIONED_BASE):
-        raise ValueError(f"endpoint must end with the versioned base path {GATEWAY_VERSIONED_BASE!r}")
-    return validated
-
-
-def validate_gateway_contract_major(value: int) -> int:
-    """Validate a gateway wire-contract major."""
-    if value not in GATEWAY_SUPPORTED_CONTRACT_MAJORS:
-        raise ValueError(f"contract_major {value} is not supported; supported majors: {sorted(GATEWAY_SUPPORTED_CONTRACT_MAJORS)}")
-    return value
-
-
-def validate_gateway_capabilities(value: tuple[str, ...]) -> tuple[str, ...]:
-    """Validate the closed, duplicate-free gateway capability set."""
-    seen: set[str] = set()
-    for capability in value:
-        if capability not in GATEWAY_SUPPORTED_CAPABILITIES:
-            raise ValueError(f"unknown gateway capability {capability!r}; supported: {sorted(GATEWAY_SUPPORTED_CAPABILITIES)}")
-        if capability in seen:
-            raise ValueError(f"duplicate gateway capability {capability!r}")
-        seen.add(capability)
-    return value
 
 
 def validate_gateway_structured_output_capability(

@@ -49,13 +49,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.core.config import (
     ElspethSettings,
     _lower_llm_component,
     _lower_llm_profile_node_options,
     _lower_llm_profile_nodes,
-    load_settings_from_config_dict,
-    load_settings_from_yaml_string,
     resolve_config,
 )
 from elspeth.core.llm_profiles import LLMProfileSettings, LoweredLLMProfileAlias, RuntimeLLMProfile

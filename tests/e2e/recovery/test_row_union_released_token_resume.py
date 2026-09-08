@@ -40,11 +40,12 @@ from pathlib import Path
 from sqlalchemy import select, update
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.identity import FrameKind
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-from elspeth.core.config import CheckpointSettings, load_settings_from_yaml_string
+from elspeth.core.config import CheckpointSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, RecorderFactory
 from elspeth.core.landscape.schema import (

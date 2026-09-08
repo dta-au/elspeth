@@ -15,6 +15,37 @@ sqlcipher3 = pytest.importorskip("sqlcipher3", reason="sqlcipher3 not installed 
 class TestSQLCipherCreateAndRead:
     """Basic CRUD operations on an encrypted database."""
 
+    @pytest.mark.parametrize("option", ["check_same_thread", "uri"])
+    @pytest.mark.parametrize("value", ["tru", "invalid", "2"])
+    def test_malformed_boolean_query_rejected_before_database_creation(self, tmp_path: Path, option: str, value: str) -> None:
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "invalid-option.db"
+        with pytest.raises(ValueError, match="must be a boolean"):
+            LandscapeDB.from_url(f"sqlite:///{db_path}?{option}={value}", passphrase="test-query-boolean")
+        assert not db_path.exists()
+
+    @pytest.mark.parametrize("value", ["true", "1", "yes", "on", "y", "t", "false", "0", "no", "off", "n", "f"])
+    def test_boolean_query_spelling_matches_sqlalchemy(self, tmp_path: Path, value: str) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        from sqlalchemy.exc import ProgrammingError
+
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "boolean-option.db"
+        with (
+            LandscapeDB.from_url(f"sqlite:///{db_path}?check_same_thread={value}", passphrase="test-query-boolean") as db,
+            db.engine.connect() as conn,
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            future = pool.submit(conn.exec_driver_sql, "SELECT 1")
+            if value in ("true", "1", "yes", "on", "y", "t"):
+                with pytest.raises(ProgrammingError, match="same thread"):
+                    future.result()
+            else:
+                assert future.result().scalar_one() == 1
+
     @pytest.mark.parametrize(
         "query",
         ["timeout=1&timeout=2", "mode=rwc&mode=ro", "uri=true&uri=false", "cache=shared&cache=shared"],

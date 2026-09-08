@@ -8,10 +8,10 @@ from dataclasses import dataclass, replace
 import pytest
 import yaml
 
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.composer_interpretation import InterpretationKind
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
-from elspeth.core.config import load_settings_from_config_dict
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.audit import begin_dispatch, finish_success

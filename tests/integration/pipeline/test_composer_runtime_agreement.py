@@ -4928,8 +4928,8 @@ class TestComposerRuntimeQueueAgreement:
         return yaml.safe_dump(doc, sort_keys=False)
 
     def test_queue_round_trips_composer_import_export_and_runtime_graph(self) -> None:
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.contracts import NodeType
-        from elspeth.core.config import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._example_yaml())
@@ -4972,7 +4972,7 @@ class TestComposerRuntimeQueueAgreement:
         fan-in is exactly the topology the runtime rejects."""
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._example_yaml())
@@ -5018,7 +5018,7 @@ class TestComposerRuntimeQueueAgreement:
         settle SILENTLY rather than crash — precisely the failure class this
         rejection forecloses by refusing to build the topology at all.
         """
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.core.dag import GraphValidationError
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
@@ -5040,7 +5040,7 @@ class TestComposerRuntimeQueueAgreement:
         a single producer had no vehicle left in this class after the
         rename/inversion above.
         """
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         yaml_text = """
@@ -5099,7 +5099,7 @@ sinks:
 
     def test_mapped_coalesce_and_ordinary_queue_consumers_are_rejected_in_both_layers(self) -> None:
         """A mapped branch plus an ordinary node is forbidden queue fan-out."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="mapping", ordinary_consumer=True))
@@ -5112,7 +5112,7 @@ sinks:
 
     def test_list_form_identity_branch_is_not_a_queue_consumer_in_either_layer(self) -> None:
         """List-form branches are gate identity edges, not queue connection consumers."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._queue_to_coalesce_yaml(branch_form="list"))
@@ -5179,7 +5179,7 @@ class TestComposerRuntimeRowUnionAgreement:
     def test_row_union_example_round_trips_semantics_and_runtime_graph(self) -> None:
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         original_yaml = self._example_yaml()
@@ -5205,7 +5205,7 @@ class TestComposerRuntimeRowUnionAgreement:
     def test_regenerated_row_union_keeps_early_trigger_guard_actionable(self) -> None:
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         state = composition_state_from_runtime_yaml(self._example_yaml())
@@ -5244,7 +5244,7 @@ class TestComposerRuntimeRowUnionAgreement:
         """
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         doc = yaml.safe_load(self._example_yaml())
@@ -5295,7 +5295,7 @@ class TestComposerRuntimeRowUnionAgreement:
         """
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         doc = yaml.safe_load(self._example_yaml())
@@ -5342,7 +5342,7 @@ class TestComposerRuntimeRowUnionAgreement:
         """
         import yaml
 
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml
 
         doc = yaml.safe_load(self._example_yaml())
@@ -5850,7 +5850,7 @@ class TestComposerRuntimeCoalescePolicyDefaultAgreement:
 
     def test_both_accept_unset_policy_as_require_all(self, tmp_path: Path) -> None:
         """Composer green on an unset policy, and the loader parses the same value."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         csv_path, output_path = self._paths(tmp_path)
         state = self._composer_state(csv_path=csv_path, output_path=output_path, policy=None)
@@ -5873,7 +5873,7 @@ class TestComposerRuntimeCoalescePolicyDefaultAgreement:
 
     def test_both_reject_a_policy_outside_the_closed_vocabulary(self, tmp_path: Path) -> None:
         """Negative control: retiring the missing-policy code did not open the vocabulary."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         csv_path, output_path = self._paths(tmp_path)
         state = self._composer_state(csv_path=csv_path, output_path=output_path, policy="require_all_branches")
@@ -5957,7 +5957,7 @@ class TestComposerRuntimeQueueGuaranteeAgreement:
         return yaml.safe_dump(doc, sort_keys=False)
 
     def _build_runtime_graph(self, settings_yaml: str) -> ExecutionGraph:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(settings_yaml)
         bundle = instantiate_plugins_from_config(settings, preflight_mode=True)

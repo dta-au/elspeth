@@ -1014,7 +1014,7 @@ payload_store:
 
 def _real_follower_settings(tmp_path: Path, *, processing_yaml: str) -> Any:
     """Load the real-follower settings through the production YAML parser."""
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
 
     return load_settings_from_yaml_string(_real_follower_settings_text(tmp_path, processing_yaml=processing_yaml))
 

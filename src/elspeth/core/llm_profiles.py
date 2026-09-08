@@ -1,12 +1,9 @@
 """Provider-neutral LLM profile settings and frozen runtime conversion.
 
 These models are shared by every authoring surface that binds an operator
-LLM profile to a provider (web plugin policy today; the pipeline gateway
-provider and batch/CLI in later phases). They live in ``core`` because
-``elspeth.core`` must never import ``elspeth.plugins`` at module scope, while
-``elspeth.plugins`` freely imports ``core`` — see the provider-allowlist
-validator below, which keeps its ``LLMTransform`` import lazily inside the
-function for exactly this reason.
+LLM profile to a provider. Binding policies live alongside these models in
+``core.llm_provider_validation`` and are also consumed by plugin configuration.
+Profile admission does not import plugin runtime implementations.
 """
 
 from __future__ import annotations
@@ -18,6 +15,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from elspeth.core.llm_provider_validation import (
+    LLM_PROVIDER_NAMES,
+    validate_bedrock_model,
+    validate_gateway_capabilities,
+    validate_gateway_contract_major,
+    validate_gateway_endpoint,
+)
 from elspeth.core.url_validation import validate_credential_safe_https_url
 
 CredentialScope = Literal["server", "user"]
@@ -117,12 +121,7 @@ class LLMProfileSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_provider_binding(self) -> LLMProfileSettings:
-        # Plan 09 owns this registry.  Profile validation consumes it rather
-        # than maintaining a second provider allowlist.
-        from elspeth.plugins.transforms.llm.transform import LLMTransform
-
-        providers = LLMTransform.discriminated_variants()[1]
-        if self.provider not in providers:
+        if self.provider not in LLM_PROVIDER_NAMES:
             raise ValueError("profile provider is not registered")
         if self.provider not in ("openrouter", "gateway") and "timeout_seconds" in self.model_fields_set:
             raise ValueError(f"{self.provider} profile does not support timeout_seconds")
@@ -135,14 +134,7 @@ class LLMProfileSettings(BaseModel):
                 raise ValueError("Bedrock profiles use the keyless AWS credential chain")
             if self.endpoint is not None or self.deployment_name is not None or self.api_version is not None:
                 raise ValueError("Bedrock profile contains fields owned by another provider")
-            # Reuse Plan 09's provider model validation for model/region shape.
-            providers[self.provider](
-                provider="bedrock",
-                model=self.model,
-                region_name=self.region_name,
-                schema={"mode": "observed"},
-                prompt_template="{{ row }}",
-            )
+            validate_bedrock_model(self.model)
         else:
             if self.credential_scope is None or self.credential_ref is None:
                 raise ValueError("credentialed profile requires explicit scope and reference")
@@ -169,28 +161,9 @@ class LLMProfileSettings(BaseModel):
                     raise ValueError("gateway profile requires contract_major")
                 if self.required_capabilities is None:
                     raise ValueError("gateway profile requires required_capabilities")
-                # Reuse Plan 09's GatewayConfig field validators for endpoint,
-                # contract_major, and required_capabilities shape rather than
-                # duplicating that logic here (endpoint validation in
-                # particular — the loopback-only-127.0.0.1 / no-userinfo /
-                # no-query / no-fragment / versioned-base-path rule — lives
-                # only in providers/gateway.py). This profile model never
-                # holds a resolved secret value, so api_key gets an inert
-                # placeholder that only needs to satisfy "non-empty str";
-                # GatewayConfig no longer validates api_key's shape (it holds
-                # an already-resolved credential at runtime, same convention
-                # as AzureOpenAIConfig/OpenRouterConfig — see Phase 2 Task 4's
-                # report for why).
-                providers[self.provider](
-                    provider="gateway",
-                    model=self.model,
-                    endpoint=self.endpoint,
-                    api_key="not a real credential placeholder",
-                    contract_major=self.contract_major,
-                    required_capabilities=self.required_capabilities,
-                    schema={"mode": "observed"},
-                    prompt_template="{{ row }}",
-                )
+                validate_gateway_endpoint(self.endpoint)
+                validate_gateway_contract_major(self.contract_major)
+                validate_gateway_capabilities(self.required_capabilities)
         return self
 
 

@@ -9,9 +9,9 @@ from pathlib import Path
 import pytest
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import NodeStateStatus, RoutingMode, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.types import GateName
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.expression_parser import ExpressionEvaluationError
 from elspeth.core.landscape.database import LandscapeDB

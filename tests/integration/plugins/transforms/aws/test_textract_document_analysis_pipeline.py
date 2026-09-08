@@ -11,9 +11,9 @@ import pytest
 import yaml
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.freeze import deep_thaw
-from elspeth.core.config import load_settings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory

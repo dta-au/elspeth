@@ -10,7 +10,7 @@ Two separate enforcement points need that fact:
 
 * the plugin's own config model, which rejects a raw ``${VAR}`` when it validates
   its options; and
-* :func:`elspeth.core.config._reject_sensitive_plugin_env_placeholders_before_expansion`,
+* :func:`elspeth.config_loading._reject_sensitive_plugin_env_placeholders_before_expansion`,
   the pre-expansion guard in the settings loader.
 
 The guard exists because the plugin-side check is BYPASSABLE. On the CLI/YAML

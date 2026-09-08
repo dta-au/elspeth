@@ -1373,7 +1373,7 @@ def _build_coalesce_graph(
 ) -> ExecutionGraph:
     """Build fork -> two pass-through branches -> union coalesce -> locked sink."""
     from elspeth.cli_helpers import instantiate_plugins_from_config
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
 
     settings = load_settings_from_yaml_string(
         _COALESCE_PIPELINE.format(
@@ -1851,7 +1851,7 @@ _COERCE_FLEX_WITHOUT_TARGET = """      mode: flexible
 def _build_invisible_retype_graph(*, coerce_schema: str, sink_id_type: str) -> ExecutionGraph:
     """source(id: int) -> type_coerce(id -> str) -> under-declared truncate -> locked sink."""
     from elspeth.cli_helpers import instantiate_plugins_from_config
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
 
     settings = load_settings_from_yaml_string(_INVISIBLE_RETYPE_PIPELINE.format(coerce_schema=coerce_schema, sink_id_type=sink_id_type))
     plugins = instantiate_plugins_from_config(settings)
@@ -1922,7 +1922,7 @@ class TestInvisibleRetypeThroughPassThrough:
         posture the dynamic/observed paths have always shipped (per-row
         preflight, not build rejection)."""
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(
             """sources:
@@ -2218,7 +2218,7 @@ def _build_linear_pass_through_graph(
 ) -> ExecutionGraph:
     """Build source -> under-declaring pass-through transform -> sink. No coalesce."""
     from elspeth.cli_helpers import instantiate_plugins_from_config
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
 
     settings = load_settings_from_yaml_string(
         _LINEAR_PASS_THROUGH_PIPELINE.format(

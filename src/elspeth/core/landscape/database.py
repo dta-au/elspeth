@@ -1255,7 +1255,10 @@ class LandscapeDB:
             value = raw_value
             if key in _CONNECT_KWARGS:
                 if key in ("check_same_thread", "uri"):
-                    connect_kwargs[key] = value.lower() in ("true", "1", "yes")
+                    normalized = value.strip().lower()
+                    if normalized not in ("true", "1", "yes", "on", "y", "t", "false", "0", "no", "off", "n", "f"):
+                        raise ValueError(f"SQLCipher URL query parameter {key!r} must be a boolean")
+                    connect_kwargs[key] = normalized in ("true", "1", "yes", "on", "y", "t")
                 elif key == "timeout":
                     connect_kwargs[key] = float(value)
                 elif key in ("detect_types", "cached_statements"):

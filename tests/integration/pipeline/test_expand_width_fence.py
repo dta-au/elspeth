@@ -21,9 +21,9 @@ from typing import Any
 
 from sqlalchemy import create_engine, select
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import token_outcomes_table

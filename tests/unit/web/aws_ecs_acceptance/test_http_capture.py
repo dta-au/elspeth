@@ -583,7 +583,7 @@ def test_fixed_output_sink_node_id_matches_the_real_preflight_and_builder(tmp_pa
     hashes the sink config, so the authored-path id never matched a real
     run's manifest.
     """
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
     from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
     from elspeth.web.composer import yaml_generator
     from elspeth.web.composer.yaml_importer import composition_state_from_runtime_yaml

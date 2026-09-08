@@ -4737,7 +4737,7 @@ def test_from_plugin_instances_extracts_schemas():
     import tempfile
     from pathlib import Path
 
-    from elspeth.core.config import load_settings
+    from elspeth.config_loading import load_settings
     from elspeth.core.dag import ExecutionGraph
 
     config_yaml = """
@@ -4818,7 +4818,7 @@ def test_from_plugin_instances_cycle_raises_graph_validation_error(monkeypatch: 
 
     import networkx as nx
 
-    from elspeth.core.config import load_settings
+    from elspeth.config_loading import load_settings
     from elspeth.core.dag import ExecutionGraph, GraphValidationError
 
     config_yaml = """

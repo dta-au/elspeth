@@ -24,10 +24,11 @@ from typing import Any, cast
 
 import pytest
 
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.secrets import ResolvedSecret, SecretInventoryItem, SecretScope
 from elspeth.core.canonical import canonical_json
-from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict
+from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer import yaml_generator as composer_yaml_generator

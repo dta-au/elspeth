@@ -21,10 +21,10 @@ import pytest
 import yaml
 from sqlalchemy import Column, Integer, MetaData, Table, Text, create_engine, func, select
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig, RuntimeRateLimitConfig
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (

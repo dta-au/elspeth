@@ -67,13 +67,14 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine, select, update
 
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts import RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
-from elspeth.core.config import ElspethSettings, load_settings_from_config_dict
+from elspeth.core.config import ElspethSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.bound_regions import derive_escalation_fixpoint_bound
 from elspeth.core.landscape import LandscapeDB

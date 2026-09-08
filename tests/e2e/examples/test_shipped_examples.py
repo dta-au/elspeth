@@ -29,8 +29,9 @@ from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, 
 from typer.testing import CliRunner
 
 from elspeth.cli import app
+from elspeth.config_loading import load_settings
 from elspeth.contracts import RunStatus
-from elspeth.core.config import ElspethSettings, load_settings
+from elspeth.core.config import ElspethSettings
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import rows_table, run_sources_table
 from elspeth.core.payload_store import FilesystemPayloadStore

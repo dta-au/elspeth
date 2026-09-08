@@ -40,6 +40,7 @@ from elspeth.contracts.token_usage import TokenUsage
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.value_source import register_value_source_plugin
 from elspeth.core.llm_profiles import require_lowered_llm_profile_alias
+from elspeth.core.llm_provider_validation import LLM_PROVIDER_NAMES
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import BatchTransformMixin, OutputPort
 from elspeth.plugins.infrastructure.clients.llm import ContextLengthError, LLMClientError
@@ -225,6 +226,9 @@ _PROVIDERS: dict[str, tuple[type[LLMConfig], type]] = {
     "bedrock": (BedrockConfig, BedrockLLMProvider),
     "gateway": (GatewayConfig, GatewayLLMProvider),
 }
+
+if _PROVIDERS.keys() != LLM_PROVIDER_NAMES:
+    raise FrameworkBugError("LLM provider implementations must exactly implement the core provider binding contract")
 
 
 # ---------------------------------------------------------------------------
@@ -1183,7 +1187,7 @@ class LLMTransform(BaseTransform, BatchTransformMixin):
     policy_capabilities = frozenset({CapabilityDeclaration(PluginCapability.LLM)})
     requires_runtime_preflight = True
     plugin_version = "1.0.0"
-    source_file_hash: str | None = "sha256:8440a78b6e6e334d"
+    source_file_hash: str | None = "sha256:9d2acfb21a7717f5"
     determinism: Determinism = Determinism.NON_DETERMINISTIC
     config_model = LLMConfig  # Base; get_config_model dispatches to provider-specific
     passes_through_input = True

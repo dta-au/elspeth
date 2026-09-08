@@ -483,7 +483,7 @@ class TestGenerateYaml:
         assert "on_error" not in yaml.safe_load(yaml_str)["gates"][0]
 
     def test_gate_route_to_discard_is_exported_as_virtual_destination(self) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         state = _make_gate_pipeline()
         gate = state.nodes[0]

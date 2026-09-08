@@ -21,13 +21,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import DEFAULT_RUN_HEARTBEAT_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.checkpoint import manager as checkpoint_manager_module
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time

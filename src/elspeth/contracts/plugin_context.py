@@ -33,8 +33,28 @@ if TYPE_CHECKING:
     from elspeth.contracts.identity import TokenInfo
     from elspeth.contracts.payload_store import PayloadStore
     from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
+    from elspeth.contracts.token_usage import TokenUsage
 
 logger = logging.getLogger(__name__)
+
+
+@observation_boundary(
+    tier=3,
+    source="optional usage metadata in the external LLM response supplied by a plugin, before audit read-back",
+    source_param="response_data",
+    suppresses=("R1",),
+    invariant=(
+        "Missing or malformed usage is observed as unknown by TokenUsage.from_dict; "
+        "returns None when no valid usage field exists, preserving partial known counts without inventing zero counts. "
+        "The caller records the original response independently; this helper only projects telemetry metadata."
+    ),
+)
+def _observed_response_token_usage(response_data: Mapping[str, object]) -> TokenUsage | None:
+    """Project optional provider usage independently of audit recording."""
+    from elspeth.contracts.token_usage import TokenUsage
+
+    usage = TokenUsage.from_dict(response_data.get("usage"))
+    return usage if usage.has_data else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,16 +437,11 @@ class PluginContext:
             response_snapshot = response_data
 
             # Extract token usage for LLM calls if available.
-            # raw_usage is external (Tier 3) optional metadata; TokenUsage.from_dict
-            # is the boundary validator — it accepts Any, returns unknown() (has_data
-            # False) for non-Mapping / missing input, so no pre-guard is needed here.
+            # Keep external metadata observation separate from the audit-writing
+            # method: the response remains untrusted even after recording it.
             token_usage = None
             if call_type == CallTypeEnum.LLM and response_snapshot is not None:
-                from elspeth.contracts.token_usage import TokenUsage
-
-                raw_usage = response_snapshot.get("usage")
-                tu = TokenUsage.from_dict(raw_usage)
-                token_usage = tu if tu.has_data else None
+                token_usage = _observed_response_token_usage(response_snapshot)
 
             # Wrap data in RawCallPayload for typed telemetry payload.
             # RawCallPayload.__init__ calls deep_freeze(), creating an independent

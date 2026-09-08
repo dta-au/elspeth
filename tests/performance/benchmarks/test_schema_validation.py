@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
-from elspeth.core.config import load_settings
+from elspeth.config_loading import load_settings
 from elspeth.core.dag import ExecutionGraph
 from tests.performance.conftest import benchmark_timer
 

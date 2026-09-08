@@ -5,11 +5,8 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from elspeth.core.config import (
-    CollectorSettings,
-    ScopeSettings,
-    load_settings_from_config_dict,
-)
+from elspeth.config_loading import load_settings_from_config_dict
+from elspeth.core.config import CollectorSettings, ScopeSettings
 
 _MINIMAL = {
     "sources": {"main": {"plugin": "csv", "options": {"path": "in.csv", "schema": {"mode": "observed"}}, "on_success": "rows"}},

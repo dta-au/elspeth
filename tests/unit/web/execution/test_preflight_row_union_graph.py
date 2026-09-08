@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from elspeth.core.config import load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.web.execution.preflight import build_runtime_graph
 

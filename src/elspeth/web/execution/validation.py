@@ -29,11 +29,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
+from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.blobs import BlobRecord
 from elspeth.contracts.freeze import deep_thaw, freeze_fields
 from elspeth.contracts.secrets import WebSecretResolver
 from elspeth.contracts.trust_boundary import observation_boundary
-from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config

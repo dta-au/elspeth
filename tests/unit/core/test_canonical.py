@@ -894,7 +894,8 @@ class TestCoreIntegration:
         assert GraphValidationError is not None
 
     def test_config_importable_from_core(self) -> None:
-        from elspeth.core import ElspethSettings, load_settings
+        from elspeth.config_loading import load_settings
+        from elspeth.core import ElspethSettings
 
         assert ElspethSettings is not None
         assert callable(load_settings)

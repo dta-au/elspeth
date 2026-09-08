@@ -74,9 +74,9 @@ from tests.fixtures.dag_scenario_corpus.schema import (
     Workflow,
 )
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.engine.orchestrator.preflight import (
     assemble_and_validate_pipeline_config,

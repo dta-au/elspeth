@@ -1312,7 +1312,12 @@ class RecoveryManager:
                 f"(token_data_ref={spec.token_data_ref!r}) — cannot resume; re-run instead."
             ) from exc
 
-        envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        try:
+            envelope = checkpoint_loads(payload_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AuditIntegrityError(
+                f"Corrupt token payload for token {spec.token_id} (run {run_id}): invalid UTF-8 or checkpoint JSON"
+            ) from exc
         if not isinstance(envelope, dict) or "data" not in envelope or "contract" not in envelope:
             raise AuditIntegrityError(
                 f"token_data_ref payload for token {spec.token_id} (run {run_id}) is not a "

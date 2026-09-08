@@ -15,8 +15,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.types import CollectorName
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.template_materialization import FILE_BACKED_TEMPLATE_OPTION_REGISTRY
 from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 from elspeth.web.composer.tools.generation import _VALIDATION_ERROR_PATTERNS

@@ -26,9 +26,10 @@ from typing import Any
 
 import pytest
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import RunStatus
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
-from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape import LandscapeDB

@@ -37,9 +37,9 @@ from unittest.mock import MagicMock, patch
 from sqlalchemy import select
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import CallStatus, CallType
 from elspeth.contracts.hashing import canonical_json
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import node_states_table, transform_errors_table

@@ -9,8 +9,9 @@ import pytest
 from pydantic import BaseModel
 from pydantic import ValidationError as PydanticValidationError
 
+from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.data import CompatibilityResult
-from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml
 from elspeth.core.dag.graph import ExecutionGraph
 from elspeth.core.dag.models import EdgeContractError, GraphValidationError, GraphValidationWarning
 from elspeth.engine.orchestrator.preflight import assemble_and_validate_pipeline_config
