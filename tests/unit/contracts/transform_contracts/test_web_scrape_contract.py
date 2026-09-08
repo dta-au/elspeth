@@ -24,6 +24,8 @@ from elspeth.contracts.plugin_context import PluginContext
 from elspeth.plugins.transforms.web_scrape import WebScrapeTransform
 from elspeth.plugins.transforms.web_scrape_errors import ForbiddenError, NotFoundError, UnauthorizedError
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_token_info
+from tests.fixtures.mock_audit import mock_audit_authority
 
 from .test_transform_protocol import TransformContractPropertyTestBase
 
@@ -217,6 +219,8 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         mock_payload_store.store.return_value = "test-processed-content-hash"
 
         return PluginContext(
+            **mock_audit_authority("test-run-001", node_id="test-transform"),
+            token=make_token_info(token_id="token-1"),
             run_id="test-run-001",
             config={},
             node_id="test-transform",
@@ -251,7 +255,9 @@ class TestWebScrapeContract(TransformContractPropertyTestBase):
         payload_store = _context_mock(ctx.payload_store, "payload_store")
 
         limiter.acquire.assert_called_once_with()
-        landscape.allocate_call_index.assert_called_once_with("test-state-001")
+        landscape.allocate_call_index.assert_called_once_with(
+            "test-state-001", member_token=ctx.require_member_token(), work_item=ctx.require_work_item()
+        )
         landscape.record_call.assert_called_once()
         call_kwargs = landscape.record_call.call_args.kwargs
         assert call_kwargs["state_id"] == "test-state-001"

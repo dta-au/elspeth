@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from tests.fixtures.factories import make_context, make_source_context
 
@@ -1107,6 +1108,7 @@ class TestJSONSourceDataKeyStructuralErrors:
         setup = make_recorder_with_run(source_plugin_name="json")
         ctx = PluginContext(
             run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             node_id=setup.source_node_id,
             config={},
             landscape=setup.factory.plugin_audit_writer(),
@@ -1150,6 +1152,7 @@ class TestJSONSourceDataKeyStructuralErrors:
             run_id="test-run",
             node_id="source_json",
             landscape=landscape,
+            coordination_token=CoordinationToken(run_id="test-run", worker_id="mock-worker", leader_epoch=1),
         )
 
         source = JSONSource(
@@ -1270,6 +1273,7 @@ class TestJSONSourceArrayModeUnicodeDecodeError:
             run_id="test-run",
             node_id="source_json",
             landscape=landscape,
+            coordination_token=CoordinationToken(run_id="test-run", worker_id="mock-worker", leader_epoch=1),
         )
 
         source = JSONSource(

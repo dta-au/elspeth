@@ -86,6 +86,10 @@ import httpx
 import pytest
 import uvicorn
 
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
+from tests.fixtures.mock_audit import mock_item_audit_authority
+
 # --- sys.path shim -----------------------------------------------------
 # ``gateway/`` is not on the default ELSPETH import path (see
 # tests/gateway_runtime/conftest.py for the same pattern, scoped to a
@@ -141,11 +145,11 @@ class FakeAuditRecorder:
     calls: list[dict[str, Any]] = field(default_factory=list)
     _next_index: int = 0
 
-    def allocate_call_index(self, state_id: str | None) -> int:
+    def allocate_call_index(self, state_id: str | None, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self._next_index += 1
         return self._next_index - 1
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         self._next_index += 1
         return self._next_index - 1
 
@@ -418,6 +422,7 @@ class TestCriterion4Shapes:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-text"),
                 state_id="state-text",
                 token_id="token-text",
             ),
@@ -447,6 +452,7 @@ class TestCriterion4Shapes:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-schema"),
                 state_id="state-schema",
                 token_id="token-schema",
             ),
@@ -463,6 +469,7 @@ class TestCriterion4Shapes:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-object"),
                 state_id="state-object",
                 token_id="token-object",
             ),
@@ -486,6 +493,7 @@ class TestCriterion5UsageAndFinishReason:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-halt-truncated"),
                 state_id="state-halt-truncated",
                 token_id="token-halt-truncated",
             ),
@@ -505,6 +513,7 @@ class TestCriterion5UsageAndFinishReason:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-halt-complete"),
                 state_id="state-halt-complete",
                 token_id="token-halt-complete",
             ),
@@ -525,6 +534,7 @@ class TestCriterion5UsageAndFinishReason:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-halt-screened"),
                     state_id="state-halt-screened",
                     token_id="token-halt-screened",
                 ),
@@ -537,6 +547,7 @@ class TestCriterion5UsageAndFinishReason:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-no-usage"),
                 state_id="state-no-usage",
                 token_id="token-no-usage",
             ),
@@ -565,6 +576,7 @@ class TestCriterion6RetriesStayOutside:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-count-once"),
                 state_id="state-count-once",
                 token_id="token-count-once",
             ),
@@ -582,6 +594,7 @@ class TestCriterion6RetriesStayOutside:
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-401-replay"),
                 state_id="state-401-replay",
                 token_id="token-401-replay",
             ),
@@ -618,6 +631,7 @@ class TestCriterion9ErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-fault-overloaded"),
                     state_id="state-fault-overloaded",
                     token_id="token-fault-overloaded",
                 ),
@@ -633,6 +647,7 @@ class TestCriterion9ErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-fault-screening"),
                     state_id="state-fault-screening",
                     token_id="token-fault-screening",
                 ),
@@ -648,6 +663,7 @@ class TestCriterion9ErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-fault-too-long"),
                     state_id="state-fault-too-long",
                     token_id="token-fault-too-long",
                 ),
@@ -663,6 +679,7 @@ class TestCriterion9ErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-unmapped-model"),
                     state_id="state-unmapped-model",
                     token_id="token-unmapped-model",
                 ),
@@ -683,6 +700,7 @@ class TestCriterion9ErrorMapping:
                 temperature=0.0,
                 max_tokens=100,
                 audit_parent=LLMAuditParent.for_row(
+                    **mock_item_audit_authority(_RUN_ID, token_id="token-contract-mismatch"),
                     state_id="state-contract-mismatch",
                     token_id="token-contract-mismatch",
                 ),
@@ -700,11 +718,19 @@ class TestCriterion9ErrorMapping:
 
 class TestRuntimePreflight:
     def test_preflight_succeeds_against_live_gateway(self, main_provider: GatewayLLMProvider) -> None:
-        main_provider.runtime_preflight(operation_id="op-preflight-ok", model=_MODEL_ALIAS)
+        main_provider.runtime_preflight(
+            operation_id="op-preflight-ok",
+            model=_MODEL_ALIAS,
+            coordination_token=CoordinationToken(run_id=_RUN_ID, worker_id="mock-worker", leader_epoch=1),
+        )
 
     def test_preflight_fails_when_model_alias_not_published(self, main_provider: GatewayLLMProvider) -> None:
         with pytest.raises(LLMClientError):
-            main_provider.runtime_preflight(operation_id="op-preflight-bad-model", model="never-published-alias")
+            main_provider.runtime_preflight(
+                operation_id="op-preflight-bad-model",
+                model="never-published-alias",
+                coordination_token=CoordinationToken(run_id=_RUN_ID, worker_id="mock-worker", leader_epoch=1),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +759,7 @@ def test_success_records_two_audit_rows_end_to_end(main_stack: tuple[str, _Recor
             temperature=0.0,
             max_tokens=100,
             audit_parent=LLMAuditParent.for_row(
+                **mock_item_audit_authority(_RUN_ID, token_id="token-audit"),
                 state_id="state-audit",
                 token_id="token-audit",
             ),

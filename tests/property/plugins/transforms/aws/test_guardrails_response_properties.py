@@ -7,6 +7,7 @@ import pytest
 from botocore.stub import Stubber
 from hypothesis import given, settings
 from hypothesis import strategies as st
+from tests.fixtures.mock_audit import mock_item_audit_authority
 from tests.unit.plugins.transforms.aws.test_guardrails_client import PROMPT_FILTERS, FakeExecution, response
 
 from elspeth.plugins.transforms.aws.guardrails_client import BedrockGuardrailsClient, GuardrailResponseError, parse_guardrail_response
@@ -31,6 +32,7 @@ def test_bounded_intervention_outputs_are_discarded(texts: list[str]) -> None:
     with Stubber(sdk) as stubber:
         stubber.add_response("apply_guardrail", provider_response)
         decision = BedrockGuardrailsClient(
+            **mock_item_audit_authority("run-1"),
             execution=FakeExecution(),
             state_id="state-1",
             run_id="run-1",

@@ -31,6 +31,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.plugins.sources.csv_source import CSVSource
 from elspeth.plugins.sources.json_source import JSONSource
+from tests.fixtures.landscape import leader_coordination_token
 
 if TYPE_CHECKING:
     from elspeth.contracts.plugin_context import ValidationErrorToken
@@ -104,6 +105,7 @@ def _make_audited_context(
         run_id=run_id,
         landscape=factory.plugin_audit_writer(),
         node_id=node_id,
+        coordination_token=leader_coordination_token(factory, run_id),
     )
 
 
@@ -123,7 +125,7 @@ def _setup_run_and_node(
         canonical_version=CANONICAL_VERSION,
     )
     node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0.0",

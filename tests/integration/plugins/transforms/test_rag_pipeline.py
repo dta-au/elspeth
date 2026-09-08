@@ -15,13 +15,15 @@ from unittest.mock import patch
 import httpx
 import pytest
 
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.probes import CollectionReadinessResult
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.security.web import SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.retrieval.azure_search import AzureSearchProvider
 from elspeth.plugins.infrastructure.clients.retrieval.types import RetrievalChunk
 from elspeth.plugins.transforms.rag.transform import RAGRetrievalTransform
+from tests.fixtures.factories import make_context, make_token_info
 
 
 def _ready_result(collection="test-index", count=10):
@@ -58,18 +60,6 @@ def _make_row(data):
 
 
 @dataclass
-class _TransformToken:
-    token_id: str = "token-1"
-
-
-@dataclass
-class _TransformContext:
-    state_id: str = "state-1"
-    run_id: str = "run-1"
-    token: _TransformToken = field(default_factory=_TransformToken)
-
-
-@dataclass
 class _TelemetryRecorder:
     payloads: list[object] = field(default_factory=list)
 
@@ -82,7 +72,7 @@ class _LandscapeRecorder:
     readiness_checks: list[dict[str, object]] = field(default_factory=list)
     calls: list[dict[str, object]] = field(default_factory=list)
 
-    def allocate_call_index(self, state_id):
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem):
         return sum(1 for call in self.calls if call["state_id"] == state_id)
 
     def record_call(self, **kwargs):
@@ -106,12 +96,17 @@ class _LifecycleContext:
     def record_readiness_check(self, *, name: str, collection: str, reachable: bool, count: int | None, message: str) -> None:
         assert self.coordination_token is not None
         self.landscape.record_readiness_check(
-            name=name, collection=collection, reachable=reachable, count=count, message=message, coordination_token=self.coordination_token
+            name=name,
+            collection=collection,
+            reachable=reachable,
+            count=count,
+            message=message,
+            member_token=self.coordination_token.membership,
         )
 
 
 def _mock_ctx(state_id="state-1"):
-    return _TransformContext(state_id=state_id)
+    return make_context(run_id="run-1", state_id=state_id, token=make_token_info(token_id="token-1"))
 
 
 def _mock_lifecycle_ctx():

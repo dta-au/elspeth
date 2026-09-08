@@ -22,7 +22,10 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.security.web import SSRFSafeRequest
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 @pytest.fixture
@@ -58,7 +61,7 @@ class FakeCallRecorder:
     _next_state_call_index: int = 0
     _next_operation_call_index: int = 0
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         self._next_state_call_index += 1
         return self._next_state_call_index
 
@@ -77,6 +80,8 @@ class FakeCallRecorder:
         error: object | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -213,6 +218,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",
@@ -283,6 +289,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",
@@ -340,6 +347,7 @@ class TestRedirectAllowedRangesThreading:
         )
 
         client = AuditedHTTPClient(
+            **mock_item_audit_authority("test-run"),
             execution=fake_execution,
             state_id="test-state",
             run_id="test-run",

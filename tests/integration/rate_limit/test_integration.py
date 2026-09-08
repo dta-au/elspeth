@@ -18,7 +18,9 @@ from elspeth.contracts import Determinism, TransformResult
 from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.config.runtime import RuntimeRateLimitConfig
 from elspeth.contracts.contexts import LifecycleContext, TransformContext
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.core.config import RateLimitSettings
 from elspeth.core.rate_limit import RateLimitRegistry
@@ -28,6 +30,7 @@ from elspeth.plugins.infrastructure.clients.http import AuditedHTTPClient
 from elspeth.plugins.infrastructure.clients.llm import AuditedLLMClient
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 class RateLimitAwareTransform(BaseTransform):
@@ -75,7 +78,7 @@ class FakeCallRecorder:
         self._next_index = 0
         self.calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         call_index = self._next_index
         self._next_index += 1
         return call_index
@@ -415,6 +418,7 @@ class TestAuditedClientRateLimiting:
 
             # Create audited client WITH limiter
             client = AuditedLLMClient(
+                **mock_item_audit_authority("test-run-001"),
                 execution=fake_recorder,
                 state_id="test-state-001",
                 run_id="test-run-001",
@@ -476,6 +480,7 @@ class TestAuditedClientRateLimiting:
 
             # Create audited client WITH limiter
             client = AuditedHTTPClient(
+                **mock_item_audit_authority("test-run-001"),
                 execution=fake_recorder,
                 state_id="test-state-001",
                 run_id="test-run-001",
@@ -499,6 +504,7 @@ class TestAuditedClientRateLimiting:
 
         # Create audited client WITHOUT limiter (limiter=None is default)
         client = AuditedLLMClient(
+            **mock_item_audit_authority("test-run-001"),
             execution=fake_recorder,
             state_id="test-state-001",
             run_id="test-run-001",

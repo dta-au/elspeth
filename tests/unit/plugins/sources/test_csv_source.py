@@ -20,6 +20,7 @@ def _make_csv_context_with_audit_recorder() -> tuple[PluginContext, RecorderSetu
     setup = make_recorder_with_run(source_node_id="source_csv", source_plugin_name="csv")
     ctx = PluginContext(
         run_id=setup.run_id,
+        coordination_token=setup.coordination_token,
         node_id=setup.source_node_id,
         config={},
         landscape=setup.factory.plugin_audit_writer(),
@@ -1229,6 +1230,7 @@ class TestCSVSourceSkipRowsAudit:
         setup = make_recorder_with_run(source_plugin_name="csv")
         ctx = PluginContext(
             run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             node_id=setup.source_node_id,
             config={},
             landscape=setup.factory.plugin_audit_writer(),

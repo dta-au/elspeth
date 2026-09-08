@@ -100,6 +100,10 @@ EXECUTOR_ONLY_FIELDS = {
     "config",
     "_config",
     "_pending_quarantine_validation_errors",
+    # Executors bind these values; plugins consume the validated require_*
+    # accessors declared by their phase protocols.
+    "member_token",
+    "work_item",
 }
 
 # [R4] Engine-internal methods: on PluginContext but called by engine, not plugins.

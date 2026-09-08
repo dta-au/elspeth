@@ -149,15 +149,14 @@ class TestSinkDurability:
 
         # Create row and token in database
         row_data = {"id": 1, "value": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, db_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        db_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Create TokenInfo for executor (includes PipelineRow)
         from elspeth.contracts.schema_contract import PipelineRow
@@ -170,7 +169,13 @@ class TestSinkDurability:
         )
 
         # Create context
-        ctx = make_context(run_id=run.run_id, node_id="sink")
+        ctx = make_context(
+            run_id=run.run_id,
+            node_id="sink",
+            token=token,
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        )
 
         # Create checkpoint callback
         checkpoint_created = False
@@ -247,15 +252,14 @@ class TestSinkDurability:
 
         # Create row and token in database
         row_data = {"id": 1, "value": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, db_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        db_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Create TokenInfo for executor (includes PipelineRow)
         from elspeth.contracts.schema_contract import PipelineRow
@@ -268,7 +272,13 @@ class TestSinkDurability:
         )
 
         # Create context
-        ctx = make_context(run_id=run.run_id, node_id="sink")
+        ctx = make_context(
+            run_id=run.run_id,
+            node_id="sink",
+            token=token,
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        )
 
         # Create checkpoint callback that fails
         def failing_checkpoint_callback(token_info):
@@ -322,15 +332,14 @@ class TestSinkDurability:
 
         # Create row and token in database
         row_data = {"id": 1, "value": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, db_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        db_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Create TokenInfo for executor (includes PipelineRow)
         from elspeth.contracts.schema_contract import PipelineRow
@@ -343,7 +352,13 @@ class TestSinkDurability:
         )
 
         # Create context
-        ctx = make_context(run_id=run.run_id, node_id="sink")
+        ctx = make_context(
+            run_id=run.run_id,
+            node_id="sink",
+            token=token,
+            landscape=factory.plugin_audit_writer(),
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        )
 
         # Track call order
         call_order = []

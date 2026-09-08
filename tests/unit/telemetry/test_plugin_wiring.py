@@ -28,10 +28,15 @@ import pytest
 from elspeth.contracts import Call, CallStatus, CallType
 from elspeth.contracts.audit_protocols import PluginAuditWriter
 from elspeth.contracts.chat_parts import ChatMessage
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.events import ExternalCallCompleted
+from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.rate_limit.registry import NoOpLimiter
 from elspeth.plugins.transforms.llm.provider import LLMAuditParent
 from elspeth.testing import make_pipeline_row
+from tests.fixtures.factories import make_context, make_token_info
+from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
 from tests.helpers.tree_gate import iter_gate_sources
 
 
@@ -41,10 +46,10 @@ class _ExecutionRepositoryDouble:
         self._operation_call_counter = itertools.count()
         self.recorded_calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
         return next(self._call_counter)
 
-    def allocate_operation_call_index(self, operation_id: str) -> int:
+    def allocate_operation_call_index(self, operation_id: str, *, coordination_token: CoordinationToken) -> int:
         return next(self._operation_call_counter)
 
     def record_call(
@@ -58,6 +63,8 @@ class _ExecutionRepositoryDouble:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        member_token: WorkerMembershipToken,
+        work_item: TokenWorkItem,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
@@ -88,12 +95,17 @@ class _ExecutionRepositoryDouble:
         error: Any | None = None,
         latency_ms: float | None = None,
         *,
+        coordination_token: CoordinationToken,
         call_index: int | None = None,
         request_ref: str | None = None,
         response_ref: str | None = None,
         resolved_prompt_template_hash: str | None = None,
     ) -> Call:
-        actual_call_index = call_index if call_index is not None else self.allocate_operation_call_index(operation_id)
+        actual_call_index = (
+            call_index
+            if call_index is not None
+            else self.allocate_operation_call_index(operation_id, coordination_token=coordination_token)
+        )
         call_kwargs = {
             "operation_id": operation_id,
             "call_index": actual_call_index,
@@ -193,9 +205,11 @@ class _HTTPClientDouble:
         self.closed = True
 
 
-def _make_lifecycle_ctx(events: list[Any]) -> SimpleNamespace:
+def _make_lifecycle_ctx(events: list[Any]) -> PluginContext:
     """Create a LifecycleContext double that captures telemetry events."""
-    return SimpleNamespace(
+    return PluginContext(
+        **mock_audit_authority("test-run"),
+        config={},
         run_id="test-run",
         node_id="node-001",
         landscape=_ExecutionRepositoryDouble(),
@@ -207,17 +221,15 @@ def _make_lifecycle_ctx(events: list[Any]) -> SimpleNamespace:
     )
 
 
-def _make_transform_ctx(recorder: _ExecutionRepositoryDouble) -> SimpleNamespace:
+def _make_transform_ctx(recorder: _ExecutionRepositoryDouble) -> PluginContext:
     """Create a TransformContext double for _process_row calls."""
-    return SimpleNamespace(
+    return make_context(
+        **mock_audit_authority("test-run", token_id="token-001", node_id="node-001"),
         run_id="test-run",
         state_id="state-001",
         node_id="node-001",
-        token=SimpleNamespace(token_id="token-001"),
-        batch_token_ids=None,
-        schema_contract=None,
+        token=make_token_info(token_id="token-001"),
         landscape=recorder,
-        shutdown_event=None,
     )
 
 
@@ -308,6 +320,7 @@ class TestBedrockProviderTelemetryWiring:
                     temperature=0.0,
                     max_tokens=16,
                     audit_parent=LLMAuditParent.for_row(
+                        **mock_item_audit_authority("test-run", token_id="token-001"),
                         state_id="state-001",
                         token_id="token-001",
                     ),
@@ -380,6 +393,7 @@ class TestGatewayProviderTelemetryWiring:
                     temperature=0.0,
                     max_tokens=16,
                     audit_parent=LLMAuditParent.for_row(
+                        **mock_item_audit_authority("test-run", token_id="token-001"),
                         state_id="state-001",
                         token_id="token-001",
                     ),

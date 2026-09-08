@@ -122,6 +122,7 @@ class TestCSVSourceContract(SourceContractPropertyTestBase):
         source.on_success = "output"
         ctx = make_context(
             run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             landscape=setup.factory.plugin_audit_writer(),
             node_id=setup.source_node_id,
         )
@@ -181,6 +182,7 @@ class TestCSVSourceContract(SourceContractPropertyTestBase):
             source.on_success = "output"
             ctx = make_context(
                 run_id=setup.run_id,
+                coordination_token=setup.coordination_token,
                 landscape=setup.factory.plugin_audit_writer(),
                 node_id=setup.source_node_id,
             )
@@ -237,6 +239,7 @@ class TestCSVSourceQuarantineContract:
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
             node_id=setup.source_node_id,
+            coordination_token=setup.coordination_token,
         )
         rows = list(source.load(ctx))
 
@@ -301,6 +304,7 @@ class TestCSVSourceDiscardContract:
             run_id=run_id,
             landscape=factory.plugin_audit_writer(),
             node_id=setup.source_node_id,
+            coordination_token=setup.coordination_token,
         )
 
         rows = list(source.load(ctx))

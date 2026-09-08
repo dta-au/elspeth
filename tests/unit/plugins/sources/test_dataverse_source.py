@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from elspeth.contracts import CallStatus
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.core.security.web import SSRFBlockedError, SSRFSafeRequest
 from elspeth.plugins.infrastructure.clients.dataverse import (
     DataverseClient,
@@ -264,6 +265,7 @@ def _plugin_context_for_operation_calls(*, telemetry_emit: Any) -> Any:
         landscape=_OperationLandscapeFake(),
         node_id="source-node",
         operation_id="op-001",
+        coordination_token=CoordinationToken(run_id="test-run-123", worker_id="mock-worker", leader_epoch=1),
         telemetry_emit=telemetry_emit,
     )
 

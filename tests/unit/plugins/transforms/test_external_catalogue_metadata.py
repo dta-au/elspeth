@@ -423,6 +423,8 @@ def test_document_intelligence_key_value_example_enables_the_required_analyze_fe
 
 
 def test_prompt_shield_both_documents_two_analyses_but_one_audited_http_call() -> None:
+    from tests.fixtures.factories import make_context
+
     class _Response:
         text = '{"userPromptAnalysis":{"attackDetected":false},"documentsAnalysis":[{"attackDetected":false}]}'
 
@@ -448,7 +450,7 @@ def test_prompt_shield_both_documents_two_analyses_but_one_audited_http_call() -
     client = _RecordingClient()
     transform._http_clients["catalogue-state"] = client
     try:
-        assert transform._analyze_prompt("retrieved text", "catalogue-state") == {
+        assert transform._analyze_prompt("retrieved text", "catalogue-state", ctx=make_context(state_id="catalogue-state")) == {
             "user_prompt_attack": False,
             "document_attack": False,
         }

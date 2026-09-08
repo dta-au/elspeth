@@ -19,15 +19,17 @@ import pytest
 
 from elspeth.contracts import NodeType, TransformResult
 from elspeth.contracts.identity import TokenInfo
+from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.scheduler import serialize_row_payload
 from elspeth.engine.executors import TransformExecutor
 from elspeth.engine.spans import SpanFactory
 from elspeth.plugins.transforms.llm.transform import LLMTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 
 DYNAMIC_SCHEMA = {"mode": "observed"}
 
@@ -298,7 +300,7 @@ def node_id(factory: RecorderFactory, run_id: str) -> str:
     """Create a node for testing."""
     schema = SchemaConfig.from_dict(DYNAMIC_SCHEMA)
     node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -318,19 +320,43 @@ def create_token_in_factory(
     row_index: int = 0,
 ) -> TokenInfo:
     """Create row and token in factory, return TokenInfo."""
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    row, db_token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
         source_node_id=node_id,
         row_index=row_index,
         data=row_data,
         row_id=row_id,
+        token_id=token_id,
         source_row_index=row_index,
         ingest_sequence=row_index,
     )
-    factory.data_flow.create_token(row_id=row.row_id, token_id=token_id)
     # Wrap row_data in PipelineRow with contract
     pipeline_row = make_pipeline_row(row_data)
-    return TokenInfo(row_id=row_id, token_id=token_id, row_data=pipeline_row)
+    return TokenInfo(row_id=row.row_id, token_id=db_token.token_id, row_data=pipeline_row)
+
+
+def _claim_context(factory: RecorderFactory, run_id: str, node_id: str, token: TokenInfo, *, ingest_sequence: int = 0) -> PluginContext:
+    """Bind the executor to a real scheduler claim for this input row."""
+    leader = leader_coordination_token(factory, run_id)
+    item = factory.scheduler.enqueue_ready_claimed(
+        member_token=leader.membership,
+        token_id=token.token_id,
+        row_id=token.row_id,
+        node_id=node_id,
+        step_index=0,
+        ingest_sequence=ingest_sequence,
+        row_payload_json=serialize_row_payload(token.row_data),
+        lease_owner=leader.worker_id,
+        lease_seconds=300,
+    )
+    return make_context(
+        run_id=run_id,
+        node_id=node_id,
+        token=token,
+        landscape=factory.plugin_audit_writer(),
+        coordination_token=leader,
+        work_item=item,
+    )
 
 
 class TestMultiQueryIntegration:
@@ -368,6 +394,7 @@ class TestMultiQueryIntegration:
             ctx = make_context(
                 run_id=run_id,
                 landscape=factory.plugin_audit_writer(),
+                coordination_token=leader_coordination_token(factory, run_id),
             )
             transform.on_start(ctx)
 
@@ -406,7 +433,7 @@ class TestMultiQueryIntegration:
             result, _, error_sink = executor.execute_transform(
                 transform=transform,
                 token=token,
-                ctx=ctx,
+                ctx=_claim_context(factory, run_id, node_id, token),
             )
 
             # Should succeed
@@ -496,6 +523,7 @@ class TestMultiQueryIntegration:
             ctx = make_context(
                 run_id=run_id,
                 landscape=factory.plugin_audit_writer(),
+                coordination_token=leader_coordination_token(factory, run_id),
             )
             transform.on_start(ctx)
 
@@ -521,7 +549,7 @@ class TestMultiQueryIntegration:
                 result, _, _error_sink = executor.execute_transform(
                     transform=transform,
                     token=token,
-                    ctx=ctx,
+                    ctx=_claim_context(factory, run_id, node_id, token, ingest_sequence=i),
                 )
                 results.append(result)
 

@@ -101,6 +101,7 @@ class TestAssertToRaiseConversions:
         before begin_run()"
         """
         from elspeth.plugins.transforms.azure.content_safety import AzureContentSafety
+        from tests.fixtures.factories import make_context
 
         transform = AzureContentSafety(_CONTENT_SAFETY_CONFIG)
 
@@ -109,7 +110,7 @@ class TestAssertToRaiseConversions:
 
         # _get_http_client must raise, not silently create a client with None recorder.
         with pytest.raises(RuntimeError, match="recorder"):
-            transform._get_http_client("some-state-id")
+            transform._get_http_client("some-state-id", ctx=make_context())
 
     # ------------------------------------------------------------------
     # Pattern 3: AzureContentSafety — connect_output() already called
