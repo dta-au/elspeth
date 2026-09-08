@@ -28,8 +28,8 @@ Design invariants enforced here:
   threshold ``k``; the thread never sets the latch on a DB error.
 - **Never self-terminate on DB errors** — the per-tick try/except swallows
   contention and continues looping; unexpected errors latch a fatal failure
-  for the drain thread. Only a deliberate
-  ``_stop_event.set()`` exits the loop. EXCEPTION: Tier-1 integrity errors
+  for the drain thread. A failure of the thread's own clock or diagnostic
+  channel also latches a fatal cause before the thread exits. Tier-1 integrity errors
   (e.g. a vanished ``run_workers`` row) are corruption, not contention — they
   latch a fatal exception that ``check_and_raise`` re-raises at the next
   drain boundary (fail closed; the thread still never raises on its own
@@ -229,36 +229,46 @@ class RunHeartbeatThread:
            deposition raises
            :class:`~elspeth.contracts.errors.RunWorkerEvictedError`.
         """
-        if self._fatal_event.is_set():
-            if self._fatal_exc is None:
-                # Unreachable by construction (exc stored before the event is
-                # set, same thread) — but a bare latch must still fail closed.
-                raise contract_errors.OrchestrationInvariantError("fatal heartbeat latch set without a stored exception")
-            raise self._fatal_exc
+        self.raise_fatal_failure()
         if self._coordination_lost_event.is_set():
             raise RunWorkerEvictedError(
                 worker_id=self._token.worker_id,
                 run_id=self._token.run_id,
             )
 
+    def raise_fatal_failure(self) -> None:
+        """Surface fatal thread failures, including the final shutdown beat.
+
+        Owners call this after joining and completing mandatory teardown.
+        Membership loss is deliberately separate: finalization may already
+        have departed the membership, but cannot excuse an integrity failure.
+        """
+        if self._fatal_event.is_set():
+            if self._fatal_exc is None:
+                # Unreachable by construction (exc stored before the event is
+                # set, same thread) — but a bare latch must still fail closed.
+                raise contract_errors.OrchestrationInvariantError("fatal heartbeat latch set without a stored exception")
+            raise self._fatal_exc
+
     # ------------------------------------------------------------------
     # Internal — the beat loop
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
-        """Thread entry point: beat loop, exits only when stop_event is set."""
-        while not self._wait_fn(self._heartbeat_seconds):
-            self._beat_once()
-        # Final beat on exit: keeps the seat live until release_seat is called
-        # (stop() is called in the finally block just before release_seat).
-        # A known-terminal follower skips it because finalize may already have
-        # departed the follower row, and a worker that has already learned it
-        # lost membership has nothing left to keep live — a second beat would
-        # only be a second membership-fence refusal. Best-effort — never raises.
-        if not self._skip_final_beat_event.is_set() and not self._coordination_lost_event.is_set():
-            self._beat_once()
+        """Beat until stopped; transport failures of the thread itself too."""
+        try:
+            while not self._wait_fn(self._heartbeat_seconds):
+                self._beat_once()
+            # Join includes a final beat unless membership already departed.
+            if not self._skip_final_beat_event.is_set() and not self._coordination_lost_event.is_set():
+                self._beat_once()
+        except BaseException as exc:
+            # A failure of the clock or last-resort logger is outside the
+            # repository handlers. Transport it to the owner too: an uncaught
+            # daemon exception would otherwise leave a healthy-looking latch.
+            self._capture_fatal(exc)
 
-    def _capture_fatal(self, exc: Exception) -> None:
+    def _capture_fatal(self, exc: BaseException) -> None:
         """Publish the first fatal cause; later failures keep their own logs.
 
         Only the beat thread writes this latch. The drain reads the exception
@@ -268,6 +278,10 @@ class RunHeartbeatThread:
         if not self._fatal_event.is_set():
             self._fatal_exc = exc
             self._fatal_event.set()
+        elif self._fatal_exc is not exc:
+            if self._fatal_exc is None:
+                raise contract_errors.OrchestrationInvariantError("fatal heartbeat latch set without a stored exception")
+            self._fatal_exc.add_note(f"Additional heartbeat failure: {type(exc).__name__}")
 
     def _beat_once(self) -> None:
         """Execute one heartbeat tick; NEVER raises.
@@ -386,6 +400,9 @@ class RunHeartbeatThread:
                 failures=self._consecutive_busy,
                 now=self._now_fn(),
             )
+        except contract_errors.TIER_1_ERRORS as exc:
+            self._capture_fatal(exc)
+            logger.error("run_heartbeat: degraded event integrity failed", exc_info=exc)
         except SQLAlchemyError:
             # A diagnostic write failure cannot stop liveness updates, but
             # must remain visible when the normal repository reporter fails.

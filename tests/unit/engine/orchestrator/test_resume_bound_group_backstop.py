@@ -37,7 +37,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from elspeth.contracts import Checkpoint, NodeID, ResumePoint, RunStatus
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import AuditIntegrityError, OrchestrationInvariantError
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.dag import ExecutionGraph
@@ -155,3 +155,24 @@ def test_resume_finalize_refuses_an_unsettled_bound_group_and_finalizes_failed()
     derive.assert_not_called()  # the verdict pre-empts the terminal-status derivation
     statuses = [call.args[0] for call in harness.factory.run_lifecycle.finalize_run.call_args_list]
     assert statuses == [RunStatus.FAILED], statuses  # the resume failure ceremony, never COMPLETED
+
+
+def test_resume_final_heartbeat_failure_survives_release_and_flush() -> None:
+    harness = _EarlyCompletionResume("run-final-heartbeat")
+    failure = AuditIntegrityError("final resume heartbeat corruption")
+    harness.factory.run_coordination.worker_heartbeat.side_effect = failure
+    backstop = MagicMock(spec=assert_bound_groups_settled_from_audit)
+    derive = MagicMock(
+        spec=derive_resume_terminal_status_from_audit,
+        return_value=(RunStatus.COMPLETED, ExecutionCounters(rows_processed=3, rows_succeeded=3)),
+    )
+    with (
+        patch.object(harness.orch._ceremony, "emit_run_summary") as summary,
+        patch.object(harness.orch._ceremony, "safe_flush_telemetry") as flush,
+        pytest.raises(AuditIntegrityError) as raised,
+    ):
+        harness.drive(backstop=backstop, derive=derive)
+    assert raised.value is failure
+    harness.factory.run_coordination.release_seat.assert_called()
+    flush.assert_called_once()
+    assert all(call.kwargs["status"].value != "completed" for call in summary.call_args_list)

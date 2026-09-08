@@ -335,7 +335,10 @@ class FollowerProcessor:
                 # named exception arms above deliberately do not depart on
                 # their own: one teardown seam keeps expected and unexpected
                 # traversal failures from leaving an ACTIVE registry row.
-                self._best_effort_depart()
+                try:
+                    self._best_effort_depart()
+                finally:
+                    heartbeat.raise_fatal_failure()
 
     # ------------------------------------------------------------------
     # Internal
@@ -370,9 +373,11 @@ class FollowerProcessor:
                 raise _SeatDeadError(worker_id, run_id)
 
         def ensure_leader_live_before_claim() -> None:
+            heartbeat.raise_fatal_failure()
             ensure_leader_live(force=True)
 
         while True:
+            heartbeat.raise_fatal_failure()
             # Eviction / finalize-departure discrimination (design §B.1 step 5,
             # §D finalize flip).  The heartbeat latch is set on TWO distinct
             # events that differ in meaning:
@@ -456,14 +461,14 @@ class FollowerProcessor:
         return run.status != RunStatus.RUNNING
 
     def _best_effort_depart(self) -> None:
-        """Call depart_worker, containing only transient operational DB failures.
+        """Call depart_worker, recording operational DB failures during teardown.
 
         ``depart_worker`` is atomic (one membership-fenced transaction: fence,
         departure CAS, event insert) and reifies the benign "finalize already
         departed this row" race as a normal return (the fence's refusal is the
         verb's declared no-op), so the only residual failure it is entitled to
-        survive is a transient ``OperationalError`` from a cross-connection
-        depart race (lock contention, connection loss). That is recorded at
+        contain is an ``OperationalError`` (including lock contention and
+        connection loss; the class does not prove transience). It is recorded at
         WARNING and contained: coordination-event writes are loss-tolerant, and
         a worker whose depart did not persist is reclaimed by lease expiry.
         Anything else — an ``IntegrityError`` (the CAS and audit-event insert
@@ -475,7 +480,7 @@ class FollowerProcessor:
             self._run_coordination.depart_worker(member_token=self._token)
         except OperationalError:
             logger.warning(
-                "follower %r: depart_worker hit a transient DB failure; lease expiry will reclaim the seat",
+                "follower %r: depart_worker hit an operational DB failure; lease expiry will reclaim the seat",
                 self._token.worker_id,
                 exc_info=True,
             )

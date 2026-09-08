@@ -161,6 +161,65 @@ def empty_choices_response(
     )
 
 
+def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -> None:
+    from structlog.testing import capture_logs
+
+    class UnprintableTransportError(OSError):
+        def __str__(self) -> str:
+            raise AssertionError("diagnostics must not execute an uncontrolled formatter")
+
+    execution = FakeExecutionRepository()
+
+    def fail_delivery(event: ExternalCallCompleted) -> None:
+        execution.assert_recorded_once()
+        assert event.status == CallStatus.SUCCESS
+        raise UnprintableTransportError("private provider payload")
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=fail_delivery,
+        underlying_client=FakeOpenAIClient(response=provider_response()),
+    )
+    with capture_logs() as records:
+        response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+
+    assert response.content == "Hello!"
+    assert execution.last_record_call_kwargs["status"] == CallStatus.SUCCESS
+    assert records == [
+        {
+            "event": "telemetry_emit_failed",
+            "log_level": "warning",
+            "error_type": "UnprintableTransportError",
+            "run_id": "run-1",
+            "state_id": "state-1",
+            "operation_id": None,
+            "call_type": "llm",
+        }
+    ]
+
+
+@pytest.mark.parametrize("failure", [TypeError("broken callback"), KeyError("missing field")])
+def test_telemetry_programming_errors_propagate_after_audit(failure: Exception) -> None:
+    execution = FakeExecutionRepository()
+
+    def fail_delivery(event: ExternalCallCompleted) -> None:
+        execution.assert_recorded_once()
+        raise failure
+
+    client = AuditedLLMClient(
+        execution=execution,
+        state_id="state-1",
+        run_id="run-1",
+        telemetry_emit=fail_delivery,
+        underlying_client=FakeOpenAIClient(response=provider_response()),
+    )
+    with pytest.raises(type(failure)) as raised:
+        client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
+    assert raised.value is failure
+
+
 class TestLLMResponse:
     """Tests for LLMResponse dataclass."""
 

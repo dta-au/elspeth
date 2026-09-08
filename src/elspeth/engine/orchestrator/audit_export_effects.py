@@ -66,7 +66,7 @@ from elspeth.engine.executors.sink_effects import (
 logger = logging.getLogger(__name__)
 
 
-def _contain_cleanup_failure(action: Callable[[], object], description: str) -> None:
+def _contain_cleanup_failure(action: Callable[[], object], description: str, *, pending_exc: BaseException | None = None) -> None:
     """Record ordinary cleanup failures; preserve Tier-1 integrity failures.
 
     Two call topologies are legitimate, and only these two:
@@ -93,8 +93,21 @@ def _contain_cleanup_failure(action: Callable[[], object], description: str) -> 
         action()
     except contract_errors.TIER_1_ERRORS:
         raise
-    except Exception:
-        logger.exception("audit-export cleanup failed: %s", description)
+    except Exception as cleanup_exc:
+        try:
+            logger.exception("audit-export cleanup failed: %s", description)
+        except contract_errors.TIER_1_ERRORS:
+            raise
+        except Exception as logging_exc:
+            # No working diagnostic channel remains. Preserve both failure
+            # classes on the exception that the caller will actually raise.
+            target = pending_exc if pending_exc is not None else cleanup_exc
+            target.add_note(
+                f"Audit-export cleanup failed: {description}; cleanup_error={type(cleanup_exc).__name__}; "
+                f"diagnostic_error={type(logging_exc).__name__}"
+            )
+            if pending_exc is None:
+                raise cleanup_exc from logging_exc
 
 
 def _required_limit(value: int | None, field_name: str) -> int:
@@ -374,8 +387,8 @@ def prepare_audit_export_snapshot(
                 )
                 spool.flush()
                 os.fsync(spool.fileno())
-            except BaseException:
-                _contain_cleanup_failure(spool.close, "spool close after derivation failure")
+            except BaseException as primary_exc:
+                _contain_cleanup_failure(spool.close, "spool close after derivation failure", pending_exc=primary_exc)
                 spool = None
                 raise
 
@@ -440,15 +453,18 @@ def prepare_audit_export_snapshot(
         if not registration.inserted:
             content_store.mark_candidate_orphans(candidate_id, descriptors)
         winner = registration.winner
-    except BaseException:
+    except BaseException as primary_exc:
         # The primary export, cancellation, or process-control exception is
         # propagating; ordinary cleanup failures are recorded rather than
         # substituted. Tier-1 cleanup failures retain their crash priority.
-        _contain_cleanup_failure(
-            lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
-            f"orphan marking for candidate {candidate_id}",
-        )
-        _contain_cleanup_failure(spool.close, "spool close after candidate registration failure")
+        try:
+            _contain_cleanup_failure(
+                lambda: content_store.mark_candidate_orphans(candidate_id, descriptors),
+                f"orphan marking for candidate {candidate_id}",
+                pending_exc=primary_exc,
+            )
+        finally:
+            _contain_cleanup_failure(spool.close, "spool close after candidate registration failure", pending_exc=primary_exc)
         raise
     # Success path: the export is durably registered and its audit record
     # already exists, so an ordinary spool-close failure is post-success cleanup of a

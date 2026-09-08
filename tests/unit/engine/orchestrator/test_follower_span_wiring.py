@@ -55,6 +55,9 @@ class _RunCoordination:
 class _Heartbeat:
     coordination_lost = False
 
+    def raise_fatal_failure(self) -> None:
+        """This span fixture models a healthy heartbeat."""
+
     def start(self) -> None:
         pass
 

@@ -62,14 +62,19 @@ def plugin_lifecycle_node_id(
         ) from exc
 
 
-def _safe_cleanup_error_text(error: Exception) -> tuple[str, str, int]:
-    """Return public-safe plugin exception text, digest, and raw length."""
+def _safe_cleanup_error_text(error: Exception) -> tuple[str, str | None, int | None]:
+    """Return public-safe text and raw-message evidence when obtainable.
+
+    A formatter failure has no raw message to hash or measure. Its explicit
+    marker describes that failure; it must not acquire fabricated raw-message
+    provenance from the marker's own bytes.
+    """
     try:
         raw_text = str(error)
     except contract_errors.TIER_1_ERRORS:
         raise
-    except Exception:
-        raw_text = f"<unrepresentable {type(error).__name__}>"
+    except Exception as formatting_error:
+        return f"<unrepresentable {type(error).__name__}: {type(formatting_error).__name__}>", None, None
 
     digest = hashlib.sha256(raw_text.encode("utf-8", errors="replace")).hexdigest()[:16]
     public_text = scrub_text_for_audit(raw_text)
