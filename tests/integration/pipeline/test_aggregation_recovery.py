@@ -48,7 +48,9 @@ from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.config import AggregationSettings, CheckpointSettings, SourceSettings, TriggerConfig
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
     aggregation_result_members_table,
     aggregation_result_outputs_table,
@@ -66,7 +68,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSchema, _TestSourceBase, as_sink, as_source, as_transform
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import age_barrier_hold, leader_coordination_token, make_factory
+from tests.fixtures.landscape import age_barrier_hold, leader_coordination_token, leader_token_for, make_factory, member_token_for
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
 
@@ -1132,24 +1134,25 @@ class TestAggregationRecoveryIntegration:
         # Record source rows and create tokens
         tokens = []
         for i in range(3):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 100},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch and add members
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens):
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
 
         # Checkpoint before flush — journal era: scalar-only checkpoint row
         # (buffered payloads live in journal BLOCKED rows, not in a blob).
@@ -1162,7 +1165,9 @@ class TestAggregationRecoveryIntegration:
         )
 
         # Simulate crash during flush
-        factory.execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+        factory.execution.update_batch_status(
+            batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # === PHASE 2: Verify recovery is possible ===
@@ -1183,10 +1188,14 @@ class TestAggregationRecoveryIntegration:
         assert incomplete[0].status == BatchStatus.EXECUTING
 
         # Mark executing as failed (crash interrupted)
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.FAILED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Retry the batch
-        retry_batch = factory.execution.retry_batch(batch.batch_id)
+        retry_batch = factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
         assert retry_batch.attempt == 1
         assert retry_batch.status == BatchStatus.DRAFT
 
@@ -1233,34 +1242,45 @@ class TestAggregationRecoveryIntegration:
         # Create rows and tokens
         tokens = []
         for i in range(4):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 10},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch for sum_aggregator (completed successfully)
         sum_batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens[:2]):
-            factory.execution.add_batch_member(sum_batch.batch_id, token.token_id, ordinal=i)
-        factory.execution.complete_batch(sum_batch.batch_id, BatchStatus.COMPLETED)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=sum_batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
+        factory.execution.complete_batch(
+            sum_batch.batch_id,
+            BatchStatus.COMPLETED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Create batch for count_aggregator (crashed during execution)
         count_batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="count_aggregator",
+            aggregation_node_id="count_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i, token in enumerate(tokens[2:]):
-            factory.execution.add_batch_member(count_batch.batch_id, token.token_id, ordinal=i)
-        factory.execution.update_batch_status(count_batch.batch_id, BatchStatus.EXECUTING)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(
+                    conn, batch_id=count_batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id
+                )
+        factory.execution.update_batch_status(
+            count_batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Checkpoint at last processed token — journal era: scalar-only row.
         create_checkpoint(
@@ -1299,28 +1319,33 @@ class TestAggregationRecoveryIntegration:
         # Create 5 rows with specific order
         tokens = []
         for i in range(5):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"seq": i, "data": f"item_{i}"},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # Create batch with specific member ordering
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         # Add in reverse order to test ordinal preservation
         for i, token in enumerate(reversed(tokens)):
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
 
         # Mark as failed for retry
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.FAILED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.FAILED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
 
         # Checkpoint (journal era: scalar-only row)
         create_checkpoint(
@@ -1332,7 +1357,7 @@ class TestAggregationRecoveryIntegration:
         )
 
         # Retry
-        retry_batch = factory.execution.retry_batch(batch.batch_id)
+        retry_batch = factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify member order is preserved
         original_members = factory.execution.get_batch_members(batch.batch_id)
@@ -1355,35 +1380,42 @@ class TestAggregationRecoveryIntegration:
 
         self._register_nodes_raw(db, run.run_id)
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id="source",
             row_index=0,
             data={"id": 0},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
-        factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=0)
+        with fenced_leader_transaction(
+            db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+        ) as conn:
+            add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=0, expected_run_id=run.run_id)
 
         # Test with draft status
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Test with executing status
-        factory.execution.update_batch_status(batch.batch_id, BatchStatus.EXECUTING)
+        factory.execution.update_batch_status(
+            batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Test with completed status
-        factory.execution.complete_batch(batch.batch_id, BatchStatus.COMPLETED)
+        factory.execution.complete_batch(
+            batch.batch_id,
+            BatchStatus.COMPLETED,
+            coordination_token=leader_token_for(factory._db, run.run_id),
+        )
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
     def _register_nodes_raw(
         self,
@@ -1518,38 +1550,44 @@ class TestAggregationRecoveryIntegration:
         # database's past rather than handed to the verb).
         tokens = []
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="sum_aggregator",
+            aggregation_node_id="sum_aggregator", coordination_token=leader_coordination_token(factory, run.run_id)
         )
         for i in range(3):
-            row_obj = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row_obj, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data={"id": i, "value": i * 100},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row_obj.row_id)
             tokens.append(token)
-            factory.execution.add_batch_member(batch.batch_id, token.token_id, ordinal=i)
+            with fenced_leader_transaction(
+                db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=80, verb="seed_batch_member"
+            ) as conn:
+                add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=token.token_id, ordinal=i, expected_run_id=run.run_id)
             payload = PipelineRow({"id": i, "value": i * 100}, _create_test_schema_contract())
             factory.scheduler.enqueue_ready(
-                run_id=run.run_id,
                 token_id=token.token_id,
                 row_id=token.row_id,
                 node_id="sum_aggregator",
                 step_index=1,
                 ingest_sequence=i,
                 row_payload_json=factory.scheduler.serialize_row_payload(payload),
+                member_token=leader_token_for(factory._db, run.run_id).membership,
             )
-            claimed = factory.scheduler.claim_ready(run_id=run.run_id, lease_owner="seeder", lease_seconds=60)
+            claimed = factory.scheduler.claim_ready(
+                lease_owner="seeder",
+                lease_seconds=60,
+                member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="seeder"),
+            )
             assert claimed is not None and claimed.token_id == token.token_id
             factory.scheduler.mark_blocked(
                 work_item_id=claimed.work_item_id,
                 queue_key=None,
                 barrier_key="sum_aggregator",
                 expected_lease_owner="seeder",
+                member_token=member_token_for(factory._db.engine, run_id=run.run_id, worker_id="seeder"),
             )
             age_barrier_hold(db.engine, claimed.work_item_id, seconds_ago=30.0 - i)  # oldest row anchors the age
         factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))

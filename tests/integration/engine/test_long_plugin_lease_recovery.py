@@ -228,6 +228,7 @@ def _run_follower_attempt(
         )
         ctx = PluginContext(
             run_id=run_id,
+            member_token=member_token_for(db.engine, worker_id=worker_id, run_id=run_id),
             config={},
             landscape=factory.plugin_audit_writer(),
             payload_store=payload_store,

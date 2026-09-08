@@ -153,15 +153,14 @@ class TestResumeSchemaRequired:
 
         # 2. Create rows and checkpoint
         row_data = {"id": 1, "value": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Create checkpoint
         create_checkpoint(

@@ -36,7 +36,7 @@ from tests.fixtures.base_classes import (
     as_source,
     as_transform,
 )
-from tests.fixtures.landscape import insert_crashed_leader_seat
+from tests.fixtures.landscape import expire_leader_seat, insert_crashed_leader_seat, leader_token_for
 from tests.fixtures.pipeline import build_linear_pipeline, build_production_graph
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.helpers.checkpoint import create_checkpoint
@@ -981,7 +981,7 @@ class TestInterruptAndResume:
         )
 
         row, token = setup.factory.data_flow.create_row_with_token(
-            run_id, setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0
+            setup.source_node_id, 0, {"value": 10}, source_row_index=0, ingest_sequence=0, coordination_token=setup.coordination_token
         )
 
         datetime.now(UTC)
@@ -989,7 +989,7 @@ class TestInterruptAndResume:
         payload_contract = SchemaContract(mode="OBSERVED", fields=(), locked=True)
         payload_json = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"value": 10}, payload_contract))
         work_item = scheduler.enqueue_ready_claimed(
-            run_id=run_id,
+            member_token=setup.coordination_token.membership,
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=coalesce_node_id,
@@ -1004,6 +1004,7 @@ class TestInterruptAndResume:
             lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-shutdown-1", member_key="direct_branch"),),
         )
         scheduler.mark_blocked(
+            member_token=setup.coordination_token.membership,
             work_item_id=work_item.work_item_id,
             queue_key=None,
             barrier_key="merge_paths",
@@ -1250,12 +1251,14 @@ class TestInterruptAndResume:
         # Mark first N rows as completed
         factory = make_factory(db)
         for i in range(processed_count):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=f"t{i}", run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="default",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
+            expire_leader_seat(db, run_id)
 
         # Create checkpoint at last processed row
         if processed_count > 0:

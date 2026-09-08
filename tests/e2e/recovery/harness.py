@@ -13,7 +13,7 @@ by a graceful shutdown — the engine always finishes the in-flight row before
 honoring the shutdown event. So each test first runs the REAL pipeline (real
 Orchestrator, real checkpoint writer, real scheduler journal) to an interrupted-but-
 checkpointed state, then crafts the kill instant through the production
-Tier-1 writers themselves: ``RecorderFactory.data_flow.create_row`` /
+Tier-1 writers themselves: ``RecorderFactory.data_flow.create_row_with_token`` /
 ``create_token`` for the row the dead worker was carrying, and
 ``TokenSchedulerRepository.enqueue_ready`` + ``claim_ready`` for its LEASED
 journal row — the exact rows the engine writes before a hard kill. Two
@@ -63,7 +63,7 @@ from types import FunctionType
 from typing import Any, ClassVar, NewType, Self
 
 import pytest
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, select, update
 
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
@@ -102,7 +102,7 @@ from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSourceBase, as_sink, as_source, as_transform
-from tests.fixtures.landscape import expire_lease
+from tests.fixtures.landscape import expire_lease, leader_token_for
 from tests.fixtures.plugins import CollectSink
 
 # Deterministic epoch for the injected MockClock (UTC datetimes derive from it).
@@ -696,42 +696,58 @@ def _craft_crashed_lease(
     A current worker killed after claiming transform work has durably written
     the source row, token, exact source-COMPLETED witness, READY enqueue, and
     LEASED claim under its own ``lease_owner`` — but no transform node state or
-    outcome. Every write below goes through the same Tier-1 production writer
-    the engine uses (RecorderFactory / TokenSchedulerRepository), never raw
-    SQL. The separate TS-02 compatibility test deliberately constructs the
+    outcome. Audit and scheduler writes use the engine's Tier-1 production
+    writers; fixture SQL ages the worker heartbeat and restores the crash status.
+    The separate TS-02 compatibility test deliberately constructs the
     pre-fix image without this source witness.
 
     Epoch-21 (ADR-030 slice 4): ``claim_ready`` is now membership-fenced —
     the claimant must hold an active ``run_workers`` row.  The fictional
     crashed worker is registered as ACTIVE before the claim (matching the
     production lifecycle: every real worker registers before claiming) and
-    left as DEPARTED after — modelling a hard-kill that occurs before the
+    left ACTIVE with an expired heartbeat — modelling a hard-kill before the
     graceful departure ceremony.
 
     Returns the crashed token_id.
     """
-    now = crashed.clock.now_utc()
-    data = {"id": ingest_sequence, "value": ingest_sequence * 10}
-    row = crashed.factory.data_flow.create_row(
+    coordination = crashed.factory.run_coordination
+    owns_fixture_seat = coordination.live_leader(run_id=crashed.run_id) is None
+    with crashed.db.engine.connect() as conn:
+        run = conn.execute(select(runs_table.c.status, runs_table.c.config_hash).where(runs_table.c.run_id == crashed.run_id)).one()
+    if owns_fixture_seat:
+        leader = coordination.acquire_run_leadership(
+            run_id=crashed.run_id,
+            worker_id=f"fixture-seeder:{lease_owner}",
+            window_seconds=300,
+        )
+    else:
+        leader = leader_token_for(crashed.db, crashed.run_id)
+    member = coordination.admit_follower(
         run_id=crashed.run_id,
+        worker_id=lease_owner,
+        config_hash=run.config_hash,
+        window_seconds=300,
+    )
+    data = {"id": ingest_sequence, "value": ingest_sequence * 10}
+    row, token = crashed.factory.data_flow.create_row_with_token(
+        coordination_token=leader,
         source_node_id=crashed.source_node_id,
         row_index=ingest_sequence,
         data=data,
         source_row_index=ingest_sequence,
         ingest_sequence=ingest_sequence,
     )
-    token = crashed.factory.data_flow.create_token(row_id=row.row_id)
     crashed.factory.execution.record_completed_node_state(
         token_id=token.token_id,
         node_id=crashed.source_node_id,
-        run_id=crashed.run_id,
+        coordination_token=leader,
         step_index=0,
         input_data=data,
         output_data=data,
         duration_ms=0,
     )
     crashed.repo.enqueue_ready(
-        run_id=crashed.run_id,
+        member_token=member,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=crashed.journal_node_id,
@@ -739,8 +755,7 @@ def _craft_crashed_lease(
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
     )
-    # Register the fictional crashed worker as ACTIVE so the membership fence
-    # in claim_ready admits it. Liveness is judged against the Landscape
+    # Age the admitted fictional worker's heartbeat. Liveness uses the Landscape
     # database clock (ADR-047), so the heartbeat is written explicitly into
     # that clock's past, lapsed by more than the liveness grace window: the
     # worker is already DEAD to every sweep, and advancing the harness's
@@ -748,18 +763,10 @@ def _craft_crashed_lease(
     with crashed.db.engine.begin() as conn:
         stale_heartbeat = read_landscape_transaction_time(conn) - timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS + 1)
         conn.execute(
-            insert(run_workers_table).values(
-                worker_id=lease_owner,
-                run_id=crashed.run_id,
-                role="follower",
-                status="active",
-                registered_at=now,
-                heartbeat_expires_at=stale_heartbeat,
-                entry_point="harness",
-            )
+            run_workers_table.update().where(run_workers_table.c.worker_id == member.worker_id).values(heartbeat_expires_at=stale_heartbeat)
         )
     claimed = crashed.repo.claim_ready(
-        run_id=crashed.run_id,
+        member_token=member,
         lease_owner=lease_owner,
         lease_seconds=lease_seconds,
     )
@@ -770,6 +777,11 @@ def _craft_crashed_lease(
         # with ``expire_lease`` at the point its scenario says it lapses.
         expire_lease(crashed.db.engine, claimed.work_item_id)
     crashed.crashed_token_ids[ingest_sequence] = token.token_id
+    if owns_fixture_seat:
+        coordination.release_seat(token=leader)
+        # Restore the preexisting crash status after the fixture's write ceremony.
+        with crashed.db.engine.begin() as conn:
+            conn.execute(runs_table.update().where(runs_table.c.run_id == crashed.run_id).values(status=run.status))
     return token.token_id
 
 

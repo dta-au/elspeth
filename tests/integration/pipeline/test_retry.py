@@ -51,7 +51,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
 from tests.fixtures.factories import make_context
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.fixtures.pipeline import build_linear_pipeline
 from tests.fixtures.plugins import CollectSink, FailingSink, ListSource
 
@@ -519,12 +519,12 @@ class TestRetryAuditTrail:
 
         # Register transform node
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name=plugin_name,
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config={},
             schema_config=schema_config,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         return run.run_id, node.node_id
@@ -545,17 +545,14 @@ class TestRetryAuditTrail:
         contract = _make_contract(row_data)
 
         # Create the row record
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-
-        # Create the token record
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Wrap in PipelineRow
         pipeline_row = PipelineRow(row_data, contract)
@@ -590,12 +587,12 @@ class TestRetryAuditTrail:
 
         schema_config = SchemaConfig(mode="observed", fields=None)
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=schema_config,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
         # Create token
@@ -613,7 +610,9 @@ class TestRetryAuditTrail:
         # Create retry manager with 3 attempts (enough to succeed)
         retry_manager = RetryManager(RuntimeRetryConfig(max_attempts=3, base_delay=0.01, max_delay=60.0, jitter=0.0, exponential_base=2.0))
 
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id=run_id, landscape=factory.plugin_audit_writer(), member_token=leader_coordination_token(factory, run_id).membership
+        )
         transform.on_start(ctx)
 
         # Track attempt number manually since _execute_transform_with_retry
@@ -698,12 +697,12 @@ class TestRetryAuditTrail:
 
         schema_config = SchemaConfig(mode="observed", fields=None)
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=schema_config,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
         # Create token
@@ -721,7 +720,9 @@ class TestRetryAuditTrail:
         # Create retry manager with only 2 attempts
         retry_manager = RetryManager(RuntimeRetryConfig(max_attempts=2, base_delay=0.01, max_delay=60.0, jitter=0.0, exponential_base=2.0))
 
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id=run_id, landscape=factory.plugin_audit_writer(), member_token=leader_coordination_token(factory, run_id).membership
+        )
         transform.on_start(ctx)
 
         # Track attempt number
@@ -809,12 +810,12 @@ class TestRetryAuditTrail:
 
         schema_config = SchemaConfig(mode="observed", fields=None)
         source_node = factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=schema_config,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
 
         # Create token
@@ -829,7 +830,9 @@ class TestRetryAuditTrail:
         step_resolver = lambda node_id: 1  # noqa: E731
         transform_executor = TransformExecutor(factory.execution, span_factory, step_resolver, data_flow=factory.data_flow)
 
-        ctx = make_context(run_id=run_id, landscape=factory.plugin_audit_writer())
+        ctx = make_context(
+            run_id=run_id, landscape=factory.plugin_audit_writer(), member_token=leader_coordination_token(factory, run_id).membership
+        )
         transform.on_start(ctx)
 
         # Execute without retry manager (single attempt)

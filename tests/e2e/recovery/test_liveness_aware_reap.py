@@ -62,7 +62,7 @@ from tests.e2e.recovery.harness import (
     _run_to_interrupted_checkpoint,
     _work_items_by_token,
 )
-from tests.fixtures.landscape import expire_lease, landscape_database_now
+from tests.fixtures.landscape import expire_lease, landscape_database_now, member_token_for
 
 # Grace window used in every test — matches production default.
 _GRACE = DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
@@ -318,11 +318,10 @@ class TestLivenessAwareReap:
         # still-LEASED item in place (the production revive path) — the
         # deadline moves from the database clock's past to its future.
         revived_until = crashed.repo.heartbeat_lease(
-            run_id=crashed.run_id,
             work_item_id=str(items_after[crashed_token]["work_item_id"]),
             lease_owner=slow_worker,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
-            membership_fenced=True,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=slow_worker),
         )
         assert revived_until > landscape_database_now(crashed.db.engine) - timedelta(seconds=1)
         revived = _work_items_by_token(crashed.db, crashed.run_id)[crashed_token]

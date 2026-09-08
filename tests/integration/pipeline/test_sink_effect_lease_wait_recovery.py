@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import Mock, create_autospec
+from unittest.mock import create_autospec
 
 import pytest
 from sqlalchemy import select, update
@@ -78,7 +78,11 @@ def test_lease_wait_clock_expires_at_observed_database_boundary(remaining_validi
     """Equality and a fresh lease both cross the next strict SQLite clock boundary."""
     effects = create_autospec(SinkEffectRepository, instance=True)
     effects.lease_validity_seconds.return_value = remaining_validity
-    expire_lease = Mock()
+
+    def expire_lease_callback() -> None:
+        """Expire the test's observed lease."""
+
+    expire_lease = create_autospec(expire_lease_callback)
     lease_clock = _LeaseWaitClock(MockClock(), effects, "effect", expire_lease)
     boundary = remaining_validity + 1.0
 

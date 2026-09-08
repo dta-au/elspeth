@@ -20,8 +20,8 @@ import pytest
 from sqlalchemy import event, select
 
 from elspeth.contracts import PipelineRow
-from elspeth.contracts.coordination import CoordinationToken
-from elspeth.contracts.errors import RunLeadershipLostError, RunWorkerEvictedError
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
@@ -51,7 +51,14 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_token_for, member_token_for
+from tests.fixtures.landscape import (
+    assert_stamped_between,
+    expire_leader_seat,
+    expire_lease,
+    landscape_database_now,
+    leader_token_for,
+    member_token_for,
+)
 from tests.helpers.state_engine import capture_state_engine_image
 
 _PROCESS_TIMEOUT_SECONDS = 20.0
@@ -72,6 +79,7 @@ def _pause_on_token_work_statement(
     before_update: Any,
     permit_update: Any,
     statement_prefix: str,
+    table_name: str = "TOKEN_WORK_ITEMS",
 ) -> Any:
     """Install a child-local hook after write intent, before a claim statement."""
 
@@ -84,7 +92,7 @@ def _pause_on_token_work_statement(
         _executemany: bool,
     ) -> None:
         normalized = statement.lstrip().upper()
-        if normalized.startswith(statement_prefix) and "TOKEN_WORK_ITEMS" in normalized:
+        if normalized.startswith(statement_prefix) and table_name in normalized:
             before_update.set()
             if not permit_update.wait(_PROCESS_TIMEOUT_SECONDS):
                 raise TimeoutError("winner was not released from the contested token-work UPDATE")
@@ -102,9 +110,9 @@ def _claim_ready_as_registered_process(
 ) -> None:
     """Child action: cross the registered READY-claim production repository."""
     claimed = RecorderFactory(db).scheduler.claim_ready(
-        run_id=run_id,
         lease_owner=worker_id,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
+        member_token=member_token_for(db.engine, run_id=run_id, worker_id=worker_id),
     )
     if expected_token_id is None:
         assert claimed is None
@@ -150,9 +158,9 @@ def _park_pending_sink_as_registered_process(
     factory = RecorderFactory(db)
     datetime.fromisoformat(now_iso)
     claimed = factory.scheduler.claim_ready(
-        run_id=run_id,
         lease_owner=worker_id,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
+        member_token=member_token_for(factory._db.engine, run_id=run_id, worker_id=worker_id),
     )
     assert claimed is not None
     assert claimed.token_id == expected_token_id
@@ -165,29 +173,33 @@ def _park_pending_sink_as_registered_process(
         error_hash=None,
         error_message=None,
         expected_lease_owner=worker_id,
-        worker_id=worker_id,
+        member_token=member_token_for(factory._db.engine, run_id=run_id, worker_id=worker_id),
     )
 
 
 def _claim_pending_sink_as_registered_process(
     db: LandscapeDB,
-    run_id: str,
-    worker_id: str,
+    coordination_token: CoordinationToken,
     now_iso: str,
     expected_token_id: str | None,
 ) -> None:
     """Child action: cross the registered complete-bundle claim boundary."""
-    claimed = RecorderFactory(db).scheduler.claim_pending_sink(
-        run_id=run_id,
-        lease_owner=worker_id,
-        lease_seconds=_DEFAULT_LEASE_SECONDS,
-    )
     if expected_token_id is None:
-        assert claimed is None
+        with pytest.raises(RunLeadershipLostError):
+            RecorderFactory(db).scheduler.claim_pending_sink(
+                lease_owner=coordination_token.worker_id,
+                lease_seconds=_DEFAULT_LEASE_SECONDS,
+                coordination_token=coordination_token,
+            )
         return
+    claimed = RecorderFactory(db).scheduler.claim_pending_sink(
+        lease_owner=coordination_token.worker_id,
+        lease_seconds=_DEFAULT_LEASE_SECONDS,
+        coordination_token=coordination_token,
+    )
     assert claimed is not None
     assert claimed.token_id == expected_token_id
-    assert claimed.lease_owner == worker_id
+    assert claimed.lease_owner == coordination_token.worker_id
     assert claimed.pending_sink_name == "output"
     assert claimed.pending_outcome == "success"
     assert claimed.pending_path == "default_flow"
@@ -195,8 +207,7 @@ def _claim_pending_sink_as_registered_process(
 
 def _contend_pending_sink_claim_as_registered_process(
     db: LandscapeDB,
-    run_id: str,
-    worker_id: str,
+    coordination_token: CoordinationToken,
     now_iso: str,
     expected_token_id: str | None,
     call_entered: Any,
@@ -208,10 +219,16 @@ def _contend_pending_sink_claim_as_registered_process(
     """Enter a real pending claim while optional SQL hooks hold its lock."""
     listener = None
     if before_update is not None and permit_update is not None:
-        listener = _pause_on_token_work_statement(db, before_update, permit_update, pause_statement_prefix)
+        listener = _pause_on_token_work_statement(
+            db,
+            before_update,
+            permit_update,
+            pause_statement_prefix,
+            "RUN_COORDINATION" if expected_token_id is None else "TOKEN_WORK_ITEMS",
+        )
     call_entered.set()
     try:
-        _claim_pending_sink_as_registered_process(db, run_id, worker_id, now_iso, expected_token_id)
+        _claim_pending_sink_as_registered_process(db, coordination_token, now_iso, expected_token_id)
         call_returned.set()
     finally:
         if listener is not None:
@@ -373,11 +390,10 @@ def _lease_heartbeat_process(
     del now_iso  # the deadline is Landscape database time + lease_seconds (ADR-047), not a caller clock
     heartbeat_from = landscape_database_now(db.engine)
     expires_at = RecorderFactory(db).scheduler.heartbeat_lease(
-        run_id=run_id,
         work_item_id=work_item_id,
         lease_owner=worker_id,
         lease_seconds=2 * _DEFAULT_LEASE_SECONDS,
-        membership_fenced=True,
+        member_token=member_token_for(db.engine, run_id=run_id, worker_id=worker_id),
     )
     assert_stamped_between(
         expires_at, start=heartbeat_from, end=landscape_database_now(db.engine), offset=timedelta(seconds=2 * _DEFAULT_LEASE_SECONDS)
@@ -391,11 +407,11 @@ def _refuse_inactive_claim_process(
     now_iso: str,
 ) -> None:
     """Refuse a registered-but-inactive worker before claim mutation."""
-    with pytest.raises(RunWorkerEvictedError):
+    with pytest.raises(RunMembershipLostError):
         RecorderFactory(db).scheduler.claim_ready(
-            run_id=run_id,
             lease_owner=worker_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(db.engine, run_id=run_id, worker_id=worker_id),
         )
 
 
@@ -406,37 +422,40 @@ def _refuse_inactive_disposition_process(
     now_iso: str,
 ) -> None:
     """Refuse a registered-but-inactive worker before disposition mutation."""
-    with pytest.raises(RunWorkerEvictedError):
+    with db.engine.connect() as conn:
+        run_id = conn.execute(
+            select(token_work_items_table.c.run_id).where(token_work_items_table.c.work_item_id == work_item_id)
+        ).scalar_one()
+    with pytest.raises(RunMembershipLostError):
         RecorderFactory(db).scheduler.mark_terminal(
             work_item_id=work_item_id,
             expected_lease_owner=worker_id,
-            worker_id=worker_id,
+            member_token=member_token_for(db.engine, run_id=run_id, worker_id=worker_id),
         )
 
 
 def _refuse_inactive_enqueue_process(
     db: LandscapeDB,
-    run_id: str,
+    member_token: WorkerMembershipToken,
     token_id: str,
     row_id: str,
     node_id: str,
     step_index: int,
     ingest_sequence: int,
     row_payload_json: str,
-    worker_id: str,
+    expected_error: type[Exception],
     now_iso: str,
 ) -> None:
     """Refuse inactive or absent membership before enqueue insertion."""
-    with pytest.raises(RunWorkerEvictedError):
+    with pytest.raises(expected_error):
         RecorderFactory(db).scheduler.enqueue_ready(
-            run_id=run_id,
             token_id=token_id,
             row_id=row_id,
             node_id=node_id,
             step_index=step_index,
             ingest_sequence=ingest_sequence,
             row_payload_json=row_payload_json,
-            worker_id=worker_id,
+            member_token=member_token,
         )
 
 
@@ -581,7 +600,7 @@ def test_registered_process_ready_claim_has_one_owner_and_zero_mutation_loser(
 
 
 @pytest.mark.timeout(120)
-def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_loser(
+def test_registered_process_pending_sink_claim_preserves_bundle_and_refuses_predecessor(
     tmp_path: Path,
     request: pytest.FixtureRequest,
 ) -> None:
@@ -590,9 +609,9 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_lo
     request.addfinalizer(crashed.db.close)
     clock.advance(_DEFAULT_LEASE_SECONDS + 60)
     leader_id = f"worker:{crashed.run_id}:leader-pending-authority"
-    leader_token = _seat_run_with_live_leader(crashed, leader_id=leader_id)
-    producer_id = _join_follower(crashed, leader_token)
-    loser_id = _join_follower(crashed, leader_token)
+    loser_id = f"worker:{crashed.run_id}:predecessor-pending-authority"
+    predecessor_token = _seat_run_with_live_leader(crashed, leader_id=loser_id)
+    producer_id = _join_follower(crashed, predecessor_token)
     token_id, work_item_id = _seed_ready_row(crashed, ingest_sequence=101)
 
     with spawn_database_process_at_seam(
@@ -618,6 +637,8 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_lo
     )
     parked_bundle = {column: parked[column] for column in bundle_columns}
     assert parked["status"] == TokenWorkStatus.PENDING_SINK.value
+    expire_leader_seat(crashed.db, crashed.run_id)
+    leader_token = _seat_run_with_live_leader(crashed, leader_id=leader_id)
 
     spawn_context = multiprocessing.get_context("spawn")
     winner_entered = spawn_context.Event()
@@ -634,8 +655,7 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_lo
         seam="registered-pending-winner",
         action=_contend_pending_sink_claim_as_registered_process,
         action_args=(
-            crashed.run_id,
-            leader_id,
+            leader_token,
             clock.now_utc().isoformat(),
             token_id,
             winner_entered,
@@ -651,21 +671,20 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_lo
             seam="registered-pending-loser",
             action=_contend_pending_sink_claim_as_registered_process,
             action_args=(
-                crashed.run_id,
-                loser_id,
+                predecessor_token,
                 clock.now_utc().isoformat(),
                 None,
                 loser_entered,
                 loser_returned,
                 loser_before_update,
                 permit_loser_update,
-                "SELECT",
+                "UPDATE",
             ),
         ) as loser:
             assert winner_entered.is_set()
             assert loser_entered.wait(_PROCESS_TIMEOUT_SECONDS), "loser did not enter its repository call"
             assert not loser_returned.wait(0.25), "loser returned while the winner held SQLite write intent"
-            assert not loser_before_update.is_set(), "loser reached SELECT before the winner released SQLite write intent"
+            assert not loser_before_update.is_set(), "predecessor reached its fence before the winner released SQLite write intent"
             permit_winner_update.set()
             winner_ready = winner.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             assert winner_returned.is_set()
@@ -678,7 +697,17 @@ def test_registered_process_pending_sink_claim_preserves_bundle_and_has_clean_lo
             loser_image = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
             _release_and_assert_clean(winner, loser)
 
-    assert loser_image == winner_image, "the losing pending-sink claimant must mutate no durable plane"
+    winner_image.diff(loser_image).assert_only({"run_coordination_events": set(run_coordination_events_table.c.keys())})
+    assert loser_image.tables["token_work_items"] == winner_image.tables["token_work_items"]
+    refusals = [
+        row
+        for row in loser_image.tables["run_coordination_events"]
+        if row["event_type"] == "fence_refusal"
+        and row["worker_id"] == loser_id
+        and json.loads(str(row["context_json"])) == {"verb": "claim_pending_sink"}
+    ]
+    assert len(refusals) == 1
+    assert refusals[0]["leader_epoch"] == predecessor_token.leader_epoch
     with crashed.db.engine.connect() as conn:
         claimed = dict(
             conn.execute(select(token_work_items_table).where(token_work_items_table.c.work_item_id == work_item_id)).mappings().one()
@@ -877,9 +906,11 @@ def test_inactive_registered_process_is_refused_for_claim_and_disposition_withou
     ) as refused_claim:
         refused_claim.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         _release_and_assert_clean(refused_claim)
-    assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == before_claim
+    after_claim = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
+    before_claim.diff(after_claim).assert_only({"run_coordination_events": set(run_coordination_events_table.c.keys())})
+    assert len(after_claim.tables["run_coordination_events"]) == len(before_claim.tables["run_coordination_events"]) + 1
 
-    before_disposition = before_claim
+    before_disposition = after_claim
     with spawn_database_process_at_seam(
         database_url=crashed.db.connection_string,
         seam="inactive-disposition-refusal",
@@ -888,7 +919,9 @@ def test_inactive_registered_process_is_refused_for_claim_and_disposition_withou
     ) as refused_disposition:
         refused_disposition.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         _release_and_assert_clean(refused_disposition)
-    assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == before_disposition
+    after_disposition = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
+    before_disposition.diff(after_disposition).assert_only({"run_coordination_events": set(run_coordination_events_table.c.keys())})
+    assert len(after_disposition.tables["run_coordination_events"]) == len(before_disposition.tables["run_coordination_events"]) + 1
 
     evicted_worker = _join_follower(crashed, leader_token)
     with crashed.db.engine.begin() as conn:
@@ -897,20 +930,28 @@ def test_inactive_registered_process_is_refused_for_claim_and_disposition_withou
             .where(run_workers_table.c.worker_id == evicted_worker)
             .values(status="evicted", evicted_at=clock.now_utc())
         )
-    for sequence, worker_id, seam in (
-        (107, evicted_worker, "evicted-enqueue-refusal"),
-        (108, f"worker:{crashed.run_id}:absent", "absent-enqueue-refusal"),
+    missing_worker = _join_follower(crashed, leader_token)
+    missing_member = member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=missing_worker)
+    with crashed.db.engine.begin() as conn:
+        conn.execute(run_workers_table.delete().where(run_workers_table.c.worker_id == missing_worker))
+    for sequence, member, expected_error, seam in (
+        (
+            107,
+            member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=evicted_worker),
+            RunMembershipLostError,
+            "evicted-enqueue-refusal",
+        ),
+        (108, missing_member, AuditIntegrityError, "missing-membership-corruption"),
     ):
         data = {"id": sequence, "value": sequence * 10}
-        row = crashed.factory.data_flow.create_row(
-            run_id=crashed.run_id,
+        row, token = crashed.factory.data_flow.create_row_with_token(
             source_node_id=crashed.source_node_id,
             row_index=sequence,
             data=data,
             source_row_index=sequence,
             ingest_sequence=sequence,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
         )
-        token = crashed.factory.data_flow.create_token(row_id=row.row_id)
         payload = TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data)))
         before_enqueue = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
         with spawn_database_process_at_seam(
@@ -918,20 +959,25 @@ def test_inactive_registered_process_is_refused_for_claim_and_disposition_withou
             seam=seam,
             action=_refuse_inactive_enqueue_process,
             action_args=(
-                crashed.run_id,
+                member,
                 token.token_id,
                 row.row_id,
                 crashed.journal_node_id,
                 crashed.journal_step_index,
                 sequence,
                 payload,
-                worker_id,
+                expected_error,
                 clock.now_utc().isoformat(),
             ),
         ) as refused_enqueue:
             refused_enqueue.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             _release_and_assert_clean(refused_enqueue)
-        assert capture_state_engine_image(crashed.factory, run_id=crashed.run_id) == before_enqueue
+        after_enqueue = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
+        if expected_error is AuditIntegrityError:
+            assert after_enqueue == before_enqueue
+        else:
+            before_enqueue.diff(after_enqueue).assert_only({"run_coordination_events": set(run_coordination_events_table.c.keys())})
+            assert len(after_enqueue.tables["run_coordination_events"]) == len(before_enqueue.tables["run_coordination_events"]) + 1
 
 
 @pytest.mark.timeout(120)
@@ -1005,7 +1051,8 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
     leader_id = f"worker:{crashed.run_id}:leader-recovery-authority"
     leader_token = _seat_run_with_live_leader(crashed, leader_id=leader_id)
     transform_owner = _join_follower(crashed, leader_token)
-    sink_owner = _join_follower(crashed, leader_token)
+    sink_producer = _join_follower(crashed, leader_token)
+    sink_owner = leader_id
 
     transform_token_id, transform_work_item_id = _seed_ready_row(crashed, ingest_sequence=102)
     with spawn_database_process_at_seam(
@@ -1022,7 +1069,7 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
         database_url=crashed.db.connection_string,
         seam="registered-sink-producer",
         action=_park_pending_sink_as_registered_process,
-        action_args=(crashed.run_id, sink_owner, clock.now_utc().isoformat(), sink_token_id),
+        action_args=(crashed.run_id, sink_producer, clock.now_utc().isoformat(), sink_token_id),
     ) as sink_producer:
         sink_producer.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         _release_and_assert_clean(sink_producer)
@@ -1030,7 +1077,7 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
         database_url=crashed.db.connection_string,
         seam="registered-sink-redrive-claim",
         action=_claim_pending_sink_as_registered_process,
-        action_args=(crashed.run_id, sink_owner, clock.now_utc().isoformat(), sink_token_id),
+        action_args=(leader_token, clock.now_utc().isoformat(), sink_token_id),
     ) as sink_claimant:
         sink_claimant.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         _release_and_assert_clean(sink_claimant)
@@ -1056,6 +1103,10 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
         leased_rows[transform_token_id]["lease_expires_at"],
         leased_rows[sink_token_id]["lease_expires_at"],
     ) + timedelta(seconds=1)
+    predecessor_token = leader_token
+    crashed.factory.run_coordination.release_seat(token=predecessor_token)
+    leader_id = f"worker:{crashed.run_id}:replacement-recovery-authority"
+    leader_token = _seat_run_with_live_leader(crashed, leader_id=leader_id)
     with crashed.db.engine.begin() as conn:
         conn.execute(
             run_workers_table.update()
@@ -1120,13 +1171,22 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
     assert events_by_token[sink_token_id]["from_attempt"] == 1
     assert events_by_token[sink_token_id]["to_attempt"] == 1
 
-    replacement_id = _join_follower(crashed, leader_token)
-    losing_replacement_id = _join_follower(crashed, leader_token)
+    replacement_id = leader_id
+    losing_replacement_id = predecessor_token.worker_id
+    with crashed.db.engine.connect() as conn:
+        prior_claim_event_ids = tuple(
+            conn.execute(
+                select(scheduler_events_table.c.event_id).where(
+                    scheduler_events_table.c.token_id == sink_token_id,
+                    scheduler_events_table.c.event_type == SchedulerEventType.CLAIM_PENDING_SINK.value,
+                )
+            ).scalars()
+        )
     with spawn_database_process_at_seam(
         database_url=crashed.db.connection_string,
         seam="registered-recovered-sink-winner",
         action=_claim_pending_sink_as_registered_process,
-        action_args=(crashed.run_id, replacement_id, recovery_now.isoformat(), sink_token_id),
+        action_args=(leader_token, recovery_now.isoformat(), sink_token_id),
     ) as winner:
         winner.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
         winner_image = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
@@ -1134,12 +1194,21 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
             database_url=crashed.db.connection_string,
             seam="registered-recovered-sink-loser",
             action=_claim_pending_sink_as_registered_process,
-            action_args=(crashed.run_id, losing_replacement_id, recovery_now.isoformat(), None),
+            action_args=(predecessor_token, recovery_now.isoformat(), None),
         ) as loser:
             loser.wait_until_ready(timeout=_PROCESS_TIMEOUT_SECONDS)
             loser_image = capture_state_engine_image(crashed.factory, run_id=crashed.run_id)
             _release_and_assert_clean(winner, loser)
-    assert loser_image == winner_image
+    winner_image.diff(loser_image).assert_only({"run_coordination_events": set(run_coordination_events_table.c.keys())})
+    assert loser_image.tables["token_work_items"] == winner_image.tables["token_work_items"]
+    refusals = [
+        row
+        for row in loser_image.tables["run_coordination_events"]
+        if row["event_type"] == "fence_refusal"
+        and row["worker_id"] == losing_replacement_id
+        and json.loads(str(row["context_json"])) == {"verb": "claim_pending_sink"}
+    ]
+    assert len(refusals) == 1
     with crashed.db.engine.connect() as conn:
         reclaimed_sink = dict(
             conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == sink_token_id)).mappings().one()
@@ -1151,6 +1220,7 @@ def test_registered_leader_process_recovers_transform_and_sink_redrive_exactly(
                     scheduler_events_table.c.token_id == sink_token_id,
                     scheduler_events_table.c.event_type == SchedulerEventType.CLAIM_PENDING_SINK.value,
                     scheduler_events_table.c.caller_owner.in_((replacement_id, losing_replacement_id)),
+                    scheduler_events_table.c.event_id.not_in(prior_claim_event_ids),
                 )
             ).mappings()
         )

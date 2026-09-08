@@ -31,7 +31,7 @@ Common contract asserted for EVERY fenced verb:
 Slice scope: ``adopt_blocked_barrier_item`` and
 ``adopt_group_losses`` joined this matrix in slice 3 (design :490);
 the membership-fence arms (``claim_ready`` / ``claim_pending_sink`` /
-``enqueue_ready`` refusing ``RunWorkerEvictedError``) are slice 4.
+``enqueue_ready`` refusing ``RunMembershipLostError``) are slice 4.
 """
 
 from __future__ import annotations
@@ -45,13 +45,13 @@ import pytest
 from sqlalchemy import func, insert, select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.enums import FrameKind
 from elspeth.contracts.errors import (
     AuditIntegrityError,
     OrchestrationInvariantError,
     RunLeadershipLostError,
-    RunWorkerEvictedError,
+    RunMembershipLostError,
 )
 from elspeth.contracts.scheduler import GroupLossSpec, SourceIngestSpec, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
@@ -90,7 +90,7 @@ from tests.e2e.recovery.harness import (
     _run_workers,
     _usurp_seat,
 )
-from tests.fixtures.landscape import expire_leader_seat
+from tests.fixtures.landscape import expire_leader_seat, leader_token_for, member_token_for
 from tests.helpers.checkpoint import create_checkpoint
 
 WORKER_OLD = "worker-old"
@@ -128,28 +128,27 @@ def _seed_journal_row(crashed: _CrashedRun, *, ingest_sequence: int) -> tuple[st
     Returns (token_id, row_id, work_item_id).
     """
     data = {"id": ingest_sequence, "value": ingest_sequence * 10}
-    row = crashed.factory.data_flow.create_row(
-        run_id=crashed.run_id,
+    row, token = crashed.factory.data_flow.create_row_with_token(
         source_node_id=crashed.source_node_id,
         row_index=ingest_sequence,
         data=data,
         source_row_index=ingest_sequence,
         ingest_sequence=ingest_sequence,
+        coordination_token=leader_token_for(crashed.db, crashed.run_id),
     )
-    token = crashed.factory.data_flow.create_token(row_id=row.row_id)
     crashed.repo.enqueue_ready(
-        run_id=crashed.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=crashed.journal_node_id,
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
+        member_token=leader_token_for(crashed.db, crashed.run_id).membership,
     )
     claimed = crashed.repo.claim_ready(
-        run_id=crashed.run_id,
         lease_owner=WORKER_OLD,
         lease_seconds=_DEFAULT_LEASE_SECONDS,
+        member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=WORKER_OLD),
     )
     assert claimed is not None and claimed.token_id == token.token_id
     return token.token_id, row.row_id, claimed.work_item_id
@@ -169,12 +168,13 @@ def _parked_pending_sink(crashed: _CrashedRun, *, ingest_sequence: int, claim_ba
         error_hash=None,
         error_message=None,
         expected_lease_owner=WORKER_OLD,
+        member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=WORKER_OLD),
     )
     if claim_back:
         reclaimed = crashed.repo.claim_pending_sink(
-            run_id=crashed.run_id,
             lease_owner=WORKER_OLD,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
         )
         assert reclaimed is not None and reclaimed.token_id == token_id
     return token_id
@@ -354,6 +354,7 @@ class TestSuspendedWinnerFences:
             queue_key=None,
             barrier_key="barrier-1",
             expected_lease_owner=WORKER_OLD,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=WORKER_OLD),
         )
         current = _usurp(crashed)
         seat_before = _coordination_row(crashed.db, crashed.run_id)
@@ -365,7 +366,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
             crashed.repo.complete_barrier(
-                run_id=crashed.run_id,
                 barrier_key="barrier-1",
                 consumed_token_ids=(token_id,),
                 emitted_pending_sink=(),
@@ -383,7 +383,6 @@ class TestSuspendedWinnerFences:
 
         # Positive control: the current leader completes the same barrier.
         crashed.repo.complete_barrier(
-            run_id=crashed.run_id,
             barrier_key="barrier-1",
             consumed_token_ids=(token_id,),
             emitted_pending_sink=(),
@@ -409,8 +408,11 @@ class TestSuspendedWinnerFences:
             queue_key=None,
             barrier_key="agg-1",
             expected_lease_owner=WORKER_OLD,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=WORKER_OLD),
         )
-        batch = crashed.factory.execution.create_batch(crashed.run_id, crashed.journal_node_id)
+        batch = crashed.factory.execution.create_batch(
+            crashed.journal_node_id, coordination_token=leader_token_for(crashed.db, crashed.run_id)
+        )
         current = _usurp(crashed)
         seat_before = _coordination_row(crashed.db, crashed.run_id)
         item_before = _work_item(crashed.db, token_id)
@@ -421,7 +423,6 @@ class TestSuspendedWinnerFences:
 
         def _adopt(coordination_token: CoordinationToken) -> Any:
             return crashed.repo.adopt_blocked_barrier_item(
-                run_id=crashed.run_id,
                 work_item_id=work_item_id,
                 token_id=token_id,
                 barrier_key="agg-1",
@@ -476,15 +477,15 @@ class TestSuspendedWinnerFences:
         replay cursor (``adopted_epoch`` stays NULL for the real leader's
         intake replay)."""
         crashed, token_old = _takeover_image(tmp_path)
-        row = crashed.factory.data_flow.create_row(
-            run_id=crashed.run_id,
+        _row, token = crashed.factory.data_flow.create_row_with_token(
             source_node_id=crashed.source_node_id,
             row_index=99,
             data={"id": 99},
             source_row_index=99,
             ingest_sequence=99,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
+            token_id="token-left",
         )
-        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-left")
         with begin_write(crashed.db.engine) as conn:
             assert record_group_loss(
                 conn,
@@ -505,7 +506,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
             crashed.repo.adopt_group_losses(
-                run_id=crashed.run_id,
                 loss_ids=(loss.loss_id,),
                 coordination_token=token_old,
             )
@@ -520,7 +520,6 @@ class TestSuspendedWinnerFences:
 
         # Positive control: the current leader marks it under its own epoch.
         marked = crashed.repo.adopt_group_losses(
-            run_id=crashed.run_id,
             loss_ids=(loss.loss_id,),
             coordination_token=current,
         )
@@ -537,15 +536,15 @@ class TestSuspendedWinnerFences:
         exact ``fenced_leader_transaction`` wrapper — there is no claimed
         token at intake time for either verb, so both fence the same way."""
         crashed, token_old = _takeover_image(tmp_path)
-        row = crashed.factory.data_flow.create_row(
-            run_id=crashed.run_id,
+        _row, token = crashed.factory.data_flow.create_row_with_token(
             source_node_id=crashed.source_node_id,
             row_index=98,
             data={"id": 98},
             source_row_index=98,
             ingest_sequence=98,
+            coordination_token=leader_token_for(crashed.db, crashed.run_id),
+            token_id="token-outer-a",
         )
-        token = crashed.factory.data_flow.create_token(row_id=row.row_id, token_id="token-outer-a")
         current = _usurp(crashed)
         seat_before = _coordination_row(crashed.db, crashed.run_id)
 
@@ -559,7 +558,6 @@ class TestSuspendedWinnerFences:
 
         def _stage(coordination_token: CoordinationToken) -> bool:
             return crashed.repo.stage_escalation_loss(
-                run_id=crashed.run_id,
                 spec=spec,
                 frame_kind=FrameKind.FORK,
                 declared_roster=("outer_a",),
@@ -716,7 +714,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError) as exc_info:
             crashed.repo.mark_pending_sink_terminal_many(
-                run_id=crashed.run_id,
                 token_ids=(token_id,),
                 expected_lease_owner=WORKER_OLD,
                 coordination_token=token_old,
@@ -732,7 +729,6 @@ class TestSuspendedWinnerFences:
 
         # Positive control: same batch, same owner, current epoch.
         terminalized = crashed.repo.mark_pending_sink_terminal_many(
-            run_id=crashed.run_id,
             token_ids=(token_id,),
             expected_lease_owner=WORKER_OLD,
             coordination_token=current,
@@ -767,7 +763,6 @@ class TestSuspendedWinnerFences:
 
         with pytest.raises(RunLeadershipLostError):
             crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
-                run_id=crashed.run_id,
                 caller_owner=WORKER_OLD,
                 coordination_token=token_old,
             )
@@ -782,7 +777,6 @@ class TestSuspendedWinnerFences:
 
         # Positive control: the current leader's sweep repairs it.
         repaired = crashed.repo.terminalize_pending_sinks_with_terminal_outcomes(
-            run_id=crashed.run_id,
             caller_owner=USURPER,
             coordination_token=current,
         )
@@ -887,9 +881,9 @@ class TestSuspendedWinnerFences:
 
     def test_evicted_worker_claim_ready_raises_membership_fence(self, tmp_path: Path) -> None:
         """Slice-4 (design §G): an EVICTED worker calling claim_ready is refused
-        with RunWorkerEvictedError and leaves the READY row untouched.
+        with RunMembershipLostError and leaves the READY row untouched.
 
-        Contract: (i) RunWorkerEvictedError not AuditIntegrityError; (ii) zero
+        Contract: (i) RunMembershipLostError not AuditIntegrityError; (ii) zero
         payload mutation — the row stays READY; (iii) positive control: an
         ACTIVE worker claims it successfully.
         """
@@ -908,11 +902,11 @@ class TestSuspendedWinnerFences:
         assert item_before["status"] == TokenWorkStatus.READY.value
 
         # EVICTED worker refused.
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             crashed.repo.claim_ready(
-                run_id=crashed.run_id,
                 lease_owner=evicted_id,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
+                member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=evicted_id),
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == evicted_id
@@ -925,26 +919,22 @@ class TestSuspendedWinnerFences:
         # Positive control: an ACTIVE worker claims it successfully.
         _seed_active_follower(crashed, worker_id=USURPER)
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=USURPER),
         )
         assert claimed is not None and claimed.token_id == token_id
         assert claimed.lease_owner == USURPER
         crashed.db.close()
 
-    def test_evicted_worker_claim_pending_sink_raises_membership_fence(self, tmp_path: Path) -> None:
-        """Slice-4 (design §G): an EVICTED worker calling claim_pending_sink is
-        refused with RunWorkerEvictedError and leaves the PENDING_SINK row
-        untouched.
+    def test_predecessor_claim_pending_sink_raises_leadership_fence(self, tmp_path: Path) -> None:
+        """A predecessor's captured leader token cannot claim a pending sink.
 
-        Contract: same (i)-(iii) as claim_ready above.
+        The refusal preserves the complete bundle; the current leader can claim it.
         """
-        clock = MockClock(start=_T0)
-        crashed = _run_to_interrupted_checkpoint(tmp_path, clock)
         # Use _takeover_image (which registers WORKER_OLD as ACTIVE) then run
         # the production acquire_run_leadership with a second worker to evict it.
-        crashed2, _token_old = _takeover_image(tmp_path)
+        crashed2, token_old = _takeover_image(tmp_path)
         # Seed the PENDING_SINK row while WORKER_OLD is still ACTIVE.
         token_id = _parked_pending_sink(crashed2, ingest_sequence=6, claim_back=False)
         # Now run a real takeover CAS: evicts WORKER_OLD in run_workers. The
@@ -964,11 +954,11 @@ class TestSuspendedWinnerFences:
         assert item_before["status"] == TokenWorkStatus.PENDING_SINK.value
 
         # EVICTED worker refused.
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunLeadershipLostError) as exc_info:
             crashed2.repo.claim_pending_sink(
-                run_id=crashed2.run_id,
                 lease_owner=WORKER_OLD,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
+                coordination_token=token_old,
             )
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == WORKER_OLD
@@ -980,24 +970,23 @@ class TestSuspendedWinnerFences:
 
         # Positive control: USURPER (now the active leader) claims it.
         claimed = crashed2.repo.claim_pending_sink(
-            run_id=crashed2.run_id,
             lease_owner=USURPER,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            coordination_token=leader_token_for(crashed2.db, crashed2.run_id),
         )
         assert claimed is not None and claimed.token_id == token_id
-        crashed.db.close()
         crashed2.db.close()
 
     def test_evicted_worker_enqueue_ready_raises_membership_fence(self, tmp_path: Path) -> None:
         """Slice-4 (design §G): an EVICTED worker calling enqueue_ready with its
-        worker_id raises RunWorkerEvictedError BEFORE inserting any row.
+        worker_id raises RunMembershipLostError BEFORE inserting any row.
 
         The fence fires on the pre-INSERT membership probe; the dedup path
         (existing work_item_id) is not reached.  An ABSENT worker (no registry
         row) is also refused.  An ACTIVE worker succeeds.
         """
         clock = MockClock(start=_T0)
-        crashed = _run_to_interrupted_checkpoint(tmp_path, clock)
+        crashed, _leader = _takeover_image(tmp_path)
 
         # Seed an evicted worker row explicitly.
         evicted_id = "worker-evicted-enq-slice4"
@@ -1015,40 +1004,41 @@ class TestSuspendedWinnerFences:
                 )
             )
 
-        def _try_enqueue(worker_id: str, seq: int) -> None:
+        def _try_enqueue(member_token: WorkerMembershipToken, seq: int) -> None:
             data = {"id": seq}
-            row = crashed.factory.data_flow.create_row(
-                run_id=crashed.run_id,
+            row, token = crashed.factory.data_flow.create_row_with_token(
                 source_node_id=crashed.source_node_id,
                 row_index=seq,
                 data=data,
                 source_row_index=seq,
                 ingest_sequence=seq,
+                coordination_token=leader_token_for(crashed.db, crashed.run_id),
             )
-            token = crashed.factory.data_flow.create_token(row_id=row.row_id)
             crashed.repo.enqueue_ready(
-                run_id=crashed.run_id,
                 token_id=token.token_id,
                 row_id=row.row_id,
                 node_id=crashed.journal_node_id,
                 step_index=crashed.journal_step_index,
                 ingest_sequence=seq,
                 row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
-                worker_id=worker_id,
+                member_token=member_token,
             )
 
         # Evicted worker refused.
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
-            _try_enqueue(evicted_id, seq=20)
+        with pytest.raises(RunMembershipLostError) as exc_info:
+            _try_enqueue(member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=evicted_id), seq=20)
         assert not isinstance(exc_info.value, AuditIntegrityError)
         assert exc_info.value.worker_id == evicted_id
 
-        # Absent worker (no registry row) also refused.
-        with pytest.raises(RunWorkerEvictedError) as exc_info2:
-            _try_enqueue("worker-phantom", seq=21)
-        assert exc_info2.value.worker_id == "worker-phantom"
+        # Losing a previously admitted identity from the permanent ledger is corruption.
+        _seed_active_follower(crashed, worker_id="worker-phantom")
+        missing_member = member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id="worker-phantom")
+        with crashed.db.engine.begin() as conn:
+            conn.execute(run_workers_table.delete().where(run_workers_table.c.worker_id == missing_member.worker_id))
+        with pytest.raises(AuditIntegrityError, match="unregistered"):
+            _try_enqueue(missing_member, seq=21)
 
         # Positive control: USURPER (active) enqueues successfully.
         _seed_active_follower(crashed, worker_id=USURPER)
-        _try_enqueue(USURPER, seq=22)  # must not raise
+        _try_enqueue(member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=USURPER), seq=22)
         crashed.db.close()

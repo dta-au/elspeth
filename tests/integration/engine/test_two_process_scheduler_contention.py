@@ -49,10 +49,10 @@ from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     nodes_table,
     rows_table,
-    runs_table,
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.integration.engine import _scheduler_contention_worker as worker
 
 WORKER_PATH = Path(worker.__file__).resolve()
@@ -116,19 +116,10 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
     db = LandscapeDB(f"sqlite:///{db_path}")
     try:
         engine = db.engine
+        factory = make_factory(db)
+        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=RUN_ID)
+        leader = leader_coordination_token(factory, RUN_ID)
         with engine.begin() as conn:
-            conn.execute(
-                insert(runs_table).values(
-                    run_id=RUN_ID,
-                    started_at=now,
-                    config_hash="config",
-                    settings_json="{}",
-                    canonical_version="v1",
-                    status="running",
-                    openrouter_catalog_sha256="0" * 64,
-                    openrouter_catalog_source="bundled",
-                )
-            )
             for node_id, node_type, plugin in (
                 ("source-a", NodeType.SOURCE, "csv"),
                 ("normalize", NodeType.TRANSFORM, "identity"),
@@ -175,7 +166,7 @@ def _seed_database(db_path: Path, *, now: datetime) -> None:
                     )
                 )
             repo.enqueue_ready(
-                run_id=RUN_ID,
+                member_token=leader.membership,
                 token_id=token_id,
                 row_id=row_id,
                 node_id="normalize",
@@ -254,6 +245,12 @@ def _spawn_children(
                             str(metrics),
                             "--min-recovered",
                             str(MIN_RECOVERED_PER_HAMMER),
+                            *[
+                                argument
+                                for peer in hammer_owners
+                                if peer != owner
+                                for argument in ("--peer-recovered-file", str(tmp_path / f"ready-{peer}.recovered"))
+                            ],
                         ],
                         env=env,
                         stdout=log_handle,
@@ -284,7 +281,7 @@ def _spawn_children(
                 raise AssertionError(
                     f"{role} {owner} did not finish within {JOIN_TIMEOUT_SECONDS}s: "
                     f"a hammer stops only once it has reaped {MIN_RECOVERED_PER_HAMMER} peer lease(s), "
-                    f"so its peer never claimed:\n{log.read_text()}"
+                    f"and every peer has observed a committed recovery:\n{log.read_text()}"
                 ) from None
             # A1 (exit codes): exit 1 is harness-internal failure, never a
             # recorded contention error — those land in the artifact.

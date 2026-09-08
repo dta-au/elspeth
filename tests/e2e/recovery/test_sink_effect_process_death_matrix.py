@@ -24,6 +24,8 @@ from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB, run_lifecycle_repository
 from elspeth.core.landscape.data_flow import tokens as token_repository_module
+from elspeth.core.landscape.execution import node_states as node_states_module
+from elspeth.core.landscape.execution import operations as operations_module
 from elspeth.core.landscape.execution import sink_effect_finalization as sink_effect_finalization_module
 from elspeth.core.landscape.execution import sink_effect_lifecycle as sink_effect_lifecycle_module
 from elspeth.core.landscape.execution import sink_effect_reservation as sink_effect_reservation_module
@@ -275,6 +277,10 @@ def _install_short_run_liveness() -> None:
     run_lifecycle_repository.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     checkpoint_manager_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     token_repository_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
+    # The operation begins before BEFORE_RESERVATION and extends the same seat.
+    operations_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
+    # Bulk sink state opening also fences before the first reservation seam.
+    node_states_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     scheduler_dispositions_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     scheduler_fencing_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS
     scheduler_queue_module.DEFAULT_RUN_LIVENESS_WINDOW_SECONDS = _LEASE_SECONDS

@@ -2,7 +2,7 @@
 """Multi-source scheduler chaos proofs (filigree elspeth-7bb7124e8f).
 
 Deterministic failure injection against REAL multi-source pipelines — real
-Orchestrator.run, real SQLite LandscapeDB, real durable token scheduler —
+Orchestrator runs and follower traversal, SQLite LandscapeDB, durable scheduler —
 asserting only through durable, observable surfaces (token_work_items,
 scheduler_events, node_states, terminal-outcome journal, rows, run_sources, runs,
 terminal RunStatus). Nothing here reads checkpoint-blob internals, so these
@@ -55,9 +55,16 @@ from sqlalchemy import and_, select, update
 from elspeth.cli_helpers import instantiate_plugins_from_config
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import Determinism, PluginSchema, RunStatus
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
-from elspeth.core.config import ElspethSettings, QueueSettings, SourceSettings, TransformSettings
+from elspeth.contracts.schema_contract import PipelineRow
+from elspeth.core.config import (
+    ElspethSettings,
+    QueueSettings,
+    SourceSettings,
+    TransformSettings,
+)
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.wiring import WiredTransform
 from elspeth.core.landscape import LandscapeDB
@@ -230,7 +237,7 @@ class _LeaseBusterTransform(BaseTransform):
         clock: MockClock,
         db: LandscapeDB,
         *,
-        peer_owner: str,
+        coordination_token: CoordinationToken,
         bust_key: tuple[str, int],
         input_connection: str,
         on_success: str,
@@ -241,7 +248,7 @@ class _LeaseBusterTransform(BaseTransform):
         self.on_error = "discard"
         self._clock = clock
         self._db = db
-        self._peer_owner = peer_owner
+        self._coordination_token = coordination_token
         self._bust_key = bust_key
         self.peer_recovered_count: int | None = None
         self._fired = False
@@ -266,9 +273,9 @@ class _LeaseBusterTransform(BaseTransform):
                 )
                 assert aged.rowcount == 1, f"expected exactly the in-flight lease to be LEASED, matched {aged.rowcount}"
             peer_repo = TokenSchedulerRepository(self._db.engine)
-            self.peer_recovered_count = peer_repo.recover_expired_leases_legacy_unfenced(
-                run_id=ctx.run_id,
-                caller_owner=self._peer_owner,
+            self.peer_recovered_count = peer_repo.recover_expired_leases(
+                coordination_token=self._coordination_token,
+                stall_budget_seconds=0,
             )
         return TransformResult.success(row, success_reason={"action": "lease_buster"})
 
@@ -622,14 +629,15 @@ def test_chaosllm_first_attempt_failures_retry_with_durable_per_attempt_audit(
 
 @pytest.mark.timeout(60)
 def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_owner(tmp_path: Path) -> None:
-    """Mid-transform lease expiry + peer recovery sweep, on the real engine path.
+    """Mid-transform follower lease expiry + live leader recovery sweep.
 
     A transform advances the injected MockClock past the production-default
     scheduler lease (``_SCHEDULER_LEASE_SECONDS``, read from RowProcessor's
     signature so a default change moves this test with it) while processing
-    orders row #1, then runs a PEER-owner
-    ``recover_expired_leases`` sweep — exactly what a concurrent recovery
-    worker does. Current-model semantics pinned through durable surfaces:
+    orders row #1 on an admitted follower, then invokes the live leader's
+    ``recover_expired_leases`` sweep. Both authorities come from durable
+    admission; the leader recovers a different worker's expired item.
+    Current-model semantics pinned through durable surfaces:
 
     - the peer sweep reclaims exactly one item: the in-flight lease — durable
       ``recover_expired_lease`` event with attempt bump 1 -> 2, lease_owner
@@ -639,27 +647,37 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
       work item and the engine abandons the in-flight result — durably
       journaled as a ``lease_lost`` event attributed to the stale owner, and
       no mark_* transition for the busted token is ever written by it;
-    - the engine keeps pumping the remaining source (refunds rows are claimed
-      and parked PENDING_SINK after the fence), proving the fence is
-      token-scoped, not run-scoped;
-    - the run REFUSES completion: the reclaimed READY continuation is never
-      re-claimed in-run (per-row drains drive only their own token, and the
-      G1 self-steal guard forbids the run's own maintenance sweep from
-      recovering peer-reclaimed work back), so the post-source invariant
-      check fails the run rather than silently dropping the token. The
-      FAILED run + READY-attempt-2 journal row is precisely the durable
-      state a resume sweep recovers from.
+    - refunds rows are claimed and reach PENDING_SINK after the orders fence,
+      proving healthy-source progress under the same follower membership;
+    - the follower pass stops at its next claim boundary so the fixture can
+      delay the reclaimed continuation's availability. Real claims then
+      advance refunds while preserving the READY retry. The live leader REFUSES
+      successful completion with residual scheduler work, then records FAILED
+      without silently dropping the token or delivering parked sink rows.
     """
     clock = MockClock(start=_CLOCK_EPOCH)
     db = LandscapeDB(f"sqlite:///{tmp_path / 'audit.db'}")
     peer_owner = "chaos-peer-sweeper"
+    from contextlib import suppress
+
+    from elspeth.contracts.plugin_context import PluginContext
+    from elspeth.core.canonical import stable_hash
+    from elspeth.engine.orchestrator.follower import build_follower_processor
+    from elspeth.engine.orchestrator.graph_wiring import build_source_id_map
+    from tests.fixtures.base_classes import create_observed_contract
+    from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
+
+    payload_store = FilesystemPayloadStore(tmp_path / "payloads")
+    factory = make_factory(db, payload_store=payload_store)
+    run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1", leader_worker_id=peer_owner)
+    leader = leader_coordination_token(factory, run.run_id)
 
     orders = ListSource([{"src": "orders", "value": i} for i in range(2)], name="orders_source", on_success="inbound")
     refunds = ListSource([{"src": "refunds", "value": i} for i in range(2)], name="refunds_source", on_success="inbound")
     buster = _LeaseBusterTransform(
         clock,
         db,
-        peer_owner=peer_owner,
+        coordination_token=leader,
         bust_key=("orders", 1),
         input_connection="inbound",
         on_success="mid",
@@ -668,12 +686,85 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
     sink = CollectSink("output")
     config, graph = _build_two_source_pipeline({"orders": orders, "refunds": refunds}, [buster, passthrough], {"output": sink})
 
-    with pytest.raises(OrchestrationInvariantError, match="non-terminal scheduler work"):
-        Orchestrator(db, clock=clock).run(
-            config,
-            graph=graph,
-            payload_store=FilesystemPayloadStore(tmp_path / "payloads"),
+    for node in graph.get_nodes():
+        register_test_node(factory.data_flow, run.run_id, node.node_id, node_type=node.node_type, plugin_name=node.plugin_name)
+    for edge in graph.get_edges():
+        factory.data_flow.register_edge(edge.from_node, edge.to_node, edge.label, edge.mode, coordination_token=leader)
+    source_ids = build_source_id_map(graph)
+    for name, source_id in source_ids.items():
+        factory.run_lifecycle.record_run_source(
+            source_node_id=source_id,
+            source_name=name,
+            plugin_name=config.sources[name].name,
+            config_hash=stable_hash({}),
+            lifecycle_state="loaded",
+            coordination_token=leader,
         )
+    member = factory.run_coordination.admit_follower(
+        run_id=run.run_id, worker_id="worker:chaos-follower", config_hash=stable_hash({}), window_seconds=80
+    )
+    follower = build_follower_processor(
+        factory=factory, member_token=member, graph=graph, config=config, payload_store=payload_store, clock=clock
+    )
+    ctx = PluginContext(
+        run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), payload_store=payload_store, member_token=member
+    )
+    buster.on_start(ctx)
+    passthrough.on_start(ctx)
+
+    class _PauseAfterLeaseLoss(Exception):
+        """Stop the bounded follower pass before it can reclaim its continuation."""
+
+    def pause_after_loss() -> None:
+        if buster._fired:
+            raise _PauseAfterLeaseLoss
+
+    # Each source retains its own row index and durable global ingest sequence.
+    # No mock replaces membership, claim, traversal, or disposition.
+    for source_name, value, ingest_sequence in (("orders", 0, 0), ("orders", 1, 1), ("refunds", 0, 2), ("refunds", 1, 3)):
+        data = {"src": source_name, "value": value}
+        row, token = factory.data_flow.create_row_with_token(
+            source_ids[source_name],
+            ingest_sequence,
+            data,
+            source_row_index=value,
+            ingest_sequence=ingest_sequence,
+            coordination_token=leader,
+        )
+        factory.execution.record_completed_node_state(
+            token.token_id, source_ids[source_name], 0, data, data, 0.0, coordination_token=leader
+        )
+        factory.scheduler.enqueue_ready(
+            token_id=token.token_id,
+            row_id=row.row_id,
+            node_id=buster.node_id,
+            step_index=graph.get_node_step_map()[buster.node_id],
+            ingest_sequence=ingest_sequence,
+            row_payload_json=factory.scheduler.serialize_row_payload(PipelineRow(data, create_observed_contract(data))),
+            member_token=leader.membership,
+        )
+        if source_name == "orders":
+            with suppress(_PauseAfterLeaseLoss):
+                follower._processor.drain_follower_ready_work(ctx, before_claim=pause_after_loss)
+            if value == 1:
+                # Model retry backoff only after the stale attempt was fenced.
+                # This keeps the continuation available for finalization checks
+                # while real follower claims advance the other source.
+                with db.engine.begin() as conn:
+                    deferred = conn.execute(
+                        update(token_work_items_table)
+                        .where(token_work_items_table.c.token_id == token.token_id)
+                        .where(token_work_items_table.c.status == TokenWorkStatus.READY.value)
+                        .where(token_work_items_table.c.attempt == 2)
+                        .values(available_at=read_landscape_transaction_time(conn) + timedelta(hours=1))
+                    )
+                    assert deferred.rowcount == 1
+        else:
+            follower._processor.drain_follower_ready_work(ctx)
+
+    with pytest.raises(OrchestrationInvariantError, match="residual scheduler work"):
+        factory.run_lifecycle.complete_run(status=RunStatus.COMPLETED, coordination_token=leader)
+    factory.run_lifecycle.complete_run(status=RunStatus.FAILED, coordination_token=leader)
 
     run_id = _single_run_id(db)
     assert _run_status(db, run_id) == RunStatus.FAILED.value
@@ -693,8 +784,8 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
     assert busted_item["lease_owner"] is None
     assert busted_item["lease_expires_at"] is None
 
-    # Every other token (orders row 0 + both refunds rows, claimed AFTER the
-    # fence) is durably parked PENDING_SINK awaiting sink delivery; nothing
+    # Every other token (orders row 0 + both refunds rows) remains durably
+    # parked PENDING_SINK awaiting sink delivery; nothing
     # is LEASED or FAILED. The sink itself never ran (the run refused
     # completion before sink writes), so no result was emitted twice or at all.
     others = [item for item in items if item["token_id"] != busted_item["token_id"]]
@@ -716,16 +807,23 @@ def test_lease_expiry_mid_transform_peer_reclaim_bumps_attempt_and_fences_stale_
     assert recovery["from_attempt"] == 1 and recovery["to_attempt"] == 2
     assert recovery["to_status"] == TokenWorkStatus.READY.value
     stale_owner = recovery["from_lease_owner"]
-    # Epoch 21 (ADR-030 §A.1): the engine threads the registered worker
-    # identity (worker:{run_id}:{uuid}) into RowProcessor as the scheduler
-    # lease_owner; row-processor:{run_id}:{uuid} remains only as the fallback
-    # mint for direct repository-level construction.
-    assert isinstance(stale_owner, str) and stale_owner.startswith("worker:")
+    assert stale_owner == member.worker_id
 
     assert fence["token_id"] == busted_item["token_id"]
     assert fence["caller_owner"] == stale_owner
     assert fence["from_lease_owner"] == stale_owner
     assert recovery["seq"] < fence["seq"]
+
+    # The fence is item-scoped: the same admitted follower continues processing
+    # refunds after losing its orders lease, through actual claim/disposition.
+    refund_tokens = {token_id for token_id, source_name in token_sources.items() if source_name == "refunds"}
+    assert len(refund_tokens) == 2
+    for token_id in refund_tokens:
+        for event_type in (SchedulerEventType.CLAIM_READY, SchedulerEventType.MARK_PENDING_SINK):
+            transitions = [event for event in events if event["token_id"] == token_id and event["event_type"] == event_type.value]
+            assert len(transitions) == 1
+            assert transitions[0]["caller_owner"] == stale_owner
+            assert transitions[0]["seq"] > fence["seq"]
 
     # Fencing is complete: the stale owner never wrote any post-reclaim
     # transition for the busted token — no mark_* event exists for it.

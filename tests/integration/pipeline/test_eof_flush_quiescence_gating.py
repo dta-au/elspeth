@@ -33,7 +33,7 @@ from sqlalchemy import select
 
 from elspeth.contracts import PipelineRow, RunStatus
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
-from elspeth.contracts.errors import OrchestrationInvariantError
+from elspeth.contracts.errors import OrchestrationInvariantError, RunMembershipLostError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
@@ -50,7 +50,7 @@ from elspeth.core.landscape.schema import (
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator
 from tests.fixtures.base_classes import _TestSourceBase
-from tests.fixtures.landscape import register_test_worker
+from tests.fixtures.landscape import expire_lease, leader_coordination_token, leader_token_for, member_token_for, register_test_worker
 from tests.fixtures.plugins import CollectSink, ListSource
 from tests.integration.pipeline.test_aggregation_recovery import (
     _build_eof_aggregation_pipeline,
@@ -132,27 +132,39 @@ class _PeerSimulatingSource(_TestSourceBase):
         factory = RecorderFactory(self._db, payload_store=self._payload_store)
         repo = TokenSchedulerRepository(self._db.engine)
         data = {"value": 99}
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node_id,
             row_index=PEER_INGEST_SEQUENCE,
             data=data,
             source_row_index=PEER_INGEST_SEQUENCE,
             ingest_sequence=PEER_INGEST_SEQUENCE,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         self.peer_token_id = token.token_id
+        factory.execution.record_completed_node_state(
+            token.token_id,
+            source_node_id,
+            0,
+            data,
+            data,
+            0.0,
+            coordination_token=leader_coordination_token(factory, run_id),
+        )
         repo.enqueue_ready(
-            run_id=run_id,
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=str(sample["node_id"]),
             step_index=int(sample["step_index"]),
             ingest_sequence=PEER_INGEST_SEQUENCE,
             row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
+            member_token=leader_token_for(self._db, run_id).membership,
         )
         register_test_worker(self._db, run_id=run_id, worker_id=PEER_OWNER)
-        claimed = repo.claim_ready(run_id=run_id, lease_owner=PEER_OWNER, lease_seconds=3600)
+        claimed = repo.claim_ready(
+            lease_owner=PEER_OWNER,
+            lease_seconds=3600,
+            member_token=member_token_for(self._db.engine, run_id=run_id, worker_id=PEER_OWNER),
+        )
         assert claimed is not None and claimed.token_id == token.token_id
         if self._peer_completes_into_barrier:
             repo.mark_blocked(
@@ -160,6 +172,7 @@ class _PeerSimulatingSource(_TestSourceBase):
                 queue_key=None,
                 barrier_key=str(sample["barrier_key"]),
                 expected_lease_owner=PEER_OWNER,
+                member_token=member_token_for(self._db.engine, run_id=run_id, worker_id=PEER_OWNER),
             )
 
 
@@ -190,9 +203,9 @@ class TestEofFlushQuiescenceGating:
         flush is REFUSED before completing any batch or emitting any
         PENDING_SINK from the barrier; the run fails loudly.
 
-        Phase 2 (the peer completes into the barrier + resume): the row goes
-        BLOCKED via production ``mark_blocked``; the resume leader inherits
-        it intake-pending, adopts it journal-first, and the §D step-3 loop
+        Phase 2 (the finalized run has evicted the peer + resume): the stale
+        peer cannot mutate its claim. Once its lease expires, the resume
+        leader recovers it and the §D step-3 loop
         produces exactly ONE batch containing ALL four members. COMPLETED in
         one resume pass, no second FAILED/resume cycle.
         """
@@ -227,17 +240,19 @@ class TestEofFlushQuiescenceGating:
         assert peer_row["lease_owner"] == PEER_OWNER
         assert peer_row["token_id"] == source.peer_token_id
 
-        # ── Phase 2: the slow peer completes into the barrier... ───────────
+        # Finalization evicts the peer; its late completion must be refused.
         repo = TokenSchedulerRepository(db.engine)
-        datetime.now(UTC)
-        repo.mark_blocked(
-            work_item_id=str(peer_row["work_item_id"]),
-            queue_key=None,
-            barrier_key=str(blocked[0]["barrier_key"]),
-            expected_lease_owner=PEER_OWNER,
-        )
+        with pytest.raises(RunMembershipLostError):
+            repo.mark_blocked(
+                work_item_id=str(peer_row["work_item_id"]),
+                queue_key=None,
+                barrier_key=str(blocked[0]["barrier_key"]),
+                expected_lease_owner=PEER_OWNER,
+                member_token=member_token_for(db.engine, worker_id=PEER_OWNER),
+            )
+        expire_lease(db.engine, str(peer_row["work_item_id"]))
 
-        # ...and the resume leader finishes the run in ONE pass.
+        # The resume leader recovers the expired claim and finishes in ONE pass.
         recovery = RecoveryManager(db, checkpoint_mgr)
         check = recovery.can_resume(str(peer_row["run_id"]), graph)
         assert check.can_resume, f"expected resumable run, got: {check.reason}"

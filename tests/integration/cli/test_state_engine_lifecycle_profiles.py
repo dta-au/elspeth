@@ -21,6 +21,7 @@ from typer.testing import CliRunner
 
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import FrameworkBugError, RunStatus, TerminalOutcome, TerminalPath
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.core.landscape import LandscapeDB
@@ -296,11 +297,12 @@ payload_store:
     def pause_leader_before_second_claim(
         self: TokenSchedulerRepository,
         *,
-        run_id: str,
+        member_token: WorkerMembershipToken,
         lease_owner: str,
         lease_seconds: int,
     ) -> Any:
         nonlocal leader_thread_id
+        run_id = member_token.run_id
         with self._engine.connect() as conn:
             role = conn.execute(
                 select(run_workers_table.c.role).where(
@@ -323,7 +325,7 @@ payload_store:
             assert leader_release.wait(30), "web leader was never released after follower hand-off"
         return real_claim_ready(
             self,
-            run_id=run_id,
+            member_token=member_token,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
         )
@@ -651,6 +653,13 @@ transforms:
     result = Orchestrator(db).run(config, graph=graph, settings=settings, payload_store=payload_store)
     run_id = result.run_id
     factory = RecorderFactory(db, payload_store=payload_store)
+    with db.engine.begin() as conn:
+        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
+    factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=f"worker:{run_id}:exceptional-leader",
+        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
+    )
     target_node_id = graph.get_next_node(graph.get_sources()[0])
     assert target_node_id is not None
     token_id = _seed_real_follower_ready_item(
@@ -660,13 +669,6 @@ transforms:
         row_data={"id": 5, "value": 50},
         target_node_id=str(target_node_id),
         target_step_index=graph.get_node_step_map()[target_node_id],
-    )
-    with db.engine.begin() as conn:
-        conn.execute(update(runs_table).where(runs_table.c.run_id == run_id).values(status=RunStatus.RUNNING.value, completed_at=None))
-    factory.run_coordination.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=f"worker:{run_id}:exceptional-leader",
-        window_seconds=_GUARD_LIVE_SEAT_WINDOW_SECONDS,
     )
 
     lifecycle: list[str] = []

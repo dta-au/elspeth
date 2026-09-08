@@ -41,7 +41,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import PipelineRow, RunStatus
-from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.contracts.errors import RunMembershipLostError, RunWorkerEvictedError
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
@@ -64,7 +64,7 @@ from tests.e2e.recovery.test_follower_join_and_drain import (
     _seat_run_with_live_leader,
     _seed_ready_row,
 )
-from tests.fixtures.landscape import expire_lease, member_token_for
+from tests.fixtures.landscape import expire_lease, leader_token_for, member_token_for
 
 _GUARD_LIVE_SEAT_WINDOW_SECONDS = 10**9
 
@@ -105,23 +105,22 @@ def _seed_ready_row_direct(crashed: Any, *, ingest_sequence: int) -> tuple[str, 
     with no run_workers side effects.  Returns (token_id, work_item_id).
     """
     data = {"id": ingest_sequence, "value": ingest_sequence * 10}
-    row = crashed.factory.data_flow.create_row(
-        run_id=crashed.run_id,
+    row, token = crashed.factory.data_flow.create_row_with_token(
         source_node_id=crashed.source_node_id,
         row_index=ingest_sequence,
         data=data,
         source_row_index=ingest_sequence,
         ingest_sequence=ingest_sequence,
+        coordination_token=leader_token_for(crashed.db, crashed.run_id),
     )
-    token = crashed.factory.data_flow.create_token(row_id=row.row_id)
     work_item = crashed.repo.enqueue_ready(
-        run_id=crashed.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=crashed.journal_node_id,
         step_index=crashed.journal_step_index,
         ingest_sequence=ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
+        member_token=leader_token_for(crashed.db, crashed.run_id).membership,
         # No worker_id → unfenced legacy enqueue (test/harness use case)
     )
     return token.token_id, work_item.work_item_id
@@ -177,18 +176,18 @@ class TestFollowerIsolation:
 
         # Follower-A claims the row (now LEASED by A).
         claimed_a = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_a),
         )
         assert claimed_a is not None and claimed_a.token_id == token_id
         assert claimed_a.lease_owner == follower_a
 
         # Follower-B tries claim_ready — no READY row available → None.
         claimed_b = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_b),
         )
         assert claimed_b is None, "follower-B must not claim follower-A's LEASED row"
 
@@ -231,11 +230,11 @@ class TestFollowerIsolation:
 
         # Evicted follower tries to claim → claim_verb_fence_clause detects
         # non-active row → raises RunWorkerEvictedError (§C case (a)).
-        with pytest.raises(RunWorkerEvictedError) as exc_info:
+        with pytest.raises(RunMembershipLostError) as exc_info:
             crashed.repo.claim_ready(
-                run_id=crashed.run_id,
                 lease_owner=follower_id,
                 lease_seconds=_DEFAULT_LEASE_SECONDS,
+                member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
             )
 
         assert exc_info.value.worker_id == follower_id
@@ -284,18 +283,18 @@ class TestFollowerIsolation:
 
         # Follower-A claims its row.
         claimed_a = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_a),
         )
         assert claimed_a is not None
         token_a_claimed = claimed_a.token_id
 
         # Follower-B claims the remaining row.
         claimed_b = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_b),
         )
         assert claimed_b is not None
         token_b_claimed = claimed_b.token_id
@@ -358,9 +357,9 @@ class TestFollowerIsolation:
 
         # Follower-A claims one row.
         claimed_a = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_a,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_a),
         )
         assert claimed_a is not None
         assert claimed_a.token_id in (token_a, token_b)
@@ -368,9 +367,9 @@ class TestFollowerIsolation:
 
         # Follower-B claims the remaining row.
         claimed_b = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_b,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_b),
         )
         assert claimed_b is not None
         assert claimed_b.token_id in (token_a, token_b)
@@ -380,10 +379,12 @@ class TestFollowerIsolation:
         crashed.repo.mark_terminal(
             work_item_id=claimed_a.work_item_id,
             expected_lease_owner=follower_a,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_a),
         )
         crashed.repo.mark_terminal(
             work_item_id=claimed_b.work_item_id,
             expected_lease_owner=follower_b,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_b),
         )
 
         # Both items are TERMINAL with attempt==1 and lease_owner=None (cleared).
@@ -446,17 +447,17 @@ class TestFollowerChaos:
 
         # Leader claims first.
         leader_claim = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=leader_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=leader_id),
         )
         assert leader_claim is not None, "leader must claim one of the READY rows"
 
         # Follower claims next (the remaining READY row).
         follower_claim = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert follower_claim is not None, "follower must claim the second READY row"
 
@@ -468,10 +469,12 @@ class TestFollowerChaos:
         crashed.repo.mark_terminal(
             work_item_id=leader_claim.work_item_id,
             expected_lease_owner=leader_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=leader_id),
         )
         crashed.repo.mark_terminal(
             work_item_id=follower_claim.work_item_id,
             expected_lease_owner=follower_id,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
 
         # Both rows are TERMINAL.
@@ -508,9 +511,9 @@ class TestFollowerChaos:
 
         # Follower claims the row.
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
 
@@ -527,12 +530,7 @@ class TestFollowerChaos:
         clock.advance(_DEFAULT_LEASE_SECONDS + 100)
         expire_lease(crashed.db.engine, claimed.work_item_id)
 
-        # This direct crash-image harness has no leader seat, so it opts into
-        # the explicitly named legacy recovery adapter.
-        recovered = crashed.repo.recover_expired_leases_legacy_unfenced(
-            run_id=crashed.run_id,
-            caller_owner=leader_id,
-        )
+        recovered = crashed.repo.recover_expired_leases(coordination_token=leader_token)
         assert recovered >= 1, "reaper must recover the follower's lapsed lease"
 
         # The item is now READY with attempt bumped to 2.
@@ -616,9 +614,9 @@ class TestFollowerChaos:
 
         # Follower claims the row.
         claimed = crashed.repo.claim_ready(
-            run_id=crashed.run_id,
             lease_owner=follower_id,
             lease_seconds=_DEFAULT_LEASE_SECONDS,
+            member_token=member_token_for(crashed.db.engine, run_id=crashed.run_id, worker_id=follower_id),
         )
         assert claimed is not None and claimed.token_id == token_id
 

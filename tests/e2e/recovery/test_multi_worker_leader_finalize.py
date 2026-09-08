@@ -44,7 +44,7 @@ import pytest
 from sqlalchemy import select, update
 
 from elspeth.contracts import Determinism, PipelineRow, PluginSchema, RunStatus
-from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
+from elspeth.contracts.coordination import DEFAULT_ITEM_STALL_BUDGET_SECONDS, DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, WorkerMembershipToken
 from elspeth.contracts.errors import OrchestrationInvariantError, RunWorkerEvictedError
 from elspeth.contracts.results import SourceRow
 from elspeth.contracts.scheduler import TokenWorkStatus
@@ -58,6 +58,8 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     node_states_table,
+    run_workers_table,
+    runs_table,
     scheduler_events_table,
     token_work_items_table,
 )
@@ -67,9 +69,27 @@ from elspeth.engine.processor import RowProcessor
 from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from tests.fixtures.base_classes import _TestSourceBase, as_sink, as_source, as_transform
+from tests.fixtures.landscape import leader_token_for, member_token_for
 from tests.fixtures.plugins import CollectSink
 
 PEER_OWNER = "follower-peer"
+
+
+def _admit_peer(factory: RecorderFactory, run_id: str) -> WorkerMembershipToken:
+    """Keep the peer's durable membership available to every injected continuation."""
+    with factory._db.engine.connect() as conn:
+        existing = conn.execute(
+            select(run_workers_table.c.worker_id).where(run_workers_table.c.worker_id == PEER_OWNER)
+        ).scalar_one_or_none()
+        config_hash = conn.execute(select(runs_table.c.config_hash).where(runs_table.c.run_id == run_id)).scalar_one()
+    if existing is not None:
+        return member_token_for(factory._db.engine, run_id=run_id, worker_id=PEER_OWNER)
+    return factory.run_coordination.admit_follower(
+        run_id=run_id,
+        worker_id=PEER_OWNER,
+        config_hash=config_hash,
+        window_seconds=300,
+    )
 
 
 class _RowSchema(PluginSchema):
@@ -187,33 +207,38 @@ def _seed_peer_leased_row(
 
     A real row+token+READY enqueue via production writers, then a direct SQL flip
     to LEASED under ``PEER_OWNER`` with the chosen expiry (positive=unexpired,
-    negative=already expired). No run_workers row is created → the leader's
-    liveness-aware reaper treats the owner as dead (owner_registry_dead=TRUE).
+    negative=already expired). The admitted peer's registry row is departed,
+    so the leader's liveness-aware reaper treats the owner as dead.
     """
     from datetime import timedelta
 
     factory = RecorderFactory(db, payload_store=payload_store)
     repo = TokenSchedulerRepository(db.engine)
+    peer_token = _admit_peer(factory, run_id)
     data = {"id": 1000 + ingest_sequence, "value": ingest_sequence}
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    row, token = factory.data_flow.create_row_with_token(
         source_node_id=source_node_id,
         row_index=1000 + ingest_sequence,
         data=data,
         source_row_index=1000 + ingest_sequence,
         ingest_sequence=1000 + ingest_sequence,
+        coordination_token=leader_token_for(factory._db, run_id),
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
     item = repo.enqueue_ready(
-        run_id=run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=source_node_id,
         step_index=0,
         ingest_sequence=1000 + ingest_sequence,
         row_payload_json=TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data))),
+        member_token=leader_token_for(db, run_id).membership,
     )
     with db.engine.begin() as conn:
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == peer_token.worker_id)
+            .values(status="departed", departed_at=read_landscape_transaction_time(conn))
+        )
         conn.execute(
             update(token_work_items_table)
             .where(token_work_items_table.c.work_item_id == item.work_item_id)
@@ -257,6 +282,7 @@ def _seed_follower_pending_sink_row(
 
     factory = RecorderFactory(db, payload_store=payload_store)
     repo = TokenSchedulerRepository(db.engine)
+    peer_token = _admit_peer(factory, run_id)
     datetime.now(UTC)
     # Reuse an existing leader source row (a continuation child), not a new row.
     # The child's scheduler cursor MUST carry the parent row's ingest_sequence
@@ -275,16 +301,19 @@ def _seed_follower_pending_sink_row(
     row_id = str(existing["row_id"])
     row_ingest_sequence = int(existing["ingest_sequence"])
     data = {"id": 2000 + ingest_sequence, "value": value if value is not None else ingest_sequence}
-    token = factory.data_flow.create_token(row_id=row_id)
+    token = factory.data_flow.create_token(
+        row_id=row_id,
+        coordination_token=leader_token_for(factory._db, run_id),
+    )
     payload = TokenSchedulerRepository.serialize_row_payload(PipelineRow(data, _observed_contract(data)))
     item = repo.enqueue_ready(
-        run_id=run_id,
         token_id=token.token_id,
         row_id=row_id,
         node_id=source_node_id,
         step_index=1,
         ingest_sequence=row_ingest_sequence,
         row_payload_json=payload,
+        member_token=leader_token_for(db, run_id).membership,
     )
     # Flip LEASED under the peer so mark_pending_sink's owner CAS passes.
     with db.engine.begin() as conn:
@@ -306,6 +335,7 @@ def _seed_follower_pending_sink_row(
         error_hash=None,
         error_message=None,
         expected_lease_owner=PEER_OWNER,
+        member_token=peer_token,
     )
     return token.token_id
 
@@ -453,7 +483,7 @@ def test_dead_peer_expired_lease_reaped_to_ready_in_loop(tmp_path: Path) -> None
     reap_expired_peer_leases — within the liveness window, not the 300s item TTL.
 
     Two peer leases are seeded: a still-ALIVE one (unexpired, keeps the bounded
-    wait loop running) and a DEAD one (already-expired lease, no run_workers
+    wait loop running) and a DEAD one (already-expired lease, departed run_workers
     registry row → owner_registry_dead). Each loop iteration drives
     reap_expired_peer_leases, which recovers the dead one to READY (attempt
     bumped) while leaving the live one LEASED. Pre-fix the wait loop performed NO
@@ -464,7 +494,7 @@ def test_dead_peer_expired_lease_reaped_to_ready_in_loop(tmp_path: Path) -> None
     contract under test).
 
     NOTE on "within the liveness window": the dead peer here is seeded with an
-    ALREADY-expired lease AND no run_workers registry row, so it is
+    ALREADY-expired lease AND a departed run_workers registry row, so it is
     owner_registry_dead and immediately reapable on the FIRST in-loop iteration —
     no real wall-clock wait is needed to demonstrate the reap. The "within the
     liveness window, not the 300s item TTL" claim is the GENERAL slice-4

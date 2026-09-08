@@ -22,7 +22,7 @@ from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import RunSourceLifecycleState, operations_table, run_sources_table, runs_table
 from elspeth.engine.clock import MockClock
 from tests.e2e.recovery.harness import _SOURCE_ROWS, _T0, _build_pipeline, _run_to_interrupted_checkpoint, spawn_database_process_at_seam
-from tests.fixtures.landscape import leader_coordination_token, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, register_test_node
 from tests.helpers.state_engine import capture_state_engine_image
 from tests.unit.core.landscape.test_sink_effect_reservation import _pipeline_request
 
@@ -92,19 +92,19 @@ def _build_open_effect_run(
                 coordination_token=leader_coordination_token(factory, run_id),
             )
         _row, token = factory.data_flow.create_row_with_token(
-            run_id,
             source_id,
             0,
             {"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink_id,
-            run_id=run_id,
             step_index=0,
             input_data={"value": 1},
+            member_token=leader_token_for(factory._db, run_id).membership,
         )
         members = resolve_sink_effect_members(
             factory,
@@ -227,19 +227,19 @@ def test_public_resume_refuses_non_resumable_failed_effect_without_reopening_or_
 
     sink_node_id = str(crashed.graph.get_sinks()[0])
     _row, token = crashed.factory.data_flow.create_row_with_token(
-        crashed.run_id,
         crashed.source_node_id,
         50_000,
         {"id": 50_000, "value": 1},
         source_row_index=50_000,
         ingest_sequence=50_000,
+        coordination_token=leader_token_for(crashed.db, crashed.run_id),
     )
     crashed.factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=sink_node_id,
-        run_id=crashed.run_id,
         step_index=0,
         input_data={"id": 50_000, "value": 1},
+        member_token=leader_token_for(crashed.db, crashed.run_id).membership,
     )
     members = resolve_sink_effect_members(
         crashed.factory,
@@ -273,7 +273,7 @@ def test_public_resume_refuses_non_resumable_failed_effect_without_reopening_or_
             payload_store=crashed.payload_store,
         )
     with pytest.raises(FrameworkBugError, match="already-completed operation"):
-        crashed.factory.execution.complete_operation(operation.operation_id, "completed", duration_ms=1.0)
+        crashed.factory.execution.complete_operation(operation.operation_id, "completed", duration_ms=1.0, coordination_token=leader_token)
 
     with crashed.db.engine.connect() as conn:
         run_after = dict(conn.execute(select(runs_table).where(runs_table.c.run_id == crashed.run_id)).mappings().one())

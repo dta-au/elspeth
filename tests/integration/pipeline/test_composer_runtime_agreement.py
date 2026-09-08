@@ -7063,6 +7063,7 @@ class TestComposerEnvPlaceholderAgreement:
 class TestCsvBindGuaranteeRuntimeAgreement:
     def _bind_csv_blob_state(self, tmp_path: Path) -> CompositionState:
         """Drive the REAL bind tool so the stamp comes from production code."""
+        from dataclasses import replace
         from datetime import datetime as _datetime
         from unittest.mock import MagicMock
 
@@ -7074,10 +7075,12 @@ class TestCsvBindGuaranteeRuntimeAgreement:
         from elspeth.web.catalog.schemas import PluginSummary
         from elspeth.web.composer.tools import _execute_create_blob, _execute_set_source_from_blob
         from elspeth.web.composer.tools._common import ToolContext
+        from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
         from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
         from elspeth.web.sessions.engine import create_session_engine
         from elspeth.web.sessions.models import chat_messages_table, sessions_table
         from elspeth.web.sessions.schema import initialize_session_schema
+        from tests.helpers.session_fences import fenced_operation_context
 
         engine = create_session_engine(
             "sqlite:///:memory:",
@@ -7142,23 +7145,29 @@ class TestCsvBindGuaranteeRuntimeAgreement:
             tool_arguments_hash="b" * 64,
         )
         empty = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
-        create_result = _execute_create_blob(
-            {"filename": "colours.csv", "mime_type": "text/csv", "content": content},
-            empty,
-            ctx,
-        )
-        assert create_result.success is True, create_result.data
-        bind_result = _execute_set_source_from_blob(
-            {
-                "blob_id": create_result.data["blob_id"],
-                "on_success": "classify",
-                "options": {"schema": {"mode": "observed"}},
-            },
-            empty,
-            ctx,
-        )
-        assert bind_result.success is True, bind_result.data
-        return bind_result.updated_state
+        with fenced_operation_context(engine, _AGREEMENT_SESSION_ID) as operation_context:
+            ctx = replace(
+                ctx,
+                session_operation_context=operation_context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            )
+            create_result = _execute_create_blob(
+                {"filename": "colours.csv", "mime_type": "text/csv", "content": content},
+                empty,
+                ctx,
+            )
+            assert create_result.success is True, create_result.data
+            bind_result = _execute_set_source_from_blob(
+                {
+                    "blob_id": create_result.data["blob_id"],
+                    "on_success": "classify",
+                    "options": {"schema": {"mode": "observed"}},
+                },
+                empty,
+                ctx,
+            )
+            assert bind_result.success is True, bind_result.data
+            return bind_result.updated_state
 
     def _runtime_graph_for_source_schema(self, tmp_path: Path, schema: dict[str, Any]) -> ExecutionGraph:
         csv_path = tmp_path / "in.csv"

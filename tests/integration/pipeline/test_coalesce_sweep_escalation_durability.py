@@ -61,6 +61,7 @@ from elspeth.engine.spans import SpanFactory
 from elspeth.engine.tokens import TokenManager
 from elspeth.testing import make_row
 from tests.fixtures.factories import make_context
+from tests.fixtures.landscape import leader_token_for
 from tests.unit.engine.test_processor import _TEST_LEADER_WORKER_ID, _make_factory, _make_processor, _persist_blocked_scheduler_work
 
 RUN_ID = "test-run"
@@ -97,8 +98,8 @@ def _mint_group_member_token(factory: Any, *, row_id: str, token_id: str, group_
     try:
         factory.data_flow.resolve_row_ingest_sequence(row_id)
     except AuditIntegrityError:
-        factory.data_flow.create_row(
-            run_id=RUN_ID,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_token_for(factory._db, RUN_ID),
             source_node_id="source-0",
             row_index=0,
             source_row_index=0,
@@ -110,6 +111,7 @@ def _mint_group_member_token(factory: Any, *, row_id: str, token_id: str, group_
         row_id,
         token_id=token_id,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id=group_id, member_key=member_key),),
+        coordination_token=leader_token_for(factory._db, RUN_ID),
     )
 
 
@@ -191,14 +193,19 @@ def test_sweep_timeout_escalation_loss_is_durable_and_drains_pending() -> None:
         ),
     )
     _persist_blocked_scheduler_work(factory, processor, token, node_id=INNER_NODE, barrier_key="merge_inner", coalesce_name="merge_inner")
-    outcome = executor.accept(token, "merge_inner")
+    outcome = executor.accept(token, "merge_inner", coordination_token=leader_token_for(db, RUN_ID))
     assert outcome.held is True
 
     clock.advance(20.0)
 
     counters = ExecutionCounters()
     pending_tokens: dict[str, list[Any]] = {"out": []}
-    ctx = make_context(landscape=factory.plugin_audit_writer())
+    ctx = make_context(
+        run_id=RUN_ID,
+        landscape=factory.plugin_audit_writer(),
+        coordination_token=leader_token_for(db, RUN_ID),
+        member_token=leader_token_for(db, RUN_ID).membership,
+    )
 
     handle_coalesce_timeouts(
         coalesce_executor=executor,
@@ -326,14 +333,19 @@ def test_three_branch_timeout_dedupes_escalation_to_one_outer_loss() -> None:
         _persist_blocked_scheduler_work(
             factory, processor, member_token, node_id=INNER_NODE, barrier_key="merge_inner", coalesce_name="merge_inner"
         )
-        outcome = executor.accept(member_token, "merge_inner")
+        outcome = executor.accept(member_token, "merge_inner", coordination_token=leader_token_for(db, RUN_ID))
         assert outcome.held is True, f"{member_key} should be holding, not {outcome}"
 
     clock.advance(20.0)
 
     counters = ExecutionCounters()
     pending_tokens: dict[str, list[Any]] = {"out": []}
-    ctx = make_context(landscape=factory.plugin_audit_writer())
+    ctx = make_context(
+        run_id=RUN_ID,
+        landscape=factory.plugin_audit_writer(),
+        coordination_token=leader_token_for(db, RUN_ID),
+        member_token=leader_token_for(db, RUN_ID).membership,
+    )
 
     # Must NOT raise — this is the C1 regression this test pins.
     handle_coalesce_timeouts(

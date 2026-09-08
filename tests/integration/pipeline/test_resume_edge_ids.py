@@ -19,7 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import edges_table
 from elspeth.core.payload_store import FilesystemPayloadStore
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import leader_coordination_token, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 
@@ -122,11 +122,11 @@ class TestResumeEdgeIDs:
 
         for edge_info in graph.get_edges():
             edge = factory.data_flow.register_edge(
-                run_id=run_id,
                 from_node_id=edge_info.from_node,
                 to_node_id=edge_info.to_node,
                 label=edge_info.label,
                 mode=edge_info.mode,
+                coordination_token=leader_coordination_token(factory, run_id),
             )
             edge_map[(edge_info.from_node, edge_info.label)] = edge.edge_id
 
@@ -218,15 +218,14 @@ class TestResumeEdgeIDs:
 
         tokens = []
         for i, row_data in enumerate(row_data_list):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id="source",
                 row_index=i,
                 data=row_data,
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             tokens.append(token)
 
         # 4. Create checkpoint (simulating partial run)

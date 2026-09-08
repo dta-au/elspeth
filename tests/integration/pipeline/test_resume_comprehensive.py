@@ -48,7 +48,7 @@ from elspeth.plugins.sources.null_source import NullSource
 from elspeth.plugins.transforms.passthrough import PassThrough
 from elspeth.testing import make_contract, make_row
 from tests.fixtures.base_classes import inject_write_failure
-from tests.fixtures.landscape import insert_crashed_leader_seat, make_factory
+from tests.fixtures.landscape import expire_leader_seat, insert_crashed_leader_seat, leader_token_for, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 
@@ -567,12 +567,14 @@ class TestResumeComprehensive:
         # Mark first 3 rows as completed
         factory = make_factory(db)
         for i in range(3):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=f"t{i}", run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="sink",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
+            expire_leader_seat(db, run_id)
 
         # Create checkpoint at row 2
         create_checkpoint(
@@ -676,14 +678,17 @@ class TestResumeComprehensive:
             {"id": 0, "value": "row-0"},
             contract=make_contract(fields={"id": int, "value": str}, mode="FIXED"),
         )
+        from tests.fixtures.landscape import register_test_worker
+
+        register_test_worker(db, run_id=run_id, worker_id=leader_token_for(db, run_id).worker_id)
         factory.scheduler.enqueue_ready(
-            run_id=run_id,
             token_id="t0",
             row_id="r0",
             node_id="xform",
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(scheduled_row),
+            member_token=leader_token_for(factory._db, run_id).membership,
         )
 
         output_path.write_text("id,value\n")
@@ -820,12 +825,14 @@ class TestResumeComprehensive:
         # Mark ALL rows as completed (terminal outcome)
         factory = make_factory(db)
         for i in range(3):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=f"t{i}", run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="sink",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
+            expire_leader_seat(db, run_id)
 
         # Create checkpoint
         create_checkpoint(
@@ -1064,12 +1071,14 @@ class TestResumeComprehensive:
 
         # Mark first row as completed (checkpoint will be at row 0)
         factory = make_factory(db)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="t0", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink",
+            coordination_token=leader_token_for(factory._db, run_id),
         )
+        expire_leader_seat(db, run_id)
 
         # Create checkpoint at row 0 (last completed row)
         create_checkpoint(
@@ -1311,12 +1320,14 @@ class TestResumeComprehensive:
 
         # Mark first row as completed (checkpoint will be at row 0)
         factory = make_factory(db)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="t0", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink",
+            coordination_token=leader_token_for(factory._db, run_id),
         )
+        expire_leader_seat(db, run_id)
 
         # Create checkpoint at row 0 (last completed row)
         create_checkpoint(
@@ -1543,12 +1554,14 @@ class TestResumeComprehensive:
 
         # Mark first row as completed (checkpoint will be at row 0)
         factory = make_factory(db)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="t0", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink",
+            coordination_token=leader_token_for(factory._db, run_id),
         )
+        expire_leader_seat(db, run_id)
 
         # Create checkpoint at row 0 (last completed row)
         create_checkpoint(
@@ -1773,12 +1786,14 @@ class TestResumeComprehensive:
 
         # Mark first row as completed (checkpoint will be at row 0)
         factory = make_factory(db)
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id="t0", run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink",
+            coordination_token=leader_token_for(factory._db, run_id),
         )
+        expire_leader_seat(db, run_id)
 
         # Create checkpoint at row 0 (last completed row)
         create_checkpoint(
@@ -2095,12 +2110,14 @@ class TestResumeComprehensive:
         # correctly accumulates ``rows_routed_success`` from Landscape.
         factory = make_factory(db)
         for i in range(5):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=f"t{i}", run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,
                 sink_name="sink",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
+            expire_leader_seat(db, run_id)
 
         # Create checkpoint at the last row so resume's recovery path is
         # exercised even though no rows remain to process.
@@ -2281,13 +2298,15 @@ class TestResumeComprehensive:
         # tests/integration/audit/test_recorder_routing_events.py:617.
         factory = make_factory(db)
         for i in range(5):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=f"t{i}", run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.ON_ERROR_ROUTED,
                 sink_name="error_sink",
                 error_hash="0123456789abcdef",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
+            expire_leader_seat(db, run_id)
 
         # Create checkpoint at the last row so resume's recovery path is
         # exercised even though no rows remain to process.  Mirrors the

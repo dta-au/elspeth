@@ -73,10 +73,14 @@ from typing import Any
 
 from sqlalchemy import event, update
 from sqlalchemy.engine import Connection
+from sqlalchemy.sql.dml import Insert
 
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.scheduler import TokenWorkStatus
+from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB, begin_write
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import runs_table, token_work_items_table
 
@@ -113,6 +117,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     # hammer's last sweep, and a lock-starved peer's first claim can land after
     # any fixed window. The parent's join timeout bounds the wait.
     parser.add_argument("--min-recovered", type=int, default=1)
+    parser.add_argument("--peer-recovered-file", action="append", default=[])
     return parser.parse_args(argv)
 
 
@@ -163,6 +168,25 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         pragmas = _read_pragmas(db)  # BEFORE instrumentation: keeps txn records verb-only
         engine = db.engine
         repo = TokenSchedulerRepository(engine)
+        coordination = RunCoordinationRepository(engine)
+        member = coordination.admit_follower(run_id=args.run_id, worker_id=args.owner, config_hash=stable_hash({}), window_seconds=80)
+        seat = coordination.live_leader(run_id=args.run_id)
+        assert seat is not None
+        # Both contention hammers hold the same real coordinator grant for
+        # maintenance. Their item claims use distinct admitted memberships.
+        leader = CoordinationToken(run_id=args.run_id, worker_id=seat.leader_worker_id, leader_epoch=seat.leader_epoch)
+        peer_recoveries: list[str] = []
+
+        def observe_recovery_events(_conn: Any, clause: Any, multiparams: Any, params: Any, _options: Any, _result: Any) -> None:
+            if not isinstance(clause, Insert) or clause.table.name != "scheduler_events":
+                return
+            if not multiparams and not params:
+                return
+            for values in multiparams or (params,):
+                if values["event_type"] == "recover_expired_lease" and values["from_lease_owner"] != args.owner:
+                    peer_recoveries.append(values["event_id"])
+
+        event.listen(engine, "after_execute", observe_recovery_events)
 
         txns: list[dict[str, Any]] = []
         _install_write_lock_instrumentation(engine, txns)
@@ -210,13 +234,17 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
         deadline = start + args.duration_seconds
         next_beat = start  # first beat fires immediately
         iteration = 0
-        while time.monotonic() < deadline or recovered_total < args.min_recovered:
+        while (
+            time.monotonic() < deadline
+            or recovered_total < args.min_recovered
+            or not all(Path(path).exists() for path in args.peer_recovered_file)
+        ):
             iteration += 1
             try:
                 item = timed(
                     VERB_CLAIM,
                     lambda: repo.claim_ready(
-                        run_id=args.run_id,
+                        member_token=member,
                         lease_owner=args.owner,
                         lease_seconds=args.lease_seconds,
                     ),
@@ -244,15 +272,22 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
 
             if iteration % args.sweep_every == 0:
                 try:
-                    recovered = timed(
+                    peer_count_before = len(peer_recoveries)
+                    timed(
                         VERB_RECOVER,
-                        lambda: repo.recover_expired_leases_legacy_unfenced(
-                            run_id=args.run_id,
-                            caller_owner=args.owner,
+                        lambda: repo.recover_expired_leases(
+                            coordination_token=leader,
+                            stall_budget_seconds=0,
                         ),
                     )
                     sweeps += 1
-                    recovered_total += int(recovered)
+                    recovered_total += len(peer_recoveries) - peer_count_before
+                    if recovered_total >= args.min_recovered:
+                        # Continue providing peer leases until every hammer has
+                        # observed its own committed cross-owner recovery. A
+                        # coordinator sweep may also reclaim this worker's last
+                        # lease, so unilateral exit can strand its waiting peer.
+                        Path(args.ready_file + ".recovered").touch()
                 except Exception as exc:
                     errors.append({"where": VERB_RECOVER, "type": type(exc).__name__, "msg": str(exc)})
 

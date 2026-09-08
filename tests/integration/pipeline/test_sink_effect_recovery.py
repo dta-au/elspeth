@@ -56,7 +56,7 @@ from elspeth.engine.orchestrator.types import ExecutionCounters, PipelineConfig
 from elspeth.engine.processor import DAGTraversalContext, RowProcessor
 from elspeth.engine.spans import SpanFactory
 from tests.fixtures.base_classes import create_observed_contract
-from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
+from tests.fixtures.landscape import leader_coordination_token, leader_token_for, make_factory, member_token_for, register_test_node
 from tests.fixtures.plugins import ListSource
 from tests.fixtures.sink_effects import (
     DuplicateObservableSink,
@@ -91,15 +91,14 @@ def test_fresh_pipeline_executor_reuses_interrupted_open_state_and_publishes_onc
             plugin_name="duplicate-observable",
         )
         row_data = {"ordinal": 0}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, durable_token = factory.data_flow.create_row_with_token(
             source_node_id=source_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
-        durable_token = factory.data_flow.create_token(row.row_id)
         token = TokenInfo(
             row_id=row.row_id,
             token_id=durable_token.token_id,
@@ -195,18 +194,18 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
         leader = leader_coordination_token(factory, run_id)
         datetime.now(UTC)
         ready = factory.scheduler.enqueue_ready(
-            run_id=run_id,
             token_id=token.token_id,
             row_id=token.row_id,
             node_id=sink_id,
             step_index=1,
             ingest_sequence=0,
             row_payload_json=factory.scheduler.serialize_row_payload(token.row_data),
+            member_token=leader_token_for(factory._db, run_id).membership,
         )
         claimed = factory.scheduler.claim_ready(
-            run_id=run_id,
             lease_owner=leader.worker_id,
             lease_seconds=300,
+            member_token=member_token_for(factory._db.engine, run_id=run_id, worker_id=leader.worker_id),
         )
         assert claimed is not None and claimed.work_item_id == ready.work_item_id
         parked = factory.scheduler.mark_pending_sink(
@@ -218,7 +217,7 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
             error_hash=None,
             error_message=None,
             expected_lease_owner=leader.worker_id,
-            worker_id=leader.worker_id,
+            member_token=member_token_for(factory._db.engine, run_id=run_id, worker_id=leader.worker_id),
         )
         assert parked.status is TokenWorkStatus.PENDING_SINK
 
@@ -316,6 +315,8 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
             coordination_token=leader,
         )
 
+        ctx.member_token = leader.membership
+        ctx.coordination_token = leader
         assert resumed.drain_scheduled_work(ctx) == []
         assert target.publication_count == 1
 
@@ -410,15 +411,14 @@ def test_ts14_resume_terminalizes_callback_loss_without_republishing_sink_effect
 def _effect_tokens(factory, *, run_id: str, source_id: str, rows: list[dict[str, object]]) -> list[TokenInfo]:  # type: ignore[no-untyped-def]
     tokens: list[TokenInfo] = []
     for index, row_data in enumerate(rows):
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        row, durable = factory.data_flow.create_row_with_token(
             source_node_id=source_id,
             row_index=index,
             data=row_data,
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=leader_coordination_token(factory, run_id),
         )
-        durable = factory.data_flow.create_token(row.row_id)
         tokens.append(
             TokenInfo(
                 row_id=row.row_id,
@@ -450,11 +450,7 @@ def test_primary_finalizes_once_while_diverted_token_waits_for_linked_failsink(t
             plugin_name="partitioning-failsink",
         )
         edge = factory.data_flow.register_edge(
-            run.run_id,
-            primary_id,
-            failsink_id,
-            "__failsink__",
-            RoutingMode.DIVERT,
+            primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run.run_id)
         )
         accepted, diverted = _effect_tokens(
             factory,
@@ -579,11 +575,7 @@ def test_recovered_two_primary_batch_preserves_per_member_failsink_provenance(tm
             plugin_name="partitioning-failsink",
         )
         edge = factory.data_flow.register_edge(
-            run.run_id,
-            primary_id,
-            failsink_id,
-            "__failsink__",
-            RoutingMode.DIVERT,
+            primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run.run_id)
         )
         first_token, second_token = _effect_tokens(
             factory,
@@ -695,7 +687,9 @@ def test_failsink_validation_rejection_terminalizes_states_and_outcomes(tmp_path
         source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
         primary_id = register_test_node(factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="partitioning")
         failsink_id = register_test_node(factory.data_flow, run.run_id, "failsink", node_type=NodeType.SINK, plugin_name="rejecting")
-        edge = factory.data_flow.register_edge(run.run_id, primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT)
+        edge = factory.data_flow.register_edge(
+            primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
         accepted, diverted = _effect_tokens(
             factory,
             run_id=run.run_id,
@@ -1294,7 +1288,9 @@ def _failsink_setup(
     source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
     primary_id = register_test_node(factory.data_flow, run.run_id, "primary", node_type=NodeType.SINK, plugin_name="partitioning")
     failsink_id = register_test_node(factory.data_flow, run.run_id, "failsink", node_type=NodeType.SINK, plugin_name="failsink")
-    edge = factory.data_flow.register_edge(run.run_id, primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT)
+    edge = factory.data_flow.register_edge(
+        primary_id, failsink_id, "__failsink__", RoutingMode.DIVERT, coordination_token=leader_coordination_token(factory, run.run_id)
+    )
     tokens = _effect_tokens(factory, run_id=run.run_id, source_id=source_id, rows=rows)
     ctx = PluginContext(run_id=run.run_id, config={}, landscape=factory.plugin_audit_writer(), node_id=primary_id)
     return factory, run.run_id, primary_id, failsink_id, edge.edge_id, tokens, ctx
@@ -1856,6 +1852,7 @@ def test_redrive_with_completed_failsink_primary_anchor_fails_closed(tmp_path: P
             status=NodeStateStatus.COMPLETED,
             output_data={"rival": True},
             duration_ms=0.0,
+            member_token=leader_token_for(factory._db, run_id).membership,
         )
 
         recovered_factory = make_factory(db)
@@ -1916,6 +1913,7 @@ def test_redrive_with_completed_discard_primary_anchor_fails_closed(tmp_path: Pa
             status=NodeStateStatus.COMPLETED,
             output_data={"rival": True},
             duration_ms=0.0,
+            member_token=leader_token_for(factory._db, run_id).membership,
         )
 
         recovered_factory = make_factory(db)
@@ -1965,12 +1963,13 @@ def test_redrive_with_divergent_discard_outcome_fails_closed(tmp_path: Path) -> 
 
         # A rival recorded a discard outcome that disagrees with the durable
         # diversion attribution (wrong error hash).
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=diverted.token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.SINK_DISCARDED,
             error_hash="0" * 16,
             sink_name="__discard__",
+            coordination_token=leader_token_for(factory._db, run_id),
         )
 
         recovered_factory = make_factory(db)

@@ -26,6 +26,7 @@ from elspeth.engine.barrier_coordination import BarrierIntakeCoordinator, Barrie
 from elspeth.engine.orchestrator.resume import ResumeCoordinator
 from elspeth.engine.processor import RowProcessor
 from elspeth.engine.scheduler_drain import ProcessorMode, SchedulerDrainCoordinator
+from tests.fixtures.landscape import make_recorder_with_run
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 RUN_ID = "run-read-model-consumers"
@@ -196,18 +197,19 @@ class _MaintenanceScheduler:
 
 def test_rm08_maintenance_evicts_exact_dead_worker_listing_in_order() -> None:
     trace: list[object] = []
-    token = SimpleNamespace(worker_id="leader-worker")
+    setup = make_recorder_with_run(run_id=RUN_ID, leader_worker_id="leader-worker")
+    token = setup.coordination_token
     drain: Any = object.__new__(SchedulerDrainCoordinator)
     drain._mode = ProcessorMode.LEADER
     drain._processor = _MaintenanceProcessor(token, trace)
+    drain._coordination_token = token
     drain._run_coordination = _MaintenanceRunCoordination(trace)
     drain._scheduler = _MaintenanceScheduler(trace)
     drain._run_id = RUN_ID
     drain._scheduler_drains_since_maintenance = 9
 
     assert drain.run_maintenance() == 4
-    assert trace[0] == "require-token"
-    dead_call = cast(tuple[object, ...], trace[1])
+    dead_call = cast(tuple[object, ...], trace[0])
     assert dead_call == ("dead", RUN_ID, "leader-worker", DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
     evicted_worker_ids = []
     for entry in trace:
@@ -250,9 +252,12 @@ def test_rm11_resume_batch_repair_uses_exact_blocked_count(
             calls.append(("count", run_id))
             return blocked_count
 
-    def _handle(execution: object, run_id: str) -> dict[str, str]:
-        calls.append(("repair", run_id))
+    setup = make_recorder_with_run(run_id=RUN_ID)
+
+    def _handle(execution: object, *, coordination_token: object) -> dict[str, str]:
+        calls.append(("repair", RUN_ID))
         assert execution == "execution-sentinel"
+        assert coordination_token is setup.coordination_token
         return {"old": "retry"}
 
     monkeypatch.setattr(resume_module, "handle_incomplete_batches", _handle)
@@ -263,7 +268,7 @@ def test_rm11_resume_batch_repair_uses_exact_blocked_count(
         run_id=RUN_ID,
     )
 
-    assert coordinator._repair_resume_batches(snapshot) == ({"old": "retry"}, expected)
+    assert coordinator._repair_resume_batches(snapshot, coordination_token=setup.coordination_token) == ({"old": "retry"}, expected)
     assert calls == [("repair", RUN_ID), ("count", RUN_ID)]
 
 

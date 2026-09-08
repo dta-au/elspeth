@@ -73,7 +73,7 @@ from tests.fixtures.base_classes import (
     as_transform,
 )
 from tests.fixtures.factories import wire_transforms
-from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, make_factory
+from tests.fixtures.landscape import insert_crashed_leader_seat, leader_coordination_token, leader_token_for, make_factory
 from tests.helpers.checkpoint import create_checkpoint
 
 # ---------------------------------------------------------------------------
@@ -501,14 +501,25 @@ def _start_interrupted_multi_source_run(tmp_path: Path) -> _MultiSourceResumeCon
 def _append_crashed_refund_row(ctx: _MultiSourceResumeContext) -> str:
     """Simulate hard kill after source row persistence but before token creation."""
     factory = RecorderFactory(ctx.db, payload_store=ctx.payload_store)
-    row = factory.data_flow.create_row(
+    seed_authority = factory.run_coordination.acquire_run_leadership(
         run_id=ctx.run_id,
+        worker_id="legacy-source-row-seeder",
+        window_seconds=300,
+    )
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=seed_authority,
         source_node_id=ctx.refunds_source_node_id,
         row_index=3,
         data={"refund_id": "R-2", "amount": 45},
         source_row_index=1,
         ingest_sequence=3,
     )
+    # Manufacture the legacy interrupted-ingest image; the live source verb
+    # now always creates its initial token atomically with the row.
+    with ctx.db.engine.begin() as conn:
+        removed = conn.execute(tokens_table.delete().where(tokens_table.c.token_id == token.token_id))
+        assert removed.rowcount == 1
+    factory.run_coordination.release_seat(token=seed_authority)
     return row.row_id
 
 
@@ -769,7 +780,6 @@ class TestResumeIdempotence:
 
         # Register nodes
         factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="list_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -777,9 +787,9 @@ class TestResumeIdempotence:
             node_id="source",
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig(mode="observed", fields=None),
+            coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="doubler",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -787,9 +797,9 @@ class TestResumeIdempotence:
             node_id="transform_0",
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig(mode="observed", fields=None),
+            coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="collect_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -797,20 +807,21 @@ class TestResumeIdempotence:
             node_id="sink_default",
             determinism=Determinism.IO_WRITE,
             schema_config=SchemaConfig(mode="observed", fields=None),
+            coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_edge(
-            run_id=run_id,
             from_node_id="source",
             to_node_id="transform_0",
             label="continue",
             mode=RoutingMode.MOVE,
+            coordination_token=leader_token_for(factory._db, run_id),
         )
         factory.data_flow.register_edge(
-            run_id=run_id,
             from_node_id="transform_0",
             to_node_id="sink_default",
             label="continue",
             mode=RoutingMode.MOVE,
+            coordination_token=leader_token_for(factory._db, run_id),
         )
 
         # ADR-025 §3 Decision 5 (G6): schema contracts live exclusively in
@@ -837,14 +848,14 @@ class TestResumeIdempotence:
             schema_contract=source_contract,
         )
         # Record the source node's output contract for resume.
-        factory.data_flow.update_node_output_contract(run_id, "source", source_contract)
+        factory.data_flow.update_node_output_contract("source", source_contract, member_token=leader_token_for(db_b, run_id).membership)
 
         # Create all 5 rows with payloads (create_row auto-stores via payload_store_b)
         row_ids = []
         token_ids = []
         for i, row_data in enumerate(source_data):
-            row = factory.data_flow.create_row(
-                run_id=run_id,
+            row, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_token_for(db_b, run_id),
                 source_node_id="source",
                 row_index=i,
                 data=row_data,
@@ -852,7 +863,6 @@ class TestResumeIdempotence:
                 ingest_sequence=i,
             )
             row_ids.append(row.row_id)
-            token = factory.data_flow.create_token(row_id=row.row_id)
             token_ids.append(token.token_id)
 
         # Build graph for checkpoint -- manual construction required because
@@ -891,11 +901,12 @@ class TestResumeIdempotence:
 
         # Record terminal outcomes for first 3 rows
         for i in range(3):
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
                 ref=TokenRef(token_id=token_ids[i], run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="default",
+                coordination_token=leader_token_for(factory._db, run_id),
             )
 
         # Create checkpoint at row 2 (0-indexed, so rows 0-2 processed)
