@@ -773,11 +773,19 @@ def _finish_gate_ledger_in_process(
     operation: str,
     paused_after_read: Any,
     release_reader: Any,
+    begin_finalize: Any,
     result_queue: Any,
 ) -> None:
     gate_ledger = importlib.import_module("elspeth.web._aws_ecs_acceptance.gate_ledger")
     original_read = gate_ledger._read_gate_ledger
     paused = False
+
+    if operation == "finalize":
+        # Spawn imports can exceed the protected read's observation budget
+        # under coverage. Establish readiness before the other process locks.
+        paused_after_read.put("finalizer_ready")
+        if not begin_finalize.wait(timeout=30):
+            raise RuntimeError("finalizer_start_timeout")
 
     def read_then_pause(path: Path) -> dict[str, object]:
         nonlocal paused
@@ -785,7 +793,7 @@ def _finish_gate_ledger_in_process(
         if operation == "cleanup" and not paused:
             paused = True
             paused_after_read.put("cleanup")
-            if not release_reader.wait(timeout=10):
+            if not release_reader.wait(timeout=30):
                 raise RuntimeError("release_timeout")
         return ledger
 
@@ -827,20 +835,23 @@ def test_gate_ledger_cleanup_and_finalize_serialize_from_the_preliminary_read(tm
     context = multiprocessing.get_context("spawn")
     paused_after_read = context.Queue()
     release_reader = context.Event()
+    begin_finalize = context.Event()
     result_queue = context.Queue()
     cleanup = context.Process(
         target=_finish_gate_ledger_in_process,
-        args=(str(ledger_path), "cleanup", paused_after_read, release_reader, result_queue),
+        args=(str(ledger_path), "cleanup", paused_after_read, release_reader, begin_finalize, result_queue),
     )
     finalizer = context.Process(
         target=_finish_gate_ledger_in_process,
-        args=(str(ledger_path), "finalize", paused_after_read, release_reader, result_queue),
+        args=(str(ledger_path), "finalize", paused_after_read, release_reader, begin_finalize, result_queue),
     )
     processes = (cleanup, finalizer)
     try:
+        finalizer.start()
+        assert paused_after_read.get(timeout=20) == "finalizer_ready"
         cleanup.start()
         assert paused_after_read.get(timeout=20) == "cleanup"
-        finalizer.start()
+        begin_finalize.set()
         assert finalizer.pid is not None
         lock_path = ledger_path.with_name(f".{ledger_path.name}.lock")
         lock_inode = lock_path.stat().st_ino
@@ -866,6 +877,7 @@ def test_gate_ledger_cleanup_and_finalize_serialize_from_the_preliminary_read(tm
             result_queue.get_nowait()
     finally:
         release_reader.set()
+        begin_finalize.set()
         for process in processes:
             if process.pid is None:
                 continue
