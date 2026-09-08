@@ -3,11 +3,12 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 from sqlalchemy import Column, Integer, MetaData, Table, create_engine, event, select
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import begin_write
@@ -72,8 +73,7 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
 
 @pytest.mark.parametrize("dialect", ["postgresql", "sqlite"])
 def test_decision_clock_reads_and_normalizes_database_result(dialect: str) -> None:
-    conn = Mock()
-    conn.dialect.name = dialect
+    conn = Mock(spec=Connection, dialect=SimpleNamespace(name=dialect))
     conn.scalar.return_value = _NOW.astimezone(timezone(timedelta(hours=10))) if dialect == "postgresql" else _NOW.replace(tzinfo=None)
     assert read_landscape_decision_time(conn) == _NOW
     assert conn.scalar.call_count == 1
@@ -85,16 +85,14 @@ def test_decision_clock_reads_and_normalizes_database_result(dialect: str) -> No
     "dialect, value", [("postgresql", None), ("postgresql", _NOW.replace(tzinfo=None)), ("sqlite", _NOW), ("sqlite", "2026-09-08")]
 )
 def test_decision_clock_rejects_corrupt_results(dialect: str, value: object) -> None:
-    conn = Mock()
-    conn.dialect.name = dialect
+    conn = Mock(spec=Connection, dialect=SimpleNamespace(name=dialect))
     conn.scalar.return_value = value
     with pytest.raises(AuditIntegrityError):
         read_landscape_decision_time(conn)
 
 
 def test_decision_clock_rejects_unknown_dialect() -> None:
-    conn = Mock()
-    conn.dialect.name = "mysql"
+    conn = Mock(spec=Connection, dialect=SimpleNamespace(name="mysql"))
     with pytest.raises(NotImplementedError):
         read_landscape_decision_time(conn)
     conn.scalar.assert_not_called()

@@ -1,7 +1,8 @@
 """Pins for the Landscape database clock (ADR-047, C6.0).
 
-``read_landscape_transaction_time`` is the single read site of Landscape
-database time. These pins hold its contract on SQLite (a real in-memory
+``read_landscape_transaction_time`` retains the transaction-time contract;
+lease decisions use the separate fresh ``read_landscape_decision_time``.
+These pins hold the former contract on SQLite (a real in-memory
 Landscape), its PostgreSQL normalisation branch (a fake connection standing
 in for a ``timestamptz`` under a non-UTC session time zone — the live twin
 is tests/testcontainer/core/test_database_clock_postgres.py), its Tier-1
@@ -31,10 +32,10 @@ from elspeth.contracts.coordination import (
 )
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.landscape.database import LandscapeDB, begin_write
-from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, verify_and_extend_leader_fence
 from elspeth.core.landscape.schema import run_coordination_table, runs_table
-from tests.fixtures.landscape import assert_deadline_within, make_landscape_db, within_one_database_second
+from tests.fixtures.landscape import make_landscape_db
 from tests.helpers.run_coordination import register_run_leader
 from tests.unit.core.landscape.test_database_clock_authority import _clock_returning_references, _scan_sources
 
@@ -170,13 +171,11 @@ class TestClockAuthorityGateClassification:
 
 
 class TestFirstFenceDatabaseDeadline:
-    """C6.1: the leader fence writes its deadline from the database clock, in SQL.
+    """The fence binds a fresh post-lock database sample into canonical storage.
 
-    The SQLite text artefact the ADR documents — ``datetime(CURRENT_TIMESTAMP,
-    '+N seconds')`` is whole-second UTC with no fraction, so a fence-written
-    expiry compares as expired up to one second early against a ``.ffffff``
-    bound — is pinned here together with the floor that keeps it harmless:
-    every production liveness window is at least ten seconds.
+    SQLite decision samples carry milliseconds, stored as six fractional
+    digits. A bound datetime for that same instant must compare exactly;
+    whole-second sampling must not stand in for the actual issuance sample.
     """
 
     @staticmethod
@@ -209,8 +208,9 @@ class TestFirstFenceDatabaseDeadline:
         try:
             run_id, token = self._seated_run(db)
             with begin_write(db.engine) as conn:
-                database_now = read_landscape_transaction_time(conn)
+                before = read_landscape_decision_time(conn)
                 verify_and_extend_leader_fence(conn, token=token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="unit-test")
+                after = read_landscape_decision_time(conn)
             with db.engine.connect() as conn:
                 raw_deadline, raw_stamp = conn.execute(
                     text("SELECT leader_heartbeat_expires_at, updated_at FROM run_coordination WHERE run_id = :run_id"),
@@ -223,11 +223,13 @@ class TestFirstFenceDatabaseDeadline:
                 ).one()
         finally:
             db.close()
-        canonical = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.000000"
+        canonical = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}000"
         assert isinstance(raw_deadline, str) and re.fullmatch(canonical, raw_deadline), raw_deadline
         assert isinstance(raw_stamp, str) and re.fullmatch(canonical, raw_stamp), raw_stamp
         assert stamped[0] - stamped[1] == timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
-        assert_deadline_within(stamped[0], database_now + timedelta(seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS))
+        assert before <= stamped[1].replace(tzinfo=UTC) <= after
+        assert raw_deadline == stamped[0].strftime("%Y-%m-%d %H:%M:%S.%f")
+        assert raw_stamp == stamped[1].strftime("%Y-%m-%d %H:%M:%S.%f")
 
     def test_sqlite_fence_deadline_compares_exactly_against_a_bound_value_below_the_ten_second_floor(self) -> None:
         """A five-second window is safe: the fence text equals the bound text for the same instant byte for byte.
@@ -242,22 +244,20 @@ class TestFirstFenceDatabaseDeadline:
         try:
             run_id, token = self._seated_run(db)
 
-            def fence_and_compare(database_now: datetime) -> tuple[str, bool, bool]:
-                bound = database_now + timedelta(seconds=5)
-                with begin_write(db.engine) as conn:
-                    verify_and_extend_leader_fence(conn, token=token, window_seconds=5.0, verb="unit-test")
-                    raw = conn.execute(
-                        text("SELECT leader_heartbeat_expires_at FROM run_coordination WHERE run_id = :run_id"), {"run_id": run_id}
-                    ).scalar_one()
-                    seat = run_coordination_table.c.leader_heartbeat_expires_at
-                    # The comparisons the fence readers make, against a bound
-                    # ``datetime`` of the same instant: not-expired at equality
-                    # and not a microsecond later than the bound either.
-                    not_expired = conn.execute(select(seat >= bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
-                    later_than_bound = conn.execute(select(seat > bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
-                return str(raw), bool(not_expired), bool(later_than_bound), bound
-
-            raw, not_expired, later_than_bound, bound = within_one_database_second(db.engine, fence_and_compare)
+            with begin_write(db.engine) as conn:
+                verify_and_extend_leader_fence(conn, token=token, window_seconds=5.0, verb="unit-test")
+                raw = conn.execute(
+                    text("SELECT leader_heartbeat_expires_at FROM run_coordination WHERE run_id = :run_id"), {"run_id": run_id}
+                ).scalar_one()
+                issued_at = conn.execute(
+                    select(run_coordination_table.c.updated_at).where(run_coordination_table.c.run_id == run_id)
+                ).scalar_one()
+                bound = issued_at.replace(tzinfo=UTC) + timedelta(seconds=5)
+                seat = run_coordination_table.c.leader_heartbeat_expires_at
+                # Preserve exact storage/comparison equality against the same
+                # fresh sample used for issuance, not an earlier whole second.
+                not_expired = conn.execute(select(seat >= bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
+                later_than_bound = conn.execute(select(seat > bound).where(run_coordination_table.c.run_id == run_id)).scalar_one()
         finally:
             db.close()
         assert raw == bound.strftime("%Y-%m-%d %H:%M:%S.%f"), (raw, bound)
