@@ -245,6 +245,7 @@ def _spawn_children(
                             str(metrics),
                             "--min-recovered",
                             str(MIN_RECOVERED_PER_HAMMER),
+                            "--expire-claims",
                             *[
                                 argument
                                 for peer in hammer_owners

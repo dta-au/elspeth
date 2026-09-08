@@ -17,9 +17,9 @@ Roles
 -----
 hammer
     Single-threaded loop: ``claim_ready`` every iteration with
-    ``--lease-seconds`` (default 0: every lease is aged into the database
-    clock's past right after the claim, so it is instantly expired, and
-    the PEER's sweep genuinely reaps it — the hammer is self-feeding);
+    ``--lease-seconds`` (default 30). With ``--expire-claims``, each committed
+    lease is aged into the database clock's past, so the PEER's sweep
+    genuinely reaps it and the hammer is self-feeding;
     ``recover_expired_leases`` every ``--sweep-every`` iterations (the
     self-steal guard means only the peer's leases are reaped — the exact
     multi-worker interleaving slice 1 must survive); plus a synthetic
@@ -109,7 +109,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--duration-seconds", type=float, required=True)
     parser.add_argument("--metrics-out", required=True)
     parser.add_argument("--sweep-every", type=int, default=8)
-    parser.add_argument("--lease-seconds", type=int, default=0)
+    parser.add_argument("--lease-seconds", type=int, default=30)
+    parser.add_argument("--expire-claims", action="store_true")
     parser.add_argument("--beat-interval-ms", type=int, default=250)
     # The cross-owner reap the parent asserts per hammer (A9). The measurement
     # window is a floor: a hammer keeps going past it until it has reaped this
@@ -254,12 +255,10 @@ def _run_hammer(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     claims += 1
                     claimed_work_item_ids.append(item.work_item_id)
-                    if args.lease_seconds <= 0:
-                        # A zero-length lease is live for the rest of its whole
-                        # SQLite database second (expiry is strict, ADR-047), so
-                        # "instantly expired" is written explicitly: the lease is
-                        # aged one second into the database clock's past, and a
-                        # peer's next sweep finds it lapsed.
+                    if args.expire_claims:
+                        # First commit a valid issued lease through the deadline
+                        # guard. Then model its expiry in a separate fixture
+                        # transaction so a peer must perform real recovery.
                         with begin_write(engine) as conn:
                             conn.execute(
                                 update(token_work_items_table)

@@ -33,9 +33,7 @@ from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
 from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB, run_coordination_repository, run_lifecycle_repository
-from elspeth.core.landscape.data_flow import tokens as token_repository_module
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
-from elspeth.core.landscape.execution import node_states as node_states_module
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
     run_coordination_table,
@@ -226,18 +224,23 @@ def _install_profile_run_liveness() -> None:
     """
     patch = pytest.MonkeyPatch()
     patch.setattr(run_lifecycle_repository, "DEFAULT_RUN_LIVENESS_WINDOW_SECONDS", _PROFILE_RUN_LIVENESS_SECONDS)
-    real_fence = run_coordination_repository.verify_and_extend_leader_fence
+    real_renew = run_coordination_repository._renew_leader_deadline_on
 
-    def profile_fence(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
-        # Apply the profile at the shared authority primitive so a new writer
-        # cannot silently restore the 80-second product window. Preserve the
-        # real identity/epoch CAS and its transaction, only shorten its lease.
-        real_fence(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS, verb=verb)
+    def profile_renew(conn: Connection, *, token: CoordinationToken, window_seconds: float, verb: str) -> None:
+        # Entry verification and successful context finalization share this
+        # renewal primitive. Both must use the profile window while retaining
+        # the real full-token CAS, fresh clock, and issued-deadline registration.
+        real_renew(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS, verb=verb)
 
-    patch.setattr(run_coordination_repository, "verify_and_extend_leader_fence", profile_fence)
-    # These two transaction-internal leader verbs import the primitive directly.
-    patch.setattr(token_repository_module, "verify_and_extend_leader_fence", profile_fence)
-    patch.setattr(node_states_module, "verify_and_extend_leader_fence", profile_fence)
+    patch.setattr(run_coordination_repository, "_renew_leader_deadline_on", profile_renew)
+    real_finalize = run_coordination_repository.RunCoordinationRepository._finalize_leader_registration_on
+
+    def profile_finalize(conn: Connection, *, token: CoordinationToken, window_seconds: float) -> None:
+        # Begin-run and takeover explicitly finalize both newly issued rows;
+        # resume must not restore the product window at this separate seam.
+        real_finalize(conn, token=token, window_seconds=_PROFILE_RUN_LIVENESS_SECONDS)
+
+    patch.setattr(run_coordination_repository.RunCoordinationRepository, "_finalize_leader_registration_on", staticmethod(profile_finalize))
 
     real_heartbeat_init = RunHeartbeatThread.__init__
 
@@ -783,7 +786,7 @@ def _exercise_worker_profile(
 def _seat_liveness(database_url: str, run_id: str) -> tuple[bool, datetime | None, datetime]:
     """The follower admission predicate itself: seat deadline against Landscape database time."""
     with LandscapeDB.from_url(database_url, create_tables=False) as db, db.engine.connect() as conn:
-        database_now = read_landscape_transaction_time(conn)
+        database_now = read_landscape_decision_time(conn)
         seat = conn.execute(
             select(
                 run_coordination_table.c.leader_heartbeat_expires_at,
