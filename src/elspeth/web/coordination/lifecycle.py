@@ -831,14 +831,13 @@ class SessionOperationLease:
         finally:
             self._closed = True
 
-    async def _join_finish_task(self, task: asyncio.Task[None], *, operation_name: str) -> None:
+    async def _join_finish_task(self, task: asyncio.Task[None]) -> None:
         try:
             await asyncio.shield(task)
-        except asyncio.CancelledError as cancellation:
-            try:
-                await _join_shielded_task_after_cancellation(task)
-            except BaseException as cleanup_error:
-                cancellation.add_note(f"Session-operation {operation_name} also failed with {type(cleanup_error).__name__}.")
+        except asyncio.CancelledError:
+            # Cancellation delays observation; it does not replace the owned
+            # task's failure. Drain it and let its original exception escape.
+            await _join_shielded_task_after_cancellation(task)
             raise
 
     async def close(self) -> None:
@@ -850,7 +849,7 @@ class SessionOperationLease:
                 name="session-operation-close",
             )
         close_task = self._close_task
-        await self._join_finish_task(close_task, operation_name="close")
+        await self._join_finish_task(close_task)
 
     async def consume_archive(
         self,
@@ -872,7 +871,7 @@ class SessionOperationLease:
             )
         elif self._finish_mode != "consume":
             raise RuntimeError("archive consume cannot begin after normal close")
-        await self._join_finish_task(self._close_task, operation_name="archive consume")
+        await self._join_finish_task(self._close_task)
 
     async def __aenter__(self) -> SessionOperationLease:
         if self._closed or self._close_task is not None:
@@ -893,5 +892,8 @@ class SessionOperationLease:
             if exc_value is None:
                 raise
             if cleanup_error is not exc_value:
-                exc_value.add_note(f"Session-operation lifecycle cleanup also failed with {type(cleanup_error).__name__}.")
+                raise BaseExceptionGroup(
+                    "Session operation body and cleanup both failed",
+                    [exc_value, cleanup_error],
+                ) from None
         return False

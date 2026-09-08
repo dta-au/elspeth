@@ -814,7 +814,7 @@ async def test_archive_consume_cancellation_after_confirmed_cascade_waits_and_ne
 
 
 @pytest.mark.asyncio
-async def test_archive_consume_cancelled_precommit_failure_reconciles_current_releases_then_raises_cancellation() -> None:
+async def test_archive_consume_cancelled_precommit_failure_reconciles_current_releases_then_raises_failure() -> None:
     authority = _FakeAuthority()
     authority.archive_delete_allowed.clear()
     authority.archive_delete_error = RuntimeError("precommit archive failure")
@@ -826,9 +826,11 @@ async def test_archive_consume_cancelled_precommit_failure_reconciles_current_re
     consume_task.cancel()
     authority.archive_delete_allowed.set()
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(RuntimeError) as caught:
         await consume_task
 
+    assert caught.value is authority.archive_delete_error
+    assert isinstance(caught.value.__context__, asyncio.CancelledError)
     assert authority.reconcile_archive_delete_calls == [lease.context]
     assert authority.release_calls == [lease.context]
     assert lease.disposition is SessionOperationLeaseDisposition.RELEASED
@@ -1026,10 +1028,12 @@ async def test_archive_cancellation_joins_restore_before_release() -> None:
 
     assert authority.release_calls == []
     restore_allowed.set()
-    with pytest.raises(asyncio.CancelledError) as raised:
+    with pytest.raises(RuntimeError) as raised:
         await consume_task
 
-    assert raised.value.args == ("first-cancellation",)
+    assert raised.value is authority.archive_delete_error
+    assert isinstance(raised.value.__context__, asyncio.CancelledError)
+    assert raised.value.__context__.args == ("first-cancellation",)
     assert restore_calls == 1
     assert authority.release_calls == [lease.context]
     assert lease.disposition is SessionOperationLeaseDisposition.RELEASED
@@ -1075,12 +1079,13 @@ async def test_archive_cancellation_after_commit_joins_finalize() -> None:
 
 
 @pytest.mark.asyncio
-async def test_archive_cleanup_failure_preserves_cancellation_primacy_and_redacts_detail() -> None:
+@pytest.mark.parametrize("failure_type", [OSError, AuditIntegrityError])
+async def test_archive_cleanup_failure_survives_cancellation(failure_type: type[Exception]) -> None:
     authority = _FakeAuthority()
     lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
     finalize_started = asyncio.Event()
     finalize_allowed = asyncio.Event()
-    cleanup_secret = "finalize-secret-path"
+    cleanup_error = failure_type("finalization failed")
 
     async def restore_current() -> None:
         raise AssertionError("restore must not run after commit")
@@ -1088,7 +1093,7 @@ async def test_archive_cleanup_failure_preserves_cancellation_primacy_and_redact
     async def finalize_consumed() -> None:
         finalize_started.set()
         await finalize_allowed.wait()
-        raise OSError(cleanup_secret)
+        raise cleanup_error
 
     consume_task = asyncio.create_task(
         lease.consume_archive(
@@ -1101,17 +1106,57 @@ async def test_archive_cleanup_failure_preserves_cancellation_primacy_and_redact
     asyncio.get_running_loop().call_soon(consume_task.cancel, "second-cancellation")
     finalize_allowed.set()
 
-    with pytest.raises(asyncio.CancelledError) as raised:
+    with pytest.raises(failure_type) as raised:
         await consume_task
 
-    rendered = "".join(traceback.format_exception(raised.value))
-    assert raised.value.args == ("first-cancellation",)
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
-    assert cleanup_secret not in rendered
-    assert "OSError" in "\n".join(raised.value.__notes__)
+    assert raised.value is cleanup_error
+    assert isinstance(raised.value.__context__, asyncio.CancelledError)
+    assert raised.value.__context__.args == ("first-cancellation",)
+    assert consume_task.done()
+    assert lease.closed
     assert authority.release_calls == []
     assert lease.disposition is SessionOperationLeaseDisposition.CONSUMED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [OSError, AuditIntegrityError])
+async def test_close_release_failure_survives_repeated_cancellation(failure_type: type[Exception]) -> None:
+    authority = _FakeAuthority()
+    cleanup_error = failure_type("release failed")
+    authority.release_error = cleanup_error
+    authority.release_allowed.clear()
+    lease = await _acquire(authority, renew_interval_seconds=10)
+    close_task = asyncio.create_task(lease.close())
+    await _wait_for_thread_event(authority.release_called)
+    close_task.cancel("first-cancellation")
+    await asyncio.sleep(0)
+    close_task.cancel("second-cancellation")
+    await asyncio.sleep(0)
+    assert not close_task.done()
+    authority.release_allowed.set()
+    with pytest.raises(failure_type) as caught:
+        await close_task
+    assert caught.value is cleanup_error
+    assert isinstance(caught.value.__context__, asyncio.CancelledError)
+    assert caught.value.__context__.args == ("first-cancellation",)
+    assert authority.release_finished.is_set()
+    assert authority.release_attempts == [lease.context]
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body_failure", [ValueError("body failed"), asyncio.CancelledError("cancelled body")])
+async def test_context_exit_preserves_body_and_integrity_cleanup_failures(body_failure: BaseException) -> None:
+    authority = _FakeAuthority()
+    cleanup_error = AuditIntegrityError("release integrity failed")
+    authority.release_error = cleanup_error
+    lease = await _acquire(authority, renew_interval_seconds=10)
+    with pytest.raises(BaseExceptionGroup) as caught:
+        async with lease:
+            raise body_failure
+    assert caught.value.exceptions == (body_failure, cleanup_error)
+    assert authority.release_finished.is_set()
+    assert lease.closed
 
 
 @pytest.mark.asyncio
