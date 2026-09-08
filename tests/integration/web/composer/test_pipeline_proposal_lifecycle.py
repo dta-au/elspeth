@@ -63,7 +63,7 @@ from elspeth.web.sessions.routes._helpers import _persist_tool_invocations
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.helpers.session_fences import fenced_operation_context
+from tests.helpers.session_fences import acquire_operation_context, fenced_operation_context
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
 
@@ -1602,27 +1602,30 @@ async def test_prepare_pipeline_commit_revalidates_and_audits_exact_arguments_wi
     recorder = BufferingRecorder()
     current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
-    prepared = await prepare_pipeline_proposal_commit(
-        authority=authority,
-        reviewed_facts={},
-        current_state=current,
-        current_state_id=None,
-        policy_catalog=policy,
-        plugin_snapshot=snapshot,
-        config=PipelineCommitConfig(
-            data_dir=str(tmp_path),
-            session_engine=service._engine,
-            secret_service=None,
-            user_id="alice",
-            user_message_content=None,
-            max_blob_storage_per_session_bytes=1_000_000,
-            runtime_preflight=None,
-            timeout_seconds=5.0,
-        ),
-        recorder=recorder,
-        actor="user:alice",
-        settlement_surface="generic",
-    )
+    async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+        prepared = await prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts={},
+            current_state=current,
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                session_operation_context=proposal_context,
+                session_operation_authority=service.session_operation_authority,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder,
+            actor="user:alice",
+            settlement_surface="generic",
+        )
 
     assert prepared.dispatch.tool_call_id == plan.tool_call_id
     assert prepared.dispatch.arguments_hash == stable_hash(plan.proposal.pipeline)
@@ -1693,27 +1696,30 @@ async def test_prepare_pipeline_commit_accepts_server_canonical_review_rows_in_p
     recorder = BufferingRecorder()
     current = CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1)
 
-    prepared = await prepare_pipeline_proposal_commit(
-        authority=authority,
-        reviewed_facts={},
-        current_state=current,
-        current_state_id=None,
-        policy_catalog=policy,
-        plugin_snapshot=snapshot,
-        config=PipelineCommitConfig(
-            data_dir=str(tmp_path),
-            session_engine=service._engine,
-            secret_service=None,
-            user_id="alice",
-            user_message_content=None,
-            max_blob_storage_per_session_bytes=1_000_000,
-            runtime_preflight=None,
-            timeout_seconds=5.0,
-        ),
-        recorder=recorder,
-        actor="user:alice",
-        settlement_surface="generic",
-    )
+    async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+        prepared = await prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts={},
+            current_state=current,
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                session_operation_context=proposal_context,
+                session_operation_authority=service.session_operation_authority,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=recorder,
+            actor="user:alice",
+            settlement_surface="generic",
+        )
 
     requirement = prepared.result.updated_state.sources["source"].options["interpretation_requirements"][0]
     assert requirement["id"] == "trusted-source-review"
@@ -1764,40 +1770,43 @@ async def test_prepare_pipeline_commit_runs_blocking_policy_validation_off_event
         return original_validate(state)
 
     monkeypatch.setattr(policy, "validate_composition_state", blocking_validate)
-    task = asyncio.create_task(
-        prepare_pipeline_proposal_commit(
-            authority=authority,
-            reviewed_facts={},
-            current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-            current_state_id=None,
-            policy_catalog=policy,
-            plugin_snapshot=snapshot,
-            config=PipelineCommitConfig(
-                data_dir=str(tmp_path),
-                session_engine=service._engine,
-                secret_service=None,
-                user_id="alice",
-                user_message_content=None,
-                max_blob_storage_per_session_bytes=1_000_000,
-                runtime_preflight=None,
-                timeout_seconds=2.0,
-            ),
-            recorder=BufferingRecorder(),
-            actor="user:alice",
-            settlement_surface="generic",
+    async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+        task = asyncio.create_task(
+            prepare_pipeline_proposal_commit(
+                authority=authority,
+                reviewed_facts={},
+                current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                current_state_id=None,
+                policy_catalog=policy,
+                plugin_snapshot=snapshot,
+                config=PipelineCommitConfig(
+                    data_dir=str(tmp_path),
+                    session_engine=service._engine,
+                    session_operation_context=proposal_context,
+                    session_operation_authority=service.session_operation_authority,
+                    secret_service=None,
+                    user_id="alice",
+                    user_message_content=None,
+                    max_blob_storage_per_session_bytes=1_000_000,
+                    runtime_preflight=None,
+                    timeout_seconds=2.0,
+                ),
+                recorder=BufferingRecorder(),
+                actor="user:alice",
+                settlement_surface="generic",
+            )
         )
-    )
-    for _ in range(50):
-        if started.is_set():
-            break
-        await asyncio.sleep(0.01)
-    assert started.is_set()
-    assert not task.done()
-    assert validation_thread_ids == [validation_thread_ids[0]]
-    assert validation_thread_ids[0] != event_loop_thread_id
-    release.set()
+        for _ in range(50):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        assert not task.done()
+        assert validation_thread_ids == [validation_thread_ids[0]]
+        assert validation_thread_ids[0] != event_loop_thread_id
+        release.set()
 
-    await task
+        await task
 
 
 @pytest.mark.asyncio
@@ -1938,66 +1947,73 @@ async def test_prepare_pipeline_commit_bounds_reviewed_source_db_without_blockin
         await database_entered.wait()
         heartbeat_seen.set()
 
-    monkeypatch.setattr(service._engine, "connect", delayed_connect)
-    monkeypatch.setattr(commit_module, "resolve_reviewed_source_authority", tracked_resolver)
-    heartbeat_task = asyncio.create_task(heartbeat())
-    prepare_task = asyncio.create_task(
-        prepare_pipeline_proposal_commit(
-            authority=authority,
-            reviewed_facts=reviewed_facts,
-            current_state=CompositionState(
-                source=None,
-                nodes=(),
-                edges=(),
-                outputs=(),
-                metadata=PipelineMetadata(),
-                version=1,
-            ),
-            current_state_id=None,
-            policy_catalog=policy,
-            plugin_snapshot=snapshot,
-            config=PipelineCommitConfig(
-                data_dir=str(tmp_path),
-                session_engine=service._engine,
-                secret_service=None,
-                user_id="alice",
-                user_message_content=None,
-                max_blob_storage_per_session_bytes=1_000_000,
-                runtime_preflight=None,
-                timeout_seconds=0.2,
-            ),
-            recorder=BufferingRecorder(),
-            actor="user:alice",
-            settlement_surface="guided",
-        )
-    )
-    try:
-        await asyncio.wait_for(database_entered.wait(), timeout=outer_failure_watchdog_seconds)
-        await asyncio.wait_for(heartbeat_seen.wait(), timeout=outer_failure_watchdog_seconds)
-        await asyncio.wait_for(heartbeat_task, timeout=outer_failure_watchdog_seconds)
-        assert not release_database.is_set()
-        with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
-            await asyncio.wait_for(
-                asyncio.shield(prepare_task),
-                timeout=outer_failure_watchdog_seconds,
+    async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+        monkeypatch.setattr(service._engine, "connect", delayed_connect)
+        monkeypatch.setattr(commit_module, "resolve_reviewed_source_authority", tracked_resolver)
+        heartbeat_task = asyncio.create_task(heartbeat())
+        prepare_task = asyncio.create_task(
+            prepare_pipeline_proposal_commit(
+                authority=authority,
+                reviewed_facts=reviewed_facts,
+                current_state=CompositionState(
+                    source=None,
+                    nodes=(),
+                    edges=(),
+                    outputs=(),
+                    metadata=PipelineMetadata(),
+                    version=1,
+                ),
+                current_state_id=None,
+                policy_catalog=policy,
+                plugin_snapshot=snapshot,
+                config=PipelineCommitConfig(
+                    data_dir=str(tmp_path),
+                    session_engine=service._engine,
+                    session_operation_context=proposal_context,
+                    session_operation_authority=service.session_operation_authority,
+                    secret_service=None,
+                    user_id="alice",
+                    user_message_content=None,
+                    max_blob_storage_per_session_bytes=1_000_000,
+                    runtime_preflight=None,
+                    timeout_seconds=0.2,
+                ),
+                recorder=BufferingRecorder(),
+                actor="user:alice",
+                settlement_surface="guided",
             )
-        assert exc_info.value.code == "TIMEOUT"
-        assert not release_database.is_set()
-    finally:
-        release_database.set()
+        )
         try:
-            if resolver_started.is_set():
-                await asyncio.wait_for(resolver_finished.wait(), timeout=outer_failure_watchdog_seconds)
+            await asyncio.wait_for(database_entered.wait(), timeout=outer_failure_watchdog_seconds)
+            await asyncio.wait_for(heartbeat_seen.wait(), timeout=outer_failure_watchdog_seconds)
+            await asyncio.wait_for(heartbeat_task, timeout=outer_failure_watchdog_seconds)
+            assert not release_database.is_set()
+            with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
+                await asyncio.wait_for(
+                    asyncio.shield(prepare_task),
+                    timeout=outer_failure_watchdog_seconds,
+                )
+            assert exc_info.value.code == "TIMEOUT"
+            assert not release_database.is_set()
         finally:
-            for task in (heartbeat_task, prepare_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(heartbeat_task, prepare_task, return_exceptions=True)
+            release_database.set()
+            try:
+                if resolver_started.is_set():
+                    # Keep the selector ticking while the cancelled caller's
+                    # worker drains, as run_sync_in_worker does during admission.
+                    async with asyncio.timeout(outer_failure_watchdog_seconds):
+                        while not resolver_finished.is_set():
+                            await asyncio.sleep(0.01)
+            finally:
+                for task in (heartbeat_task, prepare_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(heartbeat_task, prepare_task, return_exceptions=True)
 
-    assert resolver_finished.is_set()
-    assert not outer_watchdog_expired.is_set()
-    assert len(database_thread_ids) == 1
-    assert database_thread_ids[0] != event_loop_thread_id
+        assert resolver_finished.is_set()
+        assert not outer_watchdog_expired.is_set()
+        assert len(database_thread_ids) == 1
+        assert database_thread_ids[0] != event_loop_thread_id
 
 
 @pytest.mark.asyncio
@@ -2044,27 +2060,30 @@ async def test_prepare_pipeline_commit_uses_one_total_timeout_budget(
     monkeypatch.setattr(policy, "validate_composition_state", slow_validate)
     monkeypatch.setattr("elspeth.web.composer.pipeline_commit.build_set_pipeline_candidate", slow_candidate)
     with pytest.raises(PipelineCommitError, match="timed out") as exc_info:
-        await prepare_pipeline_proposal_commit(
-            authority=authority,
-            reviewed_facts={},
-            current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-            current_state_id=None,
-            policy_catalog=policy,
-            plugin_snapshot=snapshot,
-            config=PipelineCommitConfig(
-                data_dir=str(tmp_path),
-                session_engine=service._engine,
-                secret_service=None,
-                user_id="alice",
-                user_message_content=None,
-                max_blob_storage_per_session_bytes=1_000_000,
-                runtime_preflight=None,
-                timeout_seconds=0.2,
-            ),
-            recorder=BufferingRecorder(),
-            actor="user:alice",
-            settlement_surface="generic",
-        )
+        async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+            await prepare_pipeline_proposal_commit(
+                authority=authority,
+                reviewed_facts={},
+                current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+                current_state_id=None,
+                policy_catalog=policy,
+                plugin_snapshot=snapshot,
+                config=PipelineCommitConfig(
+                    data_dir=str(tmp_path),
+                    session_engine=service._engine,
+                    session_operation_context=proposal_context,
+                    session_operation_authority=service.session_operation_authority,
+                    secret_service=None,
+                    user_id="alice",
+                    user_message_content=None,
+                    max_blob_storage_per_session_bytes=1_000_000,
+                    runtime_preflight=None,
+                    timeout_seconds=0.2,
+                ),
+                recorder=BufferingRecorder(),
+                actor="user:alice",
+                settlement_surface="generic",
+            )
 
     assert exc_info.value.code == "TIMEOUT"
 
@@ -2242,27 +2261,30 @@ async def test_wire_confirm_commit_preserves_accepted_proposal_transform_nodes(
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     policy = PolicyCatalogView.for_trained_operator(catalog, snapshot)
 
-    prepared = await prepare_pipeline_proposal_commit(
-        authority=authority,
-        reviewed_facts=facts,
-        current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
-        current_state_id=None,
-        policy_catalog=policy,
-        plugin_snapshot=snapshot,
-        config=PipelineCommitConfig(
-            data_dir=str(tmp_path),
-            session_engine=service._engine,
-            secret_service=None,
-            user_id="alice",
-            user_message_content=None,
-            max_blob_storage_per_session_bytes=1_000_000,
-            runtime_preflight=None,
-            timeout_seconds=10.0,
-        ),
-        recorder=BufferingRecorder(),
-        actor="user:alice",
-        settlement_surface="guided",
-    )
+    async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+        prepared = await prepare_pipeline_proposal_commit(
+            authority=authority,
+            reviewed_facts=facts,
+            current_state=CompositionState(source=None, nodes=(), edges=(), outputs=(), metadata=PipelineMetadata(), version=1),
+            current_state_id=None,
+            policy_catalog=policy,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=service._engine,
+                session_operation_context=proposal_context,
+                session_operation_authority=service.session_operation_authority,
+                secret_service=None,
+                user_id="alice",
+                user_message_content=None,
+                max_blob_storage_per_session_bytes=1_000_000,
+                runtime_preflight=None,
+                timeout_seconds=10.0,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:alice",
+            settlement_surface="guided",
+        )
 
     committed = prepared.result.updated_state
     assert [(node.id, node.node_type, node.plugin) for node in committed.nodes] == [
@@ -2333,27 +2355,30 @@ async def test_prepare_pipeline_commit_detects_candidate_executor_mismatch_after
 
     monkeypatch.setattr(commit_module, "execute_tool", mismatching_execute)
     with pytest.raises(PipelineCommitMismatchError):
-        await prepare_pipeline_proposal_commit(
-            authority=authority,
-            reviewed_facts={},
-            current_state=current,
-            current_state_id=None,
-            policy_catalog=policy,
-            plugin_snapshot=snapshot,
-            config=PipelineCommitConfig(
-                data_dir=str(tmp_path),
-                session_engine=service._engine,
-                secret_service=None,
-                user_id="alice",
-                user_message_content=None,
-                max_blob_storage_per_session_bytes=1_000_000,
-                runtime_preflight=None,
-                timeout_seconds=5.0,
-            ),
-            recorder=recorder,
-            actor="user:alice",
-            settlement_surface="generic",
-        )
+        async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+            await prepare_pipeline_proposal_commit(
+                authority=authority,
+                reviewed_facts={},
+                current_state=current,
+                current_state_id=None,
+                policy_catalog=policy,
+                plugin_snapshot=snapshot,
+                config=PipelineCommitConfig(
+                    data_dir=str(tmp_path),
+                    session_engine=service._engine,
+                    session_operation_context=proposal_context,
+                    session_operation_authority=service.session_operation_authority,
+                    secret_service=None,
+                    user_id="alice",
+                    user_message_content=None,
+                    max_blob_storage_per_session_bytes=1_000_000,
+                    runtime_preflight=None,
+                    timeout_seconds=5.0,
+                ),
+                recorder=recorder,
+                actor="user:alice",
+                settlement_surface="generic",
+            )
 
     assert len(recorder.invocations) == 1
     assert await service.get_current_state(session_id) is None
@@ -2406,27 +2431,30 @@ async def test_owned_pipeline_executor_mismatch_binds_hash_and_supports_recovery
 
     monkeypatch.setattr(commit_module, "execute_tool", mismatching_execute)
     with pytest.raises(PipelineCommitMismatchError) as exc_info:
-        await prepare_pipeline_proposal_commit(
-            authority=authority,
-            reviewed_facts={},
-            current_state=current,
-            current_state_id=None,
-            policy_catalog=policy,
-            plugin_snapshot=snapshot,
-            config=PipelineCommitConfig(
-                data_dir=str(tmp_path),
-                session_engine=service._engine,
-                secret_service=None,
-                user_id="alice",
-                user_message_content=None,
-                max_blob_storage_per_session_bytes=1_000_000,
-                runtime_preflight=None,
-                timeout_seconds=5.0,
-            ),
-            recorder=recorder,
-            actor="user:alice",
-            settlement_surface="generic",
-        )
+        async with acquire_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as proposal_context:
+            await prepare_pipeline_proposal_commit(
+                authority=authority,
+                reviewed_facts={},
+                current_state=current,
+                current_state_id=None,
+                policy_catalog=policy,
+                plugin_snapshot=snapshot,
+                config=PipelineCommitConfig(
+                    data_dir=str(tmp_path),
+                    session_engine=service._engine,
+                    session_operation_context=proposal_context,
+                    session_operation_authority=service.session_operation_authority,
+                    secret_service=None,
+                    user_id="alice",
+                    user_message_content=None,
+                    max_blob_storage_per_session_bytes=1_000_000,
+                    runtime_preflight=None,
+                    timeout_seconds=5.0,
+                ),
+                recorder=recorder,
+                actor="user:alice",
+                settlement_surface="generic",
+            )
 
     mismatch = exc_info.value
     assert mismatch.invocation is not None
