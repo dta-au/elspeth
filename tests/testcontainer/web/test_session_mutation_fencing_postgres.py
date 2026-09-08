@@ -1572,9 +1572,18 @@ async def test_postgres_winner_reconciles_stale_manifest_and_stale_archiver_cann
     finally:
         first_stage_release.set()
 
-    with pytest.raises(SessionOperationFenceLost) as exc_info:
+    # Both the resumed phase's ownership check and its mandatory lease release
+    # independently discover the missing fence. Archive recovery retains both
+    # failures rather than discarding the release failure beneath the first.
+    with pytest.raises(ExceptionGroup, match="Session archive and recovery failed") as exc_info:
         await asyncio.wait_for(stale_task, timeout=10)
-    assert exc_info.value.reason is FenceLossReason.MISSING
+    assert len(exc_info.value.exceptions) == 2
+    phase_failure, release_failure = exc_info.value.exceptions
+    assert isinstance(phase_failure, SessionOperationFenceLost)
+    assert isinstance(release_failure, SessionOperationFenceLost)
+    assert phase_failure is not release_failure
+    assert phase_failure.reason is FenceLossReason.MISSING
+    assert release_failure.reason is FenceLossReason.MISSING
     assert restore_identities == [first_identity]
     assert len(purge_identities) == 1
     assert not blob_dir.exists()
