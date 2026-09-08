@@ -117,8 +117,15 @@ rows never return to `active`; a returning process mints a fresh uuid.
 Shutdown: follower SIGINT = finish/abandon current claim, depart, exit 0;
 leader SIGINT = `checkpoint_interrupted_progress`, fenced
 `update_run_status(INTERRUPTED)`, `leader_release` with the seat zeroed.
-Recovery of any leaderless run is `elspeth resume`. Followers never
-auto-promote.
+Recovery of any leaderless run is `elspeth resume` when the shared resume
+gates admit it, and `elspeth abandon` when they refuse (2026-09-08,
+elspeth-5dd23f4df9): resume's source-lifecycle gate (ADR-038) refuses while
+any source is outside the source-complete set, and the pull-then-process
+ingest loop records `EXHAUSTED` only after the last row's traversal returns —
+so a leader that dies mid-run leaves a run resume cannot take. `abandon`
+takes the dead seat through the same takeover CAS and finalizes INTERRUPTED
+under it, which is the fenced arm the ADR-038 abandonment sweep runs on
+(`engine/orchestrator/abandon.py`). Followers never auto-promote.
 
 ### D4 — Fencing: epoch verify-and-extend + membership, both in-statement
 

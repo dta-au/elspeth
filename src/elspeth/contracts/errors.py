@@ -1196,8 +1196,11 @@ class FollowerSeatDeadError(Exception):
     """Raised when the leader seat expires while the follower is draining.
 
     The follower has already departed cleanly (``depart_worker`` called).
-    The run is NOT complete — the operator must use ``elspeth resume`` to
-    take over the run (design §B.1 step 5, §C.3).
+    The run is NOT complete — the operator must take it over with
+    ``elspeth resume`` when the shared resume gates admit it, or finalize it
+    with ``elspeth abandon`` when they refuse (design §B.1 step 5, §C.3;
+    elspeth-5dd23f4df9). The CLI consults the gates and prints whichever verb
+    can succeed.
 
     Attributes:
         worker_id: The follower's worker identity.
@@ -1210,8 +1213,30 @@ class FollowerSeatDeadError(Exception):
         super().__init__(
             f"Follower {worker_id!r} detected no live leader for run {run_id!r}. "
             "The follower has departed cleanly. "
-            f"Use `elspeth resume {run_id}` to take over the run."
+            f"Take over the run with `elspeth resume {run_id}` if it is resumable, "
+            f"or finalize it with `elspeth abandon {run_id}`."
         )
+
+
+# elspeth-5dd23f4df9: `elspeth abandon` preflight refusal — the run is absent,
+# already terminal, or led by a LIVE seat. Operator-interpretable, zero
+# mutation; the takeover CAS stays the arbiter for the preflight/write race.
+# TIER-2: Operator-interpretable refuse signal, not audit corruption — abandon refuses rather than seizing a live or terminal run.
+class AbandonRefusedError(Exception):
+    """Raised when ``elspeth abandon`` cannot act on the named run.
+
+    The advisory preflight (``engine/orchestrator/abandon.py``) refuses before
+    any mutation when the run does not exist, is already terminal, or is led
+    by a LIVE seat — only a dead (expired or vacant) leader seat may be taken
+    over. The takeover CAS remains the arbiter for the race between the
+    preflight and the seat write; a CAS loss surfaces as
+    :class:`~elspeth.core.checkpoint.recovery.NonResumableRunError`.
+    """
+
+    def __init__(self, run_id: str, reason: str) -> None:
+        self.run_id = run_id
+        self.reason = reason
+        super().__init__(f"Cannot abandon run {run_id!r}: {reason}")
 
 
 # The audit DB write lock is held by a live or frozen process, so the takeover
@@ -1365,7 +1390,7 @@ class IncompleteSourceResumeError(Exception):
         super().__init__(
             f"Cannot resume run {run_id!r} to completion: source lifecycle is incomplete "
             f"({source_summary}). Current resume replays only persisted row payloads; "
-            "unread source rows may exist. Start a fresh run or use a source-aware resume path."
+            "unread source rows may exist. Start a fresh run."
         )
 
 

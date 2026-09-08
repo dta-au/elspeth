@@ -240,8 +240,7 @@ def check_source_lifecycle_resumable(db: LandscapeDB, run_id: str) -> SourceLife
         source_summary = ", ".join(f"{source}={state}" for source, state in sorted(incomplete_sources.items()))
         reason = (
             f"source lifecycle is incomplete ({source_summary}) — resume replays only "
-            "persisted row payloads, so unread source rows may exist; start a fresh run "
-            "or use a source-aware resume path"
+            "persisted row payloads, so unread source rows may exist; start a fresh run"
         )
         return SourceLifecycleResumeGate(
             lifecycle_by_source=lifecycle_by_source,

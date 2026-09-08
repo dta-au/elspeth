@@ -11,7 +11,7 @@ from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, get_args
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, cast, get_args
 
 import typer
 import yaml
@@ -25,6 +25,7 @@ from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import (
+    AbandonRefusedError,
     CommencementGateFailedError,
     DependencyFailedError,
     EmptyResumeStateError,
@@ -2679,8 +2680,78 @@ def _emit_interrupted_resume_guidance_from_url(db_url: str, passphrase: str | No
         _close_landscape_db(guidance_db, pending_exc=None)
 
 
+def _leaderless_abandon_hint(db: LandscapeDB, run_id: str) -> str | None:
+    """The ``elspeth abandon`` hint, or ``None`` when the run is not leaderless.
+
+    elspeth-5dd23f4df9: a run whose leader died mid-run is RUNNING with an
+    expired seat; ``resume`` refuses it on the incomplete source lifecycle
+    and no other verb reaches it. Only that state earns the hint — a
+    live-led run should be joined, and a terminal run is already finalized
+    (abandon would refuse it). Consults the SAME preflight ``abandon``
+    itself runs, so the hint is offered exactly when the verb would proceed.
+    """
+    from elspeth.engine.orchestrator.abandon import inspect_leaderless_run
+
+    if inspect_leaderless_run(db, run_id).admissible:
+        return f"elspeth abandon {run_id} --execute"
+    return None
+
+
+def _leaderless_abandon_hint_or_failure(db: LandscapeDB, run_id: str) -> tuple[str | None, str | None]:
+    """``(hint, failure)`` — the hint lookup is advisory and must never raise.
+
+    A refused resume is a clean exit 1; a failure while deciding whether to
+    offer ``abandon`` is reported alongside it, never allowed to replace it.
+    """
+    try:
+        return _leaderless_abandon_hint(db, run_id), None
+    except Exception as exc:  # advisory only: a refused resume must stay a clean exit 1
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _echo_leaderless_abandon_hint(run_id: str, hint: str | None, hint_failure: str | None) -> None:
+    """Console arm of the abandon hint after a resume refusal (stderr)."""
+    if hint is not None:
+        typer.echo(f"The run has no live leader. Finalize it with: {hint}", err=True)
+    if hint_failure is not None:
+        typer.echo(f"Leaderless-run check failed ({hint_failure}); probe with: elspeth abandon {run_id}", err=True)
+
+
+def _emit_leaderless_run_guidance(db: LandscapeDB, run_id: str) -> None:
+    """Direct the operator of a leaderless run at the verb that can succeed.
+
+    Printed when a follower exits because the leader seat died (design §B.1
+    step 5). ADR-030 §C.3 names ``elspeth resume`` as the recovery, but the
+    source-lifecycle gate refuses resume for almost the whole life of a run
+    (EXHAUSTED is recorded only after the last row's traversal returns), so an
+    unconditional "use elspeth resume" is a false promise (elspeth-5dd23f4df9).
+    Consult the shared gates: resumable ⇒ ``resume``; refused ⇒ print the
+    reason and offer ``abandon``, which takes the dead seat and finalizes the
+    run honestly (ADR-038 abandonment of the undecided tokens).
+
+    Never raises: the seat-dead exit contract (exit 2) must survive a
+    guidance failure, so errors degrade to the dry-run probe suggestion with
+    the failure surfaced.
+    """
+    from elspeth.engine.orchestrator.abandon import inspect_leaderless_run
+
+    try:
+        preflight = inspect_leaderless_run(db, run_id)
+        if preflight.resume_check.can_resume:
+            typer.echo(f"Take over the run with: elspeth resume {run_id} --execute")
+            return
+        typer.echo(f"This run cannot be resumed: {preflight.resume_check.reason}")
+        if preflight.admissible:
+            typer.echo(f"Finalize the leaderless run with: elspeth abandon {run_id} --execute")
+    except Exception as exc:  # guidance must not mask the seat-dead exit (see docstring)
+        typer.echo(f"Resumability check failed ({type(exc).__name__}: {exc}); probe with: elspeth resume {run_id}")
+
+
 def _emit_not_resumable_event(
-    error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError, output_format: str
+    error: EmptyResumeStateError | IncompleteSourceResumeError | NonResumableRunError,
+    output_format: str,
+    *,
+    db: LandscapeDB | None = None,
 ) -> None:
     """Emit the operator-facing ``not_resumable`` event for a refused resume.
 
@@ -2688,6 +2759,12 @@ def _emit_not_resumable_event(
     the operator surface is identical regardless of where the clean refuse
     originated (``can_resume()`` at recovery time vs. ``Orchestrator.resume()``
     at execute time).
+
+    When ``db`` is given and the refused run is leaderless (RUNNING with a
+    dead seat), the event also carries the ``elspeth abandon`` hint — the
+    only verb that can finalize such a run (elspeth-5dd23f4df9). The hint is
+    advisory and must never turn a clean refuse into a traceback, so a
+    failed hint lookup is reported inline rather than raised.
 
     Per ADR-025 §3, empty-state resume is the interpretable "nothing to
     resume, start fresh" outcome — distinct from the broader Tier-1
@@ -2716,20 +2793,25 @@ def _emit_not_resumable_event(
     else:
         reason = "no_recorded_work"
         message = str(error)
+    hint: str | None = None
+    hint_failure: str | None = None
+    if db is not None:
+        hint, hint_failure = _leaderless_abandon_hint_or_failure(db, error.run_id)
     if output_format == "json":
-        typer.echo(
-            json.dumps(
-                {
-                    "event": "not_resumable",
-                    "run_id": error.run_id,
-                    "reason": reason,
-                    "message": message,
-                }
-            ),
-            err=True,
-        )
+        payload: dict[str, str] = {
+            "event": "not_resumable",
+            "run_id": error.run_id,
+            "reason": reason,
+            "message": message,
+        }
+        if hint is not None:
+            payload["hint"] = hint
+        if hint_failure is not None:
+            payload["hint_failure"] = hint_failure
+        typer.echo(json.dumps(payload), err=True)
     else:
         typer.echo(f"\nCannot resume run {error.run_id}: {message}", err=True)
+        _echo_leaderless_abandon_hint(error.run_id, hint, hint_failure)
 
 
 @app.command()
@@ -2929,6 +3011,10 @@ def resume(
 
         if not check.can_resume:
             typer.echo(f"Cannot resume run {run_id}: {check.reason}", err=True)
+            # elspeth-5dd23f4df9: this pre-flight is the refusal an operator
+            # actually sees for a leaderless run (the source gate fires here,
+            # before --execute). Name the verb that can finalize it.
+            _echo_leaderless_abandon_hint(run_id, *_leaderless_abandon_hint_or_failure(db, run_id))
             raise typer.Exit(1)
 
         # Get resume point information
@@ -3123,7 +3209,7 @@ def resume(
             # for the operator-facing contract. NonResumableRunError is
             # the resume() entry guard's race-window refusal (status
             # changed between the can_resume pre-flight and --execute).
-            _emit_not_resumable_event(e, output_format)
+            _emit_not_resumable_event(e, output_format, db=db)
             raise typer.Exit(1) from e
         except RunWorkerEvictedError as e:
             if output_format == "json":
@@ -3236,7 +3322,7 @@ def resume(
         # bubble unhandled and the operator would see a Tier-1
         # invariant traceback for a benign outcome
         # (elspeth-241608388f).
-        _emit_not_resumable_event(e, output_format)
+        _emit_not_resumable_event(e, output_format, db=db)
         raise typer.Exit(1) from e
     finally:
         import sys
@@ -3467,6 +3553,228 @@ def export_resume(
             typer.echo(json_module.dumps({**export_info, "export_status": "completed", "resumed": True}, indent=2))
         else:
             typer.echo(f"Export resumed successfully for run {run_id}: export status is now 'completed'.")
+    finally:
+        import sys
+
+        _close_landscape_db(db, pending_exc=sys.exc_info()[1])
+
+
+class _AbandonPreflightPayload(TypedDict):
+    """``elspeth abandon --format json`` dry-run event."""
+
+    event: str
+    run_id: str
+    run_status: str | None
+    leader_worker_id: str | None
+    seat_expires_at: str | None
+    seat_live: bool
+    source_lifecycle: dict[str, str]
+    work_item_counts: dict[str, int]
+    undecided_tokens: int
+    resumable: bool
+    resume_reason: str | None
+    admissible: bool
+    refusal: str | None
+
+
+@app.command()
+def abandon(
+    run_id: str = typer.Argument(..., help="Run ID of the leaderless run to finalize"),
+    database: str | None = typer.Option(
+        None,
+        "--database",
+        "-d",
+        help="Path to Landscape database file (SQLite).",
+    ),
+    settings_file: str | None = typer.Option(
+        None,
+        "--settings",
+        "-s",
+        help="Path to settings YAML file (default: settings.yaml).",
+    ),
+    execute: bool = typer.Option(
+        False,
+        "--execute",
+        "-x",
+        help="Actually take the dead leader's seat and finalize the run (default is dry-run).",
+    ),
+    output_format: Literal["console", "json"] = typer.Option(
+        "console",
+        "--format",
+        "-f",
+        help="Output format: 'console' (human-readable) or 'json' (structured JSON).",
+    ),
+) -> None:
+    """Finalize a run whose leader died, recording its undecided work as abandoned.
+
+    When a multi-worker leader is killed mid-run the run stays RUNNING with an
+    expired seat. `elspeth resume` refuses it while any source is still
+    loading (resume replays only persisted rows, so unread source rows may
+    exist), and nothing else can reach it. This verb takes the dead seat
+    through the same takeover CAS resume uses and finalizes the run as
+    INTERRUPTED under it: every token nothing will ever decide is recorded
+    ABANDONED (ADR-038), open sink effects are failed, followers are departed,
+    and the seat is vacated. A run the gates still consider resumable is
+    finalized without abandoning anything and stays resumable.
+
+    By default, shows what WOULD happen (dry run). Use --execute to act.
+
+    Examples:
+
+        # Dry run - show the leaderless state and whether resume would work instead
+        elspeth abandon run-abc123
+
+        # Take the seat and finalize
+        elspeth abandon run-abc123 --execute
+
+        # Explicit database path
+        elspeth abandon run-abc123 --database ./landscape.db --execute
+    """
+    from elspeth.core.landscape import LandscapeDB
+    from elspeth.engine.orchestrator.abandon import abandon_leaderless_run, inspect_leaderless_run
+
+    settings_path = Path(settings_file).expanduser() if settings_file else Path("settings.yaml")
+    if not settings_path.exists():
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        settings_config, _secret_resolutions = _load_settings_with_secrets(settings_path)
+    except FileNotFoundError:
+        typer.echo(f"Error: Settings file not found: {settings_path}", err=True)
+        raise typer.Exit(1) from None
+    except yaml.YAMLError as e:
+        typer.echo(f"YAML syntax error in {settings_path}: {e}", err=True)
+        raise typer.Exit(1) from None
+    except ValidationError as e:
+        typer.echo("Configuration errors:", err=True)
+        for error in e.errors():
+            loc = ".".join(str(x) for x in error["loc"])
+            typer.echo(f"  - {loc}: {error['msg']}", err=True)
+        raise typer.Exit(1) from None
+    except ValueError as e:
+        typer.echo(f"Configuration error: {e}", err=True)
+        raise typer.Exit(1) from None
+    except SecretLoadError as e:
+        typer.echo(f"Error loading secrets: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    # Resolve database URL (same discipline as `resume` / `export-resume`)
+    if database:
+        db_path = Path(database).expanduser().resolve()
+        if not db_path.exists():
+            typer.echo(f"Error: Database file not found: {db_path}", err=True)
+            raise typer.Exit(1) from None
+        db_url = f"sqlite:///{db_path}"
+    else:
+        db_url = settings_config.landscape.url
+        _validate_existing_sqlite_db_url(db_url, source="settings.yaml")
+        if output_format != "json":
+            typer.echo(f"Using database from settings.yaml: {db_url}")
+
+    from elspeth.cli_helpers import resolve_audit_passphrase
+
+    try:
+        passphrase = resolve_audit_passphrase(settings_config.landscape)
+    except RuntimeError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        db = LandscapeDB.from_url(db_url, passphrase=passphrase, create_tables=False)
+    except Exception as e:
+        typer.echo(f"Error connecting to database: {e}", err=True)
+        raise typer.Exit(1) from None
+
+    try:
+        preflight = inspect_leaderless_run(db, run_id)
+        preflight_payload: _AbandonPreflightPayload = {
+            "event": "abandon_preflight",
+            "run_id": run_id,
+            "run_status": None if preflight.run_status is None else preflight.run_status.value,
+            "leader_worker_id": preflight.leader_worker_id,
+            "seat_expires_at": None if preflight.seat_expires_at is None else preflight.seat_expires_at.isoformat(),
+            "seat_live": preflight.seat_live,
+            "source_lifecycle": dict(preflight.source_lifecycle),
+            "work_item_counts": dict(preflight.work_item_counts),
+            "undecided_tokens": preflight.undecided_tokens,
+            "resumable": preflight.resume_check.can_resume,
+            "resume_reason": preflight.resume_check.reason,
+            "admissible": preflight.admissible,
+            "refusal": preflight.refusal,
+        }
+        if not preflight.admissible:
+            if output_format == "json":
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": preflight.refusal}), err=True)
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {preflight.refusal}", err=True)
+            raise typer.Exit(1)
+
+        if output_format == "json":
+            if not execute:
+                typer.echo(json.dumps(preflight_payload))
+        else:
+            run_status = preflight.run_status.value if preflight.run_status is not None else "absent"
+            seat = "vacant" if preflight.leader_worker_id is None else f"{preflight.leader_worker_id} (expired {preflight.seat_expires_at})"
+            sources = ", ".join(f"{name}={state}" for name, state in sorted(preflight.source_lifecycle.items())) or "none recorded"
+            work = ", ".join(f"{status}={count}" for status, count in sorted(preflight.work_item_counts.items())) or "none"
+            typer.echo(f"\nRun {run_id}")
+            typer.echo(f"  Status: {run_status}")
+            typer.echo(f"  Leader seat: {seat}")
+            typer.echo(f"  Sources: {sources}")
+            typer.echo(f"  Scheduler work items: {work}")
+            typer.echo(f"  Undecided tokens: {preflight.undecided_tokens}")
+            if preflight.resume_check.can_resume:
+                typer.echo(f"  Resumable: yes — prefer `elspeth resume {run_id} --execute`; abandon keeps its tokens pending")
+            else:
+                typer.echo(f"  Resumable: no — this run cannot be resumed: {preflight.resume_check.reason}")
+            if not execute:
+                typer.echo("\nDry run - use --execute to take the dead leader's seat and finalize the run as interrupted.")
+                if not preflight.resume_check.can_resume:
+                    typer.echo(f"  {preflight.undecided_tokens} undecided token(s) would be recorded as abandoned (ADR-038).")
+
+        if not execute:
+            return
+
+        try:
+            outcome = abandon_leaderless_run(db, run_id)
+        except AbandonRefusedError as e:
+            # The state moved between the preflight above and the verb's own
+            # preflight (another operator finalized or resumed it first).
+            if output_format == "json":
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
+        except NonResumableRunError as e:
+            # The takeover CAS lost: the seat came back to life after the
+            # preflight read it as dead. Zero mutation (ADR-030 §B.4).
+            if output_format == "json":
+                typer.echo(json.dumps({"event": "abandon_refused", "run_id": run_id, "reason": e.reason}), err=True)
+            else:
+                typer.echo(f"\nCannot abandon run {run_id}: {e.reason}", err=True)
+            raise typer.Exit(1) from e
+
+        if output_format == "json":
+            typer.echo(
+                json.dumps(
+                    {
+                        "event": "abandoned",
+                        "run_id": outcome.run_id,
+                        "run_status": outcome.run_status.value,
+                        "worker_id": outcome.worker_id,
+                        "leader_epoch": outcome.leader_epoch,
+                        "abandoned_tokens": outcome.abandoned_tokens,
+                    }
+                )
+            )
+        else:
+            typer.echo(
+                f"\nRun {outcome.run_id} finalized as {outcome.run_status.value} by {outcome.worker_id} (epoch {outcome.leader_epoch})."
+            )
+            typer.echo(f"  Tokens abandoned: {outcome.abandoned_tokens}")
+            if outcome.abandoned_tokens:
+                typer.echo("Start a fresh run to reprocess the source; the abandoned work is recorded in the audit trail.")
     finally:
         import sys
 
@@ -3855,7 +4163,11 @@ def join(
         except FollowerSeatDeadError as e:
             try:
                 # Design §B.1 step 5: leader seat died mid-drain. The follower
-                # departed cleanly but the run is incomplete — operator must resume.
+                # departed cleanly but the run is incomplete — the operator
+                # takes it over with `resume` when the shared gates admit it,
+                # or finalizes it with `abandon` when they refuse
+                # (elspeth-5dd23f4df9: an unconditional "use resume" was
+                # unreachable advice for almost the whole life of a run).
                 if output_format == "json":
                     import json as json_mod
 
@@ -3867,13 +4179,15 @@ def join(
                                 "worker_id": e.worker_id,
                                 "message": str(e),
                                 "hint": f"elspeth resume {run_id}",
+                                "abandon_hint": f"elspeth abandon {run_id}",
                             }
                         ),
                         err=True,
                     )
                 else:
                     typer.echo(f"\nFollower {e.worker_id} detected no live leader for run {run_id}.", err=True)
-                    typer.echo(f"The run is incomplete. Use `elspeth resume {run_id}` to take over.", err=True)
+                    typer.echo("The run is incomplete.", err=True)
+                    _emit_leaderless_run_guidance(db, run_id)
                 raise typer.Exit(2)
             except BaseException as pending_exc:
                 cleanup_pending_exc = pending_exc

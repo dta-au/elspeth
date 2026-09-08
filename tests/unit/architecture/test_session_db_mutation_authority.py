@@ -4179,12 +4179,16 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=126,
     ),
+    # Fingerprint re-pinned by elspeth-5dd23f4df9: the refuse reason this
+    # function builds dropped its phantom "source-aware resume path" clause
+    # (no such path exists). Same acquisition, same line, one fewer line in
+    # the function body — every recovery.py entry below shifts up by one.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_source_lifecycle_resumable",
         "<non-session-write-connection>",
         "write_connection",
-        "4b552d15f53e6c40",
+        "1a72af6cb37683c3",
         1,
         None,
         line=233,
@@ -4192,6 +4196,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
     # Re-pinned by P4-D6 step 5: the connection is forwarded only to a
     # same-module private callee that executes on it, which the forwarding
     # proof now inspects; same acquisition, same fingerprint, no escape.
+    # Line 429 -> 428 with the elspeth-5dd23f4df9 message trim above.
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
         "check_group_satisfiability_resumable",
@@ -4200,7 +4205,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "9e291dca4a439605",
         1,
         None,
-        line=429,
+        line=428,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4210,7 +4215,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "758fe32047daee73",
         1,
         None,
-        line=908,
+        line=907,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4220,7 +4225,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ccdaa74d89308bbb",
         1,
         None,
-        line=969,
+        line=968,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4230,7 +4235,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "63aa60b938d94231",
         1,
         None,
-        line=1036,
+        line=1035,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4240,7 +4245,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "18b91cab2434c597",
         1,
         None,
-        line=1131,
+        line=1130,
     ),
     WriterIdentity(
         "src/elspeth/core/checkpoint/recovery.py",
@@ -4250,7 +4255,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "697320a36b78fae3",
         1,
         None,
-        line=1173,
+        line=1172,
     ),
     # MEMBER-FENCE (elspeth-43ddb79074): the three entries below moved by LINE
     # ONLY -- same symbol, same fingerprint, same domain -- because the
@@ -4269,6 +4274,10 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         line=1003,
         connection_escape=True,
     ),
+    # elspeth-5dd23f4df9: the two entries below moved by LINE ONLY (+3) — same
+    # symbol, same fingerprint — because the join admission's "no live leader"
+    # refusal above them now also names `elspeth abandon` and wrapped to four
+    # lines.
     WriterIdentity(
         "src/elspeth/core/landscape/run_coordination_repository.py",
         "RunCoordinationRepository.dead_non_leader_workers",
@@ -4277,7 +4286,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "ee5e921beae1a1a7",
         1,
         None,
-        line=1415,
+        line=1418,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4288,7 +4297,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "e69348a5794c1998",
         1,
         None,
-        line=1440,
+        line=1443,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/run_lifecycle_repository.py",
@@ -4507,6 +4516,21 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         None,
         line=466,
         connection_escape=True,
+    ),
+    # elspeth-5dd23f4df9 (`elspeth abandon`): ONE read-only acquisition for the
+    # operator preflight — token_work_items status counts, undecided-token
+    # count, and ABANDONED-row count taken on the same connection so the
+    # operator sees one snapshot. Executes three SELECTs on the connection it
+    # opened; nothing is forwarded, nothing written.
+    WriterIdentity(
+        "src/elspeth/engine/orchestrator/abandon.py",
+        "_read_run_work",
+        "<non-session-write-connection>",
+        "write_connection",
+        "8f0726b70a181707",
+        1,
+        None,
+        line=143,
     ),
 )
 
@@ -16618,7 +16642,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
         line=466,
         connection_escape=True,
     )
-    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 55
+    assert len(_REVIEWED_NON_SESSION_CONNECTIONS) == 56
     assert export_read_transaction in _REVIEWED_NON_SESSION_CONNECTIONS
     expected_session_reachable: tuple[WriterIdentity, ...] = (
         # The f-string ``PRAGMA user_version = {epoch}`` is opaque raw SQL,

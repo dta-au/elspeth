@@ -80,6 +80,7 @@ Options:
 | `resume` | Resume a failed run from checkpoint |
 | `export-resume` | Resume a finalized run's unfinished audit export |
 | `join` | Attach to a running pipeline as a follower worker |
+| `abandon` | Finalize a run whose leader died, recording its undecided work as abandoned |
 | `health` | Check system health for deployment verification |
 | `web` | Start the web application server |
 | `composer users` | Add, remove, and bootstrap local Composer web users |
@@ -371,6 +372,50 @@ Resume mode:
 - Appends to existing output files (doesn't overwrite)
 - Continues from last successful checkpoint
 - Exits with the same [exit codes](#exit-codes) as `elspeth run --execute`
+
+### Leaderless Runs (`abandon`)
+
+In a multi-worker pack (`elspeth run` leader plus `elspeth join` followers),
+a leader that is killed mid-run leaves the run `running` with an expired
+seat. Followers notice the dead seat and exit 2. `elspeth resume` can take
+the seat over, but it refuses while any source is still `loading`: resume
+replays only the rows that were persisted, so it cannot prove that no unread
+source rows exist. Because a source is recorded `exhausted` only after its
+last row has finished processing, that refusal covers almost the whole life
+of a run.
+
+`elspeth abandon` is the way out. It takes the dead leader's seat through the
+same takeover CAS resume uses and finalizes the run as `interrupted` under
+that seat: every token nothing will ever decide is recorded as `abandoned`
+(ADR-038), open sink effects are failed, followers are departed, and the
+seat is vacated. The abandoned work stays in the audit trail; reprocess the
+source with a fresh run.
+
+```bash
+# Dry run - show the leaderless state and whether resume would work instead
+elspeth abandon run-abc123 --settings settings.yaml --database ./runs/audit.db
+
+Output:
+  Run run-abc123
+    Status: running
+    Leader seat: worker:run-abc123:1f3a… (expired 2026-09-08 03:12:44+00:00)
+    Sources: primary=loading
+    Scheduler work items: leased=1, pending_sink=119, terminal=1
+    Undecided tokens: 120
+    Resumable: no — this run cannot be resumed: source lifecycle is incomplete (primary=loading) …
+
+  Dry run - use --execute to take the dead leader's seat and finalize the run as interrupted.
+    120 undecided token(s) would be recorded as abandoned (ADR-038).
+
+# Take the seat and finalize
+elspeth abandon run-abc123 --settings settings.yaml --database ./runs/audit.db --execute
+```
+
+`abandon` refuses (exit 1) when the run does not exist, is already terminal,
+or is led by a live seat — a live-led run should be joined, not abandoned.
+When the dry run reports `Resumable: yes`, prefer `elspeth resume`; abandoning
+a resumable run finalizes it as `interrupted` without abandoning any token,
+and it stays resumable.
 
 ---
 

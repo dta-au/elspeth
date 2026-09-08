@@ -694,9 +694,10 @@ class ResumeCoordinator:
         (``_acquire_resume_leadership``), the post-CAS work-set computation,
         unprocessed-row restore, and batch repair (``_repair_resume_batches``)
         all run in the caller AFTER this returns. Incomplete-source refusal is
-        an operator-facing "start fresh or use a source-aware resume path"
-        outcome; it must not strand the run as RUNNING or rewrite retry batches
-        merely because the operator probed resume.
+        an operator-facing "start fresh" outcome (a leaderless run is then
+        finalized with ``elspeth abandon``, engine/orchestrator/abandon.py);
+        it must not strand the run as RUNNING or rewrite retry batches merely
+        because the operator probed resume.
         """
         run_id = resume_point.checkpoint.run_id
         worker_id = worker_id or mint_worker_id(run_id)

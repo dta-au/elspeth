@@ -1193,7 +1193,10 @@ class RunCoordinationRepository:
             ).one_or_none()
             seat_live = seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live)
             if not seat_live:
-                raise JoinRefusedError(run_id, "no live leader — use `elspeth resume` to take the seat")
+                raise JoinRefusedError(
+                    run_id,
+                    "no live leader — take the seat with `elspeth resume`, or finalize the run with `elspeth abandon`",
+                )
             self._insert_worker_row(
                 conn,
                 run_id=run_id,

@@ -684,8 +684,14 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # and never could; only the row list separates it from no change at all. Re-derived on
 # the merged tree 79fefa4fe from the gate's own printed live-vs-pinned output, and
 # agreed value for value by an independent derivation from a git archive of that sha.
-_EXPECTED_CALL_COUNT = 269
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "b53a18db3eac8c467467907e130adcfb6d5b92ac9af5fdcbaab839108ddb3850"
+# LEADERLESS-ABANDON (elspeth-5dd23f4df9): 269 -> 270, ONE row added, none removed:
+# engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle
+# .complete_run#1 — the operator verb's fenced INTERRUPTED finalize under the
+# token the takeover CAS just minted (the same shape as web/app.py's orphan
+# finaliser). Attributed by row identity from the gate's own printed
+# live-vs-pinned output on the worktree tree, not by arithmetic.
+_EXPECTED_CALL_COUNT = 270
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "fe91037172830043e94bd42c6831f7c0d97fe55235dfe2da32491745d4490a80"
 # Subordinate edges 70 -> 80 (-5 +15): create_row_with_token's second
 # insert_row_with_token_on edge and record_coalesce_branch_loss's two edges
 # retired; _transition_on's two edges rotated with the group_losses
@@ -723,8 +729,15 @@ _EXPECTED_SUBORDINATE_EDGE_SHA256 = "3fb6f61cce3d97a6dc0b69a3fc64d0fb1d623e41f1a
 # and 6, alongside the four it already had. Re-derived from the gate's own
 # printed output, not hand-counted. The drift was masked until the C6-34 landing
 # re-pinned _EXPECTED_CALL_COUNT above and moved the first failure down to here.
-_EXPECTED_COORDINATION_CALL_COUNT = 20
-_EXPECTED_COORDINATION_CALL_SHA256 = "55dc60ee8f4d822eaea9b889920e77fff395d117faf8cbc63f43bb2d7d5584bf"
+# LEADERLESS-ABANDON (elspeth-5dd23f4df9): 20 -> 22 (+2, none removed), both in
+# engine/orchestrator/abandon.py abandon_leaderless_run: the takeover CAS
+# (factory.run_coordination.acquire_run_leadership#1) that takes the dead
+# leader's seat, and the seat release (factory.run_coordination.release_seat#1)
+# after the fenced INTERRUPTED finalize — the same acquire/release pair the web
+# orphan finaliser contributes. Rows attributed by identity from the gate's
+# own scan (scan_coordination_production_calls) on the worktree tree.
+_EXPECTED_COORDINATION_CALL_COUNT = 22
+_EXPECTED_COORDINATION_CALL_SHA256 = "f09a92a3a120ee475a8f33bc337f8cd73a5451b7bf7f0dd5c0bc86a1f3c9d972"
 # Internal edges 98 -> 101 (-2 +5): create_row_with_token's second
 # insert_row_with_token_on edge and TokenSchedulerRepository's
 # adopt_coalesce_branch_losses forward retired; added:

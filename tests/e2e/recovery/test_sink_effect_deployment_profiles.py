@@ -585,7 +585,15 @@ def _run_cli_follower_until_seat_dead(
     )
     if result.exit_code != 2:
         raise AssertionError(f"CLI follower exited {result.exit_code}, expected seat-dead exit 2: {result.output}") from result.exception
-    if '"event": "seat_dead"' not in result.output or "Use `elspeth resume" not in result.output:
+    # elspeth-5dd23f4df9: the seat-dead event names BOTH recovery verbs — the
+    # takeover (`elspeth resume`) and, for the run resume must refuse, the
+    # finalize (`elspeth abandon`); the console arm picks between them by
+    # consulting the shared gates.
+    if (
+        '"event": "seat_dead"' not in result.output
+        or f'"hint": "elspeth resume {run_id}"' not in result.output
+        or f'"abandon_hint": "elspeth abandon {run_id}"' not in result.output
+    ):
         raise AssertionError(f"CLI follower omitted its seat-dead recovery evidence: {result.output}")
 
 

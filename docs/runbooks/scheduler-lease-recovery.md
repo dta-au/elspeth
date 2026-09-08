@@ -580,9 +580,14 @@ recovery, source-position recovery) and continues the run.
 **Followers during a leader death** idle and then exit; they **never
 auto-promote** (ADR-030 D3). A follower that observes a dead seat finishes or
 abandons its current item, takes no new claims, departs cleanly, and exits
-with `FollowerSeatDeadError` (CLI exit code 2 — "no live leader; use `elspeth
-resume`", `follower.py:320-322`, `cli.py:2591-2612`). Takeover requires the
-full resume reconstruction, which only `elspeth resume` performs.
+with `FollowerSeatDeadError` (CLI exit code 2). The CLI then consults the
+shared resume gates and prints the verb that can succeed: `elspeth resume
+<run_id> --execute` when the run is resumable, otherwise the refuse reason and
+`elspeth abandon <run_id> --execute` (elspeth-5dd23f4df9 — a leader that dies
+before its source is recorded `exhausted` leaves a run resume must refuse;
+`abandon` takes the dead seat and finalizes it INTERRUPTED, recording the
+undecided tokens ABANDONED per ADR-038). Takeover requires the full resume
+reconstruction, which only `elspeth resume` performs.
 
 **Racing resumes:** if two operators run `elspeth resume` against the same run
 at once, exactly one wins the seat CAS. The loser gets
@@ -708,10 +713,10 @@ checks **all three** preconditions or refuses:
    `elspeth resume`);
 2. the joiner's resolved settings hash equals `runs.config_hash` (else
    refused);
-3. the leader seat is **live** (else "no live leader — use `elspeth resume` to
-   take the seat"). A follower must never be the first process on an abandoned
-   run — barrier and ingest state need a leader. **Join and takeover are
-   disjoint verbs.**
+3. the leader seat is **live** (else "no live leader — take the seat with
+   `elspeth resume`, or finalize the run with `elspeth abandon`"). A follower
+   must never be the first process on an abandoned run — barrier and ingest
+   state need a leader. **Join and takeover are disjoint verbs.**
 
 A **filesystem-writability preflight runs first** (before the registry is
 touched): the follower verifies write access to the DB file, its directory,
