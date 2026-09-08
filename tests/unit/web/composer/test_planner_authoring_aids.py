@@ -16,6 +16,7 @@ import hashlib
 import json
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Barrier
@@ -43,11 +44,13 @@ from elspeth.web.composer.planner_authoring_aids import (
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolContext, build_set_pipeline_candidate
 from elspeth.web.composer.tools import execute_tool as _dispatch_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -578,18 +581,21 @@ def _create_real_blob(tmp_path: Path, *, filename: str, mime_type: str, content:
         user_message_id=message_id,
         user_message_content=message_content,
     )
-    result = _dispatch_tool(
-        "create_blob",
-        {"filename": filename, "mime_type": mime_type, "content": content},
-        _empty_state(),
-        view,
-        plugin_snapshot=snapshot,
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=session_id,
-        user_message_id=message_id,
-        user_message_content=message_content,
-    )
+    with fenced_operation_context(engine, session_id) as operation:
+        result = _dispatch_tool(
+            "create_blob",
+            {"filename": filename, "mime_type": mime_type, "content": content},
+            _empty_state(),
+            view,
+            plugin_snapshot=snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=message_id,
+            user_message_content=message_content,
+            session_operation_context=operation,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.to_dict()
     return result.data["blob_id"], context
 
@@ -624,7 +630,17 @@ class TestSourceCustodyExemplar:
         args = source_custody_exemplar_args(view, blob_id=blob_id)
         assert args is not None
 
-        candidate = build_set_pipeline_candidate(args, _empty_state(), context)
+        assert context.session_engine is not None and context.session_id is not None
+        with fenced_operation_context(context.session_engine, context.session_id) as operation:
+            candidate = build_set_pipeline_candidate(
+                args,
+                _empty_state(),
+                replace(
+                    context,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(context.session_engine),
+                ),
+            )
 
         rejection = None if candidate.acceptable else (candidate.result.data or {}).get("error")
         assert candidate.acceptable is True, f"existing-blob exemplar rejected: {rejection}"

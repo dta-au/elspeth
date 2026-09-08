@@ -37,9 +37,11 @@ from sqlalchemy.pool import StaticPool
 
 from elspeth.contracts.enums import CreationModality
 from elspeth.web.composer.tools import _persist_prepared_blob_create, _prepare_blob_create
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
@@ -98,11 +100,14 @@ def _session_with_user_message_and_blob(tmp_path: Path) -> tuple[Any, str, str]:
         creation_modality=CreationModality.VERBATIM,
         created_from_message_id=user_message_id,
     )
-    quota_error = _persist_prepared_blob_create(
-        prepared,
-        session_engine=engine,
-        session_id=session_id,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        quota_error = _persist_prepared_blob_create(
+            prepared,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert quota_error is None
 
     return engine, session_id, user_message_id

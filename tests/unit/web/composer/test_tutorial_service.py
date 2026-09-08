@@ -33,7 +33,7 @@ from elspeth.web.composer.tutorial_service import (
 )
 from elspeth.web.config import WebSettings
 from elspeth.web.sessions.protocol import RunRecord
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
 from tests.helpers.session_fences import RecordingSessionOperationAuthority, make_execute_context
 
 
@@ -687,8 +687,9 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     run_id = "run-llm-count"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination = leader_coordination_token(factory, run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="inline_blob",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -696,7 +697,7 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
         schema_config=schema_config,
     )
     transform_node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="llm_rate",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -704,7 +705,7 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
         schema_config=schema_config,
     )
     _row, token = factory.data_flow.create_row_with_token(
-        run_id=run_id,
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         source_row_index=0,
@@ -714,14 +715,14 @@ def test_count_calls_for_run_counts_only_llm_calls() -> None:
     state = factory.execution.record_completed_node_state(
         token_id=token.token_id,
         node_id=transform_node.node_id,
-        run_id=run_id,
+        coordination_token=coordination,
         step_index=1,
         input_data={"url": "https://example.gov"},
         output_data={"rating": 5},
         duration_ms=1.0,
     )
     operation = factory.execution.begin_operation(
-        run_id=run_id,
+        coordination_token=coordination,
         node_id=source_node.node_id,
         operation_type="source_load",
     )
@@ -762,8 +763,9 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
     factory = make_factory(db)
     run_id = "run-discard-count"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+    coordination = leader_coordination_token(factory, run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=coordination,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -773,7 +775,7 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
     )
     for i in range(2):
         factory.data_flow.record_validation_error(
-            run_id=run_id,
+            coordination_token=coordination,
             node_id="source-0",
             row_data={"i": i},
             error="comma split the row",
@@ -782,7 +784,7 @@ def test_count_discarded_rows_counts_only_discard_destination() -> None:
         )
     # A quarantined-to-a-sink row must NOT be counted as discarded.
     factory.data_flow.record_validation_error(
-        run_id=run_id,
+        coordination_token=coordination,
         node_id="source-0",
         row_data={"i": 99},
         error="bad value",
@@ -805,8 +807,9 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
     factory = make_factory(seed_db)
     landscape_run_id = "tutorial-landscape-run"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=landscape_run_id)
+    coordination = leader_coordination_token(factory, landscape_run_id)
     source = factory.data_flow.register_node(
-        run_id=landscape_run_id,
+        coordination_token=coordination,
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -814,7 +817,7 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
         schema_config=SchemaConfig.from_dict({"mode": "observed"}),
     )
     factory.data_flow.create_row_with_token(
-        run_id=landscape_run_id,
+        coordination_token=coordination,
         source_node_id=source.node_id,
         row_index=0,
         source_row_index=0,
@@ -857,7 +860,9 @@ def test_projection_opens_landscape_via_gated_factory(monkeypatch: pytest.Monkey
                 runs_table.c.run_id == landscape_run_id
             )
         ).one()
-    assert persisted == (0, False, None)
+    # A live run has no final call count until completion; projection must not
+    # finalize or mark it as a cache replay as a side effect of reading it.
+    assert persisted == (None, False, None)
 
 
 def test_coalesce_run_source_hashes_aggregates_row_hashes() -> None:

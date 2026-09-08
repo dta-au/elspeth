@@ -1684,6 +1684,17 @@ _REVIEWED_ALLOWLIST: tuple[ReviewedWriter, ...] = (
             "the production tool handlers."
         ),
     ),
+    ReviewedWriter(
+        path="tests/unit/web/blobs/test_composer_replacement_recovery.py",
+        enclosing_symbol="_proposed_record",
+        table="chat_messages",
+        operation="sqlalchemy_table_insert",
+        count=1,
+        purpose=(
+            "Replacement recovery fixture: seeds the actual triggering user message "
+            "for the proposed LLM-generated replacement's composite provenance FK."
+        ),
+    ),
     # ------ tests/unit/web/sessions/* — targeted chat transcript fixtures ------
     ReviewedWriter(
         path="tests/unit/web/sessions/test_blob_inline_resolutions_schema.py",

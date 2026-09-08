@@ -17,11 +17,13 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.service import CatalogServiceImpl
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import execute_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.schemas import ValidationCheck, ValidationReadiness, ValidationResult
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 _HEADER_MISMATCH_CODE = "csv_source_blob_header_mismatch"
 _HEADER_RESOLUTION_ERROR_CODE = "csv_source_field_resolution_error"
@@ -108,25 +110,30 @@ def _state_with_blob_source(
     session_id: str,
     blob_id: str,
     *,
+    data_dir: Path,
     plugin: str,
     options: dict[str, Any],
 ) -> CompositionState:
     catalog = _catalog()
-    result = execute_tool(
-        "set_source_from_blob",
-        {
-            "blob_id": blob_id,
-            "plugin": plugin,
-            "on_success": "out",
-            "on_validation_failure": "discard",
-            "options": options,
-        },
-        _empty_state(),
-        catalog,
-        plugin_snapshot=catalog.snapshot,
-        session_engine=engine,
-        session_id=session_id,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        result = execute_tool(
+            "set_source_from_blob",
+            {
+                "blob_id": blob_id,
+                "plugin": plugin,
+                "on_success": "out",
+                "on_validation_failure": "discard",
+                "options": options,
+            },
+            _empty_state(),
+            catalog,
+            plugin_snapshot=catalog.snapshot,
+            data_dir=str(data_dir),
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.data
 
     result = execute_tool(
@@ -165,18 +172,22 @@ def _passing_runtime_preflight(_state: CompositionState) -> ValidationResult:
     )
 
 
-def _preview_data(engine: Engine, session_id: str, state: CompositionState) -> dict[str, Any]:
+def _preview_data(engine: Engine, session_id: str, state: CompositionState, *, data_dir: Path) -> dict[str, Any]:
     catalog = _catalog()
-    result = execute_tool(
-        "preview_pipeline",
-        {},
-        state,
-        catalog,
-        plugin_snapshot=catalog.snapshot,
-        session_engine=engine,
-        session_id=session_id,
-        runtime_preflight=_passing_runtime_preflight,
-    )
+    with fenced_operation_context(engine, session_id) as operation:
+        result = execute_tool(
+            "preview_pipeline",
+            {},
+            state,
+            catalog,
+            plugin_snapshot=catalog.snapshot,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=operation,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+            data_dir=str(data_dir),
+            runtime_preflight=_passing_runtime_preflight,
+        )
     assert result.success is True, result.data
     return result.data
 
@@ -196,11 +207,12 @@ def test_csv_blob_without_header_and_no_declared_overlap_blocks(schema_mode: str
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={"schema": {"mode": schema_mode, "fields": ["url: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     diagnostics = data["proof_diagnostics"]
     matching = [item for item in diagnostics if item["code"] == _HEADER_MISMATCH_CODE]
@@ -229,11 +241,12 @@ def test_csv_blob_with_matching_header_does_not_block(tmp_path: Path) -> None:
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={"schema": {"mode": "fixed", "fields": ["url: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
@@ -254,11 +267,12 @@ def test_csv_blob_with_normalized_header_does_not_block(tmp_path: Path) -> None:
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={"schema": {"mode": "fixed", "fields": ["customer_id: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
@@ -279,6 +293,7 @@ def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> No
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={
             "field_mapping": {"external_id": "customer_id"},
@@ -286,7 +301,7 @@ def test_csv_blob_with_field_mapping_header_does_not_block(tmp_path: Path) -> No
         },
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
@@ -307,11 +322,12 @@ def test_csv_blob_with_normalization_collision_returns_blocking_diagnostic(tmp_p
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={"schema": {"mode": "fixed", "fields": ["customer_id: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
@@ -340,6 +356,7 @@ def test_csv_blob_with_invalid_field_mapping_returns_blocking_diagnostic(tmp_pat
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={
             "field_mapping": {"missing_header": "customer_id"},
@@ -347,7 +364,7 @@ def test_csv_blob_with_invalid_field_mapping_returns_blocking_diagnostic(tmp_pat
         },
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     matching = [item for item in data["proof_diagnostics"] if item["code"] == _HEADER_RESOLUTION_ERROR_CODE]
     assert matching
@@ -375,6 +392,7 @@ def test_csv_blob_headerless_columns_mode_does_not_block(tmp_path: Path) -> None
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={
             "columns": ["url"],
@@ -382,7 +400,7 @@ def test_csv_blob_headerless_columns_mode_does_not_block(tmp_path: Path) -> None
         },
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes
@@ -412,11 +430,12 @@ def test_csv_fixed_schema_omits_columns_redacts_observed_values(tmp_path: Path) 
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="csv",
         options={"schema": {"mode": "fixed", "fields": ["token: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     matching = [item for item in data["proof_diagnostics"] if item["code"] == "csv_fixed_schema_omits_observed_columns"]
     assert matching, [d["code"] for d in data["proof_diagnostics"]]
@@ -445,11 +464,12 @@ def test_jsonl_blob_does_not_fire_csv_header_mismatch(tmp_path: Path) -> None:
         engine,
         session_id,
         blob_id,
+        data_dir=tmp_path,
         plugin="json",
         options={"schema": {"mode": "fixed", "fields": ["url: str"]}},
     )
 
-    data = _preview_data(engine, session_id, state)
+    data = _preview_data(engine, session_id, state, data_dir=tmp_path)
 
     codes = [item["code"] for item in data["proof_diagnostics"]]
     assert _HEADER_MISMATCH_CODE not in codes

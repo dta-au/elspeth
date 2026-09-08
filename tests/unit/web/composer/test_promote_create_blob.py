@@ -48,10 +48,12 @@ from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _execute_create_blob
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
 from elspeth.web.composer.tools.blobs import _blob_creation_provenance
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -214,22 +216,25 @@ class TestPromoteCreateBlobArgErrorRouting:
         """Functional smoke: a valid call produces a ready blob."""
         user_message_content = "Please use this exact content:\nhello world"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
-        result = _execute_create_blob(
-            {
-                "filename": "seed.txt",
-                "mime_type": "text/plain",
-                "content": "hello world",
-            },
-            _empty_state(),
-            ToolContext(
-                catalog=_mock_catalog(),
-                data_dir=str(tmp_path),
-                session_engine=engine,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                user_message_content=user_message_content,
-            ),
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            result = _execute_create_blob(
+                {
+                    "filename": "seed.txt",
+                    "mime_type": "text/plain",
+                    "content": "hello world",
+                },
+                _empty_state(),
+                ToolContext(
+                    catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
+                    session_engine=engine,
+                    session_id=session_id,
+                    user_message_id=user_message_id,
+                    user_message_content=user_message_content,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+                ),
+            )
         assert result.success is True
         assert result.data is not None
         assert result.data["filename"] == "seed.txt"
@@ -309,27 +314,30 @@ class TestCreateBlobComposerSourceProvenance:
         """LLM-authored blob content must mechanically carry composer provenance."""
         engine, session_id, user_message_id = _session_engine_with_user_message("Please create a CSV of the high-priority records.")
 
-        result = _execute_create_blob(
-            {
-                "filename": "generated.csv",
-                "mime_type": "text/csv",
-                "content": "priority,score\nhigh,99\n",
-            },
-            _empty_state(),
-            ToolContext(
-                catalog=_mock_catalog(),
-                data_dir=str(tmp_path),
-                session_engine=engine,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                user_message_content="Please create a CSV of the high-priority records.",
-                composer_model_identifier="openai/gpt-5-mini",
-                composer_model_version="gpt-5-mini-2026-05-01",
-                composer_provider="openai",
-                composer_skill_hash="a" * 64,
-                tool_arguments_hash="b" * 64,
-            ),
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            result = _execute_create_blob(
+                {
+                    "filename": "generated.csv",
+                    "mime_type": "text/csv",
+                    "content": "priority,score\nhigh,99\n",
+                },
+                _empty_state(),
+                ToolContext(
+                    catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
+                    session_engine=engine,
+                    session_id=session_id,
+                    user_message_id=user_message_id,
+                    user_message_content="Please create a CSV of the high-priority records.",
+                    composer_model_identifier="openai/gpt-5-mini",
+                    composer_model_version="gpt-5-mini-2026-05-01",
+                    composer_provider="openai",
+                    composer_skill_hash="a" * 64,
+                    tool_arguments_hash="b" * 64,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+                ),
+            )
 
         assert result.success is True
         with engine.connect() as conn:
@@ -399,27 +407,30 @@ class TestCreateBlobComposerSourceProvenance:
         user_message_content = "Use this exact file:\nname,score\nada,42\n"
         engine, session_id, user_message_id = _session_engine_with_user_message(user_message_content)
 
-        result = _execute_create_blob(
-            {
-                "filename": "verbatim.csv",
-                "mime_type": "text/csv",
-                "content": "name,score\nada,42\n",
-            },
-            _empty_state(),
-            ToolContext(
-                catalog=_mock_catalog(),
-                data_dir=str(tmp_path),
-                session_engine=engine,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                user_message_content=user_message_content,
-                composer_model_identifier="openai/gpt-5-mini",
-                composer_model_version="gpt-5-mini-2026-05-01",
-                composer_provider="openai",
-                composer_skill_hash="a" * 64,
-                tool_arguments_hash="b" * 64,
-            ),
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            result = _execute_create_blob(
+                {
+                    "filename": "verbatim.csv",
+                    "mime_type": "text/csv",
+                    "content": "name,score\nada,42\n",
+                },
+                _empty_state(),
+                ToolContext(
+                    catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
+                    session_engine=engine,
+                    session_id=session_id,
+                    user_message_id=user_message_id,
+                    user_message_content=user_message_content,
+                    composer_model_identifier="openai/gpt-5-mini",
+                    composer_model_version="gpt-5-mini-2026-05-01",
+                    composer_provider="openai",
+                    composer_skill_hash="a" * 64,
+                    tool_arguments_hash="b" * 64,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+                ),
+            )
 
         assert result.success is True
         with engine.connect() as conn:

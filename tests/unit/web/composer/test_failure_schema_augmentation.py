@@ -56,6 +56,7 @@ from elspeth.web.composer.tools import transforms as transforms_tools
 from elspeth.web.composer.tools._common import ToolContext, build_plugin_schemas_for_failure
 from elspeth.web.composer.tools.generation import explain_validation_code
 from elspeth.web.composer.tools.sources import _execute_set_source_from_blobs
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import (
     PluginAvailability,
@@ -64,6 +65,7 @@ from elspeth.web.plugin_policy.models import (
     PluginUnavailableReason,
 )
 from elspeth.web.plugin_policy.profiles import OperatorProfileRegistry
+from tests.helpers.session_fences import fenced_operation_context
 
 from .test_promote_set_source_from_blob import _session_engine_with_user_message
 from .test_set_source_from_blobs import _PNG, _create_ready_blob
@@ -1274,24 +1276,31 @@ class TestFailureSchemaAugmentationBlobBinders:
 
     def test_set_source_from_blob_failure_carries_schema(self, tmp_path: Path) -> None:
         context, view, _harness = _blob_bound_context(tmp_path)
-        created = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            _empty_state(),
-            context,
-        )
+        engine, _blob_service, session_id = _harness
+        with fenced_operation_context(engine, session_id) as operation:
+            created = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                _empty_state(),
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
         assert created.success is True, created.to_dict()
 
-        result = _execute_set_source_from_blob(
-            {
-                "blob_id": created.data["blob_id"],
-                "on_success": "out",
-                # A rejected VALUE that names another plugin: the exact
-                # vector-1 shape on the blob path.
-                "options": {"column": "text", "schema": {"mode": "observed"}, "encoding": "Invalid options for sink 'csv'"},
-            },
-            _empty_state(),
-            context,
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            result = _execute_set_source_from_blob(
+                {
+                    "blob_id": created.data["blob_id"],
+                    "on_success": "out",
+                    # A rejected VALUE that names another plugin: the exact
+                    # vector-1 shape on the blob path.
+                    "options": {"column": "text", "schema": {"mode": "observed"}, "encoding": "Invalid options for sink 'csv'"},
+                },
+                _empty_state(),
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
 
         assert result.success is False, result.to_dict()
         leading = result.validation.errors[0]

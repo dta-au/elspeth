@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -26,12 +26,14 @@ from elspeth.web.composer.tools import ToolResult, get_tool_definitions
 from elspeth.web.composer.tools import execute_tool as _execute_tool
 from elspeth.web.composer.tools._common import _SERVER_OWNED_SOURCE_OPTION_KEYS
 from elspeth.web.composer.yaml_generator import generate_pipeline_dict
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.interpretation_state import INTERPRETATION_REQUIREMENTS_KEY
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.provider_config_policy import AWS_S3_ENDPOINT_URL_POLICY_ERROR
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -189,10 +191,10 @@ def execute_tool(
 
 
 @pytest.fixture()
-def blob_env(tmp_path: Path) -> dict[str, Any]:
+def blob_env(tmp_path: Path) -> Iterator[dict[str, Any]]:
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
-    session_id = "session-inline-blob"
+    session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
@@ -224,7 +226,14 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
     data_dir = tmp_path / "data"
     data_dir.mkdir()
     (data_dir / "blobs").mkdir()
-    return {"engine": engine, "session_id": session_id, "data_dir": str(data_dir)}
+    with fenced_operation_context(engine, session_id) as context:
+        yield {
+            "engine": engine,
+            "session_id": session_id,
+            "data_dir": str(data_dir),
+            "operation": context,
+            "authority": SQLiteLocalSessionOperationAuthority(engine),
+        }
 
 
 def _create_blob(
@@ -254,6 +263,8 @@ def _create_blob(
         data_dir=blob_env["data_dir"],
         session_engine=blob_env["engine"],
         session_id=blob_env["session_id"],
+        session_operation_context=blob_env["operation"],
+        session_operation_authority=blob_env["authority"],
         user_message_id="user-message-1",
         user_message_content="Generate a source for me." if llm_authored else f"Use this exact content:\n{content}",
         **provenance_kwargs,
@@ -275,8 +286,11 @@ class TestListComposerBlobs:
             {},
             _empty_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -299,8 +313,11 @@ class TestListComposerBlobs:
             {},
             _empty_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -356,8 +373,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -419,8 +439,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -448,6 +471,8 @@ class TestWireBlobInlineRef:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -468,8 +493,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -493,8 +521,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
         output_result = execute_tool(
             "wire_blob_inline_ref",
@@ -504,8 +535,11 @@ class TestWireBlobInlineRef:
             },
             source_result.updated_state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert source_result.success is True
@@ -526,8 +560,11 @@ class TestWireBlobInlineRef:
             },
             _named_sources_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -552,8 +589,11 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -571,8 +611,11 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -590,8 +633,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -615,8 +661,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -643,8 +692,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -665,8 +717,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -692,8 +747,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -713,8 +771,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -755,8 +816,11 @@ class TestWireBlobInlineRef:
             },
             state,
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -775,8 +839,11 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -794,8 +861,11 @@ class TestWireBlobInlineRef:
             },
             _inline_ref_state(),
             _catalog(),
+            data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -859,6 +929,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success, result.to_dict()
@@ -899,6 +971,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is False
@@ -917,6 +991,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         assert result.success is True
@@ -938,6 +1014,8 @@ class TestSetSourceFromBlobMode:
             data_dir=blob_env["data_dir"],
             session_engine=blob_env["engine"],
             session_id=blob_env["session_id"],
+            session_operation_context=blob_env["operation"],
+            session_operation_authority=blob_env["authority"],
         )
 
         pipeline = generate_pipeline_dict(result.updated_state)

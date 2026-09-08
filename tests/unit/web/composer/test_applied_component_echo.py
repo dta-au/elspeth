@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -26,11 +27,13 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import ToolResult, execute_tool
 from elspeth.web.composer.tools import _common as tools_common
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -218,7 +221,7 @@ def blob_env(tmp_path: Path) -> dict[str, Any]:
     """Minimal session + blob storage for the inline-ref tool."""
     engine = create_session_engine("sqlite:///:memory:")
     initialize_session_schema(engine)
-    session_id = "session-echo-blob"
+    session_id = str(uuid4())
     now = datetime.now(UTC)
     with engine.begin() as conn:
         conn.execute(
@@ -296,30 +299,35 @@ def test_inline_ref_on_a_named_source_echoes_the_source_not_a_same_named_node(
     catalog = create_catalog_service()
     snapshot = PluginAvailabilitySnapshot.for_trained_operator(catalog)
     content = "a,b\n1,2\n"
-    blob = execute_tool(
-        "create_blob",
-        {"filename": "rows.csv", "mime_type": "text/csv", "content": content},
-        _empty_state(),
-        PolicyCatalogView.for_trained_operator(catalog, snapshot),
-        plugin_snapshot=snapshot,
-        data_dir=blob_env["data_dir"],
-        session_engine=blob_env["engine"],
-        session_id=blob_env["session_id"],
-        user_message_id="user-message-1",
-        user_message_content=f"Use this exact content:\n{content}",
-    )
-    assert blob.success is True
+    with fenced_operation_context(blob_env["engine"], blob_env["session_id"]) as context:
+        blob = execute_tool(
+            "create_blob",
+            {"filename": "rows.csv", "mime_type": "text/csv", "content": content},
+            _empty_state(),
+            PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            user_message_id="user-message-1",
+            user_message_content=f"Use this exact content:\n{content}",
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(blob_env["engine"]),
+        )
+        assert blob.success is True
 
-    result = execute_tool(
-        "wire_blob_inline_ref",
-        {"field_path": "source:clean.options.path", "blob_id": blob.data["blob_id"]},
-        _collision_state(tmp_path),
-        PolicyCatalogView.for_trained_operator(catalog, snapshot),
-        plugin_snapshot=snapshot,
-        data_dir=blob_env["data_dir"],
-        session_engine=blob_env["engine"],
-        session_id=blob_env["session_id"],
-    )
+        result = execute_tool(
+            "wire_blob_inline_ref",
+            {"field_path": "source:clean.options.path", "blob_id": blob.data["blob_id"]},
+            _collision_state(tmp_path),
+            PolicyCatalogView.for_trained_operator(catalog, snapshot),
+            plugin_snapshot=snapshot,
+            data_dir=blob_env["data_dir"],
+            session_engine=blob_env["engine"],
+            session_id=blob_env["session_id"],
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(blob_env["engine"]),
+        )
 
     assert result.success is True
     assert result.affected_nodes == ("source:clean",)

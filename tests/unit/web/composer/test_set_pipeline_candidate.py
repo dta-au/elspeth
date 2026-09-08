@@ -41,6 +41,8 @@ from elspeth.web.composer.tools import (
 )
 from elspeth.web.composer.tools import sessions as sessions_tools
 from elspeth.web.composer.tools._common import normalize_tool_result_validation
+from elspeth.web.coordination.contracts import SessionOperationFenceLost
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.interpretation_state import (
     INTERPRETATION_REQUIREMENTS_KEY,
@@ -61,6 +63,7 @@ from elspeth.web.plugin_policy.validation import (
 from elspeth.web.sessions.engine import create_session_engine
 from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.composer_fences import fenced_tool_context
 from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer._probe_lifecycle_helpers import DelegatingPluginManagerDouble
 
@@ -2402,11 +2405,48 @@ def test_inline_blob_replacement_preserves_trusted_existing_source_requirement_i
         tool_arguments_hash="b" * 64,
     )
 
-    result = _execute_set_pipeline(args, state, context)
+    with fenced_operation_context(engine, session_id) as operation:
+        result = _execute_set_pipeline(
+            args,
+            state,
+            replace(context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)),
+        )
 
     assert result.success, result.to_dict()
     requirements = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY]
     assert requirements[0]["id"] == trusted_id
+
+
+@pytest.mark.parametrize("release_before_create", [False, True])
+def test_explicit_tool_context_keeps_real_authority_loss_observable(tmp_path: Path, release_before_create: bool) -> None:
+    """A scoped producer succeeds only while its actual database fence is live."""
+    from elspeth.web.composer.tools import _execute_create_blob
+
+    engine, session_id, message_id = _session_with_user_message()
+    policy_context = _trained_context()
+    arguments = {"filename": "ada.csv", "mime_type": "text/csv", "content": "name,score\nada,42\n"}
+    with fenced_tool_context(
+        catalog=policy_context.catalog,
+        plugin_snapshot=policy_context.plugin_snapshot,
+        session_engine=engine,
+        session_id=session_id,
+        data_dir=str(tmp_path),
+        user_message_id=message_id,
+        user_message_content="Use this CSV: name,score\nada,42\n",
+    ) as context:
+        assert context.session_operation_context is not None
+        assert context.session_operation_authority is not None
+        if release_before_create:
+            context.session_operation_authority.release(context.session_operation_context)
+            with pytest.raises(SessionOperationFenceLost):
+                _execute_create_blob(arguments, _empty_state(), context)
+        else:
+            result = _execute_create_blob(arguments, _empty_state(), context)
+            assert result.success is True
+    with engine.connect() as conn:
+        assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == (0 if release_before_create else 1)
+    files = tuple(path for path in (tmp_path / "blobs").rglob("*") if path.is_file())
+    assert len(files) == (0 if release_before_create else 1)
 
 
 @pytest.mark.asyncio
@@ -2474,7 +2514,14 @@ async def test_current_executor_inline_blob_effects_are_single_settlement(tmp_pa
     )
 
     async def _dispatch() -> Any:
-        return _execute_set_pipeline(args, state, context)
+        with fenced_operation_context(engine, session_id) as operation:
+            return _execute_set_pipeline(
+                args,
+                state,
+                replace(
+                    context, session_operation_context=operation, session_operation_authority=SQLiteLocalSessionOperationAuthority(engine)
+                ),
+            )
 
     outcome = await dispatch_with_audit(
         recorder=recorder,

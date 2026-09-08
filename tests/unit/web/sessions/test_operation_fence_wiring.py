@@ -20,6 +20,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.blobs import (
+    BlobAtomicDeletionObligation,
     BlobCreationObligation,
     BlobDeletionPlan,
     BlobGuidedOperationWriteFence,
@@ -613,6 +614,10 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                     (("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     BlobRecord,
                 ),
+                "read_atomic_blob_deletion": (
+                    (("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
+                    BlobAtomicDeletionObligation | None,
+                ),
                 "read_blob_deletion": (
                     (("blob_id", inspect.Parameter.KEYWORD_ONLY, UUID),),
                     BlobDeletionPlan | None,
@@ -640,6 +645,10 @@ def test_fenced_unit_of_work_exposes_only_exact_composed_capabilities() -> None:
                 ),
                 "retire_abandoned_blob_reservation": (
                     (("obligation", inspect.Parameter.KEYWORD_ONLY, BlobCreationObligation),),
+                    bool,
+                ),
+                "retire_atomic_blob_deletion": (
+                    (("obligation", inspect.Parameter.KEYWORD_ONLY, BlobAtomicDeletionObligation),),
                     bool,
                 ),
                 "retire_blob_deletion": (

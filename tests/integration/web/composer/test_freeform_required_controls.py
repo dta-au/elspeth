@@ -402,27 +402,30 @@ async def test_explicit_approval_seals_auto_wired_textract_candidate_and_hash(tm
     from elspeth.web.composer.audit import BufferingRecorder
     from elspeth.web.composer.pipeline_commit import PipelineCommitConfig, prepare_pipeline_proposal_commit
 
-    prepared = await prepare_pipeline_proposal_commit(
-        authority=authority.pipeline,
-        reviewed_facts={},
-        current_state=initial_state,
-        current_state_id=None,
-        policy_catalog=view,
-        plugin_snapshot=snapshot,
-        config=PipelineCommitConfig(
-            data_dir=str(tmp_path),
-            session_engine=harness.engine,
-            secret_service=None,
-            user_id="proposal-prevalidation-user",
-            user_message_content="Build a Textract to LLM pipeline and prepare it for review.",
-            max_blob_storage_per_session_bytes=10_000_000,
-            runtime_preflight=None,
-            timeout_seconds=5.0,
-        ),
-        recorder=BufferingRecorder(),
-        actor="user:proposal-prevalidation-user",
-        settlement_surface="generic",
-    )
+    with fenced_operation_context(harness.engine, harness.session_id, operation_kind=SessionOperationKind.PROPOSAL) as operation:
+        prepared = await prepare_pipeline_proposal_commit(
+            authority=authority.pipeline,
+            reviewed_facts={},
+            current_state=initial_state,
+            current_state_id=None,
+            policy_catalog=view,
+            plugin_snapshot=snapshot,
+            config=PipelineCommitConfig(
+                data_dir=str(tmp_path),
+                session_engine=harness.engine,
+                session_operation_context=operation,
+                session_operation_authority=harness.sessions.session_operation_authority,
+                secret_service=None,
+                user_id="proposal-prevalidation-user",
+                user_message_content="Build a Textract to LLM pipeline and prepare it for review.",
+                max_blob_storage_per_session_bytes=10_000_000,
+                runtime_preflight=None,
+                timeout_seconds=5.0,
+            ),
+            recorder=BufferingRecorder(),
+            actor="user:proposal-prevalidation-user",
+            settlement_surface="generic",
+        )
     assert prepared.result.success is True
     assert prepared.result.validation.is_valid is True
     sealed = deep_thaw(proposals[0].arguments_json)

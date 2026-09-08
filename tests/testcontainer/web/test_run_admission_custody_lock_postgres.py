@@ -36,6 +36,7 @@ import pytest
 import structlog
 from sqlalchemy import Engine, event
 from tests.helpers.postgres_target import postgres_test_target
+from tests.helpers.session_fences import fenced_operation_context
 from tests.unit.web.composer.test_tools import _empty_state, _insert_user_message, _trained_tool_context
 
 from elspeth.contracts.blobs import BlobActiveRunError, BlobNotFoundError, BlobRecord
@@ -358,6 +359,7 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
     second_engine: Engine,
     second_service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    tmp_path: Path,
 ) -> None:
     """update-vs-run: same proof through the composer's update_blob custody transaction."""
     service = postgres_service
@@ -374,18 +376,22 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
 
     def update_blob() -> None:
         try:
-            update_outcome.append(
-                _execute_update_blob(
-                    {"blob_id": str(blob.id), "content": new_content},
-                    _empty_state(),
-                    _trained_tool_context(
-                        session_engine=postgres_engine,
-                        session_id=str(session.id),
-                        user_message_id=user_message_id,
-                        user_message_content=message_content,
-                    ),
+            with fenced_operation_context(postgres_engine, session.id) as compose:
+                update_outcome.append(
+                    _execute_update_blob(
+                        {"blob_id": str(blob.id), "content": new_content},
+                        _empty_state(),
+                        _trained_tool_context(
+                            data_dir=str(tmp_path),
+                            session_engine=postgres_engine,
+                            session_id=str(session.id),
+                            session_operation_context=compose,
+                            session_operation_authority=service.session_operation_authority,
+                            user_message_id=user_message_id,
+                            user_message_content=message_content,
+                        ),
+                    )
                 )
-            )
         except BaseException as exc:
             update_outcome.append(exc)
             parked.set()
@@ -416,11 +422,16 @@ def test_update_blob_past_its_guard_excludes_run_admission_on_another_replica(
 
     assert run_created.wait(timeout=15)
     runner.join(timeout=15)
-    assert failures == []
+    # The queued admission acquires the session lock before the update has
+    # released its COMPOSE operation, so it must refuse that live fence.
+    # Admission can succeed after the complete replacement operation ends.
+    assert [type(exc) for exc in failures] == [SessionOperationConflictError], failures
     assert len(update_outcome) == 1
     result = update_outcome[0]
     assert not isinstance(result, BaseException), result
     assert result.success is True, result.to_dict()
+    run = _admit_run(second_service, session.id, state.id)
+    assert run.status == "pending"
     updated = asyncio.run(_get_blob(second_service, blob_service, session.id, blob.id))
     assert updated is not None
     assert Path(updated.storage_path).read_bytes() == new_content.encode()
@@ -434,6 +445,7 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
     postgres_service: SessionServiceImpl,
     second_service: SessionServiceImpl,
     blob_service: BlobServiceImpl,
+    tmp_path: Path,
 ) -> None:
     """The mirror order: a committed pending run is visible to both guards on the other replica."""
     service = postgres_service
@@ -447,15 +459,20 @@ def test_run_admitted_first_is_observed_by_blob_delete_and_update(
     new_content = "id,value\n1,gamma\n"
     message_content = f"Use this exact content:\n{new_content}"
     user_message_id = _insert_user_message(postgres_engine, str(session.id), message_content)
-    result = _execute_update_blob(
-        {"blob_id": str(blob.id), "content": new_content},
-        _empty_state(),
-        _trained_tool_context(
-            session_engine=postgres_engine,
-            session_id=str(session.id),
-            user_message_id=user_message_id,
-            user_message_content=message_content,
-        ),
-    )
+    with fenced_operation_context(postgres_engine, session.id) as compose:
+        result = _execute_update_blob(
+            {"blob_id": str(blob.id), "content": new_content},
+            _empty_state(),
+            _trained_tool_context(
+                data_dir=str(tmp_path),
+                session_engine=postgres_engine,
+                session_id=str(session.id),
+                session_operation_context=compose,
+                session_operation_authority=service.session_operation_authority,
+                user_message_id=user_message_id,
+                user_message_content=message_content,
+            ),
+        )
     assert result.success is False, result.to_dict()
+    assert result.data["error"] == str(BlobActiveRunError(str(blob.id), run_id=str(run.id)))
     assert Path(blob.storage_path).read_bytes() == _BLOB_CONTENT

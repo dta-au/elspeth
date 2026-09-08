@@ -61,6 +61,7 @@ from elspeth.contracts.chat_parts import ChatMessage
 from elspeth.contracts.composer_interpretation import InterpretationChoice, InterpretationKind
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import calls_table
@@ -77,6 +78,7 @@ from elspeth.web.sessions.protocol import CompositionStateData
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
+from tests.fixtures.landscape import leader_coordination_token, member_token_for
 from tests.integration.web.conftest import _save_composition_state_with_compose_authority
 from tests.unit.web.sessions.guided_test_authority import DualFencedSessionServiceHarness
 
@@ -333,8 +335,10 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -342,26 +346,39 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": resolved_template},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -377,6 +394,9 @@ async def test_runtime_handoff_cross_db_hash_anchored() -> None:
         execution=factory.execution,
         state_id=node_state.state_id,
         run_id=run.run_id,
+        token_id=token.token_id,
+        member_token=member,
+        work_item=work_item,
         telemetry_emit=lambda event: None,
         underlying_client=openai_stub,
         provider="stub",
@@ -440,8 +460,10 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -449,26 +471,39 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": "Rate how modern this is."},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -493,6 +528,8 @@ async def test_openrouter_hash_handoff_records_logical_llm_call_not_http_transpo
         audit_parent=LLMAuditParent.for_row(
             state_id=node_state.state_id,
             token_id=token.token_id,
+            member_token=member,
+            work_item=work_item,
         ),
     )
 
@@ -521,8 +558,10 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
     factory = RecorderFactory(db)
 
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+    coordination = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=coordination.worker_id, run_id=run.run_id)
     source_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="csv_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -530,26 +569,39 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
         schema_config=DYNAMIC_SCHEMA,
     )
     llm_node = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=coordination,
         plugin_name="llm",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
         config={"prompt_template": "plain template, no interpretation"},
         schema_config=DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=coordination,
         source_node_id=source_node.node_id,
         row_index=0,
         data={"input": "demo"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
+    work_item = factory.scheduler.enqueue_ready_claimed(
+        member_token=member,
+        token_id=token.token_id,
+        row_id=row.row_id,
+        node_id=llm_node.node_id,
+        step_index=1,
+        ingest_sequence=0,
+        row_payload_json=factory.scheduler.serialize_row_payload(
+            PipelineRow({"input": "demo"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
+        ),
+        lease_owner=member.worker_id,
+        lease_seconds=300,
+    )
     node_state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=llm_node.node_id,
-        run_id=run.run_id,
+        member_token=member,
+        attempt=work_item.attempt,
         step_index=1,
         input_data={"input": "demo"},
     )
@@ -565,6 +617,9 @@ async def test_runtime_handoff_none_hash_records_null() -> None:
         execution=factory.execution,
         state_id=node_state.state_id,
         run_id=run.run_id,
+        token_id=token.token_id,
+        member_token=member,
+        work_item=work_item,
         telemetry_emit=lambda event: None,
         underlying_client=openai_stub,
         provider="stub",

@@ -882,9 +882,9 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
             assert await blob_service.get_blob(blob.id, session_operation_context=context) == blob
             return
 
-        from elspeth.web.blobs import service as blob_service_module
+        from elspeth.web.coordination import repository as coordination_repository
 
-        original_pending = blob_service_module.pending_proposal_reference_id
+        original_pending = coordination_repository.pending_proposal_reference_id
 
         def blocked_pending(*args, **kwargs):
             entered.set()
@@ -892,7 +892,7 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
                 raise AssertionError("delete race barrier timed out")
             return original_pending(*args, **kwargs)
 
-        monkeypatch.setattr(blob_service_module, "pending_proposal_reference_id", blocked_pending)
+        monkeypatch.setattr(coordination_repository, "pending_proposal_reference_id", blocked_pending)
         delete_task = asyncio.create_task(blob_service.delete_blob(blob.id, session_operation_context=context))
         assert await asyncio.to_thread(entered.wait, 5)
         proposal_task = asyncio.create_task(create_proposal())

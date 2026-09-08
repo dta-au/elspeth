@@ -21,7 +21,8 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import func, insert, select
 from sqlalchemy.pool import StaticPool
 
-from elspeth.web.blobs.service import blob_pre_update_sidecar, reconcile_blob_storage_versions
+from elspeth.web.blobs.replacement import BlobReplacementCoordinator
+from elspeth.web.blobs.service import content_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer.protocol import ToolArgumentError
@@ -34,10 +35,12 @@ from elspeth.web.composer.redaction_telemetry import NoopRedactionTelemetry
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _execute_create_blob, _execute_update_blob
 from elspeth.web.composer.tools._common import ToolContext as _ToolContext
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import blobs_table, chat_messages_table, sessions_table
+from elspeth.web.sessions.models import blob_replacement_cleanups_table, blobs_table, chat_messages_table, sessions_table
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 
 def _empty_state() -> CompositionState:
@@ -137,22 +140,25 @@ def test_update_blob_manifest_entry_is_type_driven() -> None:
 
 
 class TestPromoteUpdateBlobArgErrorRouting:
-    def test_empty_arguments_raise_tool_argument_error(self) -> None:
+    def test_empty_arguments_raise_tool_argument_error(self, tmp_path: Path) -> None:
         """A bare ``{}`` is missing both required fields."""
         engine, session_id = _session_engine_with_session()
-        with pytest.raises(ToolArgumentError) as exc_info:
+        with fenced_operation_context(engine, session_id) as operation, pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_wrong_type_content_raises_tool_argument_error(self) -> None:
+    def test_wrong_type_content_raises_tool_argument_error(self, tmp_path: Path) -> None:
         """Pydantic rejects ``content: int`` before the handler acquires the session lock.
 
         Validation MUST run before the file-mutation critical section
@@ -161,36 +167,42 @@ class TestPromoteUpdateBlobArgErrorRouting:
         file on a pure argument-validation failure.
         """
         engine, session_id = _session_engine_with_session()
-        with pytest.raises(ToolArgumentError) as exc_info:
+        with fenced_operation_context(engine, session_id) as operation, pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {"blob_id": "anything", "content": 42},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_missing_blob_id_raises_tool_argument_error(self) -> None:
+    def test_missing_blob_id_raises_tool_argument_error(self, tmp_path: Path) -> None:
         engine, session_id = _session_engine_with_session()
-        with pytest.raises(ToolArgumentError) as exc_info:
+        with fenced_operation_context(engine, session_id) as operation, pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {"content": "new content"},
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    def test_extra_field_raises_tool_argument_error(self) -> None:
+    def test_extra_field_raises_tool_argument_error(self, tmp_path: Path) -> None:
         """extra='forbid' rejects fields belonging to neighbouring tools."""
         engine, session_id = _session_engine_with_session()
-        with pytest.raises(ToolArgumentError) as exc_info:
+        with fenced_operation_context(engine, session_id) as operation, pytest.raises(ToolArgumentError) as exc_info:
             _execute_update_blob(
                 {
                     "blob_id": "anything",
@@ -200,14 +212,17 @@ class TestPromoteUpdateBlobArgErrorRouting:
                 _empty_state(),
                 ToolContext(
                     catalog=_mock_catalog(),
+                    data_dir=str(tmp_path),
                     session_engine=engine,
                     session_id=session_id,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
                 ),
             )
         assert isinstance(exc_info.value.__cause__, PydanticValidationError)
 
-    @pytest.mark.parametrize("sidecar_retirement_fails", [False, True])
-    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, monkeypatch, sidecar_retirement_fails: bool) -> None:
+    @pytest.mark.parametrize("backup_retirement_fails", [False, True])
+    def test_valid_arguments_dispatch_normally(self, tmp_path: Path, monkeypatch, backup_retirement_fails: bool) -> None:
         """Functional smoke: a valid call updates an existing blob's content."""
         engine, session_id = _session_engine_with_session()
         catalog = _mock_catalog()
@@ -216,65 +231,76 @@ class TestPromoteUpdateBlobArgErrorRouting:
         # tool — exercises the create_blob → update_blob lifecycle together).
         user_message_content = "Use this exact content:\nold"
         user_message_id = _insert_user_message(engine, session_id, user_message_content)
-        create_result = _execute_create_blob(
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "old"},
-            _empty_state(),
-            ToolContext(
-                catalog=catalog,
-                data_dir=str(tmp_path),
-                session_engine=engine,
-                session_id=session_id,
-                user_message_id=user_message_id,
-                user_message_content=user_message_content,
-            ),
-        )
+        with fenced_operation_context(engine, session_id) as operation:
+            create_result = _execute_create_blob(
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "old"},
+                _empty_state(),
+                ToolContext(
+                    catalog=catalog,
+                    data_dir=str(tmp_path),
+                    session_engine=engine,
+                    session_id=session_id,
+                    user_message_id=user_message_id,
+                    user_message_content=user_message_content,
+                    session_operation_context=operation,
+                    session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+                ),
+            )
         assert create_result.success is True
         blob_id = create_result.data["blob_id"]
         with engine.connect() as conn:
             storage = Path(conn.execute(select(blobs_table.c.storage_path).where(blobs_table.c.id == blob_id)).scalar_one())
-        sidecar = blob_pre_update_sidecar(storage)
-        original_unlink = Path.unlink
-
-        def fail_sidecar_unlink(path: Path, missing_ok: bool = False) -> None:
-            if path == sidecar:
-                raise PermissionError("sidecar retirement unavailable")
-            original_unlink(path, missing_ok=missing_ok)
-
-        if sidecar_retirement_fails:
-            monkeypatch.setattr(Path, "unlink", fail_sidecar_unlink)
-
         update_user_message_content = "Use this exact content:\nnew contents"
         update_user_message_id = _insert_user_message(engine, session_id, update_user_message_content)
-        update_result = _execute_update_blob(
-            {"blob_id": blob_id, "content": "new contents"},
-            _empty_state(),
-            ToolContext(
+        authority = SQLiteLocalSessionOperationAuthority(engine)
+        with fenced_operation_context(engine, session_id) as operation:
+            context = ToolContext(
                 catalog=catalog,
                 data_dir=str(tmp_path),
                 session_engine=engine,
                 session_id=session_id,
                 user_message_id=update_user_message_id,
                 user_message_content=update_user_message_content,
-            ),
-        )
-        assert update_result.success is True
-        assert update_result.data is not None
-        # update_blob's data payload carries the updated size_bytes /
-        # content_hash; we verify byte count matches the new content.
-        assert update_result.data["size_bytes"] == len(b"new contents")
+                session_operation_context=operation,
+                session_operation_authority=authority,
+            )
+            if backup_retirement_fails:
+                original_remove = BlobReplacementCoordinator._remove
+
+                def fail_backup_removal(coordinator, path, directory_fd, context):
+                    if path.suffix == ".backup":
+                        raise PermissionError("backup retirement unavailable")
+                    original_remove(coordinator, path, directory_fd, context)
+
+                with monkeypatch.context() as fault:
+                    fault.setattr(BlobReplacementCoordinator, "_remove", fail_backup_removal)
+                    with pytest.raises(PermissionError, match="backup retirement unavailable"):
+                        _execute_update_blob({"blob_id": blob_id, "content": "new contents"}, _empty_state(), context)
+                with engine.connect() as conn:
+                    cleanup = conn.execute(select(blob_replacement_cleanups_table)).one()
+                    committed = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
+                assert cleanup.phase == "purge_pending"
+                backup = Path(cleanup.backup_path)
+                assert backup.read_bytes() == b"old"
+                assert storage.read_bytes() == b"new contents"
+                assert committed.content_hash == content_hash(b"new contents")
+                assert committed.size_bytes == len(b"new contents")
+                BlobReplacementCoordinator(engine=engine, data_dir=tmp_path, session_operation_authority=authority).reconcile(
+                    context=operation
+                )
+                assert not backup.exists()
+            else:
+                update_result = _execute_update_blob({"blob_id": blob_id, "content": "new contents"}, _empty_state(), context)
+                assert update_result.success is True
+                assert update_result.data is not None
+                assert update_result.data["size_bytes"] == len(b"new contents")
+                assert update_result.data["content_hash"] == content_hash(b"new contents")
         assert storage.read_bytes() == b"new contents"
         with engine.connect() as conn:
             committed = conn.execute(select(blobs_table).where(blobs_table.c.id == blob_id)).one()
-        assert committed.content_hash == update_result.data["content_hash"]
+            assert conn.execute(select(blob_replacement_cleanups_table)).all() == []
+        assert committed.content_hash == content_hash(b"new contents")
         assert committed.size_bytes == len(b"new contents")
-        if sidecar_retirement_fails:
-            assert sidecar.read_bytes() == b"old"
-            monkeypatch.setattr(Path, "unlink", original_unlink)
-            from elspeth.web.composer.tools.blobs import locked_session_transaction
-
-            with locked_session_transaction(engine, session_id):
-                reconcile_blob_storage_versions(storage, expected_hash=committed.content_hash)
-        assert not sidecar.exists()
         assert storage.read_bytes() == b"new contents"
 
 

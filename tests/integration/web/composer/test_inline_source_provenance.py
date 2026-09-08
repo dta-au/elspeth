@@ -40,6 +40,7 @@ from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.state import CompositionState, PipelineMetadata
 from elspeth.web.composer.tools import _prepare_blob_create, execute_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
 from elspeth.web.sessions.engine import create_session_engine
@@ -49,6 +50,7 @@ from elspeth.web.sessions.models import (
     sessions_table,
 )
 from elspeth.web.sessions.schema import initialize_session_schema
+from tests.helpers.session_fences import fenced_operation_context
 
 # ─────────────────────────────────────────────────────────────────────────
 # Test fixtures
@@ -159,18 +161,21 @@ def test_verbatim_blob_records_creation_modality_and_message_id(tmp_path: Path) 
     args = _minimal_inline_blob_args("name,score\nada,42\n")
     catalog = _trained_operator_catalog()
 
-    result = execute_tool(
-        "set_pipeline",
-        args,
-        _empty_state(),
-        catalog,
-        plugin_snapshot=catalog.snapshot,
-        data_dir=str(tmp_path),
-        session_engine=engine,
-        session_id=session_id,
-        user_message_id=user_message_id,
-        user_message_content=_USER_MESSAGE_CONTENT,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        result = execute_tool(
+            "set_pipeline",
+            args,
+            _empty_state(),
+            catalog,
+            plugin_snapshot=catalog.snapshot,
+            data_dir=str(tmp_path),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=user_message_id,
+            user_message_content=_USER_MESSAGE_CONTENT,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.data
 
     with engine.begin() as conn:
@@ -223,11 +228,14 @@ def test_llm_generated_blob_carries_llm_provenance(tmp_path: Path) -> None:
         creating_composer_skill_hash="cafebabe" + "0" * 56,
         creating_arguments_hash="deadbeef" + "0" * 56,
     )
-    quota_error = _persist_prepared_blob_create(
-        prepared,
-        session_engine=engine,
-        session_id=session_id,
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        quota_error = _persist_prepared_blob_create(
+            prepared,
+            session_engine=engine,
+            session_id=session_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert quota_error is None
 
     with engine.begin() as conn:
@@ -327,11 +335,13 @@ def test_cross_session_message_id_rejected(tmp_path: Path) -> None:
         creation_modality=CreationModality.VERBATIM,
         created_from_message_id=session_b_message_id,
     )
-    with pytest.raises(IntegrityError):
+    with fenced_operation_context(engine, session_a_id) as context, pytest.raises(IntegrityError):
         _persist_prepared_blob_create(
             prepared,
             session_engine=engine,
             session_id=session_a_id,
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
         )
 
 

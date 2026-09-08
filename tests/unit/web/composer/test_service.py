@@ -68,6 +68,7 @@ from elspeth.web.composer.state import (
 )
 from elspeth.web.composer.tools import ToolResult
 from elspeth.web.composer.tools import execute_tool as _strict_execute_tool
+from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
 from elspeth.web.execution.preflight import runtime_preflight_settings_hash
 from elspeth.web.execution.schemas import (
     ValidationCheck,
@@ -86,7 +87,7 @@ from elspeth.web.sessions.protocol import GuidedOperationFence
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
-from tests.helpers.session_fences import make_compose_context
+from tests.helpers.session_fences import fenced_operation_context, make_compose_context
 from tests.unit.web.composer._helpers import (
     FakeChoice,
     FakeFunction,
@@ -807,21 +808,24 @@ def _create_session_blob_for_test(
     content: str = "original content",
 ) -> str:
     provenance_context = _verbatim_blob_context(engine, session_id, content)
-    result = _execute_tool(
-        "create_blob",
-        {
-            "filename": filename,
-            "mime_type": "text/plain",
-            "content": content,
-        },
-        _empty_state(),
-        _mock_catalog(),
-        data_dir=str(data_dir),
-        session_engine=engine,
-        session_id=session_id,
-        user_message_id=provenance_context["user_message_id"],
-        user_message_content=provenance_context["user_message_content"],
-    )
+    with fenced_operation_context(engine, session_id) as context:
+        result = _execute_tool(
+            "create_blob",
+            {
+                "filename": filename,
+                "mime_type": "text/plain",
+                "content": content,
+            },
+            _empty_state(),
+            _mock_catalog(),
+            data_dir=str(data_dir),
+            session_engine=engine,
+            session_id=session_id,
+            user_message_id=provenance_context["user_message_id"],
+            user_message_content=provenance_context["user_message_content"],
+            session_operation_context=context,
+            session_operation_authority=SQLiteLocalSessionOperationAuthority(engine),
+        )
     assert result.success is True, result.data
     return str(result.data["blob_id"])
 
@@ -6286,16 +6290,19 @@ class TestToolArgumentErrorAcrossThreadBoundary:
         )
         state = _empty_state()
 
-        create_result = _execute_tool(
-            "create_blob",
-            {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
-            state,
-            catalog,
-            data_dir=str(self.data_dir),
-            session_engine=self.engine,
-            session_id=self.session_id,
-            **_verbatim_blob_context(self.engine, self.session_id, "hello"),
-        )
+        with fenced_operation_context(self.engine, self.session_id) as context:
+            create_result = _execute_tool(
+                "create_blob",
+                {"filename": "seed.txt", "mime_type": "text/plain", "content": "hello"},
+                state,
+                catalog,
+                data_dir=str(self.data_dir),
+                session_engine=self.engine,
+                session_id=self.session_id,
+                **_verbatim_blob_context(self.engine, self.session_id, "hello"),
+                session_operation_context=context,
+                session_operation_authority=SQLiteLocalSessionOperationAuthority(self.engine),
+            )
         blob_id = create_result.data["blob_id"]
 
         bad_call = _make_llm_response(
