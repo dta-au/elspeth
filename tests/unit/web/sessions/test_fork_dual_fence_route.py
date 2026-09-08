@@ -103,7 +103,7 @@ async def test_reverse_close_propagates_integrity_after_closing_both_leases(two_
     parent = _failing_lease("parent", calls, parent_error)
     cancellation = asyncio.CancelledError()
     logger_error = AuditIntegrityError("diagnostic integrity")
-    diagnostic = MagicMock(side_effect=logger_error)
+    diagnostic = MagicMock(spec=sessions._log_last_resort_diagnostic, side_effect=logger_error)
     monkeypatch.setattr(sessions, "_log_last_resort_diagnostic", diagnostic)
 
     with pytest.raises(BaseException) as caught:

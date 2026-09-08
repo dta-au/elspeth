@@ -25,6 +25,79 @@
 # Never hand-edit a `key`.
 
 sites:
+- key: d5d21ee28663e6cf
+  path: src/elspeth/config_loading.py
+  qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
+  exception: ValueError
+  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion:
+    {}.{} Env expansion runs before plugin validation on this path, so '
+  ordinal: 0
+  disposition: mirrored
+  counterpart:
+  - settings_load
+  note: 'elspeth-8f0a6b3391. Re-keyed, not newly introduced: same site as 545f5085d49071c7, whose message
+    changed when the guard was inverted to derive its forbidden fields from EmittedToOutput declarations
+    on plugin config models instead of a hand-maintained map. Disposition MIRRORED on fresh end-to-end
+    evidence, replacing the inherited unmirrored reading. Counterpart is not a Stage-1 error_code: Stage
+    1 mirrors this rejection by REACHING THE SAME GUARD - load_runtime_settings calls load_settings_from_config_dict(expand_env_vars=False)
+    and catches ValueError into _settings_failure (web/execution/_validation_runtime.py:198-202), failing
+    the settings check and yielding is_valid=False. Pinned end to end through validate_pipeline_for_trained_operator
+    on a real CompositionState by TestComposerEnvPlaceholderAgreement (tests/integration/pipeline/test_composer_runtime_agreement.py),
+    which asserts the PREDICATE - the error text names the placeholder - not merely is_valid=False, and
+    carries a positive control proving a clean CUSTOM header mapping still validates. That distinction
+    mattered: a loader-level probe cannot tell whether an earlier phase failed first or the composer normalised
+    the option away before materialisation. The prior note recorded Stage 1 is_valid=True for report_assemble
+    while also stating the pass ran unconditionally on the web path; that historical claim is UNEXPLAINED
+    and is contradicted by this evidence - no reconciliation is offered rather than an invented one. Coverage
+    is also WIDER than the original adjudication: sources and sinks are now walked, and every plugin declaring
+    an emitted option is covered (report_assemble join_with/title, truncate.suffix, web_scrape.text_separator,
+    batch_classifier_metrics.positive_label, batch_outlier_annotator.output_prefix, pdf_rasterize.page_text_field,
+    and the sink headers option on csv/json/aws_s3/azure_blob) rather than report_assemble alone.'
+- key: d4c584dc8e39ee9b
+  path: src/elspeth/config_loading.py
+  qualname: load_settings
+  exception: FileNotFoundError
+  message: 'Config file not found: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: load_settings is the Dynaconf/file CLI loader. Composer Stage 2 uses load_settings_from_yaml_string
+    (validation.py:222) and never touches a config path.
+- key: 16b3eec7848c2216
+  path: src/elspeth/config_loading.py
+  qualname: load_settings
+  exception: ValueError
+  message: 'Configuration file {} must be a YAML mapping (key: value), not {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Same CLI-only file loader (config.py:2908); the composer path never reads a settings file (validation.py:221-223).
+- key: 82c333f93d15d482
+  path: src/elspeth/config_loading.py
+  qualname: load_settings
+  exception: ValueError
+  message: 'Unknown configuration keys in {}: {}. Check for typos. Valid top-level keys: {}'
+  ordinal: 0
+  disposition: not_authorable
+  note: Same CLI-only file loader (config.py:2912); the unknown-key check reads the YAML file from disk,
+    which the composer path never provides (validation.py:221-223).
+- key: 0ccae0b07c0d8a4b
+  path: src/elspeth/config_loading.py
+  qualname: load_settings_from_config_dict
+  exception: ValueError
+  message: 'Unknown configuration keys: {}. Valid top-level keys: {}'
+  ordinal: 0
+  disposition: structural
+  note: The dict is built by _generate_pipeline_dict from a literal key set (yaml_generator.py:197-354)
+    that is a strict subset of ElspethSettings.model_fields, so config.py:2964-2965 is a defensive re-check
+    on the composer path.
+- key: d780261c3488bacd
+  path: src/elspeth/config_loading.py
+  qualname: load_settings_from_yaml_string
+  exception: ValueError
+  message: 'Configuration must be a YAML mapping (key: value), not {}'
+  ordinal: 0
+  disposition: structural
+  note: generate_yaml always dumps a dict (yaml_generator.py:612-616), which round-trips to a dict; config.py:3007-3008
+    cannot fire for composer-generated YAML.
 - key: 3d4dabaae9897318
   path: src/elspeth/core/config.py
   qualname: AggregationSettings.validate_input
@@ -1826,34 +1899,6 @@ sites:
     collision even with ELSPETH_FINGERPRINT_KEY SET; unlike sibling 39ea951af8715cb6 this raise is not
     env-conditioned. Stage 1 does not inspect nested option payloads for secret-field shape. elspeth-2ed41f0a4a
     census 2026-08-17.'
-- key: 19d4370762325eae
-  path: src/elspeth/core/config.py
-  qualname: _reject_sensitive_plugin_env_placeholders_before_expansion
-  exception: ValueError
-  message: '{}[{}] {} option {} must not contain environment-variable placeholders before env expansion:
-    {}.{} Env expansion runs before plugin validation on this path, so '
-  ordinal: 0
-  disposition: mirrored
-  counterpart:
-  - settings_load
-  note: 'elspeth-8f0a6b3391. Re-keyed, not newly introduced: same site as 545f5085d49071c7, whose message
-    changed when the guard was inverted to derive its forbidden fields from EmittedToOutput declarations
-    on plugin config models instead of a hand-maintained map. Disposition MIRRORED on fresh end-to-end
-    evidence, replacing the inherited unmirrored reading. Counterpart is not a Stage-1 error_code: Stage
-    1 mirrors this rejection by REACHING THE SAME GUARD - load_runtime_settings calls load_settings_from_config_dict(expand_env_vars=False)
-    and catches ValueError into _settings_failure (web/execution/_validation_runtime.py:198-202), failing
-    the settings check and yielding is_valid=False. Pinned end to end through validate_pipeline_for_trained_operator
-    on a real CompositionState by TestComposerEnvPlaceholderAgreement (tests/integration/pipeline/test_composer_runtime_agreement.py),
-    which asserts the PREDICATE - the error text names the placeholder - not merely is_valid=False, and
-    carries a positive control proving a clean CUSTOM header mapping still validates. That distinction
-    mattered: a loader-level probe cannot tell whether an earlier phase failed first or the composer normalised
-    the option away before materialisation. The prior note recorded Stage 1 is_valid=True for report_assemble
-    while also stating the pass ran unconditionally on the web path; that historical claim is UNEXPLAINED
-    and is contradicted by this evidence - no reconciliation is offered rather than an invented one. Coverage
-    is also WIDER than the original adjudication: sources and sinks are now walked, and every plugin declaring
-    an emitted option is covered (report_assemble join_with/title, truncate.suffix, web_scrape.text_separator,
-    batch_classifier_metrics.positive_label, batch_outlier_annotator.output_prefix, pdf_rasterize.page_text_field,
-    and the sink headers option on csv/json/aws_s3/azure_blob) rather than report_assemble alone.'
 - key: 00f2bf94a9e053a4
   path: src/elspeth/core/config.py
   qualname: _sanitize_dsn
@@ -1967,51 +2012,6 @@ sites:
   note: The composer's Stage-2 input is yaml.dump output from generate_yaml (yaml_generator.py:612-616),
     which is by construction alias-free, shallow, and parseable by _BoundedInMemoryYamlLoader; config.py:176-177
     is a defensive re-check.
-- key: 17629cf20941285f
-  path: src/elspeth/core/config.py
-  qualname: load_settings
-  exception: FileNotFoundError
-  message: 'Config file not found: {}'
-  ordinal: 0
-  disposition: not_authorable
-  note: load_settings is the Dynaconf/file CLI loader. Composer Stage 2 uses load_settings_from_yaml_string
-    (validation.py:222) and never touches a config path.
-- key: bb98734e37080a10
-  path: src/elspeth/core/config.py
-  qualname: load_settings
-  exception: ValueError
-  message: 'Configuration file {} must be a YAML mapping (key: value), not {}'
-  ordinal: 0
-  disposition: not_authorable
-  note: Same CLI-only file loader (config.py:2908); the composer path never reads a settings file (validation.py:221-223).
-- key: dadef486162311d0
-  path: src/elspeth/core/config.py
-  qualname: load_settings
-  exception: ValueError
-  message: 'Unknown configuration keys in {}: {}. Check for typos. Valid top-level keys: {}'
-  ordinal: 0
-  disposition: not_authorable
-  note: Same CLI-only file loader (config.py:2912); the unknown-key check reads the YAML file from disk,
-    which the composer path never provides (validation.py:221-223).
-- key: f978377dd540cafa
-  path: src/elspeth/core/config.py
-  qualname: load_settings_from_config_dict
-  exception: ValueError
-  message: 'Unknown configuration keys: {}. Valid top-level keys: {}'
-  ordinal: 0
-  disposition: structural
-  note: The dict is built by _generate_pipeline_dict from a literal key set (yaml_generator.py:197-354)
-    that is a strict subset of ElspethSettings.model_fields, so config.py:2964-2965 is a defensive re-check
-    on the composer path.
-- key: 89e7625f72ec2db4
-  path: src/elspeth/core/config.py
-  qualname: load_settings_from_yaml_string
-  exception: ValueError
-  message: 'Configuration must be a YAML mapping (key: value), not {}'
-  ordinal: 0
-  disposition: structural
-  note: generate_yaml always dumps a dict (yaml_generator.py:612-616), which round-trips to a dict; config.py:3007-3008
-    cannot fire for composer-generated YAML.
 - key: 31fb18aa23e4a028
   path: src/elspeth/core/config.py
   qualname: sanitize_node_config_for_audit

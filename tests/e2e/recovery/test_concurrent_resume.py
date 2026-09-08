@@ -248,6 +248,9 @@ class TestMidClaimCrashResume:
             def check_and_raise(self) -> None:
                 pass
 
+            def raise_fatal_failure(self) -> None:
+                """No heartbeat ran before this simulated process death."""
+
         config_crash, graph_crash, sink_crash, source_crash = _build_pipeline(_SOURCE_ROWS)
         transform_crash = config_crash.transforms[0]
         with (

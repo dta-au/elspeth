@@ -66,19 +66,6 @@ _EXPECTED_SUPPRESSION_OBSERVATIONS = {
     ),
 }
 
-# This parser is a fail-closed admission point for our JSON-round-tripped
-# completion-gate envelope. Every key read — the two optional envelope probes
-# and the three required signoff fields — is now membership form, so an absent
-# field lands in the same raise as a malformed one and no R1 remains. The two
-# Mapping shape checks stay explicit release-signing candidates: they validate
-# the round-tripped shape before constructing the owned CompletionGateFacts
-# type, and every malformed present value raises.
-_COMPLETION_GATE_ADJUDICATION_CANDIDATES = Counter(
-    {
-        "R5:parse_completion_gates": 2,
-    }
-)
-
 
 def _suppression_key(message: str, symbol_context: tuple[str, ...]) -> str:
     marker = "@trust_boundary suppressed "
@@ -105,7 +92,7 @@ def test_touched_validation_files_have_only_explicit_adjudication_candidates() -
     assert suppressions_by_file == _EXPECTED_SUPPRESSION_OBSERVATIONS
 
 
-def test_completion_gate_parser_has_only_explicit_adjudication_candidates() -> None:
+def test_completion_gate_parser_needs_no_shape_suppressions() -> None:
     repository_root = Path(__file__).resolve().parents[4]
     source_root = repository_root / "src" / "elspeth"
     findings, suppressed = scan_file_with_observations(
@@ -113,7 +100,8 @@ def test_completion_gate_parser_has_only_explicit_adjudication_candidates() -> N
         source_root,
     )
 
-    assert Counter(f"{finding.rule_id}:{':'.join(finding.symbol_context)}" for finding in findings) == (
-        _COMPLETION_GATE_ADJUDICATION_CANDIDATES
-    )
+    # Persisted envelopes admit only the closed dict/MappingProxyType
+    # representations produced by JSON decoding and owned record freezing.
+    # The former arbitrary-Mapping R5 probes no longer need adjudication.
+    assert findings == []
     assert suppressed == []

@@ -419,8 +419,12 @@ class TestWebSocketTimeoutRecovery:
         )
         outcomes = [corruption] if phase == "seed" else [initial, corruption]
         with (
-            patch.object(routes, "_load_run_status_snapshot_with_accounting", new=AsyncMock(side_effect=outcomes)),
-            patch.object(routes.asyncio, "wait_for", new=AsyncMock(side_effect=TimeoutError())),
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=outcomes),
+            ),
+            patch.object(routes.asyncio, "wait_for", new=AsyncMock(spec=routes.asyncio.wait_for, side_effect=TimeoutError())),
             patch.object(routes.slog, "error", side_effect=OSError("logger unavailable") if logger_fails else None),
             pytest.raises(routes._RunStatusIntegrityError) as caught,
         ):

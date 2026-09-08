@@ -1903,7 +1903,7 @@ _SOURCE_PATH_CANARY = "/var/lib/elspeth/SOURCE_PATH_CANARY.csv"
 _DECLARED_OUTPUT_OPTIONS: dict[str, object] = {
     "path": "out.jsonl",
     "schema": {
-        "mode": "declared",
+        "mode": "fixed",
         "fields": [{"name": "name", "type": "str", "required": True, "nullable": False}, "amount: int"],
         "guaranteed_fields": ["name"],
         "required_fields": ["name"],
@@ -1914,7 +1914,7 @@ _DECLARED_OUTPUT_OPTIONS: dict[str, object] = {
 # the same helper, so the frozen half of the gate is a RECORD here and not a
 # second call to the code under test.
 _DECLARED_BUSINESS_SCHEMA: dict[str, object] = {
-    "mode": "declared",
+    "mode": "fixed",
     "fields": [
         {"name": "name", "type": "str", "required": True, "nullable": False},
         {"name": "amount", "type": "int", "required": True, "nullable": False},

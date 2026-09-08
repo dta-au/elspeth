@@ -87,10 +87,11 @@ BASELINE_PATH: Final = REPO_ROOT / "config" / "cicd" / "runtime_rejection_parity
 
 # Roots whose raise sites the composer's Stage-2 preflight can reach on an
 # authored pipeline: the DAG builder/validator family and the settings
-# models whose validators fire at ``settings_load``.
+# models and loading boundary whose validators fire at ``settings_load``.
 SCAN_ROOTS: Final[tuple[str, ...]] = (
     "src/elspeth/core/dag",
     "src/elspeth/core/config.py",
+    "src/elspeth/config_loading.py",
 )
 # Stage-1 error codes are string literals under this tree.
 STAGE1_ROOT: Final = "src/elspeth/web"
@@ -275,7 +276,7 @@ _HEADER: Final = """\
 # READ THIS BEFORE TRUSTING A GREEN GATE.
 #
 # One entry per constructed-exception raise site under the runtime
-# preflight roots (src/elspeth/core/dag/, src/elspeth/core/config.py).
+# preflight roots (DAG validation, config models and config_loading).
 # Each entry adjudicates whether the composer's Stage-1 authoring
 # validator mirrors that runtime rejection. Identity is
 # (path, qualname, exception, message, ordinal) - no line numbers.

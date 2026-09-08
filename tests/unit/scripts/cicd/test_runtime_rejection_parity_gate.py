@@ -1,7 +1,7 @@
 """Runtime-rejection parity gate (elspeth-2ed41f0a4a).
 
 Whole-tree gate: every raise site the composer's Stage-2 preflight can reach
-(``core/dag/`` and ``core/config.py``) must carry a reviewed authoring-side
+(``core/dag/``, ``core/config.py`` and ``config_loading.py``) must carry a reviewed authoring-side
 disposition in ``config/cicd/runtime_rejection_parity.yaml``. See the module
 docstring of ``scripts/cicd/runtime_rejection_parity.py`` for the vocabulary
 and the reason this exists.
@@ -113,6 +113,20 @@ def test_baseline_file_is_canonically_rendered() -> None:
     assert BASELINE_PATH.read_text(encoding="utf-8") == rendered, (
         "config/cicd/runtime_rejection_parity.yaml is not in canonical form; run "
         ".venv/bin/python scripts/cicd/runtime_rejection_parity.py --write and commit the result."
+    )
+
+
+def test_inventory_follows_the_runtime_settings_loader_module() -> None:
+    """Moving loading out of the settings models must not drop its rejections."""
+    import inspect
+
+    from elspeth.config_loading import load_settings_from_config_dict
+
+    source_file = inspect.getsourcefile(load_settings_from_config_dict)
+    assert source_file is not None
+    source_path = Path(source_file).relative_to(REPO_ROOT).as_posix()
+    assert any(
+        site.path == source_path and site.qualname == load_settings_from_config_dict.__qualname__ for site in enumerate_raise_sites()
     )
 
 
