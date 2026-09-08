@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.web.blobs.protocol import (
     BlobContentMissingError,
     BlobError,
@@ -651,9 +652,10 @@ async def _close_fork_operation_leases(
     parent: SessionOperationLease | None,
     primary: BaseException | None,
 ) -> None:
-    """Reverse-close without replacing a stale retry or cancellation."""
+    """Drain both leases, then propagate integrity failures before ordinary primaries."""
     first_close_error: BaseException | None = None
     cleanup_diagnostics: list[tuple[SessionOperationLease, BaseException]] = []
+    integrity_errors: list[BaseException] = []
     for lease in (child, parent):
         if lease is None or lease.closed:
             continue
@@ -661,11 +663,21 @@ async def _close_fork_operation_leases(
             await lease.close()
         except BaseException as close_error:
             cleanup_diagnostics.append((lease, close_error))
+            if isinstance(close_error, contract_errors.TIER_1_ERRORS) or (
+                isinstance(close_error, BaseExceptionGroup) and close_error.subgroup(contract_errors.TIER_1_ERRORS) is not None
+            ):
+                integrity_errors.append(close_error)
             if primary is not None:
                 primary.add_note(f"Fork lease reverse-close also failed with {type(close_error).__name__}.")
             elif first_close_error is None:
                 first_close_error = close_error
     try:
+        if len(integrity_errors) == 1:
+            if integrity_errors[0] is primary:
+                raise integrity_errors[0]
+            raise integrity_errors[0] from primary
+        if integrity_errors:
+            raise BaseExceptionGroup("Fork lease cleanup integrity failures", integrity_errors) from primary
         if first_close_error is not None:
             raise first_close_error
     finally:
@@ -1216,6 +1228,8 @@ def register_session_routes(router: APIRouter) -> None:
                     )
                 except (GuidedOperationFenceLostError, SessionOperationFenceLost) as failure_fence_error:
                     close_primary = failure_fence_error
+                    if cleanup_integrity_exc is not None:
+                        raise cleanup_integrity_exc from failure_fence_error
                     continue
 
                 if cleanup_integrity_exc is not None:

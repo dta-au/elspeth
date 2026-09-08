@@ -205,9 +205,14 @@ def _build_fork_mutation_connection_controls() -> tuple[
         return connection
 
     def unregister_fork_mutation_connection(connection_token: str) -> None:
-        with registry_lock:
-            registered_pairs.pop(connection_token, None)
-        _unregister_mutation_connection(connection_token)
+        try:
+            with registry_lock:
+                try:
+                    del registered_pairs[connection_token]
+                except KeyError:
+                    raise AuditIntegrityError("fork mutation connection revocation has no registered pair") from None
+        finally:
+            _unregister_mutation_connection(connection_token)
 
     def fork_mutation_pair_count() -> int:
         with registry_lock:
@@ -4108,7 +4113,10 @@ class _SessionOperationAuthorityRepository:
                         yield conn
                     finally:
                         with registry_lock:
-                            active_pairs.pop(connection_identity, None)
+                            try:
+                                del active_pairs[connection_identity]
+                            except KeyError:
+                                raise AuditIntegrityError("fork pair lock scope disappeared before revocation") from None
 
         def require_active_locked_fork_pair(
             connection: Connection,

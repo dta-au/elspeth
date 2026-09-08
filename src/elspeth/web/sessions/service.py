@@ -7016,24 +7016,6 @@ class SessionServiceImpl:
         current_stage_attempted = False
         authority_uncertain = False
 
-        def record_secondary_failure(primary: BaseException, secondary: BaseException, *, phase: str) -> None:
-            # ASGI may discard request cancellation without rendering its notes.
-            # Record the recovery obligation using safe identifiers, never the
-            # filesystem exception's text, path, or traceback.
-            try:
-                self._log.error(
-                    "session_archive_secondary_failure",
-                    session_id=sid,
-                    operation_id=str(identity.operation_id),
-                    operation_epoch=identity.operation_epoch,
-                    phase=phase,
-                    error_type=type(secondary).__name__,
-                )
-            except contract_errors.TIER_1_ERRORS:
-                raise
-            except Exception as logging_error:
-                primary.add_note(f"Session archive secondary-failure logging also failed with {type(logging_error).__name__}.")
-
         async def run_owned_phase[T](
             coroutine_factory: Callable[[], Coroutine[Any, Any, T]],
             *,
@@ -7075,8 +7057,8 @@ class SessionServiceImpl:
                             continue
                     task.result()
                 except BaseException as phase_error:
-                    cancellation.add_note(f"Session archive phase also failed with {type(phase_error).__name__}.")
-                    record_secondary_failure(cancellation, phase_error, phase=name)
+                    # Cancellation cannot hide a failure from the joined phase.
+                    raise phase_error from cancellation
                 raise
 
         async def checkpoint() -> None:
@@ -7208,6 +7190,8 @@ class SessionServiceImpl:
                     data_dir,
                     identity,
                 )
+            except contract_errors.TIER_1_ERRORS:
+                raise
             except OSError as cleanup_exc:
                 record_cleanup_failure(cleanup_exc, cleanup_exc.errno)
                 raise QuarantineCleanupError("Session archive committed, but quarantine cleanup remains pending.") from None
@@ -7277,6 +7261,7 @@ class SessionServiceImpl:
                 finalize_consumed=finalize_consumed,
             )
         except BaseException as primary_error:
+            failures = [primary_error]
             if not lease.closed:
                 try:
                     if data_dir is not None and current_obligation_may_exist and not authority_uncertain:
@@ -7286,18 +7271,16 @@ class SessionServiceImpl:
                                 name="session-archive-quarantine-precommit-compensation",
                             )
                         except BaseException as compensation_error:
-                            if compensation_error is not primary_error:
-                                primary_error.add_note(
-                                    f"Session archive compensation also failed with {type(compensation_error).__name__}."
-                                )
-                                record_secondary_failure(primary_error, compensation_error, phase="precommit-compensation")
+                            if not any(compensation_error is failure for failure in failures):
+                                failures.append(compensation_error)
                 finally:
                     try:
                         await lease.close()
                     except BaseException as close_error:
-                        if close_error is not primary_error:
-                            primary_error.add_note(f"Session archive lease cleanup also failed with {type(close_error).__name__}.")
-                            record_secondary_failure(primary_error, close_error, phase="lease-close")
+                        if not any(close_error is failure for failure in failures):
+                            failures.append(close_error)
+            if len(failures) > 1:
+                raise BaseExceptionGroup("Session archive and recovery failed", failures) from None
             raise
 
     async def get_composer_preferences(self, session_id: UUID) -> ComposerSessionPreferencesRecord:

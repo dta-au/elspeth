@@ -1658,6 +1658,30 @@ def test_fork_active_lock_scope_registry_cleans_up(engine, monkeypatch, outcome:
     assert connection_before == coordination_repository._MUTATION_CONNECTION_REGISTRY
 
 
+def test_fork_lock_scope_missing_registration_fails_and_releases_scope(engine) -> None:
+    repository = coordination_repository._SessionOperationAuthorityRepository(engine)
+    locked_pair = inspect.unwrap(repository._locked_pair_transaction)
+    active_pairs = inspect.getclosurevars(locked_pair).nonlocals["active_pairs"]
+    with (
+        pytest.raises(AuditIntegrityError, match="lock scope disappeared"),
+        repository._locked_pair_transaction(str(uuid4()), str(uuid4())) as connection,
+    ):
+        del active_pairs[id(connection)]
+    assert _active_locked_fork_pair_count() == 0
+    with repository._locked_pair_transaction(str(uuid4()), str(uuid4())):
+        assert _active_locked_fork_pair_count() == 1
+    assert _active_locked_fork_pair_count() == 0
+
+
+def test_fork_mutation_missing_pair_revokes_underlying_connection(engine) -> None:
+    with engine.connect() as connection:
+        token = coordination_repository._register_mutation_connection(connection)
+        with pytest.raises(AuditIntegrityError, match="revocation has no registered pair"):
+            coordination_repository._unregister_fork_mutation_connection(token)
+        with pytest.raises(RuntimeError, match="transaction is closed"):
+            coordination_repository._resolve_mutation_connection(token)
+
+
 def test_fork_parent_guided_facet_rejects_mismatched_authority_before_update(engine) -> None:
     authority = SQLiteLocalSessionOperationAuthority(engine)
     parent = _created(authority)

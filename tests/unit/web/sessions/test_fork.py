@@ -3680,6 +3680,43 @@ class TestForkEndpoint:
         assert "permission denied removing blob dir" not in response.text
 
     @pytest.mark.asyncio
+    async def test_fork_cleanup_integrity_survives_failure_settlement_fence_loss(self, tmp_path) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.coordination.contracts import FenceLossReason, SessionOperationFenceLost
+
+        app, service, blob_service = _make_fork_app(tmp_path)
+        session = await service.create_session("alice", "Original", "local")
+        msg = await service.add_message(session.id, "user", "Go", writer_principal="route_user_message")
+        integrity = AuditIntegrityError("fork compensation integrity")
+        fence_loss = SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+        settlements = 0
+
+        async def fail_copy(*args: Any, **kwargs: Any) -> None:
+            raise OSError("copy failed")
+
+        async def fail_cleanup(*args: Any, **kwargs: Any) -> None:
+            raise integrity
+
+        async def fail_settlement(*args: Any, **kwargs: Any) -> None:
+            nonlocal settlements
+            settlements += 1
+            raise fence_loss
+
+        with (
+            patch.object(blob_service, "copy_blobs_for_fork", new=fail_copy),
+            patch.object(blob_service, "cleanup_blobs_for_fork", new=fail_cleanup),
+            patch.object(service, "fail_guided_fork_operation", new=fail_settlement),
+            pytest.raises(AuditIntegrityError) as caught,
+        ):
+            TestClient(app).post(
+                f"/api/sessions/{session.id}/fork",
+                json={"operation_id": str(uuid.uuid4()), "from_message_id": str(msg.id), "new_message_content": "Edited"},
+            )
+        assert caught.value is integrity
+        assert integrity.__cause__ is fence_loss
+        assert settlements == 1
+
+    @pytest.mark.asyncio
     async def test_fork_top_level_blob_ref_without_copied_blob_fails_closed(self, tmp_path) -> None:
         """sources[].options.blob_ref must be guarded even when blob_map is empty.
 

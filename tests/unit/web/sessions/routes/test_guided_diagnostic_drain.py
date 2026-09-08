@@ -63,3 +63,46 @@ async def test_reconciliation_cancellation_closes_before_diagnostic_emission(mon
     assert len(cancellation.__notes__) == 2
     assert lease.closed
     authority.release.assert_called_once_with(context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("fatal_phase", ["mutation", "close", "both"])
+async def test_reconciliation_integrity_failures_escape_after_close(monkeypatch, cancel: bool, fatal_phase: str) -> None:
+    context = SessionOperationContext(
+        fence=SessionOperationFence(session_id=str(uuid4()), operation_id=str(uuid4()), lease_token="test-lease", operation_epoch=1),
+        operation_kind=SessionOperationKind.COMPOSE,
+    )
+    authority = MagicMock(spec=SessionOperationAuthority)
+    mutation_error = AuditIntegrityError("mutation integrity") if fatal_phase != "close" else RuntimeError("ordinary mutation")
+    close_error = AuditIntegrityError("close integrity") if fatal_phase != "mutation" else OSError("ordinary close")
+    authority.release.side_effect = close_error
+    lease = SessionOperationLease(authority, context, lease_seconds=30, renew_interval_seconds=10)
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def mutation() -> None:
+        started.set()
+        await finish.wait()
+        raise mutation_error
+
+    def forbidden_logging(*_args, **_kwargs) -> None:
+        raise AssertionError("a logger must not replace integrity failures")
+
+    monkeypatch.setattr(guided_operations.slog, "error", forbidden_logging)
+    request = asyncio.create_task(guided_operations.run_guided_reconciliation_mutation(lease, mutation()))
+    await started.wait()
+    if cancel:
+        request.cancel()
+        await asyncio.sleep(0)
+    finish.set()
+    if fatal_phase == "both":
+        with pytest.raises(BaseExceptionGroup) as grouped:
+            await request
+        assert grouped.value.exceptions == (mutation_error, close_error)
+    else:
+        with pytest.raises(AuditIntegrityError) as caught:
+            await request
+        assert caught.value is (mutation_error if fatal_phase == "mutation" else close_error)
+    assert lease.closed
+    authority.release.assert_called_once_with(context)

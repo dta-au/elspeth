@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 from structlog.testing import capture_logs
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.web.coordination.contracts import (
     FenceLossReason,
     SessionOperationContext,
@@ -47,7 +48,7 @@ def test_fork_route_reverse_close_preserves_primary_retry_or_cancellation() -> N
     assert "SessionOperationFenceLost," in source
 
 
-def _failing_lease(label: str, calls: list[str]) -> SessionOperationLease:
+def _failing_lease(label: str, calls: list[str], error: BaseException | None = None) -> SessionOperationLease:
     context = SessionOperationContext(
         fence=SessionOperationFence(session_id=str(uuid4()), operation_id=str(uuid4()), lease_token="test-lease", operation_epoch=1),
         operation_kind=SessionOperationKind.SESSION_FORK,
@@ -57,6 +58,8 @@ def _failing_lease(label: str, calls: list[str]) -> SessionOperationLease:
     def fail_release(actual_context: SessionOperationContext) -> None:
         assert actual_context is context
         calls.append(label)
+        if error is not None:
+            raise error
         raise SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
 
     authority.release.side_effect = fail_release
@@ -88,3 +91,26 @@ async def test_reverse_close_never_replaces_stale_retry_or_cancellation(
     assert [(record["session_id"], record["operation_id"], record["exc_class"]) for record in records] == [
         (lease.context.fence.session_id, lease.context.fence.operation_id, "SessionOperationFenceLost") for lease in (child, parent)
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("two_failures", [False, True])
+async def test_reverse_close_propagates_integrity_after_closing_both_leases(two_failures: bool) -> None:
+    calls: list[str] = []
+    child_error = AuditIntegrityError("child release integrity")
+    parent_error = AuditIntegrityError("parent release integrity") if two_failures else OSError("parent release")
+    child = _failing_lease("child", calls, child_error)
+    parent = _failing_lease("parent", calls, parent_error)
+    cancellation = asyncio.CancelledError()
+
+    with pytest.raises(BaseException) as caught:
+        await sessions._close_fork_operation_leases(child, parent, cancellation)
+
+    assert calls == ["child", "parent"]
+    assert child.closed and parent.closed
+    if two_failures:
+        assert isinstance(caught.value, BaseExceptionGroup)
+        assert caught.value.exceptions == (child_error, parent_error)
+    else:
+        assert caught.value is child_error
+    assert caught.value.__cause__ is cancellation
