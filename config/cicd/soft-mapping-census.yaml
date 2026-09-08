@@ -143,7 +143,7 @@ files:
     Mapping[str, object]: 1
     dict[str, object]: 1
   src/elspeth/core/landscape/data_flow/outcomes.py:
-    Mapping[str, object]: 5
+    Mapping[str, object]: 4
     dict[str, object]: 2
   src/elspeth/core/landscape/data_flow/tokens.py:
     Mapping[str, object]: 6
@@ -1012,9 +1012,9 @@ files:
     dict[str, object]: 2
 totals:
   Mapping[str, Any]: 861
-  Mapping[str, object]: 291
+  Mapping[str, object]: 290
   MutableMapping[str, Any]: 13
   boundary: 64
   dict[str, Any]: 1141
   dict[str, object]: 399
-  soft: 2705
+  soft: 2704

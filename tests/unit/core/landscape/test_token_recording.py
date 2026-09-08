@@ -2107,6 +2107,7 @@ class TestRecordTokenOutcomeAtomicity:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                context_json=None,
                 conn=caller_conn,
             )
             assert seen_connections == [caller_conn]
@@ -2148,44 +2149,6 @@ class TestRecordTokenOutcomeAtomicity:
 
         assert opened_transactions == []
         assert factory.data_flow.get_token_outcome(token.token_id) is None
-
-    def test_context_serialization_failure_precedes_caller_connection_validation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        db, factory = _setup()
-        _row, token = _make_row(factory)
-        validation_calls: list[TokenRef] = []
-        outcomes = factory.data_flow.outcomes
-        original_ownership = outcomes._ownership.validate_token_run_ownership
-
-        def capture_ownership(ref: TokenRef, *, conn: Connection | None = None) -> None:
-            validation_calls.append(ref)
-            original_ownership(ref, conn=conn)
-
-        monkeypatch.setattr(outcomes._ownership, "validate_token_run_ownership", capture_ownership)
-
-        with fenced_leader_transaction(
-            db.engine,
-            token=leader_coordination_token(factory, "run-1"),
-            window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-            verb="test_outcome_context_validation",
-        ) as caller_conn:
-            with pytest.raises(ValueError, match="Cannot canonicalize non-finite float"):
-                factory.data_flow.outcomes.record_token_outcome_on(
-                    ref=TokenRef(token_id=token.token_id, run_id="run-1"),
-                    outcome=TerminalOutcome.SUCCESS,
-                    path=TerminalPath.DEFAULT_FLOW,
-                    sink_name="output",
-                    context={"invalid": float("nan")},
-                    conn=caller_conn,
-                )
-            persisted_outcomes = caller_conn.execute(
-                select(token_outcomes_table.c.outcome_id).where(token_outcomes_table.c.token_id == token.token_id)
-            ).all()
-
-        assert validation_calls == []
-        assert persisted_outcomes == []
 
     def test_repository_owned_begin_failure_uses_landscape_error_taxonomy(
         self,
@@ -2271,6 +2234,7 @@ class TestRecordTokenOutcomeAtomicity:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                context_json=None,
                 conn=caller_conn,
             )
 

@@ -493,7 +493,7 @@ class TokenOutcomeRepository:
             with fenced_item_transaction(
                 self._db.engine, member_token=member_token, work_item=work_item, verb="record_token_outcome"
             ) as conn:
-                return self._record_prepared_token_outcome_on(
+                return self.record_token_outcome_on(
                     ref,
                     outcome,
                     path,
@@ -534,7 +534,7 @@ class TokenOutcomeRepository:
                 window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                 verb="record_token_outcome_leader",
             ) as conn:
-                return self._record_prepared_token_outcome_on(
+                return self.record_token_outcome_on(
                     ref,
                     outcome,
                     path,
@@ -560,7 +560,7 @@ class TokenOutcomeRepository:
         artifact_id: str | None = None,
         batch_id: str | None = None,
         error_hash: str | None = None,
-        context: Mapping[str, object] | None = None,
+        context_json: str | None,
         conn: Connection,
         dependencies_prelocked: bool = False,
     ) -> str:
@@ -584,7 +584,8 @@ class TokenOutcomeRepository:
                 failsink-paired outcomes. Accepted but not written in Phase 1.
             batch_id: For BATCH_CONSUMED / BUFFERED (REQUIRED)
             error_hash: Error witness for failure/transient error paths
-            context: Optional additional context (stored as JSON)
+            context_json: Context canonicalized by the caller before opening
+                its transaction, or None when no context is supplied.
 
         Returns:
             outcome_id for tracking
@@ -601,43 +602,6 @@ class TokenOutcomeRepository:
             batch_id=batch_id,
             error_hash=error_hash,
         )
-        # Canonicalization can fail; prepare the context before the dependent
-        # audit INSERT so malformed data cannot leave a partial outcome.
-        context_json = canonical_json(context) if context is not None else None
-        return self._record_prepared_token_outcome_on(
-            ref,
-            outcome,
-            path,
-            conn=conn,
-            sink_name=sink_name,
-            sink_node_id=sink_node_id,
-            artifact_id=artifact_id,
-            batch_id=batch_id,
-            error_hash=error_hash,
-            context_json=context_json,
-            dependencies_prelocked=dependencies_prelocked,
-        )
-
-    def _record_prepared_token_outcome_on(
-        self,
-        ref: TokenRef,
-        outcome: TerminalOutcome | None,
-        path: TerminalPath,
-        *,
-        sink_name: str | None,
-        sink_node_id: str | None,
-        artifact_id: str | None,
-        batch_id: str | None,
-        error_hash: str | None,
-        context_json: str | None,
-        conn: Connection,
-        dependencies_prelocked: bool = False,
-    ) -> str:
-        """Persist validated outcome fields and prepared context on the fenced connection.
-
-        Public writers prepare context before opening their own transaction;
-        composed callers retain ownership of their transaction boundary.
-        """
         # Every Tier-1 read and the dependent insert use the caller's exact
         # fenced transaction, which holds SQLite's writer slot.
         # Outcome inserts acquire a token FK lock even for pairs without a

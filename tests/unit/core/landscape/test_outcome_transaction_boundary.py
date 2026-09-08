@@ -14,6 +14,7 @@ from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, 
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.contracts.errors import AuditIntegrityError, RunLeadershipLostError, RunMembershipLostError
 from elspeth.core.landscape import run_coordination_repository
+from elspeth.core.landscape.data_flow import outcomes as outcome_module
 from elspeth.core.landscape.database import Tier1Engine
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
@@ -170,9 +171,52 @@ def test_caller_owned_commit_failure_stays_raw_and_rolls_back(writer: OutcomeWri
             writer.ref,
             TerminalOutcome.SUCCESS,
             TerminalPath.DEFAULT_FLOW,
+            context_json=None,
             conn=conn,
             sink_name="output",
         )
         raise failure
     assert caught.value is failure
     assert writer.factory.data_flow.get_token_outcome(writer.ref.token_id) is None
+
+
+@pytest.mark.parametrize("dependencies_prelocked", (False, True))
+def test_caller_prepared_context_uses_exact_connection_without_serializing_again(
+    writer: OutcomeWriter,
+    monkeypatch: pytest.MonkeyPatch,
+    dependencies_prelocked: bool,
+) -> None:
+    repository = writer.factory.data_flow.outcomes
+    lock_connections: list[Connection] = []
+    original_lock = repository.lock_token_outcome_dependencies
+
+    def capture_lock(refs: tuple[TokenRef, ...], *, conn: Connection) -> None:
+        lock_connections.append(conn)
+        original_lock(refs, conn=conn)
+
+    def refuse_serialization(value: object) -> str:
+        raise AssertionError("Prepared context must not be serialized again")
+
+    monkeypatch.setattr(repository, "lock_token_outcome_dependencies", capture_lock)
+    monkeypatch.setattr(outcome_module, "canonical_json", refuse_serialization)
+    with fenced_leader_transaction(
+        writer.engine,
+        token=writer.coordination_token,
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        verb="test_prepared_outcome_context",
+    ) as conn:
+        if dependencies_prelocked:
+            repository.lock_token_outcome_dependencies((writer.ref,), conn=conn)
+        repository.record_token_outcome_on(
+            writer.ref,
+            TerminalOutcome.SUCCESS,
+            TerminalPath.DEFAULT_FLOW,
+            sink_name="output",
+            context_json='{"value":1}',
+            conn=conn,
+            dependencies_prelocked=dependencies_prelocked,
+        )
+        assert lock_connections == [conn]
+    outcome = writer.factory.data_flow.get_token_outcome(writer.ref.token_id)
+    assert outcome is not None
+    assert outcome.context_json == '{"value":1}'
