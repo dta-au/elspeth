@@ -50,6 +50,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
 from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
 # ---------------------------------------------------------------------------
@@ -324,6 +325,41 @@ class TestFatalIntegrityLatch:
 
 
 class TestBusyTolerated:
+    def test_deadline_guard_rejection_degrades_then_recovers_on_next_tick(self) -> None:
+        repo = _StubRepo()
+        repo.side_effects = [LeaseDeadlineExpiredError("heartbeat reserve exhausted"), _HEALTHY_SNAPSHOT]
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        assert not thread._coordination_lost_event.is_set()
+        assert not thread._fatal_event.is_set()
+        thread.check_and_raise()
+
+        thread._step_beat()
+
+        assert len(repo.worker_heartbeat_calls) == 2
+        assert thread._consecutive_busy == 0
+        assert not thread._coordination_lost_event.is_set()
+        assert not thread._fatal_event.is_set()
+        thread.check_and_raise()
+
+    def test_unrelated_timeout_still_fails_closed(self) -> None:
+        failure = TimeoutError("unexpected owned operation timeout")
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(TimeoutError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
+
     def test_operational_error_does_not_set_latch(self) -> None:
         """SQLITE_BUSY does NOT set the coordination-lost latch."""
         repo = _StubRepo()

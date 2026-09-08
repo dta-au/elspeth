@@ -24,12 +24,13 @@ communicates through :class:`threading.Event` flags:
 Design invariants enforced here:
 
 - **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` whose DBAPI
-  message is SQLite write-lock contention (``_is_lock_contention``) is logged
-  at DEBUG and counted toward the ``heartbeat_degraded`` threshold ``k``; the
-  thread never sets the latch on contention. An ``OperationalError`` that is
-  NOT contention (unable to open the database file, disk I/O error, a readonly
-  database) is an audit-store failure carrying no liveness evidence, and
-  latches like any other non-contention failure.
+  message is SQLite write-lock contention (``_is_lock_contention``), or a
+  rolled-back lease deadline rejection (``LeaseDeadlineExpiredError``), is
+  logged at DEBUG and counted toward the ``heartbeat_degraded`` threshold
+  ``k``; the thread never sets the latch on either. An ``OperationalError``
+  that is NOT contention (unable to open the database file, disk I/O error, a
+  readonly database) is an audit-store failure carrying no liveness evidence,
+  and latches like any other non-contention failure.
 - **Never self-terminate on DB errors** — the per-tick try/except contains
   contention and continues looping; every other error latches a fatal failure
   for the drain thread. A failure of the thread's own clock or diagnostic
@@ -73,6 +74,7 @@ from elspeth.contracts.coordination import (
     WorkerMembershipToken,
 )
 from elspeth.contracts.errors import RunWorkerEvictedError
+from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
 
 __all__ = ["RunHeartbeatThread"]
 
@@ -418,8 +420,10 @@ class RunHeartbeatThread:
                 self._token.run_id,
                 exc_info=exc,
             )
-        except OperationalError as exc:
-            if not _is_lock_contention(exc):
+        except (OperationalError, LeaseDeadlineExpiredError) as exc:
+            # ``LeaseDeadlineExpiredError`` is a ``TimeoutError``, disjoint from
+            # ``OperationalError``, so this narrows to the DB arm exactly.
+            if isinstance(exc, OperationalError) and not _is_lock_contention(exc):
                 # NOT contention: an operational failure of the audit store
                 # itself (unable to open the database file, disk I/O error, a
                 # readonly database). It carries no evidence about this
@@ -436,7 +440,10 @@ class RunHeartbeatThread:
                 )
                 return
             # BUSY = liveness-unknown (design §A.3): count toward degraded
-            # threshold but never crash and never set the latch.
+            # threshold but never crash and never set the latch. A deadline
+            # guard rejects before commit and rolls the heartbeat back; the
+            # next tick starts a new operation. Other TimeoutError subclasses
+            # remain programmer/operational failures outside this narrow arm.
             self._consecutive_busy += 1
             logger.debug(
                 "run_heartbeat: busy for worker %r in run %r (consecutive=%d): %s",

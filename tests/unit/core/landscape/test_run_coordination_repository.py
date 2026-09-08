@@ -48,8 +48,9 @@ from elspeth.contracts.errors import (
     WriteLockHeldError,
 )
 from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine, begin_write
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     RunCoordinationRepository,
@@ -69,7 +70,6 @@ from tests.fixtures.landscape import (
     assert_deadline_within,
     assert_stamped_between,
     landscape_database_now,
-    within_one_database_second,
 )
 from tests.helpers.run_coordination import register_run_leader
 
@@ -1099,40 +1099,29 @@ class TestRunCoordinationTruthTables:
         self,
         engine: Tier1Engine,
         repo: RunCoordinationRepository,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A seat whose deadline EQUALS database time is not yet expired: the CAS predicate is strict ``<``.
 
-        The boundary can only be pinned when the seat is stamped and the CAS
-        decides inside the same database second (SQLite stamps whole seconds),
-        so each attempt seeds a fresh run and is repeated when the clock
-        rolled over during it.
+        Pin the decision helper to an actual database sample so wall-clock
+        advancement cannot turn equality into a different boundary case.
+        PostgreSQL contention proofs separately exercise unmodified fresh reads.
         """
-        attempts: list[str] = []
-
-        def attempt(database_now: datetime) -> tuple[CoordinationToken, dict[str, tuple[dict[str, object], ...]], bool]:
-            run_id = f"{RUN_ID}-equality-{len(attempts)}"
-            attempts.append(run_id)
-            _seed_run(engine, run_id=run_id, status="failed")
-            incumbent = register_run_leader(repo, run_id=run_id, worker_id=f"leader-a-{len(attempts)}", window_seconds=WINDOW)
-            with engine.begin() as conn:
-                conn.execute(
-                    update(run_coordination_table)
-                    .where(run_coordination_table.c.run_id == run_id)
-                    .values(leader_heartbeat_expires_at=database_now)
-                )
-            before = _coordination_image(engine, run_id)
-            try:
-                repo.acquire_run_leadership(run_id=run_id, worker_id=f"leader-b-{len(attempts)}", window_seconds=WINDOW)
-            except NonResumableRunError as exc:
-                assert "run leadership is held by" in str(exc)
-                return incumbent, before, True
-            return incumbent, before, False
-
-        incumbent, before, refused = within_one_database_second(engine, attempt)
-
-        assert refused, "a deadline equal to database time is live; the takeover CAS must lose"
+        _seed_run(engine, status="failed")
+        incumbent = register_run_leader(repo, run_id=RUN_ID, worker_id="leader-a", window_seconds=WINDOW)
+        with engine.begin() as conn:
+            database_now = read_landscape_decision_time(conn)
+            conn.execute(
+                update(run_coordination_table)
+                .where(run_coordination_table.c.run_id == RUN_ID)
+                .values(leader_heartbeat_expires_at=database_now)
+            )
+        before = _coordination_image(engine)
+        monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+        with pytest.raises(NonResumableRunError, match="run leadership is held by"):
+            repo.acquire_run_leadership(run_id=RUN_ID, worker_id="leader-b", window_seconds=WINDOW)
         assert incumbent.leader_epoch == 1
-        assert _coordination_image(engine, attempts[-1]) == before
+        assert _coordination_image(engine) == before
 
     def test_rc02_takeover_exactly_rotates_seat_evicts_incumbent_and_records_winner(
         self,
@@ -1331,6 +1320,7 @@ class TestRunCoordinationTruthTables:
         self,
         engine: Tier1Engine,
         repo: RunCoordinationRepository,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _seed_run(engine)
         token = register_run_leader(repo, run_id=RUN_ID, worker_id="leader", window_seconds=WINDOW)
@@ -1341,26 +1331,21 @@ class TestRunCoordinationTruthTables:
         _seed_follower(engine, "eligible", heartbeat_expires_at=seeded_at - timedelta(seconds=grace + 60))
         _seed_follower(engine, "fresh", heartbeat_expires_at=seeded_at - timedelta(seconds=grace - 60))
 
-        # The equality boundary (``heartbeat_expires_at == database_now - grace``
-        # is NOT strictly expired) needs the row stamped and the verb deciding
-        # inside one database second; a fresh row per attempt keeps a rolled-over
-        # attempt from leaving anything to restore.
-        equal_rows: list[str] = []
-
-        def equal_arm(database_now: datetime) -> bool:
-            worker_id = f"equal-{len(equal_rows)}"
-            equal_rows.append(worker_id)
-            _seed_follower(engine, worker_id, heartbeat_expires_at=database_now - timedelta(seconds=grace))
-            return repo.evict_worker(token=token, target_worker_id=worker_id, grace_seconds=grace, window_seconds=WINDOW)
-
-        assert within_one_database_second(engine, equal_arm) is False
+        # Keep exact equality independent of elapsed milliseconds. Only this
+        # boundary arm pins the repository helper to the observed DB instant.
+        with engine.connect() as conn:
+            database_now = read_landscape_decision_time(conn)
+        _seed_follower(engine, "equal", heartbeat_expires_at=database_now - timedelta(seconds=grace))
+        with monkeypatch.context() as boundary:
+            boundary.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+            assert repo.evict_worker(token=token, target_worker_id="equal", grace_seconds=grace, window_seconds=WINDOW) is False
         assert repo.evict_worker(token=token, target_worker_id="fresh", grace_seconds=grace, window_seconds=WINDOW) is False
         assert repo.evict_worker(token=token, target_worker_id=token.worker_id, grace_seconds=grace, window_seconds=WINDOW) is False
         before = landscape_database_now(engine)
         assert repo.evict_worker(token=token, target_worker_id="eligible", grace_seconds=grace, window_seconds=WINDOW) is True
         after = landscape_database_now(engine)
 
-        assert _worker_row(engine, equal_rows[-1])["status"] == "active"
+        assert _worker_row(engine, "equal")["status"] == "active"
         assert _worker_row(engine, "fresh")["status"] == "active"
         eligible = _worker_row(engine, "eligible")
         assert eligible["status"] == "evicted"

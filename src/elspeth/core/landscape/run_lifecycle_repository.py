@@ -436,13 +436,14 @@ class RunLifecycleRepository:
                 # the runs row above satisfies the run_coordination FK. The
                 # seat's deadline is Landscape database time (ADR-047); the
                 # forensic ``timestamp`` above never reaches it.
-                coordination.register_run_leader_on(
+                leader_token = coordination.register_run_leader_on(
                     conn,
                     run_id=run.run_id,
                     worker_id=worker_id,
                     window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
                     entry_point="run",
                 )
+                coordination._finalize_leader_registration_on(conn, token=leader_token, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS)
         except SQLAlchemyError as exc:
             # Preserve the pre-epoch-21 error contract: begin_run surfaced
             # constraint violations (e.g. duplicate run_id) as

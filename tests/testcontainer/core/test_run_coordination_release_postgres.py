@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, func, insert, select, update
+from sqlalchemy.engine import Connection
 from tests.fixtures.landscape import assert_stamped_between, expire_leader_seat, landscape_database_now, stamp_inside_next_transaction
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
@@ -25,6 +26,7 @@ from elspeth.contracts.coordination import (
     mint_worker_id,
 )
 from elspeth.core.checkpoint.recovery import NonResumableRunError
+from elspeth.core.landscape import run_coordination_repository as coordination_module
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import run_coordination_events_table, run_coordination_table, run_workers_table, runs_table
@@ -217,14 +219,13 @@ def test_postgresql_initial_leader_registration_is_atomic(postgres_url: str) -> 
 
 
 @pytest.mark.timeout(120)
-def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(postgres_url: str) -> None:
+def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(postgres_url: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """RC-02 uses a strict-expiry conditional update at microsecond precision.
 
-    The CAS compares the seat against the Landscape database's transaction
-    time (ADR-047), so each boundary arm stamps the seat INSIDE the takeover's
-    own transaction from ``CURRENT_TIMESTAMP``: equal to it (not expired,
-    refused, rolled back with the refusal) and one microsecond before it
-    (strictly expired, admitted).
+    A test hook reads the actual fresh database decision instant after the
+    seat lock, then stamps equality (refused and rolled back) or one microsecond
+    before it (admitted). This controlled boundary proof complements the
+    unmodified-clock contention tests; it does not pin transaction-wide time.
     """
     now = datetime(2026, 8, 12, 7, 0, tzinfo=UTC)
     run_id = "run-postgresql-takeover-boundary"
@@ -236,28 +237,42 @@ def test_postgresql_takeover_excludes_exact_expiry_then_admits_after_boundary(po
     before_equality = capture_state_engine_image(db, run_id=run_id)
     equality_contender = mint_worker_id(run_id)
     seat_deadline = update(run_coordination_table).where(run_coordination_table.c.run_id == run_id)
+    read_decision = coordination_module.read_landscape_decision_time
+    decision_stamps: list[datetime] = []
+    offset = timedelta(0)
+
+    def stamp_locked_decision(conn: Connection) -> datetime:
+        database_now = read_decision(conn)
+        if not decision_stamps:
+            conn.execute(seat_deadline.values(leader_heartbeat_expires_at=database_now - offset))
+            decision_stamps.append(database_now)
+        return database_now
 
     with (
-        stamp_inside_next_transaction(db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp())),
+        monkeypatch.context() as boundary,
         pytest.raises(NonResumableRunError, match="run leadership is held by"),
     ):
+        boundary.setattr(coordination_module, "read_landscape_decision_time", stamp_locked_decision)
         repo.acquire_run_leadership(
             run_id=run_id,
             worker_id=equality_contender,
             window_seconds=30,
         )
+    assert len(decision_stamps) == 1
     assert capture_state_engine_image(db, run_id=run_id) == before_equality
 
     successor_id = mint_worker_id(run_id)
-    with stamp_inside_next_transaction(
-        db.engine, seat_deadline.values(leader_heartbeat_expires_at=func.current_timestamp() - timedelta(microseconds=1))
-    ):
+    decision_stamps.clear()
+    offset = timedelta(microseconds=1)
+    with monkeypatch.context() as boundary:
+        boundary.setattr(coordination_module, "read_landscape_decision_time", stamp_locked_decision)
         token = repo.acquire_run_leadership(
             run_id=run_id,
             worker_id=successor_id,
             window_seconds=30,
         )
     try:
+        assert len(decision_stamps) == 1
         assert token == CoordinationToken(run_id=run_id, worker_id=successor_id, leader_epoch=2)
         with db.read_only_connection() as conn:
             seat = conn.execute(
