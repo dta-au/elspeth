@@ -723,18 +723,22 @@ async def test_integrity_logger_failure_does_not_skip_guided_or_fork_close(monke
 
 
 @pytest.mark.asyncio
-async def test_guided_cleanup_failures_reach_logs_when_http_response_omits_notes() -> None:
+async def test_guided_integrity_cleanup_failure_escapes_http_conflict() -> None:
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id="http-cleanup", lease_token="secret", attempt=1)
     context = _context(session_id)
+    integrity_error = AuditIntegrityError("PRIVATE-INTEGRITY-DETAIL")
+    closed = False
 
     class FailingLease(_Lease):
         async def close(self) -> None:
+            nonlocal closed
+            closed = True
             raise OSError("PRIVATE-LEASE-DETAIL")
 
     class GuardService:
         async def fail_guided_operation(self, *_args, **_kwargs):
-            raise AuditIntegrityError("PRIVATE-INTEGRITY-DETAIL")
+            raise integrity_error
 
     app = FastAPI()
 
@@ -748,16 +752,78 @@ async def test_guided_cleanup_failures_reach_logs_when_http_response_omits_notes
 
     with capture_logs() as logs:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/guarded")
-    assert response.status_code == 409
-    assert response.json() == {"detail": "primary conflict"}
-    records = [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"]
-    assert [(entry["site"], entry["exc_class"]) for entry in records] == [
-        ("guard_fail", "AuditIntegrityError"),
-        ("guard_close", "OSError"),
-    ]
-    assert all(entry["session_id"] == str(session_id) for entry in records)
-    assert "PRIVATE-" not in repr(records)
+            with pytest.raises(AuditIntegrityError) as caught:
+                await client.get("/guarded")
+    assert caught.value is integrity_error
+    assert isinstance(caught.value.__cause__, HTTPException)
+    assert closed
+    assert not logs
+
+
+@pytest.mark.asyncio
+async def test_guard_retains_multiple_integrity_failures_and_closes_before_propagation() -> None:
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id="fatal-cleanup", lease_token="secret", attempt=1)
+    primary = AuditIntegrityError("primary integrity")
+    proof_error = ExceptionGroup("proof cohort", [AuditIntegrityError("proof integrity")])
+    close_error = AuditIntegrityError("close integrity")
+
+    class FailingLease(_Lease):
+        async def close(self):
+            self.closed = True
+            raise close_error
+
+    class GuardService:
+        async def fail_guided_operation(self, *_args, **_kwargs):
+            raise proof_error
+
+    lease = FailingLease(_context(session_id))
+    with pytest.raises(BaseExceptionGroup) as caught:
+        async with guided_operations_module.guided_operation_lease_guard(
+            service=GuardService(), lease=GuidedOperationLease(fence=fence, session_lease=lease)
+        ):
+            raise primary
+    assert caught.value.exceptions == (primary, proof_error, close_error)
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_reservation_integrity_error_propagates_after_close(monkeypatch, cancel: bool) -> None:
+    session_id = uuid4()
+    session_lease = _Lease(_context(session_id))
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    failure = AuditIntegrityError("reservation integrity")
+
+    class FailingService(_Service):
+        async def reserve_guided_operation(self, **_kwargs):
+            started.set()
+            await finish.wait()
+            raise failure
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    task = asyncio.create_task(
+        reserve_or_replay_guided_operation(
+            service=FailingService([None]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    )
+    await started.wait()
+    if cancel:
+        task.cancel()
+        await asyncio.sleep(0)
+    finish.set()
+    with pytest.raises(AuditIntegrityError) as caught:
+        await task
+    assert caught.value is failure
+    assert session_lease.closed
 
 
 @pytest.mark.asyncio

@@ -29,16 +29,19 @@ def service(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure_phase", ["phase", "compensation", "close"])
-@pytest.mark.parametrize("logging_failure", [None, "ordinary", "tier1"])
-async def test_cancelled_archive_reports_secondary_failure_and_closes_lease(service, monkeypatch, failure_phase, logging_failure):
+@pytest.mark.parametrize("failure_type", [AuditIntegrityError, RuntimeError])
+@pytest.mark.parametrize("additional_close_failure", [False, True])
+async def test_cancelled_archive_propagates_failure_and_closes_lease(
+    service, monkeypatch, failure_phase, failure_type, additional_close_failure
+):
     session = await service.create_session("alice", "archive cancellation", "local")
     entered = asyncio.Event()
     release = asyncio.Event()
     closed = asyncio.Event()
     worker = service_module.run_sync_in_worker
     real_close = SessionOperationLease.close
-    secondary = AuditIntegrityError("private filesystem detail must not reach logs")
-    diagnostic_failure = AuditIntegrityError("diagnostic integrity failure")
+    secondary = failure_type("private filesystem detail must not reach logs")
+    close_failure = AuditIntegrityError("independent close failure")
 
     async def controlled_worker(function, *args, **kwargs):
         pause_at = (
@@ -58,19 +61,13 @@ async def test_cancelled_archive_reports_secondary_failure_and_closes_lease(serv
             await real_close(lease)
         finally:
             closed.set()
+            if additional_close_failure:
+                raise close_failure
         if failure_phase == "close":
             raise secondary
 
-    def fail_logging(event, **fields):
-        assert event == "session_archive_secondary_failure"
-        if logging_failure == "tier1":
-            raise diagnostic_failure
-        raise RuntimeError("ordinary logger failure")
-
     monkeypatch.setattr(service_module, "run_sync_in_worker", controlled_worker)
     monkeypatch.setattr(SessionOperationLease, "close", controlled_close)
-    if logging_failure is not None:
-        monkeypatch.setattr(service._log, "error", fail_logging)
     with structlog.testing.capture_logs() as logs:
         task = asyncio.create_task(service.archive_session(session.id))
         await asyncio.wait_for(entered.wait(), timeout=5)
@@ -84,38 +81,44 @@ async def test_cancelled_archive_reports_secondary_failure_and_closes_lease(serv
         assert not task.done()
         assert not closed.is_set()
         release.set()
-        expected_error = AuditIntegrityError if logging_failure == "tier1" else asyncio.CancelledError
+        expected_error = failure_type if failure_phase == "phase" and not additional_close_failure else BaseExceptionGroup
         with pytest.raises(expected_error) as caught:
             await asyncio.wait_for(task, timeout=5)
 
     assert closed.is_set()
-    if logging_failure == "tier1":
-        assert caught.value is diagnostic_failure
-    elif logging_failure == "ordinary":
-        assert any("secondary-failure logging also failed with RuntimeError" in note for note in caught.value.__notes__)
+    if failure_phase == "phase" and not additional_close_failure:
+        assert caught.value is secondary
+        assert isinstance(secondary.__cause__, asyncio.CancelledError)
     else:
-        failures = [entry for entry in logs if entry["event"] == "session_archive_secondary_failure"]
-        expected_phase = {
-            "phase": "session-archive-quarantine-reconcile-prior",
-            "compensation": "precommit-compensation",
-            "close": "lease-close",
-        }[failure_phase]
-        # Closing the real lease also retrieves a failed owned task, so its
-        # failure is visible at both the phase and the lease cleanup boundary.
-        expected_phases = [expected_phase] if failure_phase == "close" else [expected_phase, "lease-close"]
-        assert [entry["phase"] for entry in failures] == expected_phases
-        for entry in failures:
-            assert entry == {
-                "event": "session_archive_secondary_failure",
-                "log_level": "error",
-                "session_id": str(session.id),
-                "operation_id": entry["operation_id"],
-                "operation_epoch": entry["operation_epoch"],
-                "phase": entry["phase"],
-                "error_type": "AuditIntegrityError",
-            }
-            assert entry["operation_id"]
-            assert entry["operation_epoch"] >= 1
+        failures = caught.value.exceptions
+        if failure_phase == "phase":
+            assert failures == (secondary, close_failure)
+            assert isinstance(secondary.__cause__, asyncio.CancelledError)
+        else:
+            assert isinstance(failures[0], asyncio.CancelledError)
+            if additional_close_failure:
+                assert failures[1:] == ((secondary, close_failure) if failure_phase == "compensation" else (close_failure,))
+            else:
+                assert failures[1:] == (secondary,)
+    assert not any(entry["event"] == "session_archive_secondary_failure" for entry in logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_function", [service_module.purge_archive_quarantine, service_module.retire_archive_quarantine])
+async def test_archive_finalization_preserves_integrity_failure(service, monkeypatch, failure_function):
+    session = await service.create_session("alice", "archive finalization", "local")
+    worker = service_module.run_sync_in_worker
+    failure = AuditIntegrityError("untrustworthy quarantine state")
+
+    async def fail_finalization(function, *args, **kwargs):
+        if function is failure_function:
+            raise failure
+        return await worker(function, *args, **kwargs)
+
+    monkeypatch.setattr(service_module, "run_sync_in_worker", fail_finalization)
+    with pytest.raises(AuditIntegrityError) as caught:
+        await service.archive_session(session.id)
+    assert caught.value is failure
 
 
 @pytest.mark.asyncio
