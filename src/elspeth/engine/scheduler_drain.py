@@ -51,6 +51,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.plugin_context import plugin_context_scope
 from elspeth.contracts.results import FailureInfo
 from elspeth.contracts.scheduler import GroupLossSpec, TokenWorkItem, TokenWorkStatus
+from elspeth.core.landscape.lease_deadlines import LeaseDeadlineExpiredError
 from elspeth.engine._error_hash import compute_error_hash
 
 if TYPE_CHECKING:
@@ -646,9 +647,15 @@ class SchedulerDrainCoordinator:
                                 row_union_name=item.row_union_name,
                                 collector_name=item.collector_name,
                             )
-                        except (SchedulerLeaseLostError, RunLeadershipLostError, RunMembershipLostError, RunWorkerEvictedError):
-                            # A traversal-boundary heartbeat already classified
-                            # the claim loss. Do not issue a duplicate heartbeat.
+                        except (
+                            SchedulerLeaseLostError,
+                            RunLeadershipLostError,
+                            RunMembershipLostError,
+                            RunWorkerEvictedError,
+                            LeaseDeadlineExpiredError,
+                        ):
+                            # A traversal-boundary heartbeat already refused.
+                            # Do not issue a duplicate heartbeat.
                             raise
                         except Exception:
                             # A plugin exception may arrive after recovery rotated
@@ -687,6 +694,14 @@ class SchedulerDrainCoordinator:
                         # AuditIntegrityError when another member remains.
                         self._pending_group_losses.clear()
                         exc.add_note("worker membership lost during row processing; in-flight token result was abandoned")
+                        raise
+                    except LeaseDeadlineExpiredError as exc:
+                        # The heartbeat transaction rolled back for insufficient
+                        # completion reserve. This does not establish membership
+                        # or generation loss and cannot authorize a disposition
+                        # or a replay of the plugin's possible external effect.
+                        self._pending_group_losses.clear()
+                        exc.add_note("scheduler lease completion refused; in-flight token result was abandoned")
                         raise
                     except Exception as processing_exc:
                         try:
@@ -1054,6 +1069,9 @@ class SchedulerDrainCoordinator:
             RunWorkerEvictedError: the registered lease owner is no longer an
                 active run member. The existing eviction path propagates this
                 clean-abandon signal without a scheduler disposition mutation.
+            LeaseDeadlineExpiredError: the heartbeat transaction could not
+                finish with sufficient lease reserve. The drain propagates
+                this operational refusal without retrying or disposing work.
 
         **Single-plugin-call limitation.** This heartbeat fires *between* and
         *after* plugin calls, not *during* a single synchronous call. If one

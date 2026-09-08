@@ -22,7 +22,8 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.errors import AuditIntegrityError, RunWorkerEvictedError, SchedulerLeaseLostError
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.core.landscape.database import Tier1Engine
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
+from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
 from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     fenced_member_transaction,
@@ -105,20 +106,15 @@ class SchedulerLeaseRepository:
         """Claim the next available READY work item for a bounded lease.
 
         Availability and the lease deadline are both decided on Landscape
-        database time (ADR-047). This SELECT and the CAS UPDATE inside
-        ``claim_ready_row`` each read the clock on ``conn``: on PostgreSQL
-        ``CURRENT_TIMESTAMP`` is transaction time, so the two reads are the
-        same instant; on SQLite they can straddle a whole second, and that
-        direction is safe because the second read is never earlier — a row
-        that satisfied ``available_at <= first`` still satisfies
-        ``available_at <= second``, so the UPDATE cannot refuse a row the
-        SELECT admitted.
+        database time (ADR-047). Discovery may conservatively defer work that
+        becomes available later. ``claim_ready_row`` locks the candidate and
+        samples again for the authoritative availability and issuance decision.
         """
         run_id = member_token.run_id
         if lease_owner != member_token.worker_id:
             raise ValueError("lease owner must match authority token")
         with fenced_member_transaction(self._engine, member_token=member_token, verb="claim_ready") as conn:
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             row = (
                 conn.execute(
                     select(token_work_items_table)
@@ -171,8 +167,10 @@ class SchedulerLeaseRepository:
         """CAS update to claim a READY row under a lease.
 
         Reads the Landscape database clock on the caller's ``conn`` (ADR-047):
-        availability, the lease deadline and ``updated_at`` are all one
-        in-transaction instant, and no caller can hand this CAS a timestamp.
+        after acquiring membership and item locks: availability, the lease
+        deadline and ``updated_at`` share one fresh instant. The caller owns
+        completion; its commit guard refuses an overlong transaction tail
+        without changing the returned snapshot or recorded event deadline.
 
         ``membership_fenced=True`` (set only by the public ``claim_ready``
         verb) adds the ``claim_verb_fence_clause`` to the UPDATE WHERE.
@@ -190,8 +188,6 @@ class SchedulerLeaseRepository:
         as ``False`` because they are explicitly legacy or operate inside a
         broader leader-fenced transaction.
         """
-        database_now = read_landscape_transaction_time(conn)
-        lease_expires_at = database_now + timedelta(seconds=lease_seconds)
         if strict_membership_fenced or membership_fenced:
             # Serialize the fence with worker eviction BEFORE the CAS UPDATE:
             # the EXISTS predicate below is an unlocked MVCC read and would
@@ -199,6 +195,20 @@ class SchedulerLeaseRepository:
             # already observed no live lease sits uncommitted
             # (elspeth-6903f82511).
             lock_worker_membership_row(conn, worker_id=lease_owner, run_id=run_id)
+        locked_row = (
+            conn.execute(
+                select(token_work_items_table)
+                .where(token_work_items_table.c.work_item_id == row["work_item_id"], token_work_items_table.c.run_id == run_id)
+                .with_for_update(of=token_work_items_table)
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if locked_row is None:
+            return None
+        row = locked_row
+        database_now = read_landscape_decision_time(conn)
+        lease_expires_at = database_now + timedelta(seconds=lease_seconds)
         where_clauses = and_(
             token_work_items_table.c.work_item_id == row["work_item_id"],
             token_work_items_table.c.run_id == run_id,
@@ -273,6 +283,12 @@ class SchedulerLeaseRepository:
                 f"work_item_id={row['work_item_id']!r}: SELECT saw READY but UPDATE matched "
                 f"{result.rowcount} rows for lease_owner={lease_owner!r}. Concurrent claim by another worker."
             )
+        record_issued_deadline(
+            conn,
+            key=DeadlineKey(DeadlineKind.ITEM, (row["work_item_id"],)),
+            expires_at=lease_expires_at,
+            window_seconds=lease_seconds,
+        )
         self._events.record(
             conn,
             event_type=SchedulerEventType.CLAIM_READY,
@@ -318,15 +334,14 @@ class SchedulerLeaseRepository:
         """Claim a sink-bound token whose transform work is already durable.
 
         The lease deadline is database time + ``lease_seconds``, read once
-        inside this verb's own write transaction (ADR-047).
+        after the membership and item locks in this verb's write transaction
+        (ADR-047). An overlong completion tail is refused before commit.
         """
         complete_bundle = pending_sink_bundle_clause()
         run_id = coordination_token.run_id
         if lease_owner != coordination_token.worker_id:
             raise ValueError("lease owner must match authority token")
         with fenced_write(self._engine, coordination_token=coordination_token, verb="claim_pending_sink") as conn:
-            database_now = read_landscape_transaction_time(conn)
-            lease_expires_at = database_now + timedelta(seconds=lease_seconds)
             row = (
                 conn.execute(
                     select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
@@ -352,6 +367,20 @@ class SchedulerLeaseRepository:
             # Serialize the membership fence with worker eviction before the
             # CAS UPDATE (elspeth-6903f82511) — same seam as claim_ready_row.
             lock_worker_membership_row(conn, worker_id=lease_owner, run_id=coordination_token.run_id)
+            locked_row = (
+                conn.execute(
+                    select(token_work_items_table, complete_bundle.label("_pending_sink_bundle_complete"))
+                    .where(token_work_items_table.c.work_item_id == row["work_item_id"], token_work_items_table.c.run_id == run_id)
+                    .with_for_update(of=token_work_items_table)
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if locked_row is None:
+                return None
+            row = locked_row
+            database_now = read_landscape_decision_time(conn)
+            lease_expires_at = database_now + timedelta(seconds=lease_seconds)
             result = conn.execute(
                 update(token_work_items_table)
                 .where(
@@ -410,6 +439,12 @@ class SchedulerLeaseRepository:
                     f"Scheduler claim_pending_sink lost race on run_id={run_id!r} work_item_id={row['work_item_id']!r}: "
                     f"UPDATE matched {result.rowcount} rows for lease_owner={lease_owner!r}."
                 )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.ITEM, (row["work_item_id"],)),
+                expires_at=lease_expires_at,
+                window_seconds=lease_seconds,
+            )
             self._events.record(
                 conn,
                 event_type=SchedulerEventType.CLAIM_PENDING_SINK,
@@ -570,7 +605,40 @@ class SchedulerLeaseRepository:
         )
         complete_pending_sink_bundle = pending_sink_bundle_clause()
 
-        database_now = read_landscape_transaction_time(conn)
+        # Discovery only bounds this sweep's candidates. Rows that expire
+        # after discovery are left to the next sweep. Owner liveness is not
+        # filtered here: it may expire while this transaction waits for locks.
+        discovery_now = read_landscape_decision_time(conn)
+        candidates = (
+            conn.execute(
+                select(token_work_items_table.c.work_item_id, token_work_items_table.c.lease_owner)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .where(token_work_items_table.c.lease_expires_at < discovery_now)
+                .where(lease_owner_not_caller)
+            )
+            .mappings()
+            .all()
+        )
+        if not candidates:
+            return 0
+        candidate_ids = sorted(row["work_item_id"] for row in candidates)
+        owner_ids = sorted({row["lease_owner"] for row in candidates if row["lease_owner"] is not None})
+        # All membership locks precede item locks, matching claim/heartbeat
+        # and eviction. Stable ordering also protects composed batch callers.
+        conn.execute(
+            select(run_workers_table.c.worker_id)
+            .where(run_workers_table.c.run_id == run_id, run_workers_table.c.worker_id.in_(owner_ids))
+            .order_by(run_workers_table.c.worker_id)
+            .with_for_update(read=True, of=run_workers_table)
+        ).fetchall()
+        conn.execute(
+            select(token_work_items_table.c.work_item_id)
+            .where(token_work_items_table.c.run_id == run_id, token_work_items_table.c.work_item_id.in_(candidate_ids))
+            .order_by(token_work_items_table.c.work_item_id)
+            .with_for_update(of=token_work_items_table)
+        ).fetchall()
+        database_now = read_landscape_decision_time(conn)
         grace_threshold = database_now - timedelta(seconds=grace_seconds)
         owner_registry_dead = ~(
             select(run_workers_table.c.worker_id)
@@ -593,6 +661,8 @@ class SchedulerLeaseRepository:
                 complete_pending_sink_bundle.label("_pending_sink_bundle_complete"),
             )
             .where(token_work_items_table.c.run_id == coordination_token.run_id)
+            .where(token_work_items_table.c.work_item_id.in_(candidate_ids))
+            .where(or_(token_work_items_table.c.lease_owner.is_(None), token_work_items_table.c.lease_owner.in_(owner_ids)))
             .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
             .where(token_work_items_table.c.lease_expires_at < database_now)
             .where(lease_owner_not_caller)
@@ -743,7 +813,7 @@ class SchedulerLeaseRepository:
         """Extend a held lease's ``lease_expires_at`` by ``lease_seconds``.
 
         The new deadline is Landscape database time + ``lease_seconds``, read
-        once inside this heartbeat's own write transaction (ADR-047), so a
+        after acquiring the item lock inside this heartbeat's transaction (ADR-047), so a
         worker whose process clock has drifted forward cannot buy itself a
         longer lease than the reaper will honour: the reaper compares against
         the same database clock.
@@ -769,7 +839,12 @@ class SchedulerLeaseRepository:
         if lease_owner != member_token.worker_id:
             raise ValueError("lease owner must match authority token")
         with fenced_member_transaction(self._engine, member_token=member_token, verb="heartbeat_lease") as conn:
-            database_now = read_landscape_transaction_time(conn)
+            conn.execute(
+                select(token_work_items_table.c.work_item_id)
+                .where(token_work_items_table.c.work_item_id == work_item_id, token_work_items_table.c.run_id == run_id)
+                .with_for_update(of=token_work_items_table)
+            ).fetchall()
+            database_now = read_landscape_decision_time(conn)
             new_expires_at = database_now + timedelta(seconds=lease_seconds)
             where_clauses = and_(
                 token_work_items_table.c.work_item_id == work_item_id,
@@ -844,6 +919,13 @@ class SchedulerLeaseRepository:
                             },
                         )
                 lease_lost = True
+            if not lease_lost:
+                record_issued_deadline(
+                    conn,
+                    key=DeadlineKey(DeadlineKind.ITEM, (work_item_id,)),
+                    expires_at=new_expires_at,
+                    window_seconds=lease_seconds,
+                )
             self._events.record_many(conn, records=() if lease_lost_event is None else (lease_lost_event,))
         if lease_lost:
             raise SchedulerLeaseLostError(
@@ -863,9 +945,8 @@ class SchedulerLeaseRepository:
 
         A "peer" is any ``lease_owner`` other than ``caller_owner``. A lease is
         "active" if ``lease_expires_at`` is later than Landscape database time,
-        read on this probe's own connection (ADR-047) — the same clock
-        ``recover_expired_leases`` reaps against, so this precondition and the
-        sweep can never disagree about which leases are live. Rows whose lease
+        read on this probe's own connection (ADR-047). Recovery uses the same
+        clock authority at its own decision boundary. Rows whose lease
         has expired are recoverable via ``recover_expired_leases`` and do not
         contribute to the peer set.
 
@@ -886,7 +967,7 @@ class SchedulerLeaseRepository:
         duplicate RowResults into the audit trail.
         """
         with self._engine.connect() as conn:
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             owners = (
                 conn.execute(
                     select(token_work_items_table.c.lease_owner)

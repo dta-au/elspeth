@@ -54,10 +54,12 @@ def _audit_snapshot(db: LandscapeDB, run_id: str) -> dict[str, tuple[tuple[objec
 def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: str, repetition: int) -> None:
     """The old member stays active, so refusal must come from its item CAS.
 
-    Recovery holds its generation rotation uncommitted while the old writer
-    reaches the real item verify-UPDATE. Observe PostgreSQL's exact blocker
-    before releasing recovery, then require the old writer's domain refusal.
-    A run-only verify-UPDATE mutation still blocks, but after recovery it
+    Recovery holds owner and item locks while its generation rotation is
+    uncommitted. The old writer now blocks at its earlier MEMBER verify-UPDATE;
+    this test does not claim a direct item-lock wait. Observe PostgreSQL's
+    exact blocker and the member UPDATE's worker identity before releasing
+    recovery, then require the still-active writer's item-generation refusal.
+    A run-only item verify-UPDATE mutation still blocks earlier, but after recovery it
     violates PostgreSQL's leased-owner CHECK instead of refusing the stale
     generation; a DBAPI error from either actor always fails this test.
     """
@@ -68,6 +70,7 @@ def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: 
     holder_ready = threading.Event()
     release_holder = threading.Event()
     writer_at_item = threading.Event()
+    writer_at_member = threading.Event()
     pids: dict[str, int] = {}
 
     def hold_rotated_item(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
@@ -77,8 +80,13 @@ def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: 
             assert release_holder.wait(timeout=15), "recovery's held item was not released"
 
     def observe_item_attempt(conn: Connection, _cursor: Any, statement: str, _parameters: Any, _context: Any, _executemany: bool) -> None:
-        if " ".join(statement.upper().split()).startswith("UPDATE TOKEN_WORK_ITEMS"):
+        normalized = " ".join(statement.upper().split())
+        if normalized.startswith("UPDATE RUN_WORKERS"):
+            assert _parameters["worker_id_1"] == member.worker_id
+            assert _parameters["run_id_1"] == run.run_id
             pids["writer"] = int(conn.connection.driver_connection.info.backend_pid)
+            writer_at_member.set()
+        if normalized.startswith("UPDATE TOKEN_WORK_ITEMS"):
             writer_at_item.set()
 
     try:
@@ -133,7 +141,7 @@ def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: 
                 try:
                     assert holder_ready.wait(timeout=10), "recovery never rotated the leased item"
                     writing = pool.submit(record_error)
-                    assert writer_at_item.wait(timeout=10), "old writer never reached its item verify-UPDATE"
+                    assert writer_at_member.wait(timeout=10), "old writer never reached its member verify-UPDATE"
                     assert pids["writer"] != pids["recovery"]
                     deadline = time.monotonic() + 10
                     with recovery_db.engine.connect() as observer:
@@ -143,10 +151,11 @@ def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: 
                                 break
                             if writing.done():
                                 writing.result()
-                                pytest.fail("old writer passed the item fence before recovery released its generation lock")
-                            assert time.monotonic() < deadline, "PostgreSQL did not report the exact recovery/item-writer blocker"
+                                pytest.fail("old writer passed membership admission before recovery released its owner lock")
+                            assert time.monotonic() < deadline, "PostgreSQL did not report the exact recovery/member-writer blocker"
                             time.sleep(0.01)
                     assert not recovering.done()
+                    assert not writer_at_item.is_set(), "writer crossed the member lock before recovery committed"
                     release_holder.set()
                     assert recovering.result(timeout=10) == 1
                     try:
@@ -159,6 +168,7 @@ def test_recovery_generation_blocks_then_refuses_stale_item_audit(postgres_url: 
                         )
                     assert refused.value.work_item_id == item.work_item_id
                     assert refused.value.lease_owner == member.worker_id
+                    assert writer_at_item.is_set(), "stale generation was not checked after membership admission"
                 finally:
                     release_holder.set()
         finally:

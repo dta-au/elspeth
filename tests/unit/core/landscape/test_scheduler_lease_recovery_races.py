@@ -69,6 +69,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine, delete, event, insert, select, update
@@ -673,7 +674,10 @@ def test_ts04_and_ts06_coalesced_sink_redrive_preserves_join_group_and_complete_
 
     def sweep_at_exact_expiry(database_now: datetime) -> int:
         assert expire_lease(engine, original.work_item_id, seconds_ago=0) == database_now
-        return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
+        # Equality is a controlled decision boundary, independent of the
+        # fresh reader's finer resolution and time spent arranging the row.
+        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
+            return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0)
 
     assert on_fresh_database_second(engine, sweep_at_exact_expiry) == 0
     equality_row = _work_item_row(engine, "token-0")
@@ -777,14 +781,15 @@ def test_ts05_and_ts06_expiry_equality_is_not_recoverable_for_either_lease_subty
     assert sink_claim is not None
     before_events = {token_id: _scheduler_events(engine, token_id) for token_id in ("token-transform", "token-sink")}
 
-    # Both deadlines are set EQUAL to database time inside one database
-    # second; the sweep's ``lease_expires_at < database_now`` is strict, so
-    # neither subtype is recoverable at exact equality.
+    # Both deadlines are set EQUAL to the database-derived controlled
+    # decision sample; the sweep's ``lease_expires_at < database_now`` is
+    # strict, so neither subtype is recoverable at exact equality.
     def sweep_at_exact_expiry(database_now: datetime) -> tuple[int, dict[str, dict[str, object]]]:
         assert expire_lease(engine, transform_claim.work_item_id, seconds_ago=0) == database_now
         assert expire_lease(engine, sink_claim.work_item_id, seconds_ago=0) == database_now
         rows_before = {token_id: _work_item_row(engine, token_id) for token_id in ("token-transform", "token-sink")}
-        return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0), rows_before
+        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
+            return repo.recover_expired_leases(coordination_token=_RECOVERY_TOKEN, stall_budget_seconds=0), rows_before
 
     recovered, rows_before = on_fresh_database_second(engine, sweep_at_exact_expiry)
 
@@ -814,7 +819,8 @@ def test_ts05_stall_budget_equality_refuses_then_strictly_past_budget_recovers(
     def sweep_at_stall_threshold(database_now: datetime) -> tuple[int, dict[str, object]]:
         assert expire_lease(engine, claimed.work_item_id, seconds_ago=30) == database_now - timedelta(seconds=30)
         row_before = _work_item_row(engine, "token-0")
-        return scheduler.recover_expired_leases(coordination_token=token, grace_seconds=80, stall_budget_seconds=30), row_before
+        with patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", return_value=database_now):
+            return scheduler.recover_expired_leases(coordination_token=token, grace_seconds=80, stall_budget_seconds=30), row_before
 
     at_budget, before_row = on_fresh_database_second(engine, sweep_at_stall_threshold)
 

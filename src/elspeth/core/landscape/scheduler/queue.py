@@ -273,10 +273,14 @@ class SchedulerQueueRepository:
         then the first database statement in this method and the claim UPDATE
         rechecks membership. ``None`` is reserved for ingest, whose
         leader-epoch CAS is the outer fence.
+
+        A successful claim registers its exact item deadline on ``conn``.
+        The outer commit guard refuses an overlong remaining body; this
+        helper neither commits nor refreshes the returned lease snapshot.
         """
         work_item_id = make_work_item_id(run_id, token_id, node_id, attempt)
         # Available at the caller transaction's database time (ADR-047); the
-        # claim CAS below reads the same clock on the same connection.
+        # claim CAS below takes a fresh sample after locking the item.
         available_at = read_landscape_transaction_time(conn)
         values = ready_work_item_values(
             run_id=run_id,

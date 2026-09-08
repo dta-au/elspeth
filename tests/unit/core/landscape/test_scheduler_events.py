@@ -493,8 +493,8 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
 
     ``heartbeat_lease`` is the one production caller of
     ``recovery_event_for_previous_work_item``, which walks recovery events
-    newest-first by ``seq``. Two recoveries of one token inside one database
-    second tie on ``recorded_at``; each lapsed owner's heartbeat must still be
+    newest-first by ``seq``. Two recoveries of one token with deliberately
+    tied forensic ``recorded_at`` values must each leave the lapsed heartbeat
     attributed to the recovery that rotated ITS work item, and the newest
     recovery must be the first the reader yields.
     """
@@ -546,6 +546,16 @@ def test_heartbeat_after_two_same_second_recoveries_attributes_each_loss_to_its_
         return first.work_item_id, second_claim.work_item_id
 
     first_item_id, second_item_id = on_fresh_database_second(engine, two_recoveries_inside_one_second)
+    # Fresh decisions now carry milliseconds. Model a forensic timestamp tie
+    # explicitly without freezing lease eligibility, issuance or deadlines.
+    # recorded_at is excluded from the event's content identity.
+    with engine.begin() as conn:
+        conn.execute(
+            update(scheduler_events_table)
+            .where(scheduler_events_table.c.run_id == "run-1")
+            .where(scheduler_events_table.c.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value)
+            .values(recorded_at=now)
+        )
     recoveries = [event for event in _scheduler_events(engine) if event.event_type == SchedulerEventType.RECOVER_EXPIRED_LEASE.value]
     assert len(recoveries) == 2
     assert recoveries[0].recorded_at == recoveries[1].recorded_at

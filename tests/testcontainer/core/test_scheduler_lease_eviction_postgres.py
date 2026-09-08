@@ -27,10 +27,12 @@ from collections.abc import Callable, Iterator
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from scripts.state_engine_profile_reporter import RuntimeProfileReporter
 from sqlalchemy import event, func, insert, select, update
+from sqlalchemy.engine import Connection
 from tests.fixtures.landscape import (
     assert_stamped_between,
     expire_leader_seat,
@@ -297,6 +299,18 @@ def _run_two_contenders(
             while not all(gate.is_set() for gate in reached_update.values()):
                 exited_early = [name for name, gate in reached_update.items() if name in outcomes and not gate.is_set()]
                 assert not exited_early, f"PostgreSQL contenders exited before the pre-UPDATE race seam: {exited_early!r}"
+                # Fresh issuance first locks the selected item. The second
+                # claimant therefore waits before its CAS; release the first
+                # only after PostgreSQL identifies it as that exact blocker.
+                reached = [name for name, gate in reached_update.items() if gate.is_set()]
+                if len(reached) == 1:
+                    holder = reached[0]
+                    waiter = "second" if holder == "first" else "first"
+                    if waiter in pids:
+                        with first_db.engine.connect() as observer:
+                            blockers = observer.execute(select(func.pg_blocking_pids(pids[waiter]))).scalar_one()
+                        if pids[holder] in blockers:
+                            break
                 if time.monotonic() >= deadline:
                     missing = [name for name, gate in reached_update.items() if not gate.is_set()]
                     raise AssertionError(f"PostgreSQL contenders did not reach the pre-UPDATE race seam: {missing!r}")
@@ -503,12 +517,12 @@ def test_postgresql_registered_lease_heartbeat_changes_only_expiry_and_updated_a
 
 
 def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_claim(postgres_url: str) -> None:
-    """Epoch 38 (elspeth-2d436dd6e8): one transaction, one timestamp, ``seq`` still orders.
+    """Epoch 38 (elspeth-2d436dd6e8): tied forensic timestamps still replay by ``seq``.
 
     ``enqueue_ready_claimed`` writes ENQUEUE and CLAIM_READY inside one
-    transaction, so on PostgreSQL both carry the identical transaction
-    timestamp; a ``(recorded_at, event_id)`` key then replays them in hash
-    order. Eight tokens make a hash-order pass a 1-in-256 accident.
+    transaction. Pin only their forensic recorded_at values to a tie: a
+    ``(recorded_at, event_id)`` key then replays them in hash order. Eight
+    tokens make a hash-order pass a 1-in-256 accident.
     """
     now = datetime(2026, 8, 12, 2, 45, tzinfo=UTC)
     run_id = "run-postgresql-enqueue-claimed-order"
@@ -558,6 +572,8 @@ def test_postgresql_enqueue_and_claim_in_one_transaction_replay_enqueue_then_cla
                 lease_seconds=30,
             )
 
+        with db.engine.begin() as conn:
+            conn.execute(update(scheduler_events_table).where(scheduler_events_table.c.run_id == run_id).values(recorded_at=now))
         query = make_factory(db).query
         for token_id in token_ids:
             events = query.get_scheduler_events(run_id=run_id, token_id=token_id)
@@ -677,16 +693,24 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
         fenced_from = landscape_database_now(db.engine)
-        # Exact-expiry arm: the deadline is written from the sweep's OWN
-        # transaction time as its first statement, so it EQUALS the
-        # database_now the sweep decides on; ``lease_expires_at <
-        # database_now`` is strict, so nothing is recoverable.
-        with stamp_inside_next_transaction(
-            db.engine,
-            update(token_work_items_table)
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-            .values(lease_expires_at=func.current_timestamp()),
+        # Pin the owned internal reader to this transaction's database sample
+        # solely for exact equality. Public APIs still receive no timestamp.
+        decision_samples: list[datetime] = []
+
+        def equality_clock(conn: Connection) -> datetime:
+            sampled = read_landscape_transaction_time(conn)
+            decision_samples.append(sampled)
+            return sampled
+
+        with (
+            stamp_inside_next_transaction(
+                db.engine,
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .values(lease_expires_at=func.current_timestamp()),
+            ),
+            patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", side_effect=equality_clock),
         ):
             assert repo.recover_expired_leases(coordination_token=successor) == 0
         fenced_until = landscape_database_now(db.engine)
@@ -709,8 +733,7 @@ def test_postgresql_transform_recovery_excludes_expiry_equality_then_rotates_onc
         assert equality_seat[0] - equality_seat[1] == timedelta(seconds=WINDOW)
         assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
         equality_image = _work_item_row(db, run_id=run_id)
-        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
-        assert equality_image["lease_expires_at"] == equality_seat[1]
+        assert decision_samples and all(sample == equality_image["lease_expires_at"] for sample in decision_samples)
         assert equality_image["work_item_id"] == original.work_item_id
         assert equality_image["status"] == TokenWorkStatus.LEASED.value
         assert equality_image["attempt"] == 1
@@ -803,16 +826,22 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
         fenced_from = landscape_database_now(db.engine)
-        # Exact-expiry arm: the deadline is written from the sweep's OWN
-        # transaction time as its first statement, so it EQUALS the
-        # database_now the sweep decides on; ``lease_expires_at <
-        # database_now`` is strict, so nothing is recoverable.
-        with stamp_inside_next_transaction(
-            db.engine,
-            update(token_work_items_table)
-            .where(token_work_items_table.c.run_id == run_id)
-            .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
-            .values(lease_expires_at=func.current_timestamp()),
+        decision_samples: list[datetime] = []
+
+        def equality_clock(conn: Connection) -> datetime:
+            sampled = read_landscape_transaction_time(conn)
+            decision_samples.append(sampled)
+            return sampled
+
+        with (
+            stamp_inside_next_transaction(
+                db.engine,
+                update(token_work_items_table)
+                .where(token_work_items_table.c.run_id == run_id)
+                .where(token_work_items_table.c.status == TokenWorkStatus.LEASED.value)
+                .values(lease_expires_at=func.current_timestamp()),
+            ),
+            patch("elspeth.core.landscape.scheduler.leases.read_landscape_decision_time", side_effect=equality_clock),
         ):
             assert repo.recover_expired_leases(coordination_token=successor) == 0
         fenced_until = landscape_database_now(db.engine)
@@ -836,8 +865,7 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
         assert_stamped_between(equality_seat[1], start=fenced_from, end=fenced_until)
         equality_image = _work_item_row(db, run_id=run_id)
         assert tuple(equality_image[column] for column in bundle_columns) == before_bundle
-        # The stamped deadline IS the sweep's transaction time (the seat's updated_at).
-        assert equality_image["lease_expires_at"] == equality_seat[1]
+        assert decision_samples and all(sample == equality_image["lease_expires_at"] for sample in decision_samples)
 
         expire_lease(db.engine, redrive.work_item_id)
         assert repo.recover_expired_leases(coordination_token=successor) == 1
