@@ -805,44 +805,44 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[19]/body[22]/body[10]/body[5]/body[1]/value'
   judge_metadata_signature: 'hmac-sha256:v2:dc987d43fb343511a6648986976614aa3c486fb7fc1877b492ce17250cefdb00'
-- key: contracts/plugin_context.py:R6:PluginContext:record_call:fp=3c9c205f2ab610a2
+- key: contracts/plugin_context.py:R6:PluginContext:record_call:fp=668992f7a9f7a03c
   owner: john
   reason: |-
     This is a prescribed telemetry-boundary suppression, not a Tier-1 audit-data swallow. In `src/elspeth/contracts/plugin_context.py:312-335`, `record_call` writes the call to Landscape before telemetry, and `src/elspeth/contracts/plugin_context.py:362-363` states `"Emit telemetry AFTER successful Landscape recording"` and `"Wrapped in try/except to prevent telemetry failures from affecting callers"`. The caught site is only the telemetry transport call at `src/elspeth/contracts/plugin_context.py:397`, `self.telemetry_emit(...)`, and the handler at `src/elspeth/contracts/plugin_context.py:416` catches only transport-shaped failures: `except (OSError, ConnectionError, TimeoutError) as tel_err:`. It explicitly acknowledges the failure via `logger.warning("telemetry_emit_failed in record_call", ...)` at lines 420-428, while the comment at lines 417-419 preserves the drift-sensitive boundary: `"Telemetry transport failures are expected"` and `"All other exceptions (including Tier 1, programming errors like KeyError) propagate naturally."`
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:09:17.342517+00:00'
+  judge_recorded_at: '2026-09-07T23:34:44.072043+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the narrow handler intentionally contains only telemetry transport failures after the authoritative Landscape write, matching the policy that audit fires first and telemetry is best-effort. Reading contracts/plugin_context.py:303-336 verified that every path reaching the flagged telemetry block first calls `PluginAuditWriter.record_call` or `PluginAuditWriter.record_operation_call`, while contracts/plugin_context.py:363-429 shows that only `OSError`, `ConnectionError`, and `TimeoutError` are caught around telemetry and explicitly logged; programming and Tier-1 integrity errors still propagate. R6 therefore fires by syntax, but this site is the prescribed last-resort handling for failed telemetry after successful audit recording, not a lost integrity signal.
+    PRESCRIBED FORM — R6's swallowed-exception shape is present, but this is policy-prescribed best-effort telemetry handling after the Landscape record. The ordering is verified in src/elspeth/contracts/plugin_context.py:355 and :405, while tests/unit/contracts/test_plugin_context_recording.py:453 confirms Landscape write failures propagate and telemetry is not emitted. The handler at plugin_context.py:459 catches only transport-shaped failures, records an explicit warning, and leaves programming and Tier-1 integrity exceptions to propagate.
   judge_signature_version: 2
   scope_fingerprint: 04b7256663952917c10add136dbc76b4dcf65af6b66d4a4f458ecf8d442282d2
   judge_transport: codex_cli
-  ast_path: 'body[19]/body[22]/body[10]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:765bf603fc467d766c30ce32897dd53e4e2904435e10406b5fcf6075a94a73ac'
-- key: contracts/plugin_context.py:R6:PluginContext:record_validation_error:fp=d76afb3126d15d25
+  ast_path: 'body[19]/body[24]/body[10]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:6a18d1e9af47000fe91234901e7061c0126ca51f5cd651cd514d8caec34e0d62'
+- key: contracts/plugin_context.py:R6:PluginContext:record_validation_error:fp=d53ddc1c5c6c28ec
   owner: john
   reason: |-
     This is a prescribed Tier-3 ingestion-boundary fallback, not a swallowed audit-data error. In `contracts/plugin_context.py:448-449`, `record_validation_error` documents that `row` may be "malformed external data like JSON arrays containing primitives"; at `contracts/plugin_context.py:466-470` it first tries `stable_hash(row)` and catches only `ValueError`/`TypeError` from canonicalization. The exception is not ignored: `contracts/plugin_context.py:477-481` logs the error type and assigns `row_id = repr_hash(row)[:16]` so the malformed external row can still be recorded in the validation-error audit path. This suppression is valid only while the caught exception remains the canonical-hash failure for external `row` data and the handler continues to derive a fallback row id for audit recording.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:09:33.631950+00:00'
+  judge_recorded_at: '2026-09-07T23:35:16.263399+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — `record_validation_error` handles Tier-3 external row data already rejected by validation and destined for quarantine, as established by the docstring and comments. The narrow `ValueError`/`TypeError` handler does not silently fabricate pipeline data or permit processing: it replaces only the failed canonical row identifier with a `repr_hash` identifier so the malformed row can still be represented in the validation-error audit path, while recording the failure type. The visible code and site-specific rationale therefore establish a recorded-quarantine fallback consistent with R6's legitimate form.
+    PRESCRIBED FORM — the caught ValueError/TypeError is limited to canonical hashing of Tier-3 external row data that has already failed validation and is being quarantined. The visible handler does not suppress the malformed row or fabricate a replacement value: it explicitly derives a fallback identifier with repr_hash(row), while the function contract states that the original row and validation failure are recorded through the validation-error audit path. R6 therefore matches syntactically, but the code and site-specific rationale establish the prescribed recorded-quarantine fallback.
   judge_signature_version: 2
   scope_fingerprint: 9b7d958e5b0759ac2ab38a8e7e2cfa266ea908497732ced0d24ed24b1b89b91f
   judge_transport: codex_cli
-  ast_path: 'body[19]/body[23]/body[2]/orelse[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:981e7d7a3a21796dd4ff96dccfe8efcda636918e0741001e8abb5fa2d1ac0b76'
+  ast_path: 'body[19]/body[25]/body[2]/orelse[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:26eb541a1fc6361696feb3b08232b3d63c1a036cda0c772c6344d98e5a54cab3'
 - key: contracts/contract_propagation.py:R1:narrow_contract_to_output:fp=0277527a2fa13ad3
   owner: john
   reason: |-
@@ -1337,120 +1337,120 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[16]/body[1]/test'
   judge_metadata_signature: 'hmac-sha256:v2:6a2f6c67e40deeb218290b719a953397f001c4fa1ed10e2f7e7e22646e62e0a7'
-- key: contracts/chat_parts.py:R5:ImagePart:from_bytes:fp=6cc90f03aede8b05
+- key: contracts/chat_parts.py:R5:ImagePart:from_bytes:fp=c4a9eac9885b3a6d
   owner: john
   reason: |-
     R5 `isinstance(data, bytes)` in `ImagePart.from_bytes`, the only sanctioned constructor for an image part. It runs before `hashlib.sha256(data)` and `len(data)` in the same expression, so it is what turns a caller passing str or None into this contract's own ValueError naming the field, instead of a raw hashlib TypeError from inside the constructor. `data` is caller-supplied image bytes that nothing upstream has type-checked, and the invariant it protects is the sha256/byte_count pair computed here and bound to the content by `__post_init__`. Nominal isinstance against a concrete builtin is ADR-032 Decision(1)'s internal-boundary mechanism.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:23.626271+00:00'
+  judge_recorded_at: '2026-09-07T23:28:07.681918+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM: the concrete-builtin `isinstance(data, bytes)` check immediately raises a field-specific `ValueError`; it neither coerces nor suppresses a contract violation. The visible code confirms that this guard precedes `hashlib.sha256(data)` and `len(data)`, while `__post_init__` independently enforces the resulting content, hash, and byte-count invariants, so the rationale establishes an offensive runtime-enforcement point rather than defensive recovery. This is described as an internal constructor boundary, not a Tier-3 external-parameter boundary, so the structural decorator contract does not apply.
+    PRESCRIBED FORM — `ImagePart.from_bytes` uses a concrete-builtin `isinstance` check offensively and immediately raises a field-specific `ValueError`; it neither coerces nor silently recovers. The visible code confirms that the guard precedes `hashlib.sha256(data)` and `len(data)`, while `__post_init__` independently binds and rechecks the content, hash, and byte-count invariants, so the check is the constructor's runtime enforcement of an otherwise unenforced annotation. This is not established as a function-scoped Tier-3 external-data boundary suitable for `@trust_boundary`, so no decorator nudge applies.
   judge_signature_version: 2
   scope_fingerprint: 153f11781692d233f5447c6dbadaa089b234b17ddc8c77803cc5b4bcfdf1ea0b
   judge_transport: codex_cli
-  ast_path: 'body[14]/body[7]/body[0]/test/values[0]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:99e4e9839cca53051c6610b381527ffc41179597852bbd34a822ec1d68ee91d1'
-- key: contracts/chat_parts.py:R5:_audit_content:fp=459c0cf7e85b42f1
+  ast_path: 'body[15]/body[7]/body[0]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:0a8bb17d1338a6455965f788deef4195b4f9bb35bc85e14cc44ecc78f3d675ba'
+- key: contracts/chat_parts.py:R5:_audit_content:fp=6d1b76c9f8e3f3f3
   owner: john
   reason: |-
     R5 `isinstance(part, TextPart)` in `_audit_content`'s parts loop. This arm is the enforcement point for the module's central invariant - image bytes never reach audit, tracing, hashing, or logs - because the else arm emits `ImagePart.audit_view()`, the bytes-free projection, rather than the part itself. A structural or duck-typed test here would let any object carrying a `.text` attribute be recorded verbatim into the audit trail; nominal isinstance against the concrete owned TextPart cannot be satisfied by anything this module did not construct.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:38.389612+00:00'
+  judge_recorded_at: '2026-09-07T23:28:57.812922+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.93
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(part, TextPart)` check is nominal dispatch over the owned `TextPart | ImagePart` union, selecting distinct audit projections; it does not suppress, coerce, or recover from a contract violation. The preceding `ChatMessage` validation visibly enforces that every part is one of those concrete types, while the flagged branch ensures image parts use their bytes-free `audit_view()`. The rationale overstates this site as the sole enforcement point, but the visible code independently establishes the narrower and sufficient exemption: this is required variant discrimination, not defensive shape revalidation.
+    RULE MISFIRES — the flagged `isinstance` is closed-union dispatch between the owned `TextPart` and `ImagePart` variants, not a defensive attempt to hide a contract violation. `ChatMessage.__post_init__` already enforces the non-empty tuple and permitted part types at contracts/chat_parts.py:122-126; `_audit_content` then uses the discriminator solely to emit text directly or the image's bytes-free `audit_view()`. The value is first-party contract data rather than an external function parameter, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 7181ae8fba35d878c541d6e2ede3f6da2aa66d450d0d2a2ac05a95a1ae3286fe
   judge_transport: codex_cli
-  ast_path: 'body[18]/body[2]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:9912ea2017f92550d6b8f6efb7d41c77228f79a5a7ba1273b7e70f390423f98b'
-- key: contracts/chat_parts.py:R5:_audit_content:fp=6f7ae321a3b44ae4
+  ast_path: 'body[19]/body[2]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:3ad2984663f602e6b0ae57b6414157072ba19a7bcc95262cfe9d113e2e9fd756'
+- key: contracts/chat_parts.py:R5:_audit_content:fp=2d57525ac1d47814
   owner: john
   reason: |-
     R5 `isinstance(content, str)` in `_audit_content`. The same owned-union discrimination as `_wire_content`, but for the bytes-free projection, and it holds a different guarantee: a text-only message's audit record stays byte-identical to the pre-image tree, so audit hashes taken over string content before parts existed remain reproducible. Tier-1 value read from a frozen dataclass ELSPETH constructed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:22.382910+00:00'
+  judge_recorded_at: '2026-09-07T23:29:20.330595+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance(content, str)` discriminates the two declared variants of the owned `str | tuple[ContentPart, ...]` union so `_audit_content` can preserve string content exactly or project structured parts. It neither defensively revalidates the contract nor suppresses, coerces, or fabricates a malformed value; `ChatMessage.__post_init__` visibly enforces the owned union before `audit_messages` passes `m.content` here. This is Tier-1 projection logic, not a Tier-3 boundary rooted in external input, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — `_audit_content` is discriminating between the two explicitly declared and validated members of the owned `str | tuple[ContentPart, ...]` union, not defensively re-checking one promised shape or concealing a contract violation. The visible `ChatMessage` validation establishes that non-string content must be a non-empty tuple of `TextPart` or `ImagePart`, while this branch preserves valid string content unchanged for the distinct bytes-free audit projection. This is Tier-1 union dispatch rather than a Tier-3 boundary, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 7181ae8fba35d878c541d6e2ede3f6da2aa66d450d0d2a2ac05a95a1ae3286fe
   judge_transport: codex_cli
-  ast_path: 'body[18]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:8a3b34e06a9e517ab1857b4008108d974f29e165b3c0cdd4f67578274dafef3d'
-- key: contracts/chat_parts.py:R5:_wire_content:fp=2745b8d52372ecca
+  ast_path: 'body[19]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:4c2afdce4b0271dc89c8ecb4de4c477ed8e677934163fd87dd009ba84ef74521'
+- key: contracts/chat_parts.py:R5:_wire_content:fp=459c0cf7e85b42f1
   owner: john
   reason: |-
     R5 `isinstance(part, TextPart)` in `_wire_content`'s parts loop. Nominal dispatch on the closed owned union: TextPart takes the `{'type': 'text'}` arm and the else arm is ImagePart, which is the only place in ELSPETH permitted to base64-encode image bytes onto the wire. Replacing this with polymorphism (a `wire_view()` on each part class) was considered and rejected: it would create a second exit for image bytes, which this module's docstring forbids - `wire_messages` and `audit_messages` are the only sanctioned exits. The union is guaranteed two-armed by `ChatMessage.__post_init__`, so the else arm needs no re-check.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:23.059896+00:00'
+  judge_recorded_at: '2026-09-07T23:29:44.538054+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(part, TextPart)` is nominal dispatch over the owned `TextPart | ImagePart` union, not defensive validation, coercion, or silent recovery. The rationale names `ChatMessage.__post_init__` as the real admission control, and the visible code verifies that it rejects every non-`TextPart`/`ImagePart` tuple member before the shown `wire_messages` path reaches `_wire_content`; the `else` branch then relies on that closed contract and directly accesses `ImagePart` fields. This is not a Tier-3 boundary function, so the structural decorator does not apply.
+    RULE MISFIRES — the flagged `isinstance(part, TextPart)` is nominal dispatch over the owned `TextPart | ImagePart` union, not a defensive revalidation or recovery path: it selects the text projection while the `else` arm handles `ImagePart` and would fail loudly on an actual contract violation. The rationale names `ChatMessage.__post_init__` as the control, and the visible code verifies that it rejects every part outside `(TextPart, ImagePart)` before `wire_messages` passes `m.content` to `_wire_content`. This is not a Tier-3 parameter boundary and therefore does not qualify for the decorator mechanism.
   judge_signature_version: 2
   scope_fingerprint: 0be522ee0e68ed80c0f4f5f01731cdb2e6c423635ada75b91134926bf6a12923
   judge_transport: codex_cli
-  ast_path: 'body[17]/body[2]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:0645ac1ba8c1cfedf69d8b88b542680f7b87a7047b599271f22c106b20f1942d'
-- key: contracts/chat_parts.py:R5:_wire_content:fp=840fb7ade37a829f
+  ast_path: 'body[18]/body[2]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:deb93a5b5f5e4a9ff0f1c933ab3afe6c178e78ee2939179920bbccfcb3c2aba1'
+- key: contracts/chat_parts.py:R5:_wire_content:fp=6f7ae321a3b44ae4
   owner: john
   reason: |-
     R5 `isinstance(content, str)` in `_wire_content`. `ChatMessage.content` is the owned union `str | tuple[ContentPart, ...]`, and this discriminates its two arms to hold a byte-identity guarantee: a text-only message must reach the provider as a bare string, exactly as it did before image parts existed, rather than as a one-element content-parts list. There is no non-isinstance form of that decision - the arms are a builtin and a tuple of owned types, both Tier-1, read out of an already-constructed frozen dataclass.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:33.417262+00:00'
+  judge_recorded_at: '2026-09-07T23:30:04.921788+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `_wire_content` is discriminating the two declared arms of the fixed `str | tuple[ContentPart, ...]` union to select different wire projections, not revalidating the contract or masking an invalid type. The visible `ChatMessage` contract and its `__post_init__` establish that only those arms proceed, while the `str` branch preserves the documented bare-string, byte-identical representation. This is not a Tier-3 boundary function, so the structural decorator does not apply.
+    RULE MISFIRES — the flagged `isinstance(content, str)` discriminates the two explicitly declared arms of the owned `str | tuple[ContentPart, ...]` union; it does not defensively re-check or conceal a contract violation. The visible `ChatMessage` validation establishes that contract, and `_wire_content` returns the string arm unchanged while projecting the tuple arm to provider content parts, preserving the stated byte-identity behavior. This is not an external-parameter Tier-3 boundary and therefore does not qualify for the `@trust_boundary` decorator.
   judge_signature_version: 2
   scope_fingerprint: 0be522ee0e68ed80c0f4f5f01731cdb2e6c423635ada75b91134926bf6a12923
   judge_transport: codex_cli
-  ast_path: 'body[17]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:deec8e4bc5300f47fcd38f578b1e8425ba9225722427c83ba7ef6320d6766c1d'
-- key: contracts/chat_parts.py:R5:parts_hash:fp=3fdbed123055d23e
+  ast_path: 'body[18]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:8401fc62b36ccae60002fba7b9b6d4ec93c76d0d4fa1a3f49c5429fbaf678883'
+- key: contracts/chat_parts.py:R5:parts_hash:fp=7bd86459f7971ac8
   owner: john
   reason: |-
     R5 `isinstance(part, TextPart)` in `parts_hash`. A third and distinct projection of the same closed owned union: here TextPart contributes the SHA-256 of its text rather than the text itself, so the parts hash is order-sensitive over content without ever carrying content. This arm cannot be merged with `_audit_content`'s - that one emits `{'type','text'}` and this one emits `{'type','sha256'}` - which is why the dispatch is repeated rather than factored into a shared helper. Tier-1 throughout.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:37:35.161625+00:00'
+  judge_recorded_at: '2026-09-07T23:30:26.408642+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(part, TextPart)` branch is nominal dispatch over the stated closed, ELSPETH-owned `ContentPart` union, not a defensive revalidation or an attempt to hide a contract violation. The visible code uses the variant solely to choose the hash projection: `TextPart` contributes a SHA-256 digest of `part.text`, while the other contracted variant contributes `part.audit_view()`. The rationale is site-specific and consistent with the Tier-1 annotation and implementation; no external parameter or Tier-3 boundary exists here, so the structural decorator does not apply.
+    RULE MISFIRES — this `isinstance(part, TextPart)` is dispatch over a declared closed owned union, not defensive revalidation or recovery from a contract violation. The visible branches perform distinct projections: `TextPart` contributes a content hash, while the other union member contributes `audit_view()`, and neither branch suppresses, coerces, or fabricates malformed data. `content` is a Tier-1 typed tuple rather than external parameter-rooted data, so the `@trust_boundary` alternative does not apply.
   judge_signature_version: 2
   scope_fingerprint: 29ef3921fa8044bc3fd95506cd7fe042bae53e8975e6d974c585dec852a220d1
   judge_transport: codex_cli
-  ast_path: 'body[21]/body[2]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:9c396481a33a22728a7ef5208b75819aeac53ffa4f1a56b6ad653be31fc87b50'
+  ast_path: 'body[22]/body[2]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:6c314f612586cf3740c19e176f48f912d469e150c4b7d3004369988b693b04ab'
 - key: contracts/config/runtime.py:R5:RuntimeRateLimitConfig:__post_init__:fp=075da30c00a3a1fa
   owner: john
   reason: |-
@@ -2878,1070 +2878,557 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[16]/body[2]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:514e5f8539d54b1707ab573277157e48b8d672d62b22ca02bc4d61d8ffce16d2'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=0b441f2dd36f846d
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=b1a3e087236373a9
   owner: john
   reason: |-
     R5 `isinstance(candidate, (MethodDescriptorType, WrapperDescriptorType))` is the C-level descriptor arm of `_add_resolved_dependency`, recording a `builtin_descriptor` identity because there is no Python implementation to hash. It is the resolved-dependency counterpart of the arm at line 753 in `_normalize_class_binding`; both exist because these descriptors are real callable dependencies that must appear in the manifest even though only their identity can be recorded. Invalidated if builtin descriptors acquired hashable implementations.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:29.357464+00:00'
+  judge_recorded_at: '2026-09-07T23:35:52.295953+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance` check is nominal dispatch over a legitimate heterogeneous dependency representation, not a defensive re-check that masks a fixed-contract violation. The visible branch handles C-level method and wrapper descriptors by recording their stable `__objclass__`/`__name__` identity, while other candidate categories proceed through distinct normalization paths; it neither coerces an invalid value nor silently recovers from one. This is not an R5 Tier-3 parameter-boundary case, so the decorator contract does not apply.
+    RULE MISFIRES — this `isinstance` is concrete runtime-type discrimination among legitimate dependency representations, not a defensive re-check that masks a fixed-contract violation. The descriptor arm records the actual C-level descriptor identity and otherwise delegates to `_add_closed_global_dependency`; it neither suppresses an error nor coerces or fabricates a replacement value. The visible code and site-specific rationale therefore establish that R5's premise does not apply, and no parameter-rooted Tier-3 boundary decorator is indicated.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:672c0f1fd68decfcf050621c291186d7443d6ccad65e5905fed3b3fb1599c9d5'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=5e8493f1c4eba2eb
+  ast_path: 'body[67]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:eee3f773cad0d76d3a0ae56ee82c33479bd4c63235a6888b946184aff6897ce1'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=b04be2b01d068d89
   owner: john
   reason: |-
     R5 `not isinstance(dependency_payload, dict)` is a Tier-1 offensive precondition raising FrameworkBugError, taken immediately before the code MUTATES that payload by assigning a `receiver` key into it. It asserts our own shape contract at the point of mutation rather than making a trust decision about foreign data: if a refactor made `_add_callable_dependency` store a non-object payload, this fails at the seam instead of raising an opaque TypeError mid-assignment or silently corrupting the manifest. Invalidated if the payload stopped being mutated in place here.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:28.941210+00:00'
+  judge_recorded_at: '2026-09-07T23:36:13.703131+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the visible code shows `dependency_payload` retrieved from the first-party `dependencies` structure immediately after `_add_callable_dependency` populates it, so this is a Tier-1/internal contract rather than a Tier-3 trust decision. The `isinstance` check is offensive enforcement at the mutation seam: a wrong payload shape raises the specifically typed `FrameworkBugError` before `receiver` assignment, with no coercion, default, or suppression. The site is therefore the policy-prescribed informative crash for an invalid state in code ELSPETH controls.
+    PRESCRIBED FORM — the visible code uses `isinstance` offensively and immediately raises `FrameworkBugError`; it neither coerces the payload nor supplies a fallback that could conceal an internal contract violation. The payload is retrieved from the first-party `dependencies` mapping immediately after `_add_callable_dependency`, and the guard makes a wrong owned payload shape fail informatively before the in-place `receiver` mutation. This is not a Tier-3 boundary function over an external parameter, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[2]/body[1]/body[4]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:267bfdf19cd9dcebdee8656b74f1c9bcaf642ef10e0a1d9781d24877d60f1107'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=937cc3a6a1575f02
+  ast_path: 'body[67]/body[2]/body[1]/body[4]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:a697d316b935679053b86a5a474246881f6b1b6f10e7719f2d1ca737fff93ef0'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=9894c6ceb9210b65
   owner: john
   reason: |-
     R5 `isinstance(candidate_owner, type)` NORMALIZES the resolved owner to a class: if the owner is already a class it is used directly, otherwise its `type()` is taken. It is required because `_static_class_attribute` walks an MRO and must be handed a class -- passing an instance would walk the instance's own attributes as though they were a class MRO and resolve the wrong thing, or fail. Invalidated if owner resolution stopped requiring a class.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:34.588588+00:00'
+  judge_recorded_at: '2026-09-07T23:36:36.728801+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — `candidate_owner` is explicitly typed as `object | None`, and the visible branch performs intentional discrimination between a class and an instance so that `owner_cls` receives the corresponding class. The check neither suppresses an error nor disguises a violation of a fixed type contract; both cases are admitted by the declared contract and are handled without a fallback or fabrication. This is not an R1/R5 Tier-3 boundary over external parameter data, so the decorator contract does not apply.
+    RULE MISFIRES — `candidate_owner` is explicitly contracted as `object | None`, and the expression deliberately converts either of two valid internal representations—an existing class or an instance—into the class required by the downstream `owner_cls` parameter. The check does not conceal a malformed fixed-contract value, fabricate data, or silently recover from an error; it preserves class objects while applying `type()` to instances. This is not a Tier-3 parameter-rooted boundary case, so the `@trust_boundary` decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[2]/body[1]/body[1]/body[0]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:f21eafee522d05f9295c11333a0e938502838e2d8e64ecf671d9abaf65073d2d'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=bf90b33be1097103
+  ast_path: 'body[67]/body[2]/body[1]/body[1]/body[0]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:ad604d113ef7b260ebea211707c03654a9b0a03627650cf52189a38d040aed93'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=4a88c456ee8134b3
   owner: john
   reason: |-
     R5 `not isinstance(candidate, staticmethod)` in `_add_resolved_dependency` is the receiver test controlling whether a nested owner class is propagated: a staticmethod has no implicit receiver, so no owner is passed. Same correctness stake as the sibling test in `_normalize_class_binding` -- passing an owner for a staticmethod would let owner-attribute resolution invent dependencies the function cannot reach -- but at a different point in the graph, here for a dependency resolved out of a bytecode attribute chain rather than off a class dict. Invalidated if staticmethods gained an implicit receiver.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:30.507942+00:00'
+  judge_recorded_at: '2026-09-07T23:37:03.062489+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(candidate, staticmethod)` check is semantic descriptor discrimination, not a defensive re-check that masks a contract violation. The visible branches preserve Python binding semantics by withholding `candidate_owner` only for a descriptor that has no implicit receiver; malformed state is neither coerced, defaulted, nor silently suppressed. Although the subject is rooted at a function parameter and R5 is suppressible by `@trust_boundary`, the parameter represents an internally resolved dependency rather than Tier-3 external data, so the decorator contract does not apply.
+    RULE MISFIRES — this `isinstance(candidate, staticmethod)` is semantic descriptor discrimination, not a defensive shape re-check or an attempt to mask a contract violation. The visible branch uses the result solely to decide whether an implicit receiver owner can be propagated, and a `staticmethod` specifically has no such receiver. The candidate is not identified as external Tier-3 input rooted in a boundary parameter, so the structural decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[2]/body[1]/body[1]/test/values[0]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:34056998ce2dc7d4dc9875caa2889a9448f5cbad559e23a8f9a0b0eaa70a4682'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=ccbc965369b80db3
+  ast_path: 'body[67]/body[2]/body[1]/body[1]/test/values[0]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:8366c8abdfd7353544d3a589c43fac096f1d607f57dfdc5daff1e748144140c9'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=2407370fd8176196
   owner: john
   reason: |-
     R5 `isinstance(candidate, type)` is the class arm of `_add_resolved_dependency`, expanding a class reached through a bytecode attribute chain into a full class binding so that changes to its methods alter the manifest hash. It is reached only after the callable-unwrapping block above has run and possibly rebound `candidate`, which is why it tests the post-unwrap value rather than the original. Invalidated if resolved class dependencies stopped being expanded.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:31.249990+00:00'
+  judge_recorded_at: '2026-09-07T23:37:23.696162+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(candidate, type)` check is explicit runtime kind discrimination in a dependency-resolution dispatch, not defensive recovery from a violated fixed contract. The visible code handles the class arm by normalizing and recording the full class binding, while other runtime kinds proceed through separate descriptor or closed-global paths; it neither suppresses an error nor fabricates a fallback. The rationale specifically explains why the post-unwrapping `candidate` must be discriminated and is consistent with the visible rebinding at line 1210. This is not a Tier-3 parameter boundary suitable for the decorator.
+    RULE MISFIRES — the flagged `isinstance(candidate, type)` is explicit runtime category dispatch, not a defensive re-check that hides a fixed-contract violation. The visible class arm normalizes a class binding and returns, while subsequent descriptor handling and the final `_add_closed_global_dependency` call handle other legitimate candidate categories; the preceding `candidate = callable_obj` also confirms that this check intentionally applies after unwrapping. This is not an R5 Tier-3 parameter-boundary case, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:1513257b6b2154f4d24f9c1de5d4edc3f673864741a5b6bba43722cb8371dc08'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=e4addffa67a7ff55
+  ast_path: 'body[67]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:3c669dd1528ab4a4dd68b9882466b6d24516f1388d09e165770713e84516b2dc'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=18772a3876d58faf
   owner: john
   reason: |-
     R5 `not isinstance(candidate_owner, (type, ModuleType, FunctionType))` identifies an INSTANCE receiver by excluding the three non-instance owner kinds. This is the discriminator for the one case where the dependency payload must additionally record the receiver's normalized state: a method bound to an instance behaves according to that instance's data, so hashing the function alone would miss a behavioural dependency. Classes, modules and functions need no such record because their state is already captured by their own encodings. Invalidated if a fourth non-instance owner kind appeared and were not added to the exclusion, which would make the manifest record spurious receiver state for it.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:40.578354+00:00'
+  judge_recorded_at: '2026-09-07T23:37:53.163674+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance` at runtime_val_manifest.py:1197 is semantic discrimination among runtime owner kinds, not defensive revalidation or concealment of a contract violation. The visible branch records normalized receiver state only for instance-bound callables, while explicitly excluding classes, modules, and functions, matching the site-specific rationale. This is not a Tier-3 boundary over external data, so the structural decorator contract does not apply.
+    RULE MISFIRES — the `isinstance` expression is a semantic discriminator among supported dependency-owner kinds, not a defensive revalidation or an attempt to mask a fixed-contract violation. The visible branch records normalized receiver state only when `candidate_owner` is not a class, module, or function, which directly supports the rationale that instance-bound behavior needs an additional manifest dependency. No malformed value is suppressed, coerced, or replaced, and this internal runtime-introspection parameter is not Tier-3 input eligible for `@trust_boundary`.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[2]/body[1]/body[4]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:725118b7735c73b6568dfd16c212e8f932eb6e5e909c9dc1014d87bfc1c418ed'
-- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=ed709da899091031
+  ast_path: 'body[67]/body[2]/body[1]/body[4]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:31076ae8b4ebc69c9672b9f3f69678dd7655798540e3d4553b96432b4932abf9'
+- key: contracts/runtime_val_manifest.py:R5:_add_resolved_dependency:fp=58fc91090eb08381
   owner: john
   reason: |-
     R5 `not isinstance(candidate_owner, type)` is the instance-receiver test for the builtin-descriptor arm, deciding whether the descriptor's receiver state must also be recorded. It is narrower than the test at line 1197 -- excluding only classes rather than classes, modules and functions -- because a builtin descriptor reached here is bound either to a class or to an instance; a module or function receiver is not reachable at this point in the graph. Invalidated if builtin descriptors became reachable with module or function receivers, which would make this exclusion too narrow and record spurious receiver state.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:42.340003+00:00'
+  judge_recorded_at: '2026-09-07T23:40:31.121265+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(candidate_owner, type)` expression is semantic type discrimination between class-bound and instance-bound builtin descriptors, not defensive revalidation or recovery from a contract violation. The visible branch records receiver state only for an instance receiver and neither suppresses an error, coerces malformed data, nor fabricates a fallback. The site is not a function-scoped Tier-3 parameter boundary requiring the structural decorator.
+    RULE MISFIRES — this `isinstance` is semantic type discrimination between a class owner and an instance receiver; it neither hides a contract violation nor substitutes a fallback for malformed data. The internal resolver supplies `candidate_owner` from resolved Python attribute ownership (`runtime_val_manifest.py:1009` and `runtime_val_manifest.py:1475`), and the flagged branch uses that classification solely to decide whether receiver state belongs in the descriptor payload. The claim that module or function owners are unreachable is not credited because `_resolve_static_attribute` explicitly handles them at `runtime_val_manifest.py:959`, but that ancillary claim does not alter why R5's premise is false at this site.
   judge_signature_version: 2
   scope_fingerprint: 866fa4cd834ca1a8d44d175ca11a28d0b277aa0299484857038fd61cc8b231d7
   judge_transport: codex_cli
-  ast_path: 'body[61]/body[4]/body[1]/test/values[1]/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:5bfe680670e8b75aed0a549d6a6805998fdd5ac2881f97bb4c25dd9a813e5077'
-- key: contracts/runtime_val_manifest.py:R5:_callable_dependency_hashes:fp=04940c6f1e77992d
-  owner: john
-  reason: |-
-    R5 `isinstance(raw_candidate, type)` in `_callable_dependency_hashes` records the class binding for a global that resolved to a class, in addition to any callable dependency already added for it above. It tests `raw_candidate` -- the value BEFORE callable unwrapping -- which is the point: a class is also callable, so the unwrapped view would have lost the fact that the global names a class whose attribute payloads must be expanded. Invalidated if the unwrapping stopped discarding class-ness, making the raw/unwrapped distinction unnecessary.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:47.379689+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance(raw_candidate, type)` is semantic classification of a Python global binding for dependency hashing, not defensive revalidation or recovery from a contract violation. The visible code preserves the raw binding specifically to detect classes, which are also callable, then records normalized class attributes in addition to any callable dependency; it neither coerces, fabricates, suppresses an error, nor substitutes a default. `_callable_dependency_hashes` is not shown as a Tier-3 boundary function receiving the checked subject from an external parameter, so the decorator alternative does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 9f708f5c7d9e83c18b922e26772b675ea20c8bb38992a9588fd0f5b5c8277a98
-  judge_transport: codex_cli
-  ast_path: 'body[62]/body[4]/body[1]/body[6]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:afee4e8b72addb604dd4088ddf4e44641b6fe2671917d3ba11108c01f6871f46'
-- key: contracts/runtime_val_manifest.py:R5:_callable_dependency_hashes:fp=5f3eaff4fee01531
-  owner: john
-  reason: |-
-    R5 `isinstance(attribute, staticmethod)` is the receiver test for attributes loaded off `self`/`cls` inside `_callable_dependency_hashes`, choosing None or `owner_cls` as the nested owner. Same stake as the sibling tests at 744 and 1185 -- an owner passed for a staticmethod invents unreachable dependencies -- applied here to the owner-attribute walk driven by `_loaded_owner_attribute_names`, i.e. to attributes the bytecode actually loaded off the receiver. Invalidated if staticmethods gained an implicit receiver.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:48.305792+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the `isinstance(attribute, staticmethod)` expression discriminates between two declared Python descriptor semantics; it is not defensively revalidating Tier-1/Tier-2 data or hiding a contract violation. The visible branch uses that distinction to omit `owner_cls` only for a static method, which has no implicit receiver, while preserving the owner for receiver-bound callables during dependency traversal. This is internal callable-structure analysis rather than an R5 trust-boundary guard, and the site is not rooted in an external function parameter.
-  judge_signature_version: 2
-  scope_fingerprint: 9f708f5c7d9e83c18b922e26772b675ea20c8bb38992a9588fd0f5b5c8277a98
-  judge_transport: codex_cli
-  ast_path: 'body[62]/body[4]/body[2]/body[0]/body[3]/body[1]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:514ad94b6d949ead74671290ff84d16e7083de881833baa19d77384e7fee2afc'
-- key: contracts/runtime_val_manifest.py:R5:_callable_dependency_hashes:fp=70111995af6d3040
-  owner: john
-  reason: |-
-    R5 `isinstance(attribute, (MemberDescriptorType, GetSetDescriptorType))` SKIPS slot and getset descriptors among the owner attributes a method loads off `self`/`cls`. Without it, every `self.<slot>` access would record a dependency on the slot descriptor -- machinery that is already implied by the class definition being hashed -- burying the real code dependencies in noise and making the manifest churn whenever `__slots__` is reordered. Invalidated if slot descriptors acquired independently-changeable implementations.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:51.437173+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is semantic classification of statically retrieved class attributes, not a defensive re-check that masks a fixed-contract violation. The visible code separately records callable attributes, deliberately skips Python slot/getset descriptor machinery, and records other closed-global dependencies; a mismatched value is neither coerced, defaulted, nor silently treated as satisfying an ELSPETH contract. The rationale specifically explains why those descriptor categories are excluded and what change would invalidate that decision. The finding is not rooted in an external function parameter, so the trust-boundary decorator does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 9f708f5c7d9e83c18b922e26772b675ea20c8bb38992a9588fd0f5b5c8277a98
-  judge_transport: codex_cli
-  ast_path: 'body[62]/body[4]/body[2]/body[0]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:03fc9444086fa6010c4edea374c361378318f565f957efd9698bbe706a5fee3b'
-- key: contracts/runtime_val_manifest.py:R5:_iter_relevant_method_dependency_hashes:fp=751c459c44a97f2b
+  ast_path: 'body[67]/body[4]/body[1]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:d4a10ead2be1734b54e6af401104b59c39af6284bdbbb10d85d5439806f0abc1'
+- key: contracts/runtime_val_manifest.py:R5:_iter_relevant_method_dependency_hashes:fp=fb3a97ad0f70e2c0
   owner: john
   reason: |-
     R5 `isinstance(attribute, staticmethod)` is the receiver test in `_iter_relevant_method_dependency_hashes`, which hashes a named set of methods on a class. It chooses None or `cls` as the owner passed into `_callable_dependency_hashes`, so that a staticmethod's dependency walk is not given a receiver whose attributes it cannot actually reach. It is the fourth site of this test because the four walkers reach a method from four different directions -- class dict, resolved chain, loaded owner attribute, and explicit method-name list -- and each must make the receiver decision at its own point. Invalidated if staticmethods gained an implicit receiver, or if the four walkers were unified into one.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:50:53.083946+00:00'
+  judge_recorded_at: '2026-09-07T23:41:42.767308+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(attribute, staticmethod)` check is descriptor-kind discrimination used to determine callable binding semantics, not a defensive revalidation of data under a fixed contract. The visible code uses that result only to select whether `_callable_dependency_hashes` receives `None` or `cls` as `owner_cls`, consistent with static methods having no implicit receiver. This site is neither a Tier-3 parameter boundary nor an attempt to suppress or coerce a contract violation, so the `@trust_boundary` decorator is inapplicable.
+    RULE MISFIRES — this `isinstance` discriminates between legitimate callable descriptor kinds; it does not revalidate a fixed contract or conceal malformed data. In `src/elspeth/contracts/runtime_val_manifest.py:1612-1620`, the code statically retrieves and unwraps the named class attribute, then uses the `staticmethod` distinction solely to choose whether `_callable_dependency_hashes` receives an owner class; that helper uses the owner only when resolving a live `self` or `cls` binding at lines 1419-1429. No error is swallowed, value fabricated, or contract violation masked, and `cls` is not a Tier-3 external-data parameter, so the trust-boundary decorator is inapplicable.
   judge_signature_version: 2
-  scope_fingerprint: 6c304d74892f11cd8d7b2376072d47536e2413d93d089ea2612a584f42c5dedf
+  scope_fingerprint: 4e6b3bfe822eb232f8509fc5c1866844daff7af9f3cf925e8d9fee01cd515236
   judge_transport: codex_cli
-  ast_path: 'body[67]/body[1]/body[4]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:87deac85959b2cd112f615a8d1f354469bd49b04b3c3740e88ad77ac125a0a43'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=075bb876575c2fac
+  ast_path: 'body[73]/body[5]/body[4]/value/test'
+  judge_metadata_signature: 'hmac-sha256:v2:e6efeb56a1f29fe21fc5c901388473c33c0bbeb0c4542ee2e10a5992e5f32a08'
+- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=028cc68a4c0aa21b
   owner: john
   reason: |-
     R5 `not isinstance(normalized_value, dict)` decides the WRAPPING of a normalized fall-through value: a payload that is already a JSON object is used as-is, while a scalar is wrapped as `{"value": ...}`. This keeps every binding at a uniform shape in the manifest, which is what makes cross-run structural comparison possible. Unlike the check at line 430 this one is a branch rather than an assertion -- both outcomes are legal. Invalidated if the manifest stopped requiring uniform object-shaped bindings.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:02.469387+00:00'
+  judge_recorded_at: '2026-09-07T23:42:13.847032+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.96
   judge_rationale: |-
-    RULE MISFIRES — the visible branch does not defensively re-check a fixed contract or hide a malformed return: it discriminates two legal normalized-value shapes, preserving an object payload as-is and explicitly wrapping a scalar as the `value` member of an object-shaped binding. The code confirms the rationale because both branches assign `normalized_binding` and continue, while the separate check at line 430 is the offensive framework-invariant assertion. This R5 subject is a local result rather than a clearly external function parameter, and the excerpt does not establish the structural decorator conditions.
+    RULE MISFIRES — `_normalize_dependency_value` visibly permits both mapping and scalar normalized representations, and this `isinstance` discriminates those two legal variants rather than defensively rechecking a guaranteed `dict`. The scalar branch explicitly wraps the value into the manifest’s uniform object-shaped binding, while the mapping branch preserves it as-is; neither path suppresses an error, fabricates a missing datum, or passes malformed data forward. This is therefore intentional representation normalization under the stated manifest contract, not an R5 contract-violation mask.
   judge_signature_version: 2
   scope_fingerprint: 74fe5d879ea7af8e1a117ca139f6f1dc72d1ffcd0fc9e52a58a6726ebc3dbf4d
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[3]/orelse[0]/orelse[0]/orelse[0]/orelse[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:89ff9587f96604b57e4ecf778a06b06fa291849d071851cb6de5fc61c0651b1a'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=1316933b3bafc1ba
+  ast_path: 'body[41]/body[3]/orelse[0]/orelse[0]/orelse[0]/orelse[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:92a57df5a51787a977af5e6f5fa2fe14f3a742916bd61aec7ca60eea6572f9da'
+- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=f1731f94941e09eb
   owner: john
   reason: |-
     R5 `elif isinstance(value, type)` is the class-binding arm of `_normalize_bound_value`, the normalizer for a name a function closes over or loads globally. A class binding must be EXPANDED into its attribute payloads via `_normalize_class_binding` -- not encoded as a bare identity -- because the whole point of the resume-trust manifest is that a change to a method body of a class the code depends on must change the hash. Encoding the class by name alone would make method edits invisible. It sits after the `inspect.isfunction` arm because functions have their own richer treatment. Invalidated if class dependencies stopped being expanded.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:01.725986+00:00'
+  judge_recorded_at: '2026-09-07T23:42:33.042359+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(value, type)` check is explicit runtime classification of a bound dependency, not defensive revalidation of data under a fixed contract or concealment of a contract violation. The visible branch sends class objects to `_normalize_class_binding` so their relevant implementation dependencies contribute to the manifest, while adjacent branches deliberately normalize functions, modules, and other values differently. This is not an R5 Tier-3 boundary case rooted in an external function parameter, so the structural decorator contract does not apply.
+    RULE MISFIRES — `isinstance(value, type)` is a type-dispatch arm that identifies class bindings within a deliberately heterogeneous set of runtime dependency values. The matched branch does not hide a contract violation, coerce malformed data, or provide a silent fallback; it routes classes to `_normalize_class_binding` so their relevant implementation dependencies contribute to the manifest. The excerpt does not show the function declaration or its decorators, so there is no basis for a `@trust_boundary` recommendation.
   judge_signature_version: 2
   scope_fingerprint: 74fe5d879ea7af8e1a117ca139f6f1dc72d1ffcd0fc9e52a58a6726ebc3dbf4d
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[3]/orelse[0]/orelse[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:bb7d66ec8e585389eb65b178ded046d65eab525c9bf47fbd29708ff98920143f'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=7df993f58fcb0c3c
+  ast_path: 'body[41]/body[3]/orelse[0]/orelse[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:c89b9a7621cf234a3ad53bfd568e2b57373337f45ec728288490bfee62a4e1ba'
+- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=4ca966124ecc92a2
   owner: john
   reason: |-
     R5 `isinstance(value, ModuleType) and qualified_values` is the module-binding arm, and the conjunction is the substance: a module binding is recorded by name ONLY when the surrounding code actually loaded attributes off it (`qualified_values` non-empty). Without that conjunct, every imported-but-unused module would be recorded, inflating the manifest and making it churn on import-list edits that cannot affect behaviour. The attributes themselves are recorded separately as resolved dependencies. Invalidated if unused module imports became behaviourally significant to the manifest.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:11.676515+00:00'
+  judge_recorded_at: '2026-09-07T23:42:55.470396+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(value, ModuleType)` check is semantic classification within a heterogeneous binding normalizer, not a defensive re-check that masks a fixed-contract violation. The visible conjunction restricts the module-specific manifest representation to bindings with resolved qualified attributes, while the remaining values continue through `_normalize_dependency_value`; no malformed value is silently suppressed, coerced, or fabricated. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`.
+    RULE MISFIRES — `isinstance(value, ModuleType)` performs semantic dispatch over heterogeneous runtime binding values; it neither revalidates a fixed Tier-1/Tier-2 contract nor masks a contract violation. The visible conjunction limits module-name recording to bindings with resolved qualified attributes, while lines 553–566 separately record those attributes as bound dependencies and the `else` arm normalizes other values. This site is therefore a legitimate nominal type discriminator, not the defensive shape-guard behavior targeted by R5.
   judge_signature_version: 2
   scope_fingerprint: 74fe5d879ea7af8e1a117ca139f6f1dc72d1ffcd0fc9e52a58a6726ebc3dbf4d
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[3]/orelse[0]/orelse[0]/orelse[0]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:ba917288176c295c0ae773aab5154bbbac3c88a54d5524dcc9ccbe19c7001e74'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=e7b597a500aaea54
+  ast_path: 'body[41]/body[3]/orelse[0]/orelse[0]/orelse[0]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:f7da53c19626926cea55d0bef86bd803ae504b5474d3e4375b83c61a4ee9abcf'
+- key: contracts/runtime_val_manifest.py:R5:_normalize_bound_value:fp=ecdd56facd2df849
   owner: john
   reason: |-
     R5 `not isinstance(normalized_class, dict)` is a Tier-1 offensive POSTCONDITION on the value `_normalize_class_binding` just returned, raising FrameworkBugError. It makes no trust decision about foreign data -- both sides of this call are our own code -- it asserts the module's own shape contract that a normalized binding is a JSON object, so a refactor that returned a scalar fails loudly at the seam instead of producing a structurally wrong manifest that would silently mis-compare on resume. Invalidated if the manifest payload shape stopped requiring an object at this position.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:02.948299+00:00'
+  judge_recorded_at: '2026-09-07T23:44:33.506942+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — the flagged `isinstance` is an offensive postcondition on the first-party return from `_normalize_class_binding`, not a defensive attempt to recover from malformed external data. The visible code raises `FrameworkBugError` immediately when that internal normalized payload violates its required `dict` shape, which is the policy-prescribed crash-on-contract-violation behavior and does not coerce, fabricate, or suppress the failure. The subject is not rooted in an external function parameter, so the `@trust_boundary` decorator contract does not apply.
+    PRESCRIBED FORM — this is an offensive postcondition on a first-party helper return, not silent recovery or coercion. The helper at runtime_val_manifest.py:833-913 is annotated to return `object` while every visible branch constructs a dictionary, and runtime_val_manifest.py:533-534 immediately raises `FrameworkBugError` if that internal invariant is broken. The wrong-type path therefore crashes informatively before a malformed manifest can proceed, matching the policy’s prescribed `isinstance`→`raise` form. This is not a Tier-3 parameter boundary, so the decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 74fe5d879ea7af8e1a117ca139f6f1dc72d1ffcd0fc9e52a58a6726ebc3dbf4d
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[3]/orelse[0]/orelse[0]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:615ebc8618a9b4d9b219fda4ff573d2275c4d6cf708c4bc399d3c2e63eec7ed9'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_class_binding:fp=088fd6268ede6710
-  owner: john
-  reason: |-
-    R5 `isinstance(attribute, (MemberDescriptorType, GetSetDescriptorType))` SKIPS slot and getset descriptors when walking a class's attributes. These are pure storage and accessor machinery generated by `__slots__` or by C-level types; they carry no Python implementation to hash, and recording them would fill the manifest with entries that can never change independently of the class definition already being hashed. It is the discard half of a deliberate pair with the arm on the following line. Invalidated if these descriptor kinds acquired hashable Python implementations.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:02.195072+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal discrimination among Python descriptor kinds while normalizing class bindings, not a defensive re-check that masks a contract violation. The visible branches deliberately omit slot/getset storage descriptors, separately record method/wrapper descriptors, and normalize all remaining attributes, which directly supports the site-specific rationale. No external parameter is involved, so the `@trust_boundary` alternative does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: a9da766e631db3cf1aa6e476bf88f583513c7a45e8f73e9da1fa05d04d7ef621
-  judge_transport: codex_cli
-  ast_path: 'body[48]/body[6]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:5f3a6444ab4bda6673fe0c18b7efffdbf8474a7f5aaa7843b67d95b0ba15deee'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_class_binding:fp=095494a09d83a963
-  owner: john
-  reason: |-
-    R5 `isinstance(attribute, staticmethod)` in `_normalize_class_binding` decides which owner class is passed down for nested dependency resolution: None for a staticmethod, `cls` otherwise. This is a correctness test, not a formality -- a staticmethod has no implicit receiver, so passing `cls` would let `_qualified_owner_values` resolve `self`/`cls` attribute chains that the function cannot actually reach, INVENTING dependencies that do not exist and making the manifest churn on unrelated class edits. Invalidated if staticmethods gained an implicit receiver, or if owner resolution stopped depending on the receiver.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:14.463266+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the `isinstance(attribute, staticmethod)` check is semantic discrimination between Python descriptor kinds, not defensive revalidation or concealment of a contract violation. The visible branches use that distinction to pass `owner_cls=None` for a static method, which has no implicit receiver, while instance/class-bound callables retain `cls`; no malformed value is suppressed, coerced, or defaulted. The subject is an internally obtained class attribute rather than Tier-3 data rooted at a function parameter, so the trust-boundary decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: a9da766e631db3cf1aa6e476bf88f583513c7a45e8f73e9da1fa05d04d7ef621
-  judge_transport: codex_cli
-  ast_path: 'body[48]/body[6]/body[3]/body[1]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7fbf4ed9c7789b70f07882cc812c31879c09215c531af052251b21ec23774461'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_class_binding:fp=c82e057ddadaf50e
-  owner: john
-  reason: |-
-    R5 `isinstance(attribute, (MethodDescriptorType, WrapperDescriptorType))` is the keep half of that pair: C-level METHOD descriptors do get a manifest entry, but as a `builtin_descriptor` identity string rather than a hashed implementation, because there is no Python source behind them. Distinguishing this descriptor family from the slot/getset family on the line above is exactly what the two adjacent arms exist to do -- one is discardable machinery, the other is a real callable dependency that must be recorded. Invalidated if the two families stopped needing different treatment.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:17.869765+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is explicit runtime classification of heterogeneous Python descriptor objects, not a defensive re-check of a fixed ELSPETH contract or an attempt to mask malformed data. The visible adjacent branches confirm the site deliberately distinguishes member/getset descriptors, which are skipped, from method/wrapper descriptors, which are recorded using a `builtin_descriptor` identity because they lack Python source. The rationale is site-specific and consistent with the code, and the subject is not rooted in an external function parameter eligible for the Tier-3 boundary decorator.
-  judge_signature_version: 2
-  scope_fingerprint: a9da766e631db3cf1aa6e476bf88f583513c7a45e8f73e9da1fa05d04d7ef621
-  judge_transport: codex_cli
-  ast_path: 'body[48]/body[6]/body[5]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6d07315f8742f34fb5b373abef6cef77303590a6d28b832ca70273248da3f181'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=2769faa436368bb4
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, type)` is the general class-dependency arm, reached only after the TypedDict special case above it. Owned classes are expanded into their attribute payloads so a method change alters the hash, while foreign classes are recorded by `_type_identity` alone -- the ownership split is made by `_module_is_owned`, not by this isinstance, which only establishes that the candidate is a class at all. Invalidated if class dependencies stopped being expanded for owned modules.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:24.065760+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(candidate, type)` is a runtime-kind discriminator in a heterogeneous dependency-value normalizer, not a defensive re-check that hides a fixed-contract violation. The visible branch uses that discrimination to choose class-specific hashing: owned classes are expanded through `_normalize_class_binding`, while foreign classes are represented by `_type_identity`, consistently with the site-specific rationale. This is not a Tier-3 parameter boundary eligible for the decorator nudge, and the excerpt does not show silent recovery, coercion, fabrication, or suppression of an invalid state.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[5]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7e3f022aa8311bee7ff804d3c42a4eb2444a10f99a44cf8496c0a2ecb8258dc1'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=3243e468780d6446
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, tuple)` is the tuple arm of `_normalize_dependency_value`. Beyond ordered elementwise normalization it carries a CYCLE guard: `id(candidate) in seen` raises FrameworkBugError, because a self-referential dependency would otherwise recurse until the stack blew rather than reporting a structural problem in the code being manifested. Order is preserved (unlike the set arm below) since tuple order is semantically meaningful. Invalidated if the cycle guard were removed, or if tuple order stopped being meaningful in dependency payloads.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:36.372244+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — `_normalize_dependency_value` deliberately accepts `object` and discriminates among concrete container variants, so this is not a redundant re-check of a fixed Tier-1/Tier-2 shape or an attempt to conceal a contract violation. The tuple arm preserves ordered elements and offensively raises `FrameworkBugError` when its explicit cycle invariant is violated, consistent with runtime normalization of heterogeneous dependency values. This is not an external-data boundary eligible for `@trust_boundary`, because neither the rationale nor the visible code identifies `candidate` as Tier-3 external input.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:e335005d9c25be17fafc4ef451bea0cf13f9d8321fe55f640556c9f2d654225f'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=3ed1f3fdbbb32dc1
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, (set, frozenset))` is the set arm of the dependency normalizer, and as in the code-constant walker its distinguishing treatment is the canonical-JSON SORT that makes encoding independent of the unstable iteration order of a set. Without it the same dependency graph would hash differently between runs and every resume would report untrusted code. It carries the same cycle guard. Invalidated if the sort key were removed or made non-total.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:28.991188+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(candidate, (set, frozenset))` is explicit type dispatch in a recursive serializer for an `object`-typed dependency value, not a defensive re-check that hides a fixed-contract violation. The visible branch preserves the concrete collection kind, applies cycle detection, recursively normalizes every member, and sorts the normalized values to produce deterministic encoding despite unordered set iteration. This is neither silent recovery nor coercion, and the function is not a Tier-3 boundary suitable for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:0d7e2d33e8888e6c9ace0a5a982010899050845e79267c7272cff42574a937e8'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=50c237c931604d46
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, set)` selects the `"set"` versus `"frozenset"` encoding key inside that arm, preserving the carrier distinction after the sort has erased ordering. It matters because a mutable set dependency and a frozen one are different facts about the code -- one can be mutated at runtime and the other cannot -- and encoding them identically would let that change pass the manifest unnoticed. Invalidated if the mutability distinction stopped being meaningful for dependencies.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:30.312208+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(candidate, set)` is a type-dispatch operation used to encode the already-admitted set-like value as either `"set"` or `"frozenset"`; it neither suppresses a contract failure nor supplies a fallback. The surrounding branches show that `_normalize_dependency_value` intentionally discriminates heterogeneous runtime value kinds, and preserving mutability in the manifest is consistent with that normalization purpose. This is not an R5 Tier-3 boundary case suitable for the decorator, because the subject is an internal dependency value rather than external data being promoted to Tier 2.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[2]/body[3]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:28acb535f807ca97804033adf5fc10294cf7d03c32e77a1645ebf43a4dfa745e'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=5239fdd57f093862
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, type) and is_typeddict(candidate)` gives TypedDicts their own encoding -- a payload schema hash -- and its ORDER is the substance: it must precede the general `type` arm on line 1092, because a TypedDict IS a class and the general arm would expand it as an ordinary class, producing attribute payloads that describe the TypedDict machinery instead of the field schema that actually matters. Invalidated if this arm were moved below the general class arm, or if TypedDicts stopped being classes.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:35.401071+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the visible code is a heterogeneous value normalizer, and this `isinstance` is ordered type discrimination rather than a defensive re-check that masks a fixed-contract violation. The rationale is site-specific and the excerpt confirms its key claim: the TypedDict arm produces a `typed_dict_hash` and must precede the general `type` arm, which applies different class-binding/type normalization. This is not a Tier-3 boundary case rooted in an external-data parameter, so the decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[4]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:b33d627fe27455c6a85429ea8c5b1485c153fd03750fa8be34fab22f1da08126'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=74c33d72d1825268
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, ModuleType)` identifies a module reached as a dependency VALUE rather than as a binding, and both paths out of this arm RAISE FrameworkBugError -- one for a module whose `__name__` is not a string, one for the module itself. That is the substance: a module cannot be statically bound as a dependency value, and the module deliberately refuses rather than recording a name that would give false confidence in the manifest. This is a refusal arm, not a fall-through. Invalidated if module dependency values became statically bindable, at which point the arm would need an encoding rather than a raise.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:38.309040+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    PRESCRIBED FORM: the concrete `ModuleType` discrimination is an offensive invalid-state check, and every path in the flagged arm raises `FrameworkBugError` rather than coercing, fabricating, suppressing, or continuing with a misleading manifest entry. The rationale specifically explains the R5 check: module-valued dependencies cannot be statically represented, so the branch refuses them with informative failures, which the visible code confirms. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; `candidate` is an internally inspected dependency value and the check enforces manifest representability.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:9ea3a599a22394a32d04808557a132295c2330547827506bf2146fe31fa89991'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=8992b070bc8a4d71
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, dict)` is the mapping arm of the dependency normalizer. Keys and values are normalized separately and the pairs sorted by canonical JSON so the encoding is order-independent, and the id-based cycle guard raises FrameworkBugError on a self-referential mapping -- the most likely cycle carrier of the four, since module-level registries are dicts. Invalidated if the pair sort were dropped, reintroducing order dependence into the hash.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:50.442905+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `isinstance(candidate, dict)` is a type-dispatch arm in a heterogeneous dependency-value normalizer, not a defensive re-check that hides a fixed-contract violation. The visible tuple, list, set/frozenset, mapping, and type arms independently establish that `_normalize_dependency_value` deliberately discriminates among supported representations; the mapping arm recursively normalizes both keys and values, detects cycles by raising `FrameworkBugError`, and sorts normalized pairs for order-independent encoding. The rationale is site-specific and consistent with that behavior, and it does not claim a Tier-3 boundary or an elsewhere-located control requiring verification. The decorator contract does not apply because the evidence does not establish external data rooted at a function parameter.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7676f0935921fccc91c11b0597c53cb28c8b58b2c38fbec0379371a3d7cbe779'
-- key: contracts/runtime_val_manifest.py:R5:_normalize_dependency_value:fp=e2f6b456861a49e4
-  owner: john
-  reason: |-
-    R5 `isinstance(candidate, list)` is the list arm of the dependency normalizer, encoded under its own `"list"` key so a list and a tuple dependency with equal contents do not hash alike. It carries the same id-based cycle guard raising FrameworkBugError -- necessary here in particular because a list is mutable and genuinely can be made self-referential. Invalidated if the list and tuple encodings were merged, hiding a carrier change.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:52.904094+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `candidate: object` is deliberately discriminated among supported dependency-value carrier types; the flagged `isinstance(candidate, list)` selects the list encoding rather than concealing a fixed-contract violation. The visible code preserves list-versus-tuple identity under distinct keys and raises `FrameworkBugError` for cyclic lists, exactly matching the site-specific rationale without coercion, fabrication, or silent recovery. This is not an external-data boundary function eligible for the decorator because neither the rationale nor the code identifies `candidate` as Tier-3 input.
-  judge_signature_version: 2
-  scope_fingerprint: 60c1118a61a57ff2eea66f487b128d414d62e904064e1dc5aa735449940db1d7
-  judge_transport: codex_cli
-  ast_path: 'body[60]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a92ac9f1ff01bafd09bdc4497f30f546367f7482e243391c19562bdf7883cd46'
-- key: contracts/runtime_val_manifest.py:R5:_owned_instance_state:fp=3642e62c925e7ae8
+  ast_path: 'body[41]/body[3]/orelse[0]/orelse[0]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:be0d34fa1d1e28679f6e5c4767bb824f5aa86343188ad990957b44ce5b3d0fbf'
+- key: contracts/runtime_val_manifest.py:R5:_owned_instance_state:fp=8f64a5cef27e94df
   owner: john
   reason: |-
     R5 `not isinstance(descriptor, MemberDescriptorType)` filters a class `__dict__` down to `__slots__` descriptors when snapshotting owned instance state. The filter is what makes the snapshot mean 'per-instance state': methods, class constants, and properties also live in `__dict__` but are part of the class definition already hashed elsewhere, so including them would double-count them and make the instance-state hash churn on unrelated class edits. Invalidated if slots stopped being represented by MemberDescriptorType, or if non-slot class attributes became part of instance state.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:52.977785+00:00'
+  judge_recorded_at: '2026-09-07T23:44:55.450886+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance` call is an intentional discriminator over heterogeneous entries in a class namespace, selecting concrete `MemberDescriptorType` slot descriptors rather than revalidating a fixed data contract or concealing an invalid value. The visible code uses matching descriptors to read per-instance slot state and simply excludes methods, properties, and class attributes, consistent with the site-specific rationale. This is not a Tier-3 boundary function and the subject is not external parameter-derived data, so the decorator contract does not apply.
+    RULE MISFIRES — the `isinstance` at `_owned_instance_state` is a deliberate discriminator over the inherently heterogeneous values of `base.__dict__`, not a defensive re-check of data governed by a fixed contract. The visible loop uses `MemberDescriptorType` specifically to select slot descriptors before invoking `descriptor.__get__`; nonmatching methods, properties, and class attributes are intentionally excluded rather than treated as malformed data. This site is therefore neither masking a contract violation nor promoting Tier-3 input, and the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 7568007f48e8ad5f42ac36ba80eb0b1aa9fc81ee132f57eca24126ce2ff15238
   judge_transport: codex_cli
-  ast_path: 'body[59]/body[4]/body[1]/body[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:cd0e880cdc49b7c84a52489856d6676e563c2374b2e5bcf11c806114fc902733'
-- key: contracts/runtime_val_manifest.py:R5:_qualified_bound_values:fp=4395db1eb8c5cb26
+  ast_path: 'body[65]/body[4]/body[1]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:9e7ea10fa0c3093733642c810d505dbaf84da304f80537616885aef06a3ef6b8'
+- key: contracts/runtime_val_manifest.py:R5:_qualified_bound_values:fp=53574ce36a269a29
   owner: john
   reason: |-
     R5 `isinstance(candidate, (MemberDescriptorType, GetSetDescriptorType, property))` performs the same descriptor-terminal break in `_qualified_bound_values`, the walker for chains rooted at a BOUND name (closure or local binding) rather than a global. It is a separate site rather than shared code because this walker carries its own `directly_called` determination -- it additionally inspects the instruction BEFORE the terminal for PUSH_NULL, which the global walker does not -- so the loop bodies genuinely differ. Invalidated if the two walkers' call-detection logic converged and the loops were unified.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:51:59.300823+00:00'
+  judge_recorded_at: '2026-09-07T23:47:23.378186+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal discrimination among concrete descriptor types while statically walking an attribute chain, not a defensive re-check of data governed by a fixed shape contract. The visible loop uses the result only to terminate descriptor traversal, then invokes `_reject_truncated_descriptor_chain` before recording the resolved value, so it neither coerces, fabricates, nor silently recovers from a contract violation. The site is not a Tier-3 parameter boundary suitable for `@trust_boundary`; `candidate` is an intermediate runtime object derived during static attribute resolution.
+    RULE MISFIRES — this `isinstance` is semantic discrimination among valid Python descriptor objects during static attribute-chain walking, not a defensive re-check that masks a fixed-contract violation. In `contracts/runtime_val_manifest.py:1073-1087`, the resolved attribute may legitimately be a descriptor; the check terminates static traversal and `_reject_truncated_descriptor_chain` raises if bytecode attempts to continue through it, while the equivalent global walker does the same at lines 1009-1023. The bound walker’s distinct `PUSH_NULL` handling at lines 1088-1093 supports the site-specific rationale, and `value` is supplied from closure/default binding normalization rather than an external Tier-3 parameter, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: e83c26e898aedd56140ce98c7a2295bb28201c7e664a61091e955ae62c0e438d
+  scope_fingerprint: f82b9f81f890a4cc6bd31bf016949f9ff17f9ea2bfb0855f0cdb198bd141ab8e
   judge_transport: codex_cli
-  ast_path: 'body[56]/body[1]/body[1]/body[5]/body[7]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:bf01092f198ce66973ad5127525160ca1c97807fa608b4138f6fadf8d362cc62'
-- key: contracts/runtime_val_manifest.py:R5:_qualified_global_values:fp=3c2a253e94775804
+  ast_path: 'body[62]/body[1]/body[1]/body[5]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:6822bf74dc47f301834bc5dadee9c23c5187ac1650ca870dc9b7f405e6d17aab'
+- key: contracts/runtime_val_manifest.py:R5:_qualified_global_values:fp=f63708400430200d
   owner: john
   reason: |-
     R5 `isinstance(candidate, (MemberDescriptorType, GetSetDescriptorType, property))` BREAKS the attribute-chain walk in `_qualified_global_values`, the walker for chains rooted at a LOAD_GLOBAL/LOAD_NAME. The break is correct because a descriptor's value is per-instance and cannot be resolved statically, so the walk must stop at the last statically-known node; `_reject_truncated_descriptor_chain` is then called to decide whether stopping there was acceptable or is a hard failure. Invalidated if global-rooted chains stopped being resolved statically.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:03.621844+00:00'
+  judge_recorded_at: '2026-09-07T23:47:48.801399+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is semantic discrimination among Python descriptor objects during static bytecode analysis, not a defensive re-check that masks a fixed-contract violation. The rationale names `_reject_truncated_descriptor_chain` as the real gate, and the visible code verifies that it is called after every descriptor-triggered break; the shown helper logic raises `FrameworkBugError` when an unresolved descriptor chain continues with `LOAD_ATTR` or `LOAD_METHOD`. The check therefore stops resolution precisely where an instance-dependent descriptor prevents further static evaluation while preserving the hard-failure path for impermissible truncation. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`.
+    RULE MISFIRES — the `isinstance` at line 1014 performs explicit descriptor-kind discrimination during static attribute-chain analysis; it does not defensively revalidate a fixed data contract, coerce a value, or hide a contract violation. The named control `_reject_truncated_descriptor_chain` is visibly invoked on the descriptor-stop path at lines 1018–1023, and its visible logic at lines 984–987 raises `FrameworkBugError` if another attribute access would require unsafe continuation. This is an algorithmic boundary between statically resolvable attributes and per-instance descriptors, not a Tier-3 data-boundary case suited to `@trust_boundary`.
   judge_signature_version: 2
-  scope_fingerprint: 0b8b6886fe4f20ab8d018383ef42643eaa0c64f44d904db2b52c6457d6b905b5
+  scope_fingerprint: 288faf3a4cbe75c2a632c9950ab64a2b1abed5ff12f209ba5064a19d14a3750c
   judge_transport: codex_cli
-  ast_path: 'body[54]/body[2]/body[5]/body[7]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:09746d9934b4fba7ae0d3bb9b6012ef80a66e372d639f3913ebaaabda122e851'
-- key: contracts/runtime_val_manifest.py:R5:_qualified_owner_values:fp=5ec7c48b1faf8a58
+  ast_path: 'body[60]/body[2]/body[5]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:ca2ddda6e160892b128043fe5114c355316574aba4c1d5123d977a73ea41a143'
+- key: contracts/runtime_val_manifest.py:R5:_qualified_owner_values:fp=de167381c8295b7d
   owner: john
   reason: |-
     R5 `isinstance(candidate, (MemberDescriptorType, GetSetDescriptorType, property))` performs the descriptor-terminal break in `_qualified_owner_values`, the walker for chains rooted at `self`/`cls`. This walker differs substantively from its two siblings: it counts attributes and requires `attribute_count >= 2` before recording anything, because a single `self.x` access is ordinary instance state rather than a resolvable static dependency. The descriptor break is what stops it walking into per-instance values it cannot see. Invalidated if the two-attribute minimum were removed, changing what this walker is for.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:07.809503+00:00'
+  judge_recorded_at: '2026-09-07T23:48:39.919245+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is semantic discrimination among Python descriptor kinds in a bytecode/static-dependency walker, not defensive revalidation of data governed by a fixed contract. The visible loop uses the result only to terminate static traversal before an instance-dependent descriptor value, while the explicit `attribute_count >= 2` rule determines whether the chain is recorded; it neither coerces a wrong type nor supplies a fallback that masks a contract violation. No external parameter supplies the subject, so the `@trust_boundary` decorator contract does not apply.
+    RULE MISFIRES — the `isinstance` is a semantic discriminator over an intentionally broad `candidate: object`, not a defensive re-check of a guaranteed contract. The visible branch merely terminates static attribute-chain traversal when resolution reaches a descriptor; it neither suppresses an error nor coerces, fabricates, or defaults a value. The adjacent two-attribute minimum is consistent with the rationale’s site-specific description of this walker.
   judge_signature_version: 2
-  scope_fingerprint: 662029ed931a5c6411fba4ca9882966d045af099eaca31f7c6bd8eb174a1b40f
+  scope_fingerprint: c917be2197d4a06e5a635d679184f542a989dfffe51974be366de592f0d3eec2
   judge_transport: codex_cli
-  ast_path: 'body[57]/body[2]/body[6]/body[8]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:7c7b5532908390ed8297478ac54c8009f4d367d3933a8388d01fff560a45318f'
-- key: contracts/runtime_val_manifest.py:R5:_reject_truncated_descriptor_chain:fp=13e52fef935e6aa3
+  ast_path: 'body[63]/body[2]/body[6]/body[8]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:59ed2ec4664419a2c901d0bf8c2f521f73246e1721d1ec8091a9b2831d549820'
+- key: contracts/runtime_val_manifest.py:R5:_reject_truncated_descriptor_chain:fp=32b07f0da3751013
   owner: john
   reason: |-
     R5 `not isinstance(candidate, (MemberDescriptorType, GetSetDescriptorType, property))` in `_reject_truncated_descriptor_chain` identifies whether a statically-resolved attribute chain terminated on a DESCRIPTOR. The check gates a refusal: if the bytecode continues past that descriptor with another LOAD_ATTR, the real value depends on a runtime instance that static analysis does not have, and the function raises FrameworkBugError rather than recording a half-resolved dependency. Recording the truncated chain instead would put a value in the manifest that does not correspond to what the code actually reaches. Invalidated if descriptor values became statically resolvable.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:06.851854+00:00'
+  judge_recorded_at: '2026-09-07T23:49:06.037401+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is deliberate nominal discrimination among descriptor objects during static bytecode analysis, not a defensive re-check of Tier-1/Tier-2 data or an attempt to hide a contract violation. The visible code uses the result only to detect an unresolved descriptor chain and raises `FrameworkBugError` when a subsequent `LOAD_ATTR` or `LOAD_METHOD` would require a runtime instance, matching the rationale's refusal-to-fabricate claim. The function does not receive external-origin data, so the `@trust_boundary` structural alternative does not apply.
+    PRESCRIBED FORM: the concrete-type `isinstance` check discriminates descriptor objects produced during static attribute resolution; it does not defensively revalidate a guaranteed data contract or substitute a fallback. When a descriptor would truncate a continuing `LOAD_ATTR`/`LOAD_METHOD` chain, the function raises an informative `FrameworkBugError` instead of recording a half-resolved dependency, which is the required offensive failure behavior. This is not a Tier-3 parameter boundary eligible for `@trust_boundary`, because `candidate` represents a statically resolved program attribute rather than external-origin input.
   judge_signature_version: 2
-  scope_fingerprint: ee2ece4466a8622a05f6348b8f5fae4e39358a0468d3d1e90b9e3dc12ad5ee62
+  scope_fingerprint: df9d521f16f8861e09b635c7fbd3fed4f840fdd10a65b5cfc0f5b308e4f45a7c
   judge_transport: codex_cli
-  ast_path: 'body[53]/body[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:ebd39c56f8cf22ee231e38c3c2fd44a26a8edf02236780265f99a920cd7c6ee8'
-- key: contracts/runtime_val_manifest.py:R5:_resolve_static_attribute:fp=4fee7a0370e05d52
+  ast_path: 'body[59]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:2bc5981bc9b8ab15a898e5ffb22cfe51805cca1a8afa8d1f8da6a940fbc2e560'
+- key: contracts/runtime_val_manifest.py:R5:_resolve_static_attribute:fp=eb687eb6f9f06d72
   owner: john
   reason: |-
     R5 `isinstance(owner, type)` routes a CLASS owner through `_static_class_attribute`, which walks the MRO. This is the arm that must not be merged with the `vars()` path above it: a class's own `__dict__` does not contain inherited attributes, so resolving a class attribute by `vars()` alone would miss everything defined on a base and report a real dependency as missing. Invalidated if inheritance stopped being relevant to attribute resolution.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:06.260329+00:00'
+  judge_recorded_at: '2026-09-07T23:49:25.982260+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the `isinstance(owner, type)` check is algorithmic discrimination among supported reflection-owner categories, not a defensive re-check that masks a fixed-contract violation. The visible branches deliberately resolve modules/functions through `vars()`, classes through `_static_class_attribute`, and instances through their own namespace followed by their class; the class-specific arm is necessary for MRO-aware inherited-attribute lookup, exactly as the site-specific rationale states. This is not an R1/R5 Tier-3 parameter-boundary case suitable for `@trust_boundary`, so no decorator nudge applies.
+    RULE MISFIRES — `_resolve_static_attribute` explicitly accepts `owner: object` and uses nominal type discrimination to select distinct static-resolution semantics, rather than defensively rechecking a fixed contract. The class arm delegates to `_static_class_attribute`, while module/function and instance-like owners follow different namespace paths; the stated need to preserve inherited-attribute lookup is specific and consistent with the visible code. This is not Tier-3 parameter handling, so the structural trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: 6c6248cb245136c32d159fb98dd533bebaaa5b9355b224b3312809cec978f76e
   judge_transport: codex_cli
-  ast_path: 'body[52]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2a53252e32ff082261ba88350a50cb51b8e573252b4ab2da6bd9a36c7b1393bc'
-- key: contracts/runtime_val_manifest.py:R5:_resolve_static_attribute:fp=9955bd6bf33051b3
+  ast_path: 'body[58]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d3d1ea3787e8e73ddefc824f37eff47093bca95e5d5c8781310f9af40b760876'
+- key: contracts/runtime_val_manifest.py:R5:_resolve_static_attribute:fp=f7c5c53d8462593a
   owner: john
   reason: |-
     R5 `isinstance(owner, ModuleType) or inspect.isfunction(owner)` selects the namespace strategy in `_resolve_static_attribute`: modules and functions keep their attributes in an ordinary instance `__dict__`, so `vars()` membership is the correct static resolution for them. Routing them through the class-MRO path used below would be wrong, because a module's attributes are not on `ModuleType`. This arm also returns the `_MISSING_CLASS_ATTRIBUTE` sentinel rather than raising, letting callers decide whether an unresolvable name is fatal. Invalidated if modules or functions stopped storing attributes in an instance dict.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:14.814818+00:00'
+  judge_recorded_at: '2026-09-07T23:49:46.605654+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal dispatch among distinct Python object models, not a defensive re-check of an ELSPETH fixed contract or an attempt to mask malformed data. The visible code confirms that modules/functions use their instance namespace, classes use `_static_class_attribute`, and other instances combine instance-namespace and class-MRO lookup; the `_MISSING_CLASS_ATTRIBUTE` sentinel consistently represents lookup failure rather than fabricating a value. `_resolve_static_attribute` is not shown as an external-data boundary, so the `@trust_boundary` decorator contract does not apply.
+    RULE MISFIRES — `_resolve_static_attribute` accepts a deliberately heterogeneous `object` and uses nominal checks against `ModuleType`, function, and `type` to select the correct static namespace-resolution strategy; it is not revalidating or concealing a violated fixed contract. The visible branches confirm that modules/functions require instance-namespace lookup while classes require MRO-based lookup, and unresolved attributes remain explicit through `_MISSING_CLASS_ATTRIBUTE`. This is not a Tier-3 boundary rooted in external data, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 6c6248cb245136c32d159fb98dd533bebaaa5b9355b224b3312809cec978f76e
   judge_transport: codex_cli
-  ast_path: 'body[52]/body[0]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:2931424bb1e75daa882f6dbe99ae2661ffefaf226155604aebe0ddf1339d67e0'
-- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=b0580e6aa346b2c6
+  ast_path: 'body[58]/body[0]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:eb09593840e195dc329368f060c3500a0340489829226261bd50bee62011e9c0'
+- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=1656dae023eab257
   owner: john
   reason: |-
     R5 `isinstance(value, ast.Constant)` narrows a leading expression statement to a constant before it is stripped as a docstring. A leading bare expression that is a CALL or a name -- not a constant -- is executable code with effects, and removing it would change the program the manifest hashes. This is the first of two conjuncts that together define 'is a docstring'. Invalidated if the AST representation of literals changed away from `ast.Constant`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:18.935223+00:00'
+  judge_recorded_at: '2026-09-07T23:50:02.191483+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is semantic discrimination within Python's heterogeneous AST model, not a defensive re-check that masks a fixed-contract violation. The conjunction identifies exactly the AST representation of a docstring before mutating the tree; leaving calls, names, and non-string constants untouched preserves executable semantics in the manifest hash. `_strip_docstrings` receives an AST rather than raw Tier-3 data, so the trust-boundary decorator contract does not apply.
+    RULE MISFIRES — this `isinstance` is semantic AST variant discrimination, not defensive revalidation of data under a fixed contract. `_strip_docstrings` must distinguish a leading string-valued `ast.Constant` from other `ast.Expr` values because only the former is a docstring; removing a call, name, or non-string constant would alter executable semantics and the resulting manifest hash. The subject derives from traversal of an AST rather than an external function parameter, so the `@trust_boundary` alternative does not apply.
   judge_signature_version: 2
   scope_fingerprint: 044a81718262c9c31e8d9a0643756bb6ad31e5aab83db73715da42bd5031231e
   judge_transport: codex_cli
-  ast_path: 'body[40]/body[0]/body[5]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:eb9cd841004113061ce82a1fe12a64e4e3c6807875371d2fbc35f29c2bde9a3b'
-- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=d61f40d1999aca35
+  ast_path: 'body[46]/body[0]/body[5]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:da4eda52ba13192b981069312cad66fd80e437e73ed45e162782e3df897b3e41'
+- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=c020a64e580f6a6f
   owner: john
   reason: |-
     R5 `isinstance(value.value, str)` is the second conjunct of the docstring test, requiring the leading constant to be a STRING specifically. It is not redundant with the `ast.Constant` check beside it: a leading bare integer or bytes literal is also a constant expression statement but is not a docstring, and popping it would silently alter the hashed program. Invalidated if bytes literals became a recognised docstring form.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:21.136099+00:00'
+  judge_recorded_at: '2026-09-07T23:50:20.709189+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the check discriminates among legitimate heterogeneous AST node and constant-value variants; it does not defensively revalidate a fixed contract or mask a contract violation. The visible code removes only an initial expression whose value is specifically a string constant, while preserving integer, bytes, and other constant expressions that are not docstrings and must remain in the implementation hash. `_strip_docstrings` receives a first-party parsed AST rather than Tier-3 external data, so the structural trust-boundary decorator does not apply.
+    RULE MISFIRES — this `isinstance` is semantic AST-node discrimination, not a defensive re-check that masks a fixed-contract violation. The visible conjunction precisely identifies Python docstrings: `ast.Constant` also represents non-string literals, so the `str` check prevents `_strip_docstrings` from removing a leading integer or bytes expression and thereby changing the implementation hash. The function is not shown as a Tier-3 boundary over an external parameter, so the structural decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 044a81718262c9c31e8d9a0643756bb6ad31e5aab83db73715da42bd5031231e
   judge_transport: codex_cli
-  ast_path: 'body[40]/body[0]/body[5]/test/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:a55789649d28783c434ea7187737f80a30bd5b9ac9a0e4fd691ea9104794d281'
-- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=ec52990ed11b382e
+  ast_path: 'body[46]/body[0]/body[5]/test/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:d3bf6c5ef3c13f6e8c22eca54527ec54cdb45cc6de64665031cd3f6e66f3ab40'
+- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=1f8b454ae72538d6
   owner: john
   reason: |-
     R5 `not isinstance(child, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))` selects the docstring-BEARING scopes out of `ast.walk`, which yields every node in the tree. The tuple is exhaustive over the four node kinds Python allows a docstring on, and the inclusion of AsyncFunctionDef is the one that is easy to get wrong: omitting it would leave async-function docstrings in the hashed source, so a comment-only edit to an async method would change the class source hash and spuriously invalidate resume trust for an unchanged implementation. Invalidated if Python added a fifth docstring-bearing node kind.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:22.023179+00:00'
+  judge_recorded_at: '2026-09-07T23:50:54.161110+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is deliberate discrimination among heterogeneous `ast.walk(node)` results, not a defensive re-check that masks a fixed-contract violation. The selected concrete AST node kinds are precisely the scopes whose leading string expression can be a docstring, and the code then directly inspects and removes that expression for source-hash normalization. This is neither a Tier-3 parameter boundary eligible for `@trust_boundary` nor silent recovery, coercion, or fabrication.
+    RULE MISFIRES — `ast.walk(node)` intentionally yields heterogeneous AST node types, and this `isinstance` tuple performs semantic node-kind discrimination rather than defensively rechecking a fixed contract. The visible code confirms that only module, class, function, and async-function bodies are inspected for removable leading string expressions, matching the site-specific rationale. This is not a Tier-3 boundary function eligible for the decorator.
   judge_signature_version: 2
   scope_fingerprint: 044a81718262c9c31e8d9a0643756bb6ad31e5aab83db73715da42bd5031231e
   judge_transport: codex_cli
-  ast_path: 'body[40]/body[0]/body[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:79e7fd2a2f8dc3013a097804d33ab4585f873aeb4cd81302cdacd0fd8f3f1a7e'
-- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=f721b93dae99a64b
+  ast_path: 'body[46]/body[0]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:6b6e83fcfc5049a133628b8cdece5c3b371c0039431d8e60f4c3964af8d7579c'
+- key: contracts/runtime_val_manifest.py:R5:_strip_docstrings:fp=9cdee6305bde676b
   owner: john
   reason: |-
     R5 `not isinstance(first, ast.Expr)` checks that a scope's first statement is an expression statement before it is considered for docstring removal. A docstring is by definition a bare expression statement; any other first statement is real code, and popping it would silently delete a program statement from the hashed source -- making two genuinely different implementations hash identically. Invalidated if docstrings ceased to be represented as `ast.Expr`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:22.733825+00:00'
+  judge_recorded_at: '2026-09-07T23:51:12.531811+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `first` is an element of the intentionally heterogeneous `ast` statement hierarchy, so `isinstance(first, ast.Expr)` performs required variant discrimination rather than defensively rechecking a guaranteed concrete type. The visible code removes the statement only after additionally proving that the expression is a string constant, while every non-docstring statement remains untouched; this preserves implementation-hash distinctions. `_strip_docstrings` does not receive external data through a parameter, so the structural trust-boundary decorator does not apply.
+    RULE MISFIRES — `first` has only the broad `ast.stmt` contract, so the `isinstance(first, ast.Expr)` check legitimately discriminates among AST statement variants rather than defensively revalidating a guaranteed concrete type. The visible code then narrows the expression value to a string constant before removing it, ensuring that real executable statements remain part of the implementation hash; this directly and specifically addresses R5’s concern. This is not a Tier-3 parameter boundary eligible for the decorator.
   judge_signature_version: 2
   scope_fingerprint: 044a81718262c9c31e8d9a0643756bb6ad31e5aab83db73715da42bd5031231e
   judge_transport: codex_cli
-  ast_path: 'body[40]/body[0]/body[3]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:02a49c902af9a87e327f4ae8f4c73f09ee7049b19290b3c8f29c064906d47870'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=14f1ab6f11dee060
-  owner: john
-  reason: |-
-    R5 `isinstance(value, tuple)` is the tuple-constant arm of the code-constant normalizer. Tuples are the common compound constant in `co_consts` (they hold `__annotations__` payloads and folded literals). The arm normalizes elementwise and then propagates `_UNSUPPORTED_MANIFEST_VALUE` if ANY element is unsupported, so an unencodable element fails the whole constant rather than being silently dropped from the hash input -- the failure surfaces at `_normalize_code_constant`, which raises FrameworkBugError. Invalidated if partial encoding of a tuple constant were ever accepted, which would let a code change go unnoticed by the manifest.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:35.363922+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `value` is deliberately typed as `object`, and this function discriminates among the heterogeneous runtime types permitted in Python code constants; the tuple check is therefore a required normalizer branch, not a defensive re-check of a guaranteed fixed shape. The visible branch recursively normalizes every tuple element and propagates `_UNSUPPORTED_MANIFEST_VALUE` when any element is unsupported, so the `isinstance` check neither hides a contract violation nor silently drops data.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:c0f704405fc725c814540a04a1b58094edb5da5c62c079cf9104cd054b392164'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=4ba40e57ddc452f0
-  owner: john
-  reason: |-
-    R5 `isinstance(value, (set, frozenset))` is the set-constant arm. Its distinguishing job is DETERMINISM: set iteration order is not stable across interpreter runs, so the normalized elements are sorted by canonical JSON before encoding. Without that sort the manifest hash for identical code would differ between runs and every resume would be reported as untrusted. The two set carriers share the arm because they share the sorting treatment, and are then told apart on line 169. Invalidated if the canonical-JSON sort key were removed or made non-total.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:32.515355+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — the `isinstance` at lines 165–170 is explicit type discrimination in a heterogeneous code-constant normalizer, not a defensive re-check that hides a fixed-contract violation. The visible branch preserves the distinction between `set` and `frozenset` and sorts their recursively normalized elements with `_normalized_sort_key`, directly supporting the stated determinism purpose. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; the finding concerns intentional normalization dispatch over `value`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:205500c07e44a9b1c0013248ae93c968d456366ddc18cd26e843d4be10c7b916'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=51350aeb4ce5bee3
-  owner: john
-  reason: |-
-    R5 `isinstance(value, set)` inside the set-constant arm selects WHICH of the two set carriers is being encoded, choosing the `"set"` or `"frozenset"` key. It matters because a mutable set and a frozenset with equal contents are different constants in the source, and encoding both identically would let a `set` literal be edited to a `frozenset` without changing the manifest hash -- exactly the code drift the resume-trust manifest exists to detect. Invalidated if the distinction stopped being semantically meaningful in the hashed constants.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:38.164617+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(value, set)` is not defensively revalidating a fixed contract or masking a violation; after the explicit `(set, frozenset)` dispatch at line 165, it selects the exact carrier tag for manifest encoding. The visible branches preserve the semantically meaningful distinction between mutable `set` and immutable `frozenset`, ensuring that changing the constant’s carrier changes the manifest hash. The value is a code constant rather than Tier-3 input, so the trust-boundary decorator does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[3]/body[2]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:6b920423a1dbe9dc17ee9c3e022d4fccf491ae241e8fa8d2ec2292b243276717'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=517cd7889589fb55
-  owner: john
-  reason: |-
-    R5 `isinstance(value, CodeType)` is the first arm of `_try_normalize_code_constant`, the walker that renders a function's `co_consts` into a deterministic JSON tree for the Runtime-VAL resume-trust manifest. A nested code object -- a comprehension, lambda, or nested def -- must be recursively normalized rather than encoded by identity, because a CodeType's repr and id change on every interpreter run and would make the manifest hash nondeterministic, breaking the resume comparison this module exists to serve. The subject is an owned CPython runtime object obtained by introspection, never external data. Invalidated if code objects stopped appearing in the constants the manifest hashes.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:36.407153+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — `_try_normalize_code_constant` intentionally discriminates among the heterogeneous runtime values permitted in `co_consts`; `isinstance(value, CodeType)` selects the recursive, deterministic representation for nested code objects rather than masking a contract violation. The rationale is site-specific and consistent with the visible recursive normalizer, whose parameter is typed as `object` and whose subsequent branches likewise classify tuples, lists, sets, dictionaries, bytes, and patterns. This is owned runtime introspection rather than a Tier-3 parameter boundary, so the structural decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:3bcf83d323951fc2cdf194625eecea10ae73bf41ace3994e17ca8fa32e1a10fb'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=5ccd918f37981a38
-  owner: john
-  reason: |-
-    R5 `isinstance(value, (str, int, float, bool))` is the JSON-primitive passthrough arm, returning the value unchanged. Its placement is the substantive part: it sits BELOW the bytes, regex, complex and slice arms so those richer types are reified first, and bool is named explicitly alongside int even though bool subclasses int, because both are JSON primitives that encode directly and no separate treatment is needed. Invalidated if any primitive acquired a required encoding wrapper -- for example if float NaN needed rejecting here, as it is elsewhere in the contracts layer.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:49.181495+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is an intentional type-dispatch arm in a serializer for heterogeneous Python code constants, not a defensive re-check of data governed by a fixed contract. The visible preceding arms normalize richer supported types before this arm passes JSON primitives through unchanged, while later arms handle other explicitly supported forms. The code therefore uses runtime shape discrimination as the algorithm itself and does not coerce, fabricate, or conceal a contract violation; the site-specific rationale accurately explains that ordering.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[9]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:d1e4f1030f4b3fd784d1e49d1360f3c8d99d269be94e8495e5f0b95c015d15d1'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=6585dbab9b89b1f7
-  owner: john
-  reason: |-
-    R5 `isinstance(value, complex)` encodes a complex constant as its real/imaginary pair. complex is not JSON-encodable, so without this arm the constant would reach `_UNSUPPORTED_MANIFEST_VALUE` and raise. Splitting into two floats is the total, lossless form. Invalidated if complex constants stopped occurring in hashed code, at which point the arm would be dead rather than wrong.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:16.712485+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is a deliberate type-dispatch arm in a heterogeneous code-constant normalizer, not a defensive re-check that masks a fixed-contract violation. The visible neighboring arms likewise produce explicit tagged representations, and the complex arm preserves both real and imaginary components in JSON-encodable form rather than suppressing, defaulting, or fabricating data. This is not an R1/R5 external-parameter boundary case requiring the decorator.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[7]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:1d70958362469bbb2f98c0c9922795f51e61b2181f6a757e3b9d73ba572a87f2'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=7ad80687755b7e44
-  owner: john
-  reason: |-
-    R5 `isinstance(value, bytes)` encodes a bytes constant as hex. It is required because bytes are not JSON-encodable at all; without this arm a bytes literal would fall through to `_UNSUPPORTED_MANIFEST_VALUE` and `_normalize_code_constant` would raise FrameworkBugError, making any function with a bytes constant unhashable and therefore unresumable. Hex is chosen over a text decode because it is total -- arbitrary bytes have no guaranteed text form. Invalidated if a lossy encoding were substituted, which would let two different byte strings hash alike.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:49.701342+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is explicit type discrimination in a code-constant normalizer, not a defensive re-check that masks a fixed-contract violation. The visible function accepts `object` and dispatches across supported constant types; the bytes arm preserves arbitrary byte values losslessly as hex, while unsupported types propagate `_UNSUPPORTED_MANIFEST_VALUE`. The value is not external Tier-3 input rooted at a boundary parameter, so the `@trust_boundary` decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[5]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2340865be22c7587d0643720bc47999713abaee4891a2f8cb5213901096e30e9'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=a5b48363893e2000
-  owner: john
-  reason: |-
-    R5 `isinstance(value, dict)` is the dict-constant arm. Keys and values are normalized independently and the resulting pairs sorted by canonical JSON, because dict constants may be built from unordered sources and the encoding must be order-independent for the hash to be stable. It also propagates unsupported keys OR values, so a dict with one unencodable member fails loudly rather than being partially hashed. Invalidated if the pair sort were removed, which would reintroduce order-dependence into the manifest hash.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:52:53.625820+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `_try_normalize_code_constant` accepts `object` and uses `isinstance(value, dict)` as the dict arm of explicit runtime variant discrimination, not as a defensive re-check of a guaranteed fixed contract. The visible code recursively normalizes both keys and values, propagates `_UNSUPPORTED_MANIFEST_VALUE` if either member is unsupported, and sorts the normalized pairs for deterministic encoding, so the check neither masks a contract violation nor partially fabricates a result. This is not an external-parameter Tier-3 boundary case requiring `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:4a947bfded96c0fe1a7cb00677199b5548bd37d0f3474195ffa5ef5dca0efe05'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=ad12fe2909cb1261
-  owner: john
-  reason: |-
-    R5 `isinstance(bound_owner, type)` handles the builtin whose `__module__` is not a string -- a builtin BOUND to a class, such as `dict.fromkeys` -- by recording the owner's type identity plus the method name. The arm is the narrower of two exits: if the receiver is not a class the builtin cannot be statically identified at all and `_UNSUPPORTED_MANIFEST_VALUE` is returned, which raises upstream rather than recording a guess. That refusal is the point -- an unidentifiable dependency must not be silently omitted from the manifest. Invalidated if bound builtins on non-class receivers became encodable.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:01.849470+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` discriminates a legitimate runtime variant of `BuiltinFunctionType.__self__`; it does not defensively re-check a shape guaranteed by an ELSPETH contract or conceal a contract violation. The rationale’s control-location claim is verified in the excerpt: `_try_normalize_code_constant` returns `_UNSUPPORTED_MANIFEST_VALUE` for a non-class receiver, and the named `_normalize_code_constant` gate at lines 233-239 converts that refusal into `FrameworkBugError`, preventing silent omission or guessed manifest data. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[20]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:48f508ef5cd8c7896fe1904c794e643ade9046c99de56c927e9cadd86322b5d7'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=adce79444def12e6
-  owner: john
-  reason: |-
-    R5 `isinstance(value, list)` is the list-constant arm, structurally parallel to the tuple arm above but a separate carrier: a list and a tuple with identical contents encode under different keys (`{"list": ...}` versus `{"tuple": ...}`) so that a literal changing carrier changes the manifest hash. It applies the same all-or-nothing unsupported propagation. Invalidated if the two carriers were ever collapsed into one encoding, which would make a real code change invisible.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:06.014951+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — `value` is deliberately an `object` whose concrete carrier is part of the manifest semantics, not Tier-2 data with a fixed list contract being defensively revalidated. The visible tuple and list branches preserve that distinction through separate `{"tuple": ...}` and `{"list": ...}` encodings, while both propagate unsupported nested values without coercing or fabricating data. This R5 check is therefore type discrimination for a heterogeneous normalization routine and does not mask a contract violation; the function is not shown to be a Tier-3 external-data boundary suitable for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:08a89a098ae996004a36c090bf726c17f709f126c11d05fc0cda212855d58ea1'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=b23dade3d380804f
-  owner: john
-  reason: |-
-    R5 `isinstance(value, type)` encodes a class constant as a `_type_identity` string (module:qualname). Its ORDER is the substance: it sits after the `get_origin` check and the typing-special-form lookup above it, because parameterized generics and typing special forms are also `type` instances in some interpreter versions and would be flattened to a bare class identity by this arm if it ran first -- losing the type arguments that distinguish `list[int]` from `list[str]` in the manifest. Invalidated if this arm were moved above the generic/special-form handling.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:34.032802+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance(value, type)` discriminates one legitimate member of the heterogeneous code-constant domain so it can be encoded as a stable type identity; it is not defensively rechecking a fixed Tier-1/Tier-2 contract or hiding malformed data. The visible ordering preserves parameterized annotations and typing special forms before the broader class case, while unsupported values propagate to `_normalize_code_constant`, which raises `FrameworkBugError` rather than silently recovering. The site is not an external-parameter boundary eligible for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[18]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:1fc44ce1d67d073d463d9dd3e9a2a427a2d6626b2753d5abd036724ee6706fb5'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=d4e4c3216d89fb51
-  owner: john
-  reason: |-
-    R5 `isinstance(value, BuiltinFunctionType)` encodes a builtin as a `module:qualname` identity. Builtins are C-level and have no Python source to hash, so identity is the only available encoding; recording it (rather than rejecting) is what lets an owned function that calls `len` or `json.dumps` be hashed at all. Invalidated if builtins acquired a hashable implementation, or if a builtin's identity string stopped uniquely determining its behaviour.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:35.756602+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is a deliberate variant discriminator in a normalizer whose input contract is `object`, not a defensive re-check of a guaranteed Tier-1/Tier-2 shape. The visible code encodes supported builtin functions by identity and returns `_UNSUPPORTED_MANIFEST_VALUE` otherwise; `_normalize_code_constant` then converts that sentinel into a `FrameworkBugError`, so unsupported owned constants are not silently coerced or concealed. The rationale specifically explains why builtin identity is the available deterministic representation, and the finding is not an external-parameter trust-boundary case suited to `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[20]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:bc4772c6e73d00954720458618078c7e398c8a022eea2a3ad490f386d6892240'
-- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=e474270be80c31ec
-  owner: john
-  reason: |-
-    R5 `isinstance(value, re.Pattern)` reifies a compiled regex constant into its pattern string and flags. This is load-bearing for the manifest's purpose: a compiled pattern is an opaque object whose identity says nothing about its content, so without unpacking it an edit to a validation regex would leave the manifest hash unchanged and a resumed run would trust code that had actually changed. Invalidated if `flags` stopped being part of the encoding, since the same pattern text under different flags matches differently.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:41.421484+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    RULE MISFIRES — `_try_normalize_code_constant` deliberately accepts heterogeneous `object` values and uses runtime type discrimination to produce a canonical manifest encoding; this is not a defensive re-check of a guaranteed regex contract. The flagged branch preserves both `value.pattern` and `value.flags`, so changes that affect matching semantics also affect the manifest hash, while unsupported pattern contents remain explicitly unsupported rather than being silently coerced or fabricated. This site is not a Tier-3 parameter boundary eligible for the decorator.
-  judge_signature_version: 2
-  scope_fingerprint: 1a88e16cf5f5b3c4df3570f1c13f802eb182f86abddf77242fa60cde67026448
-  judge_transport: codex_cli
-  ast_path: 'body[28]/body[6]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:b38cf5887819fcfe214d638152a93c74025eb622c939c13277f79cef1f668514'
-- key: contracts/runtime_val_manifest.py:R5:_typing_special_form_name:fp=0487eb775a759993
+  ast_path: 'body[46]/body[0]/body[3]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:913c736e30d7538ad47a6b2b12add90294ba59731acaaf052795baa792119952'
+- key: contracts/runtime_val_manifest.py:R5:_typing_special_form_name:fp=351e1d786ea31a67
   owner: john
   reason: |-
     R5 `not isinstance(module, ModuleType)` guards a `sys.modules` lookup in `_typing_special_form_name`. It is required because `sys.modules` legitimately holds None for a module whose import is in progress (the import machinery's placeholder), and under test doubles can hold arbitrary stand-in objects; the arm skips those before the module's namespace is taken. This same-lane change replaced the site's former `inspect.getattr_static` probe with `vars(module)` membership on the following line, so this isinstance is now precisely what makes that `vars()` call safe -- `vars()` on a non-module would raise TypeError. The subject is an owned interpreter object, not Tier-3 data. Invalidated if the loop stopped reading from `sys.modules`, or if the body stopped calling `vars()` on the result.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:54:13.844403+00:00'
+  judge_recorded_at: '2026-09-07T23:51:38.468040+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.91
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the visible code reads a heterogeneous interpreter registry, and the rationale plainly states that this lookup can legitimately produce `None`, so a `ModuleType` is not guaranteed at this point and R5's fixed-contract premise is false. The check discriminates the registry value before the subsequent `vars(module)` operation; it neither coerces a first-party Tier-2 value nor fabricates pipeline data. `_typing_special_form_name` has no external-data parameter from which the finding is rooted, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — `sys.modules` does not provide a fixed `ModuleType` contract at this site and may legitimately yield `None`, so the check discriminates the runtime registry's permitted shapes rather than masking an ELSPETH-owned contract violation. The visible code confirms that only a real module proceeds to `vars(module)`, while other registry values are skipped as unavailable candidates during optional special-form discovery. This R5 subject is derived from `sys.modules`, not from an external parameter of the function, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 93e95dde4688aff4bcce498f0d2f93b73e347f5ff03b1fd71bd845ac0819858d
   judge_transport: codex_cli
-  ast_path: 'body[27]/body[0]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:26115e6851404cc5c2c3ea1525f3a133142a8301b4d4ca9af8dada71e8e9b726'
-- key: contracts/runtime_val_manifest.py:R5:_unwrap_callable:fp=48dd0980ccaf1c90
+  ast_path: 'body[32]/body[0]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:12eaa43eca9ff64dff47173bb7f346302f9dd06e313df816d642506863a74caa'
+- key: contracts/runtime_val_manifest.py:R5:_unwrap_callable:fp=406a8e56e3b2dbfe
   owner: john
   reason: |-
     R5 `elif isinstance(attribute, property)` unwraps a property to its getter (`fget`). A property's getter is real Python code whose change must be caught by the manifest, and like the method descriptors above it the property object itself is not a function. `fget` alone is unwrapped (not fset/fdel) because only the read path participates in the dependency graph this module builds. Invalidated if setter or deleter code became behaviourally relevant to the manifest.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:44.473561+00:00'
+  judge_recorded_at: '2026-09-07T23:51:54.960721+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance(attribute, property)` is explicit descriptor-kind discrimination used to unwrap heterogeneous class attributes for manifest hashing, not a defensive re-check that hides a fixed-contract violation. The visible branch extracts `property.fget`, after which `inspect.isfunction(candidate)` determines whether the read-path code participates in the dependency graph; this directly supports the site-specific rationale and does not coerce, fabricate, or suppress an invalid value. The value is not Tier-3 data rooted in an external function parameter, so the trust-boundary decorator contract does not apply.
+    RULE MISFIRES — the `isinstance(attribute, property)` branch discriminates among concrete Python descriptor kinds so the manifest can extract the getter code used by its read-path dependency graph; it does not defensively revalidate data under a fixed contract or mask a contract violation. The visible code consistently unwraps `staticmethod` and `classmethod` through `__func__`, unwraps a property through `fget`, and then admits only actual functions. This is not a Tier-3 parameter boundary eligible for `@trust_boundary`, because `attribute` is descriptor metadata being classified rather than external-origin data being promoted.
   judge_signature_version: 2
   scope_fingerprint: e1cf9d9a9763c636a38f793a0bc8cbe8d8d8a8deaaabf2fc6c14eec799819625
   judge_transport: codex_cli
-  ast_path: 'body[42]/body[1]/orelse[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:982aa990dcbb5e2f6272a21dd7381ed324c561eadaefc3459704a7ffc168dbf4'
-- key: contracts/runtime_val_manifest.py:R5:_unwrap_callable:fp=5d899aca9524e554
+  ast_path: 'body[48]/body[1]/orelse[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:362fd462b22f59ffcd3ebf418ef8ba3aff48424339ceda9389343a3156d99407'
+- key: contracts/runtime_val_manifest.py:R5:_unwrap_callable:fp=7d136aa9a56e04fe
   owner: john
   reason: |-
     R5 `isinstance(attribute, (staticmethod, classmethod))` unwraps a method descriptor to the underlying function via `__func__`. It is required because a `staticmethod` or `classmethod` object retrieved from a class `__dict__` is NOT itself a function -- `inspect.isfunction` is False for it -- so without unwrapping, every static and class method would be treated as an opaque value and its implementation would never be hashed, leaving a whole category of code changes invisible to resume trust. Invalidated if these descriptors stopped exposing `__func__`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:47.864849+00:00'
+  judge_recorded_at: '2026-09-07T23:52:14.492233+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this is explicit nominal dispatch over class-namespace entries, not a defensive re-check that masks a fixed-contract violation. The visible code retrieves attributes from class `__dict__` through `_static_class_attribute`, where `staticmethod` and `classmethod` descriptors legitimately require unwrapping through `__func__` before `inspect.isfunction` can recognize and hash their implementations. The rationale is site-specific and explains the resume-trust integrity consequence of omitting this branch; no silent coercion, fallback, or contract-violation suppression occurs. The function does not take Tier-3 data as a parameter, so the trust-boundary decorator contract is inapplicable.
+    RULE MISFIRES — this `isinstance` performs declared discrimination among Python descriptor kinds in a deliberately heterogeneous class-attribute inspection path; it does not defensively re-check data whose fixed contract guarantees a function. The visible code confirms that `_static_class_attribute` retrieves raw values from a class `__dict__`, while `_unwrap_callable` extracts `__func__` from `staticmethod` and `classmethod` descriptors before applying `inspect.isfunction`, exactly matching the site-specific rationale. This is neither silent recovery nor coercion of malformed Tier-2 data, and the finding is not rooted in an external parameter eligible for `@trust_boundary`.
   judge_signature_version: 2
   scope_fingerprint: e1cf9d9a9763c636a38f793a0bc8cbe8d8d8a8deaaabf2fc6c14eec799819625
   judge_transport: codex_cli
-  ast_path: 'body[42]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:46e7451a8b2a6bf7031f2719762a229b6d162464c9fb31c74bce8879dd347b79'
-- key: contracts/runtime_val_manifest.py:R6:_owned_instance_state:fp=61e6481b8e208487
+  ast_path: 'body[48]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:cf6fdcab40d0faac11fcce6e32fa0ec44538a4bfbb3c473075088b5ad4dfb24a'
+- key: contracts/runtime_val_manifest.py:R6:_owned_instance_state:fp=aa516b866a518a1f
   owner: john
   reason: |-
     R6 `except TypeError: state["dict_unavailable"] = True` in `_owned_instance_state`. This is the plan's stated J condition met exactly: the exception outcome is REIFIED into the manifest hash input. `state` is the value this function returns and it feeds the dependency payload that is hashed, so the fact that a candidate has no instance `__dict__` is recorded as a distinguishable marker rather than swallowed -- an object with no dict and an object with an empty dict produce DIFFERENT manifest hashes, which is what a silent `except: pass` would destroy. `vars()` raising TypeError is Python's documented signal for the no-dict case, so this is a capability probe whose result is data. Invalidated if the branch stopped writing a distinguishable marker into `state` and fell through silently, or if `state` stopped feeding the hash input.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:49.792993+00:00'
+  judge_recorded_at: '2026-09-07T23:52:34.687141+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — the TypeError is not silently discarded: `_owned_instance_state` records `{"dict_unavailable": true}` in its returned state, explicitly distinguishing an unavailable instance dictionary from an empty one. The visible code therefore establishes an explicit result for the expected `vars(candidate)` capability failure, directly addressing R6's concern without fabricating instance state. The decorator alternative does not apply because this is R6, not R1 or R5.
+    RULE MISFIRES — the caught TypeError is not silently swallowed: `_owned_instance_state` records `dict_unavailable: True` in the returned state. The visible code makes the no-`__dict__` outcome distinguishable from an empty instance dictionary, directly addressing R6's requirement for an explicit result. The decorator alternative does not apply because this is R6, not R1 or R5.
   judge_signature_version: 2
   scope_fingerprint: 7568007f48e8ad5f42ac36ba80eb0b1aa9fc81ee132f57eca24126ce2ff15238
   judge_transport: codex_cli
-  ast_path: 'body[59]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8a9ff6cb267e73d3d037639a2387319bc24bcaf33c1782ca2b2af256fbb7ca08'
-- key: contracts/runtime_val_manifest.py:R6:_owned_instance_state:fp=b17e0ce2cab92466
+  ast_path: 'body[65]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:90bd1df6857917d7a5516f68ed57fb31fbf72fbca3e0ac7a6179e366f49c1be0'
+- key: contracts/runtime_val_manifest.py:R6:_owned_instance_state:fp=b0a614486794479a
   owner: john
   reason: |-
     R6 `except AttributeError: slot_state[slot_name] = {"uninitialized_slot": True}` in `_owned_instance_state`. Like the sibling at line 1022 this meets the plan's stated J condition: a slot descriptor raises AttributeError precisely when the slot was never assigned, and that fact is REIFIED as an explicit `uninitialized_slot` marker in `slot_state`, which is part of the returned `state` and therefore part of the manifest hash input. The distinction matters -- an unset slot and a slot set to None must not hash alike -- and a bare `continue` here would erase it, letting an object's state change without changing its manifest hash. Invalidated if the marker were replaced by a silent skip, or if `slot_state` stopped contributing to the hash.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:53:54.413869+00:00'
+  judge_recorded_at: '2026-09-07T23:52:56.144172+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the caught AttributeError is not silently discarded; `_owned_instance_state` reifies it as an explicit `{"uninitialized_slot": true}` result under the affected slot key. The visible code preserves the distinction between an uninitialized slot and a slot whose value is `None`, and includes `slot_state` in the returned state, directly addressing R6's requirement for an explicit error result. This is not a Tier-3 decorator case because the finding is R6, not R1 or R5.
+    PRESCRIBED FORM — the caught AttributeError from a MemberDescriptorType slot lookup is not silently discarded: the code reifies it as an explicit `{"uninitialized_slot": true}` value under that slot’s identity and includes `slot_state` in the returned state. This preserves the observable distinction between an uninitialized slot and one explicitly assigned `None`, directly addressing R6’s requirement for an explicit result rather than silent recovery. The excerpt independently supports the site-specific rationale, and R6 is not eligible for the trust-boundary decorator.
   judge_signature_version: 2
   scope_fingerprint: 7568007f48e8ad5f42ac36ba80eb0b1aa9fc81ee132f57eca24126ce2ff15238
   judge_transport: codex_cli
-  ast_path: 'body[59]/body[4]/body[1]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:72fc814176364eefb301e26b25c44f7e65952c8898cb0e376144e0f110c387df'
-- key: contracts/runtime_val_manifest.py:R6:_resolve_static_attribute:fp=0524c9ae2be0c0b0
+  ast_path: 'body[65]/body[4]/body[1]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:718d9ca1bbd2e4d91bc69f20fd80f9718a9ab95e1510fa65443ba251cb3ae71b'
+- key: contracts/runtime_val_manifest.py:R6:_resolve_static_attribute:fp=07ed61af77f66cbe
   owner: john
   reason: |-
     R6 `except TypeError: namespace = {}` around `vars(owner)` in `_resolve_static_attribute`. The plan's default for this file's R6 sites is F, and this one is recorded as a deliberate exception with the reasoning stated for adjudication. `vars()` is DOCUMENTED to raise TypeError exactly when an object has no `__dict__`, so the except clause here is Python's sanctioned capability test, not an error being swallowed: both outcomes -- 'no instance dict' and 'name not in the instance dict' -- converge on the same next step, `_static_class_attribute(type(owner), name)`, so no information is lost and no failure is hidden. The only membership form available is `type(owner).__dictoffset__`, a CPython implementation detail with no language guarantee that is additionally WRONG for a slots class exposing `__dict__` via a descriptor; substituting it would trade a documented test for an obscure and less correct one, which the plan's own 'honest fix beats churn' constraint forbids. Invalidated if a sanctioned, total membership test for instance-dict capability entered the language, or if the two branches stopped converging -- for instance if the no-dict case ever needed recording in the manifest the way `_owned_instance_state` records `dict_unavailable`.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-06'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T11:54:34.251439+00:00'
+  judge_recorded_at: '2026-09-07T23:53:22.546312+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.95
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — the narrowly scoped `TypeError` from `vars(owner)` represents the documented absence of an instance `__dict__`, rather than an operational failure being silently hidden. The visible code shows that both an unavailable instance namespace and an available namespace lacking `name` intentionally proceed to `_static_class_attribute(type(owner), name)`, preserving the attribute-resolution semantics without fabricating a result. The site is not eligible for `@trust_boundary` because it is R6, not R1 or R5.
+    RULE MISFIRES — `vars(owner)` documents `TypeError` as the signal that `owner` has no instance `__dict__`, so this narrowly typed handler is a capability test rather than silent recovery from malformed data. Mapping that condition to an empty instance namespace preserves the lookup semantics: both an unavailable instance dictionary and an absent instance member correctly continue to `_static_class_attribute(type(owner), name)`, while other exceptions remain visible. R6 is not decorator-eligible, and the site neither fabricates data nor suppresses a fixed-contract integrity failure.
   judge_signature_version: 2
   scope_fingerprint: 6c6248cb245136c32d159fb98dd533bebaaa5b9355b224b3312809cec978f76e
   judge_transport: codex_cli
-  ast_path: 'body[52]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:0b0edd7c30b3070c44bc41c108c4d7f082289cdc2dfddeaef48b03e619fb39a6'
+  ast_path: 'body[58]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:4de766f39aadd292bfd42474a347669de374af799dd4989e567bb77236472178'
 - key: contracts/sink_effects.py:R5:_contains_restricted_reader:fp=4a17ac79e76e3f74
   owner: john
   reason: |-
@@ -4246,3 +3733,212 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[27]/body[2]/body[1]/test'
   judge_metadata_signature: 'hmac-sha256:v2:449e443a4dad99fcb1aa578389180f67a85ff161fff6ce68db6c0734799be2f8'
+- key: contracts/runtime_val_manifest.py:R1:_callable_dependency_hashes:fp=882ba68d8a9a9712
+  owner: john
+  reason: |-
+    RULE MISFIRES in _callable_dependency_hashes: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _callable_dependency_hashes keys callable_dependencies by (func, seen, owner_cls); a miss executes the same global and owner-binding traversal and only then records dependencies. Cached dictionary values are copied on return. The context lookup is not reading a dependency key and cannot fabricate a dependency omission. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:34.293792+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the flagged `.get()` is `ContextVar.get()`, not `dict.get()`, so R1's premise that a mapping lookup may hide a missing-key bug is false at this site. The visible code treats `None` as absence of the optional build-scoped cache and uses direct membership and subscript access for `cache.callable_dependencies`, consistent with the site being a context lookup rather than silent mapping recovery. No external source parameter or Tier-3 boundary is involved, so the decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 5fef4075b4b1ad1aa36806b58cd0602f4378099e2dd7df905125a40658e724ba
+  judge_transport: codex_cli
+  ast_path: 'body[68]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:27d465deb3d30da815e9f6e177bfa69782dd194166045b33a1c561c6a07eeae8'
+- key: contracts/runtime_val_manifest.py:R1:_callable_implementation_hash:fp=b780bd2eb1a43d35
+  owner: john
+  reason: |-
+    RULE MISFIRES in _callable_implementation_hash: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _callable_implementation_hash keys the optional callable_hashes memo by (func, seen), otherwise computes _json_hash(_callable_implementation_payload(...)) and only then caches that hash. Disabling the memo changes work performed, not the manifest identity or error policy. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:34.281483+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged call is ContextVar.get() on _MANIFEST_BUILD_CACHE, not dict.get() on a schema or audit record, so R1's missing-key premise does not apply. The visible code treats the returned None as absence of an optional build-scoped memoization cache and computes the implementation hash normally before conditionally caching it; it neither fabricates evidence nor suppresses a missing-field failure. No external parameter or Tier-3 boundary is involved, so the trust-boundary decorator is inapplicable.
+  judge_signature_version: 2
+  scope_fingerprint: e57497da16996d1c93622e4d88d12413d86370b5a856bc44cae80df8d44e71d3
+  judge_transport: codex_cli
+  ast_path: 'body[45]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:201d6323b1b096a1ac2b5145c06116feb5a6216aff7c2bafa3fc660ec7b5f1d9'
+- key: contracts/runtime_val_manifest.py:R1:_callable_implementation_payload:fp=3813e83c613448b0
+  owner: john
+  reason: |-
+    RULE MISFIRES in _callable_implementation_payload: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _callable_implementation_payload keys its optional memo by (func, seen_function_ids, seen_dependency_ids); a miss computes identity, code, defaults, annotations and closure through their normal normalization functions, then stores the completed payload. No missing contract field is given a default. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:40.317660+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged `.get()` is invoked on `_MANIFEST_BUILD_CACHE`, not on a dictionary, and the subsequent attribute access to `cache.callable_payloads` is consistent with the stated `ContextVar[_ManifestBuildCache | None]` contract. The optional `None` state only disables build-scoped memoization; the payload is still computed through the normal path, so no required field is hidden, defaulted, or fabricated. No Tier-3 parameter is involved, and the trust-boundary decorator contract does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 5d7492200d225bbbfac32c41e4385e542728413080e14e4cf328499da239bbcd
+  judge_transport: codex_cli
+  ast_path: 'body[44]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:79bd1cea8c97996e6a886f26011332459cf43fe52010bcf1431fcc1eae24f8db'
+- key: contracts/runtime_val_manifest.py:R1:_class_source_hash:fp=e82bcbf73a5ef074
+  owner: john
+  reason: |-
+    RULE MISFIRES in _class_source_hash: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _class_source_hash looks up class_source_hashes only when the context and exact class key exist; otherwise inspect.getsource is parsed, docstrings are stripped, and the AST is hashed. Source unavailability raises FrameworkBugError rather than returning a cached-default hash. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:39.828077+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged expression calls `_MANIFEST_BUILD_CACHE.get()` with no key or default, and the subsequent attribute accesses show that its result is an optional cache object rather than a mapping field. The visible code treats `None` as absence of build-scoped memoization, computes the class hash from source on a cache miss, and raises `FrameworkBugError` if source is unavailable, so it neither hides a missing key nor fabricates audit evidence. No external parameter is involved, so the `@trust_boundary` alternative does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 4e670aaac32014955c6ff07a7b80aa0777bfdae2a0e749714684e495e394edc2
+  judge_transport: codex_cli
+  ast_path: 'body[47]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:a1175b8b73768e968258ca8df306beb16e5391aa0336eac01e48ba00a8814c2e'
+- key: contracts/runtime_val_manifest.py:R1:_instructions:fp=1502b4c6c10312c0
+  owner: john
+  reason: |-
+    RULE MISFIRES in _instructions: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _instructions explicitly computes tuple(dis.get_instructions(code)) when no cache exists; with a cache it memoizes the same instruction tuple by CodeType. This selects an optimization policy and cannot create an empty instruction stream from absence. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:26.614067+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged call is ContextVar.get(), not dict.get(), so R1's missing-key premise does not apply. The visible declaration establishes a deliberate default of None, and _instructions handles that state by computing the full instruction tuple rather than fabricating or silently omitting data. No Tier-3 parameter or eligible structural trust-boundary case is present.
+  judge_signature_version: 2
+  scope_fingerprint: 2a6b9ae21aaaaf01979aebed6f2c4010870918f9b8e82625663cf66c3239d3b8
+  judge_transport: codex_cli
+  ast_path: 'body[25]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:6703dbd42d12fdcc9383186fb7739c90096b13652bb1f19ed6c5a47d9226ee7d'
+- key: contracts/runtime_val_manifest.py:R1:_instructions:fp=e6fec47ebf9ccc05
+  owner: john
+  reason: |-
+    RULE MISFIRES: cache.instructions.get(code) in _instructions probes a deliberately partial memo table, _ManifestBuildCache.instructions, whose field default is an empty dict. No key is required before first use. None takes the explicit miss path that computes tuple(dis.get_instructions(code)), writes that tuple to the same code key, and returns it; an empty instruction tuple remains a valid cached value because the branch tests is None. No instruction, hash, or audit value is fabricated. This is an owned cache lookup, not external-data parsing, so a Tier-3 boundary annotation would misstate its source.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:29.635967+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: `cache.instructions` is a deliberately partial memoization table, so the presence of a `CodeType` key is not guaranteed before first use and `.get(code)` expresses a legitimate cache lookup rather than hiding a missing required field. The visible miss path computes `tuple(dis.get_instructions(code))`, stores it under that key, and returns it, while `is None` preserves an empty tuple as a valid cached value. This is owned cache state rather than Tier-3 input, and `_instructions` has no external-data parameter, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 2a6b9ae21aaaaf01979aebed6f2c4010870918f9b8e82625663cf66c3239d3b8
+  judge_transport: codex_cli
+  ast_path: 'body[25]/body[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:432ea47c7dcfe6e8dbaa87848ac0ed8f36bcfd9d5ff3e27dd9de81cdac76d11a'
+- key: contracts/runtime_val_manifest.py:R1:_iter_relevant_method_dependency_hashes:fp=96a8f2e8b21eed5b
+  owner: john
+  reason: |-
+    RULE MISFIRES in _iter_relevant_method_dependency_hashes: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _iter_relevant_method_dependency_hashes keys method_dependencies by (cls, normalized method names, seen); without an entry it resolves each static callable and calls _callable_dependency_hashes with the appropriate owner class. It records nonempty dependency results or explicit recursion markers, then caches the completed mapping. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:29.071572+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged `.get()` is `_MANIFEST_BUILD_CACHE.get()`, a context lookup rather than `dict.get()`, so R1's premise that a missing mapping key may be hidden is false. The visible code treats `None` as absence of an optional build-scoped cache and otherwise performs explicit membership checks before direct cache indexing; no external-data parameter or Tier-3 boundary is involved.
+  judge_signature_version: 2
+  scope_fingerprint: 4e6b3bfe822eb232f8509fc5c1866844daff7af9f3cf925e8d9fee01cd515236
+  judge_transport: codex_cli
+  ast_path: 'body[73]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:447042fdf0c4433b1b99ea9e596253307cf7a1925fb32cfafaa2182273e8e0a6'
+- key: contracts/runtime_val_manifest.py:R1:_iter_relevant_method_hashes:fp=f648bc5803832a53
+  owner: john
+  reason: |-
+    RULE MISFIRES in _iter_relevant_method_hashes: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _iter_relevant_method_hashes derives the method-name set before consulting the context; its memo key is (cls, tuple(names), seen). A miss iterates static attributes, unwraps actual callables and computes implementation hashes or explicit cycle-reference markers. Context absence cannot bypass this traversal. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:33.213362+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged expression is a zero-argument `_MANIFEST_BUILD_CACHE.get()` context lookup, not `dict.get(key[, default])`, so R1's missing-key premise is false at this site. The visible code treats the returned optional cache explicitly and computes method hashes normally when it is absent; no external parameter or Tier-3 boundary is involved.
+  judge_signature_version: 2
+  scope_fingerprint: 6db3a6f962806c21dbd55c900eb2dfcfb3be4e5f33e702c9d738cc48d3f88bd8
+  judge_transport: codex_cli
+  ast_path: 'body[72]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:e50b1954dbb6b7af002079faf0320094798bce4ed8e259ecc2a78113c50ba382'
+- key: contracts/runtime_val_manifest.py:R1:_normalize_class_binding:fp=da3a66f319df7b45
+  owner: john
+  reason: |-
+    RULE MISFIRES in _normalize_class_binding: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _normalize_class_binding includes cls, owner_module, binding_name, attribute_names, directly_called and seen in its memo key. Without a cached result it follows the normal owned/external-class classification and resolves the actual bound attributes; stored mapping results are copied on return. Context absence cannot conceal an unresolved binding. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:34:06.415002+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged expression is `_MANIFEST_BUILD_CACHE.get()`, a zero-argument context-variable lookup, not `dict.get()` on a schema field. The subsequent code treats the returned value as an optional build-scoped cache and performs explicit membership and keyed access on `cache.class_bindings`, consistent with absence merely disabling memoization rather than concealing missing data. No Tier-3 parameter or external-data boundary is involved, so the trust-boundary decorator is inapplicable.
+  judge_signature_version: 2
+  scope_fingerprint: 498dc52e87e265481ce68733a03699e8aac22fbf2f1f0e1343767bb4e38b857a
+  judge_transport: codex_cli
+  ast_path: 'body[54]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:29e944d5eed10ad79c993ed166e1501e74d5a223076d904988c7dccd45dad4ce'
+- key: contracts/runtime_val_manifest.py:R1:_normalize_code_object:fp=6b4092487d6b8601
+  owner: john
+  reason: |-
+    RULE MISFIRES in _normalize_code_object: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _normalize_code_object uses the cache only when code is present in normalized_code_objects; otherwise it constructs the complete instruction/argument/name/exception-table payload from the concrete CodeType and stores that actual result. A missing context never substitutes a hash or payload. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:34:56.571416+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the flagged receiver is a ContextVar[_ManifestBuildCache | None], as declared at contracts/runtime_val_manifest.py:125-128, so its get() reads execution-context state rather than performing the dict.get operation targeted by R1. The visible _normalize_code_object logic constructs the complete normalized payload on a cache miss or absent context and uses the cache only for memoization, so no required field, audit evidence, or malformed value is silently defaulted. build_runtime_val_manifest at contracts/runtime_val_manifest.py:1742-1773 also visibly validates registry state and resets the cache token in finally, consistent with the stated build-scoped lifecycle. No external source parameter or Tier-3 boundary is involved, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 6a8bb83715ba364a980f288e2633da69f65f954ecffe1b2565bcc6848bf82c47
+  judge_transport: codex_cli
+  ast_path: 'body[36]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:3cd04b67f965e700dadf771f750e19f7853bdee7c221ff1432ec525c1ce95ab4'
+- key: contracts/runtime_val_manifest.py:R1:_payload_schema_hash:fp=44075cfff229f235
+  owner: john
+  reason: |-
+    RULE MISFIRES in _payload_schema_hash: The receiver is _MANIFEST_BUILD_CACHE, declared in contracts/runtime_val_manifest.py as ContextVar[_ManifestBuildCache | None] with default=None; get() reads the active execution context, not a mapping field. build_runtime_val_manifest sets a fresh _ManifestBuildCache after _assert_runtime_val_registries_frozen and resets its ContextVar token in finally. None means no build-scoped memoization; it does not stand in for audit evidence. _payload_schema_hash consults payload_schema_hashes only for an existing exact schema key; otherwise it requires a TypedDict, resolves annotations and hashes required/optional keys plus _class_source_hash. Wrong schema kind and annotation-resolution failures raise FrameworkBugError. A missing cache context never creates a schema hash. No Tier-3 source parameter is involved in the flagged context lookup.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:33:59.012083+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the flagged `.get()` is `ContextVar.get()` on `_MANIFEST_BUILD_CACHE`, not `dict.get()` hiding a missing required key. The visible code treats `None` as absence of an optional build-scoped cache and still computes the schema hash through strict TypedDict validation, with malformed schema kinds or annotations raising `FrameworkBugError`. No Tier-3 parameter or suppressible dictionary access is involved, so the trust-boundary decorator is inapplicable.
+  judge_signature_version: 2
+  scope_fingerprint: f4763c651a053383d2ac3fa0f338561b541b78dec9966d16ec7746c5a84056b0
+  judge_transport: codex_cli
+  ast_path: 'body[74]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:634e066ccba7e7ef84403370895a402cc14ddc1150189092bd236791d27341ea'

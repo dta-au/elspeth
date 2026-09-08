@@ -211,27 +211,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[16]/body[7]/body[0]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:63dba691e23ead823ffe5f3fe2409542f45f89a254494fe7ed3980f0f38152c0'
-- key: engine/orchestrator/resume.py:R6:_derive_resume_failure_counter_baseline:fp=5bee3d44d5b0a4eb
+- key: engine/orchestrator/resume.py:R6:_derive_resume_failure_counter_baseline:fp=33f044ffecbc57e9
   owner: john
   reason: |-
-    This is a narrow prescribed-form suppression for transient database availability during best-effort FAILED-resume counter enrichment, not a Tier-1 audit-data violation. In `src/elspeth/engine/orchestrator/resume.py:453-464`, `_derive_resume_failure_counter_baseline` is explicitly documented as a `"Best-effort counter baseline for FAILED resume ceremony enrichment."` It catches only `OperationalError` at `line 457`, immediately after the read-only derivation call `derive_resume_terminal_status_from_audit(factory, run_id)` at `line 456`, and converts that boundary failure to the caller's explicit `None` sentinel at `line 464`.
-
-    The site-specific safety condition is encoded in the adjacent comment: `line 458` says this is `"Transient DB contention while reading the audit-cumulative baseline"`, while `lines 460-463` state that corruption/invariant signals from the derive, specifically `AuditIntegrityError` and `OrchestrationInvariantError`, `"must propagate"`. Because the `except` clause is only `except OperationalError:` and does not catch those integrity exceptions, future drift that broadens this catch or starts suppressing audit corruption would invalidate this justification.
+    _derive_resume_failure_counter_baseline derives optional audit-cumulative enrichment for the already-failed resume result. It catches only SQLAlchemy OperationalError, logs the failure with traceback and explicitly says counters degrade to resume-local partials, then returns the declared None sentinel. _resume_failure_result_from_baseline branches on None and returns the existing partial_result unchanged; it does not assert a reconstructed cumulative baseline. AuditIntegrityError and OrchestrationInvariantError remain uncaught. Do not claim OperationalError proves transient contention: it is the actual caught DB failure family. Tests: tests/unit/engine/orchestrator/test_resume_failure.py::TestResumeFailureCounterBaselineDegradation (all three tests passed).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:14:27.666929+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-09-08T00:55:34.604902+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. The except clause is narrowly typed to OperationalError only — a transient DB availability signal at an external-boundary read — and the comment explicitly documents that AuditIntegrityError and OrchestrationInvariantError are NOT caught and must propagate. The function's contract returns Optional[ExecutionCounters] with None as an explicit sentinel the caller handles (line 431-432 shows the caller branching on None to return partial_result). This is not silent swallowing: it is a typed peel-off of a recoverable transport-layer failure with an explicit sentinel documented in the signature, while audit-integrity failures still bubble. R6's concern (swallowing without explicit error result) does not apply — None here is the documented explicit result, not a fabricated default masking corruption.
+    PRESCRIBED FORM — the narrowly caught OperationalError produces the function’s declared None sentinel and records the degradation with traceback, while integrity and orchestration exceptions remain uncaught (engine/orchestrator/resume.py:486). The named control, _resume_failure_result_from_baseline, visibly handles None by preserving the existing partial_result, and that result is used only for the already-failing ceremony before the original processing error is re-raised (engine/orchestrator/resume.py:457 and engine/orchestrator/resume.py:1203). The named test class verifies the OperationalError sentinel/log behavior and propagation of both AuditIntegrityError and OrchestrationInvariantError (tests/unit/engine/orchestrator/test_resume_failure.py:2913); the decorator alternative is inapplicable because this is R6, not R1 or R5.
   judge_signature_version: 2
-  scope_fingerprint: af1b5c47052a03b38db8361a39d2707be56ec4001f27e7d7f912523dab994d0c
-  judge_transport: openrouter
+  scope_fingerprint: afe71e4127a79b8dd1be1267647d8e08c37916ebed7d16b5f01989b87fa2f814
+  judge_transport: codex_cli
   ast_path: 'body[46]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:741628e906f415c87bbebb59bc75ed04a5009f9e6a4c2a9f0849176730aa311f'
+  judge_metadata_signature: 'hmac-sha256:v2:b174f6eaa39d167687aeb0bc3fb0775812e2fd01628f979efec2709225b2561f'
 - key: engine/orchestrator/outcomes.py:R1:reconcile_sink_write_diversions:fp=378993383f347f66
   owner: john
   reason: |-
@@ -289,44 +287,6 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[7]/body[6]/body[0]/body[1]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:df8bf956bb08daef944c9f02b4542d89e737b25835aad91faa5813b35de60239'
-- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_beat_once:fp=aba06e134a3e70b9
-  owner: john
-  reason: |-
-    This is a prescribed fail-closed async-thread boundary, not a Tier-1 suppression. In `engine/orchestrator/heartbeat.py:317-326`, `_beat_once()` catches only `contract_errors.TIER_1_ERRORS`, stores the original exception with `self._fatal_exc = exc`, then sets `self._fatal_event.set()`. The enclosing function is explicitly a heartbeat thread tick that “NEVER raises” on its own stack, but its docstring says Tier-1 corruption is latched “for `check_and_raise()` to re-raise at the next drain boundary (fail closed)” (`engine/orchestrator/heartbeat.py:248-262`). That fail-closed handoff is implemented at `engine/orchestrator/heartbeat.py:223-228`: if the fatal latch is set, a missing exception raises `OrchestrationInvariantError`, otherwise it executes `raise self._fatal_exc`. This ACCEPT depends on the exact latch-and-reraise shape remaining intact; if future code logs and continues without `self._fatal_exc = exc`, `self._fatal_event.set()`, and `raise self._fatal_exc`, this finding should BLOCK.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:15:34.931116+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The R6 pattern (except that doesn't re-raise) fires by shape, but the code implements the policy-prescribed latch-and-defer for an async thread that structurally cannot raise on its own stack: the Tier-1 exception is stored on `self._fatal_exc`, `self._fatal_event.set()` latches the failure, and per the rationale `check_and_raise()` re-raises at the next drain boundary — this is a type/routing match (Tier-1 error preserved, surfaced synchronously later), not a swallow. The excerpt shows the assignment, the event set, and an `exc_info=exc` log; nothing contradicts the claimed handoff. This is the correct shape for cross-thread Tier-1 propagation where a raise on the heartbeat stack would be lost.
-  judge_signature_version: 2
-  scope_fingerprint: d7a98ed29978325a22083757a9b9eafa6ed1e45569a4335ab8915db886c5d627
-  judge_transport: openrouter
-  ast_path: 'body[17]/body[7]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:46697c40fc2139d73d30f3ae2cf3a2da9e3af770aacaefda836bb11b14a201c5'
-- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_beat_once:fp=619f9303b823e9dd
-  owner: john
-  reason: |-
-    This suppression is legitimate for the heartbeat liveness boundary, not a Tier-1 audit-data violation. In `RunHeartbeatThread._beat_once`, the site explicitly separates Tier-1 integrity failures from SQLite contention: lines 317-326 catch `contract_errors.TIER_1_ERRORS`, store `self._fatal_exc`, set `self._fatal_event`, and later `check_and_raise()` re-raises at the drain boundary. The R6 site at line 333 is narrower: `except OperationalError as exc:` is documented by the function contract as `SQLITE_BUSY OperationalError -> liveness-unknown` and the handler only increments the degraded counter, logs the busy condition, and emits degraded telemetry after threshold. The future-drift-sensitive boundary is the exact line 333 handler paired with lines 334-345: if it starts catching Tier-1 exceptions, mutating audit state, or treating repository corruption as busy, this rationale no longer applies.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T13:15:42.802676+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.83
-  judge_rationale: |-
-    PRESCRIBED FORM. The R6 site at line 333 catches the narrow, expected SQLITE_BUSY OperationalError, which the design classifies as liveness-unknown — the handler increments a degraded counter, logs, and emits degraded telemetry after threshold, which is an explicit non-silent outcome rather than a swallow. Tier-1 integrity errors are handled separately at lines 317-326 by latching to _fatal_exc/_fatal_event for check_and_raise() to re-raise at the drain boundary, so this handler is not laundering audit-integrity failures. The exception type is correctly matched to the structural routing: recoverable contention is peeled off here, Tier-1 bubbles via the latch. The rationale is site-specific and names the exact drift conditions that would invalidate it.
-  judge_signature_version: 2
-  scope_fingerprint: d7a98ed29978325a22083757a9b9eafa6ed1e45569a4335ab8915db886c5d627
-  judge_transport: openrouter
-  ast_path: 'body[17]/body[7]/body[1]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:fb1cf3a45298b169811a6a3b52a68f4d3dbab1e7a459699644ba7dc3741cdbbc'
 - key: engine/orchestrator/quarantine_router.py:R5:QuarantineRouter:route:fp=0cae46d1a75f9edd
   owner: john
   reason: |-
@@ -562,25 +522,25 @@ allow_hits:
   judge_transport: claude_agent_sdk
   ast_path: 'body[15]/body[4]/value'
   judge_metadata_signature: 'hmac-sha256:v2:a160a1e3dfca0a4b59642b095c157c5002249d2dddf1adf21b2f5da36444c769'
-- key: engine/orchestrator/run_status.py:R1:derive_terminal_status_from_audit:fp=8bd1dcfb8e8b7559
+- key: engine/orchestrator/run_status.py:R1:derive_terminal_status_from_audit:fp=5ea1e2215c4043e2
   owner: john
   reason: |-
     engine/orchestrator/run_status.py:171 `effect = TERMINAL_PAIR_COUNTER_EFFECTS.get(pair)` uses .get() (no value default) purely to obtain a None sentinel that the next statement converts into a hard, structured crash: lines 172-176 `if effect is None: raise OrchestrationInvariantError('Unhandled (outcome, path) pair in resume aggregation: {pair!r}. Add it to TERMINAL_PAIR_COUNTER_EFFECTS; see ADR-019 mapping table.')`. Data-origin trace: `derive_terminal_status_from_audit` (line 96) derives terminal status from the Landscape audit DB; line 141 reads the audit data (`outcomes = factory.query.get_all_token_outcomes_for_run(run_id)`); `pair` (line 170) is our own engine-owned (TerminalOutcome, TerminalPath) tuple checked against our own closed mapping. An unmapped pair TERMINATES execution with a Tier-1 invariant error - it is never treated as 'no counter effect', never defaulted, never skipped, and the function neither fabricates a degraded status nor continues. This is the doctrine-prescribed offensive form (raise a structured error when absence is never correct); the .get()+`is None`+raise idiom is the intended richer alternative to dict[pair]'s bare KeyError, and matches the identical prescribed shape at the sibling site engine/orchestrator/outcomes.py:229-234. Termination path: engine/orchestrator/run_status.py:173 (`raise OrchestrationInvariantError`). INVALIDATED IF: the `if effect is None: raise` guard at 172-176 is removed or weakened to a default/warning/continue, or the .get() gains a non-None default.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:32:43.588295+00:00'
+  judge_recorded_at: '2026-09-08T00:55:50.747013+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the `.get(pair)` does not silently recover from a missing key: the immediately following `effect is None` branch raises `OrchestrationInvariantError`, and execution cannot reach counter application with an unmapped pair. The visible code independently establishes the rationale’s site-specific claim and shows an offensive, structured crash for an engine-owned closed mapping rather than coercion, fabrication, or continuation. This is not a function-parameter-rooted Tier-3 boundary, so the `@trust_boundary` decorator contract does not apply.
+    PRESCRIBED FORM: the `.get(pair)` result is checked immediately, and an absent mapping entry raises `OrchestrationInvariantError` before any counter effect is applied or execution continues. The visible code supports the rationale that this is an offensive invariant check over an engine-owned closed mapping, providing a more informative failure than a bare `KeyError` without coercing, fabricating, or silently suppressing Tier-1 data. The lookup is rooted in `TERMINAL_PAIR_COUNTER_EFFECTS`, not an external function parameter, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: ea5dc0b46cd4e0a49712d4118c0cc474bc8ad7ba4ed10a4d125f2b8c199010cc
   judge_transport: codex_cli
-  ast_path: 'body[13]/body[5]/body[2]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:8a151dc42c6bd2bfd00f35f37d369b02557485ee0529b333fabda1b9c71b39f6'
+  ast_path: 'body[15]/body[5]/body[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:2dee5219a9fa895311e40d99d45f5767412892d028da6161fbd9be85442e5313'
 - key: engine/orchestrator/outcomes.py:R1:accumulate_row_outcomes:fp=1129defdd1dba9b7
   owner: john
   reason: |-
@@ -619,96 +579,80 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[13]/body[7]/body[3]/value'
   judge_metadata_signature: 'hmac-sha256:v2:0293f990957ee77394b408f11fe5e94fb97708a57e97262f054e7a4a6d6e8081'
-- key: engine/orchestrator/heartbeat.py:R7:RunHeartbeatThread:_emit_degraded:fp=7601ea13390ef4f9
+- key: engine/executors/sink.py:R4:SinkExecutor:_best_effort_cleanup:fp=70d4ee596ad149a0
   owner: john
   reason: |-
-    `src/elspeth/engine/orchestrator/heartbeat.py:361-369` is a prescribed best-effort coordination-event emission site, not a Tier-1 audit read/write invariant being hidden. The suppressed block is limited to `_emit_degraded()`, whose docstring says `Emit ``heartbeat_degraded`` event; best-effort, never raises.`, and the only wrapped operation is `self._repo.record_heartbeat_degraded(...)` with `run_id`, `worker_id`, `failures`, and `now`. The enclosing heartbeat loop explicitly classifies DB heartbeat failures as liveness-unknown and says the thread must not crash on DB errors (`src/elspeth/engine/orchestrator/heartbeat.py:263-267`). Suppression is acceptable only for this exact degraded-heartbeat side-channel emission; if future drift adds state mutation, validation, audit-invariant repair, or other logic inside the `contextlib.suppress(Exception)` block, this rationale no longer applies and the finding must be re-judged.
+    SinkExecutor._best_effort_cleanup is called only by the two exception arms in SinkExecutor._open_primary_states (the begin_node_state failure block); both immediately bare-raise after cleanup. The helper attempts _complete_states_failed for already-open states and catches ordinary secondary cleanup failures only after except contract_errors.TIER_1_ERRORS: raise. Its warning explicitly reports that states may remain OPEN and retains the original and cleanup errors. It does not return a successful sink result, fabricate counters, or suppress cleanup corruption. R4 describes an intentional secondary cleanup boundary. Current source independently supports the control; TestReRaiseGuardPattern checks the general guard convention but is not claimed as a runtime proof of this specific helper.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-07'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-09T00:43:58.452729+00:00'
-  judge_model: 'claude-opus-4-8[1m]'
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.74
-  judge_rationale: |-
-    PRESCRIBED FORM. R7 fires on a genuinely best-effort diagnostic side-channel, not a Tier-1 audit write being hidden. `record_heartbeat_degraded` delegates to `_record_best_effort_event` (run_coordination_repository.py:167-217), which already catches the reachable failure (`SQLAlchemyError`) and LOGS it with severity discrimination — WARNING for 'database is locked', ERROR for any other DB fault — so the auditability of the real failure mode is preserved one layer down; the thread's `contextlib.suppress(Exception)` is a never-crash backstop over the residual. The file demonstrably respects crash-on-corruption where it applies: the Tier-1 integrity path is separately latched via `_fatal_exc`/`_fatal_event` and re-raised at the next drain boundary (heartbeat.py:317-332), NOT swallowed, and the design classifies degraded-heartbeat emission as benign-if-lost (§A.2/§A.3). The heartbeat thread's absolute never-raise-on-this-stack requirement is architecturally justified (a crash would leave liveness un-updated → false eviction), and the rationale scopes the suppression tightly and guards against future drift. R7 is not R1/R5 so the trust_boundary decorator does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 05dd5aa0372ca6d345f6664d257f42416a299f1e4736e32b89327ae1d2564287
-  judge_transport: claude_agent_sdk
-  ast_path: 'body[17]/body[8]/body[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:6a6bf28fdb22f4db203d11d35b44eceaf1c4e8f86e994635776e6c80ae84121b'
-- key: engine/executors/sink.py:R4:SinkExecutor:_best_effort_cleanup:fp=d89ae5b6b7ab8f5f
-  owner: john
-  reason: |-
-    This is a prescribed best-effort cleanup suppression during an already-propagating crash, not a primary-path defensive catch. In `src/elspeth/engine/executors/sink.py:223-229`, `_best_effort_cleanup` is explicitly scoped to "cleanup of OPEN states before re-raising a system error" and says it will "Attempt to close them as FAILED; if that also fails, log and let the original error propagate." The broad catch at `src/elspeth/engine/executors/sink.py:244` is preceded by `except contract_errors.TIER_1_ERRORS: raise` at lines 242-243, so audit-integrity/framework-invariant failures from the cleanup are not suppressed. The caller preserves the in-flight failure: `src/elspeth/engine/executors/sink.py:484-491` calls `_best_effort_cleanup(...)` and then immediately `raise`s in both the Tier-1 and generic exception paths. This suppression depends on that exact shape: if the `TIER_1_ERRORS` re-raise or the caller's post-cleanup `raise` is removed, the allowlist entry should go stale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:22:46.038717+00:00'
+  judge_recorded_at: '2026-09-08T00:34:03.894179+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.96
   judge_rationale: |-
-    PRESCRIBED FORM — the broad catch handles only a secondary cleanup failure during an already-propagating crash, while `engine/executors/sink.py:237-248` explicitly re-raises Tier-1 integrity failures. I verified the named control: both calls to `SinkExecutor._best_effort_cleanup` at `engine/executors/sink.py:581-588` are immediately followed by bare `raise`, so the primary system failure cannot be converted into success. R4 is not decorator-suppressible, and the visible control flow independently supports this site-specific rationale.
+    PRESCRIBED FORM: R4 applies to the broad catch, but this is a bounded secondary-cleanup path that preserves the primary system failure rather than returning success or fabricating state. I verified that SinkExecutor._open_primary_states invokes the helper only from its two exception arms and immediately bare-raises afterward at src/elspeth/engine/executors/sink.py:589-596, while _best_effort_cleanup re-raises TIER_1_ERRORS and reports both the original and secondary failures. The named control is therefore present and reached on every visible call path covered by the rationale; no specific pinning test was claimed. The decorator alternative is inapplicable because R4 is not suppressible by @trust_boundary.
   judge_signature_version: 2
   scope_fingerprint: f1632136105f9a3e355d9ebdb4b8e198c6bdf473bc7bbe06f40a09a89f9bdd57
   judge_transport: codex_cli
-  ast_path: 'body[42]/body[3]/body[2]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:f480007bf0455a3652eb85838db53176a7a20baa35bf8eef4cfda9c987de72d6'
+  ast_path: 'body[43]/body[4]/body[2]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:a58188e12c6bd2188db651cf99d82b653e8f22c3b17cca7cdc89c8d20e5db955'
 - key: engine/barrier_coordination.py:R1:BarrierRecoveryCoordinator:restore_from_journal:fp=c37f8b30a21de8c7
   owner: john
   reason: |-
     R1 `state_id=row_union_state_ids.get(item.token_id)`: the absent key is a first-class value at this site, not a masked lookup failure. `row_union_state_ids` is the OPEN-node-state map read from the Landscape audit trail (`self._barrier_restore_reads.get_open_node_state_ids(...)`, same function) for the row_union BLOCKED journal rows, and the very next statement defines `holdless` as its complement (`item.token_id not in row_union_state_ids`) — so a missing token is exactly a branch whose node_state the crashed release had ALREADY completed. This call site builds the `RowUnionRestoreEntry` tuple for `RowUnionExecutor.reconcile_released_group`, whose docstring states the contract verbatim: 'already-completed entries carry state_id=None and are not written twice'; its completion loop is guarded by `if entry.state_id is not None`. A released group is reconstructed from the UNFILTERED `row_union_items` and therefore legitimately mixes members still holding an OPEN state with members that do not, so `None` is the honest per-member answer; crashing on absence would wedge every resume that crashed mid-release. The membership form is used deliberately in the sibling loop below (`state_id=row_union_state_ids[item.token_id]`, the `restore_entries` path) because `row_union_items` has by then been narrowed to `item.token_id in row_union_state_ids` — the two reads of the same dict differ because their preconditions differ. The value is Tier-1 ELSPETH-owned engine/audit state (a node_state id we wrote); what the pattern protects is double-completion of an already-completed hold at the group's flush.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:58:28.194648+00:00'
+  judge_recorded_at: '2026-09-08T00:31:33.678900+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this mapping is intentionally partial: barrier_coordination.py:2027-2032 derives it solely from OPEN node states, so absence records that a released-group member has no remaining open state rather than hiding a required Tier-1 key. The claimed control is verified: RowUnionExecutor.reconcile_released_group documents the `state_id=None` contract at row_union_executor.py:315-326 and guards completion with `if entry.state_id is not None` at lines 358-366, while barrier_coordination.py:2149-2154 separately narrows the ordinary restore path before its direct lookup. This is internal Tier-1 recovery state, not an external-parameter R1 boundary, so the decorator contract does not apply.
+    RULE MISFIRES — this is an optional lookup in a deliberately sparse OPEN-state index, not defensive access to a required Tier-1 field. `BarrierRestoreReadModel.get_open_node_state_ids` returns only OPEN states (`core/landscape/scheduler/restore_read_model.py:268`), while the released-group reconstruction intentionally includes already-completed members (`engine/barrier_coordination.py:2043` and `engine/barrier_coordination.py:2143`). The named control is verified: `RowUnionExecutor.reconcile_released_group` explicitly defines `state_id=None` for already-completed entries and writes only non-None states (`engine/row_union_executor.py:315`), with the mixed OPEN/completed behavior pinned by `tests/unit/engine/test_row_union_executor.py::TestRestoreFromJournal::test_reconcile_released_group_completes_only_still_open_states`. The subject is locally derived Tier-1 audit state rather than external parameter-rooted data, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 04146c65c097ea33b469ac278e31036085362bfb7d2410d780993afde825d1d2
+  scope_fingerprint: 62f1e046b18da20afd314aa28b899298dada73d786dbef829bb3fc8167a9585b
   judge_transport: codex_cli
   ast_path: 'body[32]/body[2]/body[47]/body[3]/body[1]/body[1]/value/args[0]/keywords[2]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:875b7e8d2436d9a12e8f809e7fa58f1aafc4481d5b4879b6b23fd28bf7395220'
+  judge_metadata_signature: 'hmac-sha256:v2:6d64f5903e9219154d4732cc3121ea291129893b1b480f7fd180351caf9c362f'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
-      byte_count: 30
-      redacted_hash: b66764aedfac32cf
+      byte_count: 31
+      redacted_hash: 0e91936bf4b02fc1
     - pattern: dotenv_secret_assignment
       byte_count: 30
-      redacted_hash: b66764aedfac32cf
+      redacted_hash: 9aacc80f5db098d3
+    - pattern: dotenv_secret_assignment
+      byte_count: 30
+      redacted_hash: 9aacc80f5db098d3
 - key: engine/barrier_coordination.py:R5:BarrierIntakeCoordinator:_adopt_aggregation_row:fp=e05c90ed34ed6f71
   owner: john
   reason: |-
     Flagged pattern: `if isinstance(transform, GateSettings):` raising OrchestrationInvariantError. This is nominal NEGATIVE dispatch over a closed, ELSPETH-owned container, not a Tier-3 shape guard on external data. `transform` is the local return of `self._nav.resolve_plugin_for_node(node_id)`, whose signature is exactly `TransformProtocol | GateSettings | None` (engine/dag_navigator.py:157) and which raises OrchestrationInvariantError itself for any node that is neither plugin-bearing nor structural. The union therefore has three inhabitants and the method rejects the two known non-transform ones by name — `None` (structural coalesce/row-union node) on the preceding branch, `GateSettings` here — before asking the surviving value the only question that matters, `transform.is_batch_aware`. The isinstance is against a concrete class ELSPETH defines, which is precisely what ADR-032 prescribes for data ELSPETH owns. Critically, TransformProtocol conformance is deliberately NOT measured (ruling elspeth-8783933d99): a positive `isinstance(transform, TransformProtocol)` would be a runtime_checkable structural check, so a protocol-membership miss would masquerade as 'DAG/config inconsistency' and blame the graph for what is actually a plugin-contract defect. Naming GateSettings by its own defect keeps the three error messages attributable to three distinct causes. Not decorator-eligible: `transform` roots at a method call on `self._nav`, not at any parameter of `_adopt_aggregation_row`, so no `source_param` could ever cover it. WHAT WOULD INVALIDATE THIS: `resolve_plugin_for_node` gaining a fourth return shape (the two negative arms would no longer exhaust the non-transform inhabitants and an unhandled shape would reach `.is_batch_aware` and fail with a misattributed AttributeError); GateSettings ceasing to be a distinct owned class; or a decision to reverse elspeth-8783933d99 and dispatch positively on TransformProtocol, which would reintroduce the structural-typing masquerade this arm exists to avoid.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:58:07.252543+00:00'
+  judge_recorded_at: '2026-09-08T00:32:33.017869+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance` is nominal negative dispatch against the concrete ELSPETH-owned `GateSettings` member of the stated closed return union, not defensive revalidation of a guaranteed transform shape. The visible code separately rejects `None` and `GateSettings` with specific `OrchestrationInvariantError` messages, then relies directly on the surviving transform contract without coercion, fallback, or structural `Protocol` probing. The finding is not decorator-eligible because the subject is the local result of `self._nav.resolve_plugin_for_node(node_id)`, not data rooted at an external function parameter.
+    PRESCRIBED FORM: the flagged `isinstance` performs nominal negative dispatch against the concrete ELSPETH-owned `GateSettings` class and immediately raises a cause-specific `OrchestrationInvariantError`; it neither coerces, suppresses, nor structurally tests `TransformProtocol`. The named control is verified at engine/dag_navigator.py:157-175: `DAGNavigator.resolve_plugin_for_node` returns exactly `TransformProtocol | GateSettings | None` and raises for nodes outside that closed set, consistent with the two negative branches exhausting the non-transform alternatives before direct contract use. The expression is rooted at `self._nav.resolve_plugin_for_node(node_id)`, not external parameter data, so the trust-boundary decorator is inapplicable.
   judge_signature_version: 2
-  scope_fingerprint: bbf369dda7b45479284649ec4e41508775ad21168707663a5e29bac41f36035b
+  scope_fingerprint: d5109fa557eff978bb9250cfc316f27f9ab94a10cc62755bb1845ea39e77e69d
   judge_transport: codex_cli
   ast_path: 'body[31]/body[6]/body[13]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:c26344e9c6ef1f49f35426a687ddb932f0f6e6a49732b2b31d6eac5cdefd154a'
+  judge_metadata_signature: 'hmac-sha256:v2:53a25b28b6f98c4680ec44728aa71ac57e40b4ae925186b09ae9bb398f688930'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 25
-      redacted_hash: 2371e1be4c4f1093
+      redacted_hash: e015a692db68d02a
     - pattern: dotenv_secret_assignment
       byte_count: 42
-      redacted_hash: 57eb546d8a9f6584
+      redacted_hash: f9ec96e2c55f3d32
 - key: engine/batch_adapter.py:R5:SharedBatchAdapter:_wait_for:fp=2fee56024ce3d9a2
   owner: john
   reason: |-
@@ -818,253 +762,185 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 20
       redacted_hash: 70710dd684dc1d99
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_discard_diversions:fp=74b6d1e981dd4336
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_discard_diversions:fp=92ba9794e3df80b1
   owner: john
   reason: |-
     R5 fires on `elif not isinstance(current, NodeStateFailed): raise AuditIntegrityError(...)`. Written in negative form, this is the fail-closed tail of the discard dispatch: an anchor already FAILED is accepted as an idempotent re-entry, and *anything else* — OPEN having been handled above — terminates the run with an audit-integrity error rather than continuing to record a token outcome against a state whose status contradicts it. The suppression covers a raise, not a swallow: there is no branch here in which an unexpected state is tolerated. Invalidated if this arm ever gains a non-raising fallback, or if a third legitimate terminal state is added to the union without a matching arm.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:58:46.025258+00:00'
+  judge_recorded_at: '2026-09-08T00:34:22.699898+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM: the R5 concern applies to Tier-1 node state, but the negative `isinstance` check is an offensive, fail-closed union dispatch rather than defensive recovery. `NodeStateOpen` is completed explicitly, `NodeStateFailed` is accepted as the documented idempotent re-entry, and every other state raises `AuditIntegrityError`; no malformed state is coerced, swallowed, or allowed to proceed. The finding is not rooted in an external function parameter, so the `@trust_boundary` decorator contract does not apply.
+    PRESCRIBED FORM: the visible dispatch handles `NodeStateOpen`, permits `NodeStateFailed` as the documented idempotent re-entry, and immediately raises `AuditIntegrityError` for every other state. The flagged `isinstance` therefore exposes a contradictory Tier-1 audit state rather than swallowing, coercing, or fabricating it, matching the offensive fail-closed form. This is not an R5 Tier-3 parameter boundary eligible for the decorator.
   judge_signature_version: 2
   scope_fingerprint: 0b6c757cc35068fff8b029921f5eab7d2613e2545a4f2e1d7ba66e8655710e7d
   judge_transport: codex_cli
-  ast_path: 'body[42]/body[15]/body[2]/body[4]/orelse[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:8ed527829fb14333f52b70edc0b5f37eb85a85dca127fdf99a9f8c3c2bf36dfb'
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_discard_diversions:fp=81dd3b4c10d37cfa
+  ast_path: 'body[43]/body[16]/body[2]/body[4]/orelse[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:094edae06716f43f88810de58e453b03d334109b2bac38775375de8ea9380964'
+- key: engine/executors/sink.py:R5:SinkExecutor:_handle_discard_diversions:fp=e71ca5f41b3148e5
   owner: john
   reason: |-
     R5 fires on `if isinstance(current, NodeStateOpen):` in `_handle_discard_diversions`, dispatching on the re-read primary anchor for a discarded row. Nominal discrimination against the owned `NodeStateOpen` contract class is the ADR-032-prescribed internal-boundary control, and this arm carries the discard's own semantics rather than the failsink's: it completes the anchor FAILED with `output_data={"discarded": True, ...}` and a `SinkDiscard` error whose disclosable reason is the operator-facing text, not the bare hash (elspeth-9595abb7b0). Invalidated if discard anchors can reach this point in a state outside the OPEN/FAILED pair the next line enforces.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:58:58.159116+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
-  judge_rationale: |-
-    PRESCRIBED FORM: the visible code uses nominal `isinstance` discrimination against ELSPETH-owned concrete state variants to dispatch a re-read anchor, not to hide or coerce a contract violation. The `NodeStateOpen` arm performs the discard completion, while the immediately visible `NodeStateFailed` alternative permits recovery and every other state raises `AuditIntegrityError`, so the rationale's OPEN/FAILED invariant and offensive failure behavior are directly established. This is not an R5/R1 Tier-3 parameter boundary suitable for `@trust_boundary`.
-  judge_signature_version: 2
-  scope_fingerprint: 0b6c757cc35068fff8b029921f5eab7d2613e2545a4f2e1d7ba66e8655710e7d
-  judge_transport: codex_cli
-  ast_path: 'body[42]/body[15]/body[2]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:32d9084f00d3e13a2ec1f28aa380630f021445b7c25e8b9662d208278ce080a2'
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=419067aacfd8e903
-  owner: john
-  reason: |-
-    R5 fires on the second `isinstance(state, NodeStateOpen)` in the same handler, filtering `primary_divert_states` rather than the failsink states filtered five lines above. The two comprehensions are separate because they terminalize different anchors with the same boundary error: the first closes the quarantine states opened for the failsink write, this one closes the still-open *primary* divert anchors whose rows never completed their diversion. The `isinstance` filter is required because `primary_divert_states` is accumulated earlier in the run and some entries may already have been terminalized by an earlier path; re-completing a closed state would be an audit-integrity violation. Invalidated if primary divert anchors become guaranteed-open at this point, which would make the filter dead code that should be deleted rather than suppressed.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:59:53.416319+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
-  judge_rationale: |-
-    RULE MISFIRES — `primary_divert_states` intentionally contains lifecycle states that may already have been terminalized, so `NodeStateOpen` is a declared state discriminator rather than a defensive re-check of a guaranteed-open contract. The comprehension preserves audit integrity by selecting only still-open primary divert anchors for `_complete_states_failed`; it neither coerces malformed data nor conceals a contract violation. This is internal state handling rather than an R5 Tier-3 parameter boundary, so the decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: b9f425f5f5862c4dc86951149e5e61d72d5176bde96c38dcac801c083f59b5b5
-  judge_transport: codex_cli
-  ast_path: 'body[42]/body[14]/body[11]/handlers[0]/body[2]/value/keywords[0]/value/generators[0]/ifs[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:0c1f44bbb17c55e80413c77d561789d69b394998ffb548f2f5242bac15a8fdfe'
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=75b48ccc49c6b57a
-  owner: john
-  reason: |-
-    R5 fires on `isinstance(state, NodeStateOpen)` in the comprehension selecting failsink quarantine states to terminalize after a boundary contract violation. `NodeStateOpen` is a concrete class ELSPETH declares in `contracts/audit.py`, so this is ADR-032 nominal discrimination over an owned closed union, not structural typing. The filter is a state-machine selector, not a defensive probe: only states still OPEN can be completed, and the enriched row never reached the failsink, so the quarantine anchors just opened must be terminalized here or they would be left in progress forever (elspeth-2a75af7f8f). Invalidated if `NodeStateOpen` ceases to be the sole open variant of the node-state union, or if `_complete_states_failed` becomes tolerant of already-terminal states.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T12:59:55.837301+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — the `isinstance` at line 1030 discriminates the concrete `NodeStateOpen` variant of an ELSPETH-owned node-state union; it is not revalidating a fixed-contract value or concealing a contract violation. The visible code corroborates the site-specific rationale: `_open_or_reuse_effect_states` can supply reusable states, while `_complete_states_failed` is deliberately given only states that remain open after the failsink boundary failure. This is state-machine selection over a nominal concrete type, not structural typing or Tier-3 shape validation, and the subject is not rooted in an external function parameter, so the `@trust_boundary` alternative does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: b9f425f5f5862c4dc86951149e5e61d72d5176bde96c38dcac801c083f59b5b5
-  judge_transport: codex_cli
-  ast_path: 'body[42]/body[14]/body[11]/handlers[0]/body[1]/value/keywords[0]/value/generators[0]/ifs[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8b10050e8c9226d31da7331835e132c9df73863bc72315efbb3aff27bab2fa24'
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=80067ca72e525ffe
-  owner: john
-  reason: |-
-    R5 fires on `if isinstance(current, NodeStateOpen):` in the linked-failsink reconciliation loop, dispatching on the freshly re-read state of each primary divert anchor. This is the OPEN arm of a three-way nominal dispatch over ELSPETH's own audit state union, and it is the arm that does the work: it records the DIVERT routing event and completes the anchor FAILED with the operator-disclosable diversion reason. The state is re-read from `self._execution.get_node_state(...)` rather than trusted from the earlier tuple precisely because a concurrent effect may already have finalized it, so the type of what comes back is the dispatch fact. Invalidated if the node-state union gains another non-terminal variant, since the `else` below would then raise on a legitimate state.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:04:43.663439+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.95
-  judge_rationale: |-
-    RULE MISFIRES — `current` is a freshly re-read first-party audit-state union, and the flagged `isinstance(current, NodeStateOpen)` is nominal variant dispatch, not a defensive re-check that suppresses a contract violation. The visible `NodeStateOpen` and `NodeStateFailed` arms perform state-specific audit actions, while the rationale plainly states that the remaining terminal variant is handled separately and any unknown non-terminal variant raises; nothing in the excerpt contradicts that exhaustive-dispatch account. This is not a Tier-3 boundary function over an external parameter, so the structural decorator contract does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: b9f425f5f5862c4dc86951149e5e61d72d5176bde96c38dcac801c083f59b5b5
-  judge_transport: codex_cli
-  ast_path: 'body[42]/body[14]/body[22]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a5a5c58db2da84854815a6e4d031e3bc1d4ffb0d5877801f1ea5a4647d7ec09f'
-- key: engine/executors/sink.py:R5:SinkExecutor:_handle_failsink_effect_diversions:fp=d6c67af0d3bf3e82
-  owner: john
-  reason: |-
-    R5 fires on `elif isinstance(current, NodeStateFailed):`, the already-finalized arm of the same dispatch. It exists to make idempotent reconciliation safe without weakening the audit: rather than accepting a FAILED anchor silently, it fetches the routing events and asserts the anchor was finalized by *this* diversion — exactly one event, on `failsink_edge_id`, in `RoutingMode.DIVERT` — and raises `AuditIntegrityError` otherwise. The dispatch is exhaustive and fail-closed: the trailing `else` raises `AuditIntegrityError` for any state that is neither OPEN nor FAILED, so no unexpected variant is quietly tolerated. Invalidated if the evidence assertion is relaxed, or if the `else` stops raising.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:04:38.057203+00:00'
+  judge_recorded_at: '2026-09-08T00:34:50.849180+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance` is exhaustive nominal dispatch over legitimate `NodeState` variants, not a defensive shape re-check that hides a contract violation. The `NodeStateFailed` arm accepts an already-finalized state only after verifying its Tier-1 routing evidence is exactly one DIVERT event on `failsink_edge_id`, and raises `AuditIntegrityError` on divergence; the trailing arm likewise fails closed for every unexpected state. The site neither coerces nor silently recovers from malformed data, and the rationale precisely identifies the invariant being enforced.
+    PRESCRIBED FORM: the nominal `NodeStateOpen`/`NodeStateFailed` discrimination selects between the two explicitly permitted states of an ELSPETH-owned state union, and the fallback raises `AuditIntegrityError` for any other Tier-1 state. The visible code neither coerces nor silently recovers from a contract violation: OPEN is completed with the discard semantics, FAILED is treated as the permitted recovered state, and every other variant crashes as an audit-integrity failure. This is not a function-scoped Tier-3 boundary rooted in an external parameter, so the decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: b9f425f5f5862c4dc86951149e5e61d72d5176bde96c38dcac801c083f59b5b5
+  scope_fingerprint: 0b6c757cc35068fff8b029921f5eab7d2613e2545a4f2e1d7ba66e8655710e7d
   judge_transport: codex_cli
-  ast_path: 'body[42]/body[14]/body[22]/body[3]/orelse[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:2f94373736c2bfaec020bb6241ce52671854dcd95036a92dc57666b7acfa6aaa'
-- key: engine/executors/sink.py:R5:SinkExecutor:_write_primary_effect:fp=475f59ae4c1cfbca
+  ast_path: 'body[43]/body[16]/body[2]/body[4]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:841765552131f8bd9fcb9767e60ca0d27409a362de946e21e2cc1b2856e94fdb'
+- key: engine/executors/sink.py:R5:SinkExecutor:_write_primary_effect:fp=012345e0bf5c95f9
   owner: john
   reason: |-
     all_states is declared as NodeState - the closed union of the concrete ELSPETH-owned NodeStateOpen | NodeStateFailed | NodeStateCompleted records - because _open_or_reuse_effect_states REUSES the exact state set left by an interrupted effect call, so on a resume some entries are already terminal. _complete_states_failed writes a terminal FAILED record; applying it to an already-terminal state is a SECOND terminal write, which corrupts the audit trail (the invariant NodeStateGuard._terminal_persisted protects on the other side of the same doctrine). The filter is therefore the control this boundary-failure path needs - it selects the states that still require terminalizing - not a defensive re-check of a value already known to be OPEN. ADR-032 case 1: nominal discrimination over a concrete class ELSPETH defines. This site terminalizes the primary sink's states after a declaration/plugin contract violation is caught at the sink write boundary.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:10:58.391102+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — this is nominal discrimination within an ELSPETH-owned state union, not defensive validation of an allegedly fixed concrete type. The verified producer at engine/executors/sink.py:591 returns both newly opened states and current durable states recovered after interruption, while contracts/audit.py:280 defines distinct concrete state records and contracts/audit.py:400 defines their union. The consumer at engine/executors/sink.py:193 accepts only NodeStateOpen and performs a terminal FAILED write, and engine/executors/state_guard.py:248 explicitly confirms that writing over an already-persisted terminal state corrupts the audit trail. Although the supplied rationale omits NodeStatePending when enumerating the union, that omission does not undermine the site-specific reason for narrowing to open states, and the internal audit-state parameter is not a Tier-3 decorator case.
-  judge_signature_version: 2
-  scope_fingerprint: 4e2afa4736762e9f04f15c71bf74af274b7e32bb3e23e32cd707ea1643003e97
-  judge_transport: codex_cli
-  ast_path: 'body[42]/body[12]/body[4]/handlers[0]/body[0]/value/keywords[0]/value/generators[0]/ifs[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:c61d607a3d4f35f5e4592ef8bd0c52842169f7d2b73781a3b37f9ae74db87a48'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:__init__:fp=7ebcee9d382dcedf
-  owner: john
-  reason: |-
-    R5 fires on `isinstance(clock, SystemClock)` in `SinkEffectCoordinator.__init__`, computing `self._wait_on_shutdown_event`. `SystemClock` is a concrete class ELSPETH declares in `engine/clock.py`, so this is ADR-032 nominal discrimination, not structural typing — and it is a capability question rather than a contract probe: only the real wall clock may block on a `threading.Event`, because that primitive advances with wall time. Under a controlled clock the flag must be `False` so the worker falls through to `_check_wait_interruptions` at the next poll and the test's clock can advance deterministically instead of the worker parking on an event that no simulated time will ever fire. Invalidated if `SystemClock` gains subclasses that are not wall-clock backed, or if shutdown waiting stops being a wall-clock primitive.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:04:59.928554+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
-  judge_rationale: |-
-    RULE MISFIRES — the `isinstance(clock, SystemClock)` expression does not defensively revalidate the declared `Clock` contract or hide a contract violation; it selects behavior based on a concrete, ELSPETH-owned implementation capability. The visible comment establishes that `threading.Event.wait` is a wall-clock primitive and that controlled clocks must instead reach `_check_wait_interruptions` through polling, while the additional `sleep is None` condition preserves an explicitly supplied waiting strategy. This is nominal concrete-type discrimination consistent with ADR-032, not structural typing, coercion, or silent recovery, and the function has no external-data parameter that would make `@trust_boundary` applicable.
-  judge_signature_version: 2
-  scope_fingerprint: 25ceb76a4b00f87b8343166f0368f0deaa655846d145afde87b7b6d21908e05b
-  judge_transport: codex_cli
-  ast_path: 'body[35]/body[1]/body[12]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:c320ec55ea0523b831538f2303fe7a6f0a8c7d3577fb179aad8722d8478cb675'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:__init__:fp=d741eca72914c112
-  owner: john
-  reason: |-
-    isinstance(factory, RecorderFactory) is the ADR-032 case-1 internal boundary: RecorderFactory is a concrete class ELSPETH defines, and the coordinator reaches its entire authority through it - the durable sink-effect store, the payload store, lease ownership and the artifact register. An impostor accepted here forges the audit trail, which is exactly the internal-masquerade threat nominal typing is the control for. isinstance rather than the exact-type form used two lines below for lease_ttl because subclassing an owned repository facade is a supported extension and the resume/quarantine suites legitimately pass MagicMock(spec=RecorderFactory) doubles, which satisfy isinstance and would be rejected by an exact-type test. The three sibling scalar checks in this constructor were converted to the exact-type form in this pass; this one is the case where the class identity, not the exact type, is the credential.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:05:04.069450+00:00'
+  judge_recorded_at: '2026-09-08T00:39:18.343645+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.96
   judge_rationale: |-
-    PRESCRIBED FORM — the visible code performs an offensive nominal check against the ELSPETH-owned concrete RecorderFactory class and immediately raises TypeError on mismatch; it neither coerces, defaults, nor silently recovers. The rationale specifically establishes this constructor as an internal authority boundary where concrete-class discrimination prevents an impostor from supplying audit-critical repositories, while intentionally permitting supported RecorderFactory subclasses. This directly addresses R5’s concern and is consistent with ADR-032’s permitted concrete-type discrimination at a genuinely unknown internal boundary.
+    RULE MISFIRES — this is nominal variant discrimination within a first-party `NodeState` union, not defensive validation hiding a contract violation. `_open_or_reuse_effect_states` can return either an open state or the latest durable state (`engine/executors/sink.py:599`, `engine/executors/sink.py:663`), and `write` passes that exact set to `_write_primary_effect` (`engine/executors/sink.py:1377`), so recovery does not guarantee every state is OPEN. Filtering for `NodeStateOpen` before `_complete_states_failed` prevents a second terminal write; although the rationale omits `NodeStatePending` from the actual union (`contracts/audit.py:400`), that imprecision does not make this contract masking. The decorator is inapplicable because `all_states` is first-party recovered audit state, not Tier-3 data rooted in an external parameter.
   judge_signature_version: 2
-  scope_fingerprint: 25ceb76a4b00f87b8343166f0368f0deaa655846d145afde87b7b6d21908e05b
+  scope_fingerprint: 085ca918ee88c7c3d2ddd9e0d09ceccb759facc9997cd6fa459cb43279bcfe70
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[1]/body[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:578e5e016fa68701aeaba61b6410f5c472e018f91e69ef8b67e576a2e283da6b'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_execute_member_effects:fp=32a9c6cca73ed21c
+  ast_path: 'body[43]/body[13]/body[4]/handlers[0]/body[0]/value/keywords[0]/value/generators[0]/ifs[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:29b37e325817162051296a1b73f3c567fd150ac82b58ffe6a9311cd6ac660102'
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_execute_member_effects:fp=f6ae6cc7fb554481
   owner: john
   reason: |-
     result here is the value returned by _latest_exact_member_result, whose declared type is the closed union SinkEffectCommitResult | SinkEffectReconcileResult - two frozen ELSPETH-owned dataclasses. This is union DISCRIMINATION driving different audit writes, not validation of a trusted value: the commit arm finalizes with the result's own descriptor and records evidence_kind="returned", while the reconcile arm must first assert kind is APPLIED_WITH_EXACT_DESCRIPTOR and a non-None descriptor before finalizing with evidence_kind="reconciled" and the reconcile kind. Unlike this file's per-action decode sites - which this pass narrowed statically by overloading _returned_attempt on the action Literal - the union is genuinely open at this point, because the helper scans durable attempts backwards and returns whichever action's result was last exact.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:11:16.909727+00:00'
+  judge_recorded_at: '2026-09-08T00:39:34.918848+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the visible code uses `isinstance` to discriminate between two arms of a declared closed union of ELSPETH-owned result dataclasses, not to conceal a contract violation or revalidate Tier-2 shape. Each arm drives materially different audit finalization semantics, and the reconcile arm additionally enforces its exact-result invariants with a typed integrity failure. This is not a Tier-3 parameter-rooted boundary case, so the structural decorator contract does not apply.
+    RULE MISFIRES — the visible code uses `isinstance(result, SinkEffectCommitResult)` to discriminate the two arms of the declared closed union, not to defensively revalidate, coerce, default, or suppress a contract violation. Each arm performs distinct audit finalization, and the reconcile arm offensively enforces its exact-kind and non-None-descriptor invariants with `LandscapeRecordError`. The subject is an ELSPETH-owned helper result rather than external parameter-rooted Tier-3 data, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: d86839d6d1c53e4497c29b678ef7e0cb4aa593ba1ec6a130c3afd0160999677d
+  scope_fingerprint: 4485cc09736e2af4820b327933ebb979873f1ed7b574baf87116dd86f3dcf71d
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[13]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:21920768ba8da96f650d3fb739e7d250c5797f3550cc79cd7ef0b99f14f7ddae'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_is_member_effect_adapter:fp=749d7151ddbb15cd
+  ast_path: 'body[37]/body[14]/body[10]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d2ca7e5ddcf4370d51c6adb0397d44821fc2e96be4ad5a028aeda5ce9bee4a80'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+    - pattern: dotenv_secret_assignment
+      byte_count: 24
+      redacted_hash: a9267d6b39ba4e71
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_is_member_effect_adapter:fp=df0062d4676137d8
   owner: john
   reason: |-
     MemberSinkEffectCapability is a plain ELSPETH-owned base class, NOT a Protocol - its docstring states it is the nominal opt-in for the capability. The population being tested is runtime sink plugin classes, genuinely unknown Tier-2 code, so this is ADR-032 case 1 in its intended form: inheritance from a class ELSPETH defines is the credential a plugin must present before the coordinator will drive one durable effect per pipeline member for it. Structural typing is deliberately refused here - a sink that merely happens to define a method of the right name must not be routed down this path, and ADR-032 bans runtime_checkable Protocol isinstance as both a security and a dispatch control. The companion test on the same line is the exact-type form (type(effect_input) is SinkEffectPipelineMembersInput) because that input is an engine-owned closed value with no subclasses, whereas the capability marker exists precisely to be subclassed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:11:22.832873+00:00'
+  judge_recorded_at: '2026-09-08T00:42:03.722788+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.93
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance(sink, MemberSinkEffectCapability)` is nominal capability dispatch, not a defensive re-check that masks a fixed-contract violation. The rationale plainly states that `MemberSinkEffectCapability` is an ELSPETH-owned base class intended for subclass opt-in rather than a structural Protocol, and the visible predicate is consistent with using that credential to select the member-effect path while refusing accidental method-name matches. This is the policy-permitted concrete-type discrimination over ELSPETH-constructed objects whose applicable capability is not otherwise guaranteed; it neither coerces nor silently recovers from an invalid return. The decorator alternative does not apply because the subject is an internal plugin object rather than external data rooted in a Tier-3 function parameter.
+    RULE MISFIRES — this `isinstance` is nominal optional-capability dispatch, not a defensive re-check that hides a fixed-contract violation. `MemberSinkEffectCapability` is an ELSPETH-defined plain class explicitly documented as a “Nominal opt-in” at `src/elspeth/contracts/sink_effects.py:1443`, and the branch at `src/elspeth/engine/executors/sink_effects.py:625` uses that credential to select member-effect execution while non-members follow the ordinary sink path. The `sink` parameter is a first-party plugin object rather than Tier-3 external data, so the trust-boundary decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: 851e1a3e256547a9ff33e2550c5ef9d7a3140ea9976d4f2215f0488c96a8f12f
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[12]/body[0]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:c64677595f9437b7f32bc84efcaafd6d3d93098b0a5f52082a29f79f7ff1a926'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_is_restaging_adapter:fp=b4451befc0596021
+  ast_path: 'body[37]/body[13]/body[0]/value/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:3f4fe2c7ec715fd129c9178ffb7119d06437d0249083be94770485552c392def'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_is_restaging_adapter:fp=ed4a595871622b2d
   owner: john
   reason: |-
     RestagingSinkEffectCapability is a plain ELSPETH-owned base class, NOT a Protocol - its docstring states it is the nominal opt-in for the capability. The population being tested is runtime sink plugin classes, genuinely unknown Tier-2 code, so this is ADR-032 case 1 in its intended form: inheritance from a class ELSPETH defines is the credential a plugin must present before the coordinator will drive reconstruction of a lost staged body before commit for it. Structural typing is deliberately refused here - a sink that merely happens to define a method of the right name must not be routed down this path, and ADR-032 bans runtime_checkable Protocol isinstance as both a security and a dispatch control. The companion test on the same line is the exact-type form (type(effect_input) is SinkEffectPipelineMembersInput) because that input is an engine-owned closed value with no subclasses, whereas the capability marker exists precisely to be subclassed.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:13:18.786820+00:00'
+  judge_recorded_at: '2026-09-08T00:44:00.638435+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this isinstance is nominal capability discrimination, not a defensive re-check that masks a fixed-contract violation. src/elspeth/contracts/sink_effects.py:1445 defines RestagingSinkEffectCapability as an ELSPETH-owned concrete base class with an explicit nominal-opt-in docstring, while src/elspeth/engine/executors/sink_effects.py:615 uses the result only to select optional restaging behavior. The visible code and rationale therefore establish the policy-prescribed concrete-type discriminator at an unknown runtime-object boundary; this is not a Tier-3 parameter boundary eligible for @trust_boundary.
+    RULE MISFIRES — This is nominal capability dispatch, not defensive revalidation of a fixed contract: `RestagingSinkEffectCapability` is an ordinary ELSPETH-owned base class explicitly documented as a “Nominal opt-in” at `src/elspeth/contracts/sink_effects.py:1467`, with its required method raising `NotImplementedError` by default. The visible helper tests that credential before selecting the optional restaging path, deliberately excluding merely structural lookalikes while allowing implementation failures to crash. The subject is a runtime plugin object rather than Tier-3 external data, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: c917774597d5436c3b74cd2318f8ffcfe8b0886a8ea30b0d32d69ef8164d1537
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[11]/body[0]/value/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:14c9003499ff8920062840d0575d55ba486d3a4e711b9cc7a97e298b3b8d4501'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_latest_exact_member_result:fp=bd6777085b305a39
+  ast_path: 'body[37]/body[12]/body[0]/value/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:9bc51af50a981359c41ab6035026bdff791e76897ce52afb73eef8776cfe693b'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 86c36d516cacdefe
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_latest_exact_member_result:fp=e5b413ce2187166f
   owner: john
   reason: |-
     This function calls decode_sink_effect_returned_result with attempt.action - a VARIABLE read off each durable attempt row as the loop scans backwards - so, unlike the per-action decode sites in this file that this pass narrowed statically by overloading _returned_attempt on the action Literal, the returned union cannot be narrowed here at all. The two isinstance tests ARE the selection predicate the function exists to compute: the most recent member attempt whose durable result actually carries an exact descriptor, which is any SinkEffectCommitResult or a SinkEffectReconcileResult of kind APPLIED_WITH_EXACT_DESCRIPTOR. This operand admits the commit half: a returned commit result always carries a descriptor. Both operands are frozen ELSPETH-owned dataclasses (ADR-032 case 1). Dropping the predicate would let a non-exact reconcile result finalize the member set with a descriptor no publication ever established.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:11:26.901790+00:00'
+  judge_recorded_at: '2026-09-08T00:48:47.805224+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — these `isinstance` checks discriminate members of the declared returned-result union; they do not conceal a wrong type or recover from a contract violation. The visible loop decodes durable evidence using a per-row variable action, then selects every commit result and only reconcile results whose kind guarantees an exact descriptor, so the checks are part of the function’s stated selection predicate. This is not an R5 Tier-3 parameter-boundary case because the subject is the owned decoder result rather than data rooted in an external function parameter.
+    RULE MISFIRES: these checks discriminate a closed first-party result union to implement the function’s semantic selection predicate; they do not hide malformed data or a fixed-contract violation. The named control was verified: `decode_sink_effect_returned_result` in `src/elspeth/core/landscape/execution/sink_effect_attempt_results.py:88` returns a commit result for COMMIT and a reconcile result for RECONCILE, while `src/elspeth/engine/executors/sink_effects.py:979` admits those two variable actions before decoding. The frozen contracts at `src/elspeth/contracts/sink_effects.py:1340` and `:1360` guarantee that commits carry descriptors and only `APPLIED_WITH_EXACT_DESCRIPTOR` reconciliations do, so the predicate selects exactly the qualifying union members; no external function parameter roots the subject, making the decorator inapplicable.
   judge_signature_version: 2
   scope_fingerprint: 40399fc3fc28184ed6bcedd611808de60962f22ce61ee09b965ea41fb401c7f7
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[18]/body[0]/body[2]/test/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:8c2d8c2ad18f9702857e3654efd4840eba4db90a260038e7c849145dd43e6764'
+  ast_path: 'body[37]/body[19]/body[0]/body[2]/test/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:0996432a6343f0f6b990af8c05fe5e011875614c765b655cba90d8849d537114'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
 - key: engine/executors/state_guard.py:R5:NodeStateGuard:__exit__:fp=1312f434e305d38e
   owner: john
   reason: |-
@@ -1103,25 +979,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[26]/body[10]/body[7]/body[1]/body[1]/handlers[1]/body[4]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:d3929e4885e815405b9af7808b27d1cd0ff9115d7af796c6815ad9ed25c5bb81'
-- key: engine/orchestrator/export.py:R5:resume_audit_export:fp=6d299ff023f5e2d0
-  owner: john
-  reason: |-
-    R5 isinstance on `export_error`, the exception bound by the enclosing `except Exception`, against `SinkEffectLeaseHeld` — a concrete `RuntimeError` subclass ELSPETH owns. Exception-subtype discrimination is precisely what `isinstance` is for, and subclass matching is required: an exact `type() is` test would silently stop matching a future subclass of the lease-held signal and turn a benign contention outcome back into a raise. The test cannot be replaced by a separate `except SinkEffectLeaseHeld` handler, because the discrimination is on the conjunction `failure_recorded is False and isinstance(...)` and both arms need the `best_effort` block above that computes `failure_recorded`; splitting the handler would duplicate that block. It protects resume idempotence for the audit trail: `set_export_failed_unless_completed` returns `False` only when a concurrent exporter already recorded COMPLETED, so `False` together with a held sink-effect lease means another live worker owns this export. Returning quietly is correct; re-raising would surface a spurious failure for an export that a peer has already completed.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:17:11.759729+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — this `isinstance` discriminates a concrete ELSPETH-owned exception subtype for routing; it does not defensively re-check or coerce data under a fixed contract. The named control was verified at src/elspeth/core/landscape/run_lifecycle_repository.py:1723: `set_export_failed_unless_completed` returns `False` only after confirming the durable export status is `COMPLETED`, while any failed status-recording attempt leaves `failure_recorded` non-False and therefore re-raises. Thus the quiet return requires both a lease-contention signal and verified peer completion, so it preserves the audit record rather than hiding a contract violation.
-  judge_signature_version: 2
-  scope_fingerprint: 78f44db4cab16a4e56b7b681b54eb3fd586ce661fb00eaeb7d3a0dec9eb136f9
-  judge_transport: codex_cli
-  ast_path: 'body[17]/body[15]/handlers[0]/body[3]/test/values[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:a5a119b404e587f188f032e0cb37f69cce30c4d01bd28fc2cd171cdbbd3bdedb'
 - key: engine/orchestrator/preflight.py:R5:_capability_fingerprint:fp=514fb66978f585bc
   owner: john
   reason: |-
@@ -1220,22 +1077,22 @@ allow_hits:
 - key: engine/processor.py:R5:RowProcessor:_execute_transform_with_retry:is_retryable:fp=18d893faf7871108
   owner: john
   reason: |-
-    isinstance on a builtin exception class inside the `is_retryable` predicate, and the ordering is the point. is_retryable is declared `Callable[[BaseException], bool]` (src/elspeth/engine/retry.py:76) and handed to tenacity at retry.py:136; a predicate whose only parameter is BaseException has no narrower static type to dispatch on, so exception classification IS the function and isinstance is the only mechanism Python offers. This arm is load-bearing, not belt-and-braces: InterruptedError is a subclass of OSError, so without this early `return False` the final arm at processor.py:2382 would classify a cooperative-shutdown interrupt as retryable through its OSError member and the RetryManager would keep re-entering the transform during shutdown. The no-retry-manager path spells the identical ordering with `except InterruptedError` at processor.py:2313 ahead of `except (ConnectionError, TimeoutError, OSError, CapacityError)` at :2332. tenacity's own `retry_if_not_exception_type(InterruptedError)` conjunct at retry.py:136 is a second, independent guard living in the caller; this predicate is a named function that must be correct standing alone, and deleting the arm on the strength of the caller's conjunct would leave a function that reports shutdown as retryable to anyone who calls it directly. INVALIDATED BY: InterruptedError ceasing to derive from OSError; OSError being dropped from the 2382 union; this arm being reordered after 2382; or is_retryable acquiring a narrower parameter type that makes the classification statically decidable.
+    RULE MISFIRES: isinstance(e, InterruptedError) classifies a builtin exception family in an is_retryable predicate whose input contract is BaseException. It explicitly returns False for cooperative shutdown, before other exception families are considered. No owned record is revalidated, coerced or defaulted; exception hierarchy dispatch is the function's purpose. RetryManager.execute_with_retry accepts the predicate and independently excludes InterruptedError, while the processor's surrounding handler converts interruption to an explicit shutdown_requested result. The old claim that bare OSError appears in the final retryable union is obsolete and is not relied upon. Verified passing shutdown tests are in tests/unit/engine/test_processor.py, including TestExecuteTransformWithRetry::test_shutdown_during_backoff_diverts_with_last_attempt_state_id. This is not a Tier-3 parameter parser for decorator purposes.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T13:26:24.948885+00:00'
+  judge_recorded_at: '2026-09-08T00:56:40.623830+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal exception classification within a predicate deliberately typed to accept `BaseException`, not a defensive shape re-check that masks a fixed-contract violation. The ordering is visibly load-bearing because `InterruptedError` must be excluded before the `OSError` union at `src/elspeth/engine/processor.py:2377`, and the equivalent no-manager path has the same ordering at `src/elspeth/engine/processor.py:2313`. The control-location claim is verified: `RetryManager.execute_with_retry` declares the predicate as `Callable[[BaseException], bool]` at `src/elspeth/engine/retry.py:76` and independently excludes `InterruptedError` at line 136; this is not a Tier-3 parameter boundary eligible for the decorator.
+    RULE MISFIRES: the flagged `isinstance(e, InterruptedError)` is deliberate exception-family dispatch inside an `is_retryable(BaseException)` predicate, not defensive revalidation of data under a fixed contract. The visible code uses the check to exclude cooperative shutdown from retry, then routes `InterruptedError` through the surrounding explicit shutdown handler; it neither suppresses a contract violation nor coerces, defaults, or fabricates data. The decorator alternative does not apply because `e` is an exception-classification input, not an external Tier-3 data parameter being parsed.
   judge_signature_version: 2
-  scope_fingerprint: 430c179aa1a7fab06a4a188845f5778f4156e21d9bff09c6b3b6dcf1801cb36e
+  scope_fingerprint: d5d8ae6c5b4e92d271afba20e31babe135dbd3578fdfa0e1b9612d56b95aeb04
   judge_transport: codex_cli
   ast_path: 'body[78]/body[35]/body[5]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:ae4ae186e6f46f03780764b0af74ab5671f1ee7644cb7d8788d3be768212cd19'
+  judge_metadata_signature: 'hmac-sha256:v2:493eb26fe907cae5a594c67a201318b4bfcfc664f5dbe0b460e79ed0765b281f'
 - key: engine/processor.py:R5:RowProcessor:_execute_transform_with_retry:is_retryable:fp=352a9bcb7a23e240
   owner: john
   reason: |-
@@ -1483,25 +1340,29 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[14]/body[4]/body[1]/body[2]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:b7182e810955d7a4eed6ffe1099cc6ce0806f741b979fa5fd6ec0c82cb060ff1'
-- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_latest_exact_member_result:fp=755208f37daeea8f
+- key: engine/executors/sink_effects.py:R5:SinkEffectCoordinator:_latest_exact_member_result:fp=4da80006a1ee3144
   owner: john
   reason: |-
     `decode_sink_effect_returned_result` yields ELSPETH-owned `SinkEffectCommitResult | SinkEffectReconcileResult` variants. This nominal dispatch accepts every commit result but only the reconcile subtype carrying `APPLIED_WITH_EXACT_DESCRIPTOR`; if no such exact evidence exists the function raises `LandscapeRecordError`. It cannot silently credit an inexact member outcome.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:33:53.704413+00:00'
+  judge_recorded_at: '2026-09-08T00:45:36.523586+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the flagged checks perform nominal variant dispatch within a guaranteed closed union, rather than defensively revalidating or concealing a contract violation. The decoder at core/landscape/execution/sink_effect_attempt_results.py:88 strictly validates the durable envelope and, through line 143, constructs only SinkEffectInspection, SinkEffectCommitResult, or SinkEffectReconcileResult; the visible caller limits actions to COMMIT or RECONCILE before selecting all commit results or only reconcile results with APPLIED_WITH_EXACT_DESCRIPTOR. Failure to find qualifying exact evidence raises LandscapeRecordError, so the site neither coerces nor silently credits an inexact outcome. This is not an R1/R5 boundary function rooted in an external parameter, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — this `isinstance` expression performs nominal variant dispatch over the closed ELSPETH-owned result union; it does not defensively revalidate or conceal a contract violation. The verified decoder at src/elspeth/core/landscape/execution/sink_effect_attempt_results.py:88-150 validates the durable envelope and returns the action-specific owned result, while the flagged code accepts commit evidence or only reconcile evidence marked `APPLIED_WITH_EXACT_DESCRIPTOR`. If no eligible evidence exists, `_latest_exact_member_result` raises `LandscapeRecordError`, so no inexact result is silently credited. The decorator alternative is inapplicable because the checked subject is a locally decoded owned result, not data rooted at the function's `effect_id` parameter.
   judge_signature_version: 2
   scope_fingerprint: 40399fc3fc28184ed6bcedd611808de60962f22ce61ee09b965ea41fb401c7f7
   judge_transport: codex_cli
-  ast_path: 'body[35]/body[18]/body[0]/body[2]/test/values[1]/values[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:91fcaa88e9a27aede85b1641294c19547c371635c1bb9644f5f106ac9a133f6e'
+  ast_path: 'body[37]/body[19]/body[0]/body[2]/test/values[1]/values[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:1872d82cf9e0f3631d0c341d2ee010c2dbf3609aebef039fc474cb0fbd7a6e41'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
 - key: engine/executors/state_guard.py:R5:NodeStateGuard:complete:fp=a8bed108176f7977
   owner: john
   reason: |-
@@ -1565,38 +1426,42 @@ allow_hits:
     Inside the processing loop, `StopIteration` is the explicit source-EOF branch: it records shutdown-vs-exhaustion, exits the loop, and flows into the normal finalization/accounting path. This is required iterator control flow; non-EOF failures are not caught.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:34:14.955342+00:00'
+  judge_recorded_at: '2026-09-08T00:56:05.308979+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the caught `StopIteration` is the iterator protocol's explicit exhaustion signal, not an operational failure being silently suppressed. The visible branch records whether termination reflects shutdown or exhaustion and then breaks into normal post-loop finalization, while the narrow exception type leaves non-EOF failures uncaught. R6 therefore does not describe this site, and the trust-boundary decorator is inapplicable because the finding is R6 rather than R1 or R5.
+    RULE MISFIRES — the `except StopIteration` is the iterator protocol’s explicit EOF branch, not silent suppression of an error. The visible code distinguishes shutdown from ordinary exhaustion by setting `interrupted_by_shutdown` and `source_exhausted`, then deliberately breaks to the enclosing finalization path; the narrow handler leaves non-EOF failures uncaught. R6’s premise therefore does not apply at this site.
   judge_signature_version: 2
-  scope_fingerprint: b0de4d76f8d7d9cbc12b6b5e848c79e99e1271188b86504c49d9481f12768fd0
+  scope_fingerprint: 812f29cd5d0f863c97aa77f0023d9113cb2a32492a28d0aa33bd4049fb81910f
   judge_transport: codex_cli
   ast_path: 'body[32]/body[14]/body[12]/body[7]/body[10]/body[1]/body[1]/orelse[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:5813d27f7652b6815ad8d37f8a5292756f018b4e812b3fbe2fe4b372580a61e7'
+  judge_metadata_signature: 'hmac-sha256:v2:7fa23586ebf38a3fde911e659307cac1d75ec468f78ff1f7503053fff9fbcb45'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 24
+      redacted_hash: a0784fd41745d348
 - key: engine/orchestrator/source_iteration.py:R6:SourceIterationDriver:run_main_processing_loop:fp=ca59da62ad3f8a87
   owner: john
   reason: |-
     `StopIteration` is the iterator protocol's explicit EOF result. The initial fetch records that result as `source_exhausted` unless shutdown won the race; no row or error is discarded, and all other exceptions propagate. The same state drives final source accounting.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:34:47.855322+00:00'
+  judge_recorded_at: '2026-09-08T00:56:22.812918+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES — `StopIteration` is the iterator protocol's normal exhaustion signal, not an error being silently suppressed. The visible handler explicitly translates it into `source_exhausted`, while separately recording whether shutdown won the race, and the narrow exception type allows all other exceptions to propagate. This directly addresses R6's concern at the flagged site without fabricating a row, discarding an error, or silently recovering from a genuine failure.
+    PRESCRIBED FORM — `StopIteration` is the iterator protocol’s normal exhaustion signal, not a plugin error, and this handler explicitly translates it into `source_exhausted` while separately recording whether shutdown won the race. The visible code catches only `StopIteration`, so other exceptions propagate, and no default row or fabricated data is substituted; this is explicit control-flow state rather than silent error suppression.
   judge_signature_version: 2
-  scope_fingerprint: b0de4d76f8d7d9cbc12b6b5e848c79e99e1271188b86504c49d9481f12768fd0
+  scope_fingerprint: 812f29cd5d0f863c97aa77f0023d9113cb2a32492a28d0aa33bd4049fb81910f
   judge_transport: codex_cli
   ast_path: 'body[32]/body[14]/body[12]/body[7]/body[3]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:377d011a3980a6852be3b61ab7ffe8d5f3c99c0db388f6b9bac6d1df18365c88'
+  judge_metadata_signature: 'hmac-sha256:v2:64dfdd040cc1130e8818ac8b321073c208baab4ae2c39357ff047e24048b9626'
 - key: engine/executors/transform.py:R5:TransformExecutor:execute_transform:fp=9497b85b06e43bf9
   owner: john
   reason: |-
@@ -1616,3 +1481,171 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[26]/body[10]/body[6]/value/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:42d2ffbeff5ef44276c6b4c812eeb734730246d50e8ea6193e5f78c3f785c00d'
+- key: engine/barrier_coordination.py:R1:BarrierIntakeCoordinator:_intake_arrival:fp=57b57a14a072072a
+  owner: john
+  reason: |-
+    RULE MISFIRES: max_attempts.get(row.token_id, -1) reads a deliberately sparse aggregate, not a required audit column. BarrierRestoreReadModel.get_max_node_state_attempts in core/landscape/scheduler/restore_read_model.py groups existing node_states rows by token_id and adds only returned groups to its mapping. A journal token without any prior node-state attempt therefore has no mapping entry; -1 plus one means its first attempt_offset is zero. Existing attempts produce their actual maximum plus one. The durable TokenWorkItem remains the source passed to token_from_journal_item in core/landscape/scheduler/payload_codec.py, and _backdated_accept_monotonic rejects a missing barrier_blocked_at with AuditIntegrityError before this lookup. No persisted attempt record is rewritten or reconstructed with fabricated data. This is owned optional aggregate lookup, not Tier-3 parsing eligible for a boundary decorator.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:36:18.699645+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `max_attempts` is intentionally sparse, not a fixed-shape audit record whose missing key signals corruption. `BarrierRestoreReadModel.get_max_node_state_attempts` constructs the mapping solely from grouped `node_states` results, so a token with no rows legitimately has no entry (core/landscape/scheduler/restore_read_model.py:205); the default therefore computes the operational first-attempt offset of zero rather than fabricating persisted evidence. The stated control ordering is also verified: `_intake_arrival` calls `_backdated_accept_monotonic` before the aggregate lookup (engine/barrier_coordination.py:364), and `token_from_journal_item` rebuilds from the durable `TokenWorkItem` while using the supplied value only as `resume_attempt_offset` (core/landscape/scheduler/payload_codec.py:74). The subject is rooted in a first-party aggregate result rather than external parameter data, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 589f9d362332c99d8d8fcf542a4ba4962f8243f9825bba90e5154fc1e448f8c1
+  judge_transport: codex_cli
+  ast_path: 'body[31]/body[4]/body[6]/value/elts[0]/keywords[0]/value/left'
+  judge_metadata_signature: 'hmac-sha256:v2:47afc66e7421ec375b5f863e9789f0bc066dc0b4f48d5ceb4da9cfbeafa7c74d'
+- key: engine/barrier_coordination.py:R9:BarrierIntakeCoordinator:_intake_arrival:fp=bd0144bf60360666
+  owner: john
+  reason: |-
+    RULE MISFIRES: _live_barrier_holds.pop(row.token_id, None) consumes an optional process-local arrival cache. RowProcessor stores _LiveBarrierHold for arrivals observed by this process; follower handoffs and restart adoption can legitimately have no entry. The explicit None branch reconstructs the token from the already-adopted durable TokenWorkItem and derives timing via _backdated_accept_monotonic, whose missing durable timestamp check raises AuditIntegrityError. A present hold returns its exact token and monotonic arrival and is removed once, preventing repeated cache reuse. The durable journal is never defaulted or deleted by this pop. BarrierIntakeCoordinator._intake_arrival documents the two valid provenance paths and handles both explicitly. R9's implicit-required-key concern does not apply to a consumable optional cache.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:36:55.722016+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the cache contract explicitly permits absence after leader takeover and requires journal rehydration (src/elspeth/engine/barrier_coordination.py:88), so `pop(row.token_id, None)` represents optional one-time consumption rather than concealment of a required key. The absent-hold path at src/elspeth/engine/barrier_coordination.py:350 invokes `BarrierIntakeCoordinator._backdated_accept_monotonic`, which raises `AuditIntegrityError` for a missing durable timestamp before rebuilding the token from the journal. The control is pinned by `tests/unit/engine/test_adr030_slice3_intake.py::TestBackdatedAcceptTiming::test_timeout_anchor_is_blocked_at_even_when_adoption_is_delayed` at line 121, which exercises takeover adoption without a live hold and verifies the durable timing path. R9 is not decorator-suppressible, and this method does not take Tier-3 input.
+  judge_signature_version: 2
+  scope_fingerprint: 589f9d362332c99d8d8fcf542a4ba4962f8243f9825bba90e5154fc1e448f8c1
+  judge_transport: codex_cli
+  ast_path: 'body[31]/body[4]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:55190890775cce6dd6d99f300585e9aeba03ea0efe8e2cd9a2ebc9f1bc85c474'
+- key: engine/executors/sink_effects.py:R4:_SinkEffectLeaseHeartbeat:_run:fp=df7fe191d834d76c
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: _SinkEffectLeaseHeartbeat._run catches BaseException only to transfer a failed fenced heartbeat to its caller. It stores the actual exception before setting _failed_event, then immediately returns from the loop, so a later beat cannot overwrite it. _SinkEffectLeaseHeartbeat.check_and_raise raises that same stored object; an impossible published event without an error raises LandscapeRecordError. refresh_and_check checks the latch before and after synchronous lease refresh. SinkEffectCoordinator._commit and _reconcile invoke refresh_and_check after adapter I/O, and _finalize stops/joins the renewer and refreshes/checks before the terminal CAS. This is cross-thread error delivery, not a successful heartbeat substitution. Catching BaseException preserves cancellation/process-control failures for that handoff rather than losing them on a daemon stack.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:37:17.550475+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    PRESCRIBED FORM: the broad catch does not suppress the failure; `_run` stores the actual `BaseException`, publishes the failure event, and terminates at sink_effects.py:185-188, while `check_and_raise` re-raises that stored object at sink_effects.py:156-161. The named handoff controls are verified: `_commit` and `_reconcile` call `refresh_and_check` immediately after adapter I/O at sink_effects.py:1400-1404 and sink_effects.py:1442-1447, and `_finalize` stops the renewer and performs a final synchronous refresh before the terminal repository finalization at sink_effects.py:1585-1608. This is deliberate cross-thread exception propagation, including process-control failures, rather than silent recovery, coercion, or fabricated success.
+  judge_signature_version: 2
+  scope_fingerprint: 01f47d056f608d8c35b243e602647fcc41ed3ea4a86a7bce4a394f4730887cce
+  judge_transport: codex_cli
+  ast_path: 'body[32]/body[6]/body[0]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:add7432006dd7dbc03156bc03468036ad1c22439691d32c6e0bbab6a03bce5e4'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 1d5eb14ed0eb3b6d
+- key: engine/orchestrator/export.py:R5:_resume_audit_export_led:fp=2c8d7fd4ac1df7f4
+  owner: john
+  reason: |-
+    RULE MISFIRES: isinstance(export_error, SinkEffectLeaseHeld) classifies an ELSPETH-owned exception family, not the shape of audit data. The return requires BOTH that class and failure_recorded is False. RunLifecycleRepository.set_export_failed_unless_completed in core/landscape/run_lifecycle_repository.py returns False only after its leader-fenced transaction reads an existing COMPLETED export status; a missing or unexpected run status raises AuditIntegrityError. The local starts as None, so failed best-effort status recording cannot satisfy the return condition. Consequently only a lease-contention outcome overtaken by independently recorded completion is accepted. Other exceptions and other status outcomes reach the bare raise. No default status or structural impostor is admitted, and this is not a Tier-3 parsing boundary.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:39:37.716997+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: the flagged `isinstance` classifies an ELSPETH-owned exception outcome; it does not revalidate data shape or conceal a contract violation, and all non-lease exceptions reach the bare `raise`. I verified `RunLifecycleRepository.set_export_failed_unless_completed` at src/elspeth/core/landscape/run_lifecycle_repository.py:1787: it returns `False` only for an existing `COMPLETED` status and raises `AuditIntegrityError` for missing or unsupported status. The behavior is pinned by tests/integration/pipeline/test_audit_export_effect_recovery.py:1142 in `test_resume_audit_export_only_adopts_peer_completion_for_lease_contention`, which accepts typed lease contention after peer completion while requiring an unrelated error to propagate. The subject is a locally caught exception rather than external parameter-rooted data, so the trust-boundary decorator does not apply.
+  judge_signature_version: 2
+  scope_fingerprint: 0bd43e7c25fa5b63270ac959cb2778de3b0fab336c088b9e5d204bf7be648130
+  judge_transport: codex_cli
+  ast_path: 'body[19]/body[7]/handlers[0]/body[3]/test/values[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:d81b7e967bd9e4f858a21e2e551a44b04cb2eb4ef1398ad5b857f768677c3004'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 4261d13e87562717
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 4261d13e87562717
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 4261d13e87562717
+    - pattern: dotenv_secret_assignment
+      byte_count: 25
+      redacted_hash: 8efc9ea678cbf6b0
+- key: engine/orchestrator/heartbeat.py:R5:RunHeartbeatThread:_beat_once:fp=d50b0208b8802968
+  owner: john
+  reason: |-
+    RULE MISFIRES: isinstance(snapshot, WorkerMembershipLost) is nominal discrimination of the two declared first-party worker_heartbeat outcomes, CoordinationSnapshot | WorkerMembershipLost. Both concrete classes are ELSPETH-owned in contracts/coordination.py, and _HeartbeatRepository.worker_heartbeat and RunCoordinationRepository.worker_heartbeat declare the union. The refusal arm logs membership loss, sets _coordination_lost_event and returns; check_and_raise converts that latch into RunWorkerEvictedError at the drain boundary. Only the snapshot arm reads worker_role and leader_worker_id. There is no coercion, fabricated snapshot, or external-input shape guessing. The check is the ADR-032 internal-union dispatch form, not a parameter-rooted Tier-3 boundary. Verified tests: tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestFatalLatchEvicted::test_check_and_raise_raises_after_eviction and TestBeatsCorrectly::test_healthy_beat_does_not_set_latch. Both are in the passing heartbeat module selection.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:38:52.279838+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES: this `isinstance` is nominal dispatch over the declared first-party return union `CoordinationSnapshot | WorkerMembershipLost`, not defensive revalidation or concealment of a contract violation; the concrete owned outcomes are defined at `src/elspeth/contracts/coordination.py:132` and `:160`, and `RunCoordinationRepository.worker_heartbeat` constructs only those outcomes at `src/elspeth/core/landscape/run_coordination_repository.py:1078-1146`. The refusal branch records the membership-loss state and returns, while any undeclared return type falls through and fails on direct snapshot attribute access rather than being coerced or silently accepted. The named downstream control `RunHeartbeatThread.check_and_raise` was verified at `src/elspeth/engine/orchestrator/heartbeat.py:216-242`, and its membership-loss behavior is pinned by `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestFatalLatchEvicted::test_check_and_raise_raises_after_eviction` at line 549; the healthy-arm test also exists at line 182. The decorator contract is inapplicable because `_beat_once` has no external-data parameter and the checked value is a first-party repository result, not parameter-rooted Tier-3 data.
+  judge_signature_version: 2
+  scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[8]/body[1]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:d5b1f22ce4eb3c95f7b5335e457169d97aeee0272798ffe4649d31ad548aa438'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 18
+      redacted_hash: 62c2701cc3ad1304
+- key: engine/processor.py:R5:RowProcessor:__init__:fp=523a4df2d20b0d30
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: the not isinstance(member_token, WorkerMembershipToken) check in RowProcessor.__init__ enforces an owned authority-type distinction after ProcessorMode.FOLLOWER selection. WorkerMembershipToken is a concrete ELSPETH class in contracts/coordination.py. A wrong nominal type raises OrchestrationInvariantError immediately; matching attributes or IDs do not suffice. The preceding guards forbid coordination_token/run_coordination and require an explicit lease owner and non-None member token. The following check binds member_token.run_id and worker_id to this processor and owner. No type is coerced or accepted structurally. This is ADR-032 internal nominal admission and a loud wrong-type failure, not an external-data parser.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:37:12.248206+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM: the visible code uses a nominal `isinstance` check against the concrete ELSPETH-owned `WorkerMembershipToken` and immediately raises `OrchestrationInvariantError` on the wrong authority type. The surrounding mode, presence, and identity checks establish that this is loud internal admission enforcement, with no coercion, structural acceptance, defaulting, or error suppression. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; it is the policy-prescribed offensive failure for an invalid state in code ELSPETH controls.
+  judge_signature_version: 2
+  scope_fingerprint: 61799a91b9f6686f4526f817e30c5bd277125e1a8c2c815e9989d79c358be15b
+  judge_transport: codex_cli
+  ast_path: 'body[78]/body[1]/body[68]/body[4]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:3c89382d9d07a9aef50128961ae926010ac73743a71bdd5bce9cb6d502cd9cdb'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 31
+      redacted_hash: 00ca36889b6d2c95
+- key: engine/processor.py:R5:RowProcessor:__init__:fp=b6e744fc0ed5ab04
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: RowProcessor.__init__ permits absence of coordination_token where the processor contract allows it, but any supplied value must be the owned concrete CoordinationToken. The not isinstance check raises OrchestrationInvariantError rather than falling back to anonymous or follower authority. Subsequent leader checks bind scheduler_lease_owner to the token worker; follower mode explicitly forbids the leader token. This prevents WorkerMembershipToken or a same-shaped object from authorizing leader maintenance merely through matching fields. No default or coercion masks the mismatch. The nominal check enforces an ELSPETH-owned contract under ADR-032 and is not eligible for a Tier-3 boundary declaration.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:37:37.593862+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM: the visible code uses a nominal `isinstance` check against the ELSPETH-owned concrete `CoordinationToken` and immediately raises `OrchestrationInvariantError` for any supplied wrong type; it neither coerces, defaults, nor continues with malformed authority. The subsequent checks visibly bind leader lease ownership to `coordination_token.worker_id`, consistent with the rationale that this is offensive enforcement of an internal authorization contract rather than Tier-3 shape validation. The decorator is inapplicable because the rationale and code identify an ELSPETH-owned contract, not external-origin parameter data.
+  judge_signature_version: 2
+  scope_fingerprint: 61799a91b9f6686f4526f817e30c5bd277125e1a8c2c815e9989d79c358be15b
+  judge_transport: codex_cli
+  ast_path: 'body[78]/body[1]/body[58]/test/values[1]/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:684ce1b3c345d3e225329f17f2a1db65cb06b6deca60a81e3d73a4937083c660'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 26
+      redacted_hash: 464eaf187bdc2609
+    - pattern: dotenv_secret_assignment
+      byte_count: 20
+      redacted_hash: efc46f87ca8e643f
