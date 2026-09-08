@@ -33,7 +33,16 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
-from tests.fixtures.landscape import RecorderSetup, make_factory, make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import (
+    RecorderSetup,
+    leader_member_token,
+    leader_token_for,
+    make_factory,
+    make_recorder_with_run,
+    member_token_for,
+    register_test_node,
+    register_test_worker,
+)
 
 NODE_ID = "normalize"
 LEASE_OWNER = "worker-a"
@@ -45,21 +54,21 @@ _PAYLOAD = TokenSchedulerRepository.serialize_row_payload(PipelineRow({"id": 1},
 
 def _enqueue_ready(setup: RecorderSetup, scheduler: TokenSchedulerRepository, *, sequence: int) -> str:
     row, token = setup.data_flow.create_row_with_token(
-        run_id=setup.run_id,
         source_node_id=setup.source_node_id,
         row_index=sequence,
         data={"id": sequence},
         source_row_index=sequence,
         ingest_sequence=sequence,
+        coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
     )
     item = scheduler.enqueue_ready(
-        run_id=setup.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=sequence,
         row_payload_json=_PAYLOAD,
+        member_token=leader_member_token(setup.factory, setup.run_id),
     )
     return item.work_item_id
 
@@ -99,7 +108,11 @@ def test_mixed_statuses_counts_only_ready() -> None:
     # transition the specific ones we want non-READY.
     claims = {}
     for _ in range(3):
-        item = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
+        item = scheduler.claim_ready(
+            lease_owner=LEASE_OWNER,
+            lease_seconds=300,
+            member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER, run_id=setup.run_id),
+        )
         assert item is not None
         claims[item.work_item_id] = item
     # Re-enqueue the one we want to stay READY by recovering its lease back.
@@ -113,6 +126,7 @@ def test_mixed_statuses_counts_only_ready() -> None:
         error_hash=None,
         error_message=None,
         expected_lease_owner=LEASE_OWNER,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER),
     )
     # leased_id stays LEASED (claimed, untouched). ready_id: push it back to READY
     # by expiring its lease and recovering.
@@ -135,9 +149,17 @@ def test_all_non_ready_returns_zero() -> None:
     setup, scheduler = _single_run()
     ids = [_enqueue_ready(setup, scheduler, sequence=i) for i in range(2)]
     for _ in range(2):
-        item = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER, lease_seconds=300)
+        item = scheduler.claim_ready(
+            lease_owner=LEASE_OWNER,
+            lease_seconds=300,
+            member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER, run_id=setup.run_id),
+        )
         assert item is not None
-        scheduler.mark_terminal(work_item_id=item.work_item_id, expected_lease_owner=LEASE_OWNER)
+        scheduler.mark_terminal(
+            work_item_id=item.work_item_id,
+            expected_lease_owner=LEASE_OWNER,
+            member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER),
+        )
     assert scheduler.count_ready_in_set(run_id=setup.run_id, work_item_ids=ids) == 0
 
 
@@ -197,30 +219,30 @@ def test_cross_run_isolation_shared_db_run_id_predicate() -> None:
             openrouter_catalog_source="bundled",
         )
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         register_test_node(factory.data_flow, run.run_id, NODE_ID)
         row, token = factory.data_flow.create_row_with_token(
-            run_id=run.run_id,
             source_node_id=node.node_id,
             row_index=sequence,
             data={"id": sequence},
             source_row_index=sequence,
             ingest_sequence=sequence,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         item = scheduler.enqueue_ready(
-            run_id=run.run_id,
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=sequence,
             row_payload_json=_PAYLOAD,
+            member_token=leader_member_token(factory, run.run_id),
         )
         return item.work_item_id
 
@@ -280,15 +302,35 @@ def test_count_failed_counts_only_failed_rows() -> None:
     ready_id = _enqueue_ready(setup, scheduler, sequence=3)
 
     # Claim FAILED + TERMINAL + LEASED ids (lowest ingest_sequence first).
-    claimed_failed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
+    claimed_failed = scheduler.claim_ready(
+        lease_owner=LEASE_OWNER_LEADER,
+        lease_seconds=300,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER, run_id=setup.run_id),
+    )
     assert claimed_failed is not None and claimed_failed.work_item_id == failed_id
-    scheduler.mark_failed(work_item_id=failed_id, expected_lease_owner=LEASE_OWNER_LEADER)
+    scheduler.mark_failed(
+        work_item_id=failed_id,
+        expected_lease_owner=LEASE_OWNER_LEADER,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER),
+    )
 
-    claimed_terminal = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
+    claimed_terminal = scheduler.claim_ready(
+        lease_owner=LEASE_OWNER_LEADER,
+        lease_seconds=300,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER, run_id=setup.run_id),
+    )
     assert claimed_terminal is not None and claimed_terminal.work_item_id == terminal_id
-    scheduler.mark_terminal(work_item_id=terminal_id, expected_lease_owner=LEASE_OWNER_LEADER)
+    scheduler.mark_terminal(
+        work_item_id=terminal_id,
+        expected_lease_owner=LEASE_OWNER_LEADER,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER),
+    )
 
-    claimed_leased = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
+    claimed_leased = scheduler.claim_ready(
+        lease_owner=LEASE_OWNER_LEADER,
+        lease_seconds=300,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER, run_id=setup.run_id),
+    )
     assert claimed_leased is not None and claimed_leased.work_item_id == leased_id
     # leased stays LEASED; ready_id untouched (still READY).
 
@@ -317,34 +359,42 @@ def test_count_failed_is_run_scoped() -> None:
             leader_worker_id=lease_owner,
         )
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         register_test_node(factory.data_flow, run.run_id, NODE_ID)
         row, token = factory.data_flow.create_row_with_token(
-            run_id=run.run_id,
             source_node_id=node.node_id,
             row_index=sequence,
             data={"id": sequence},
             source_row_index=sequence,
             ingest_sequence=sequence,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         item = scheduler.enqueue_ready(
-            run_id=run.run_id,
             token_id=token.token_id,
             row_id=row.row_id,
             node_id=NODE_ID,
             step_index=1,
             ingest_sequence=sequence,
             row_payload_json=_PAYLOAD,
+            member_token=leader_member_token(factory, run.run_id),
         )
-        claimed = scheduler.claim_ready(run_id=run.run_id, lease_owner=lease_owner, lease_seconds=300)
+        claimed = scheduler.claim_ready(
+            lease_owner=lease_owner,
+            lease_seconds=300,
+            member_token=member_token_for(scheduler._engine, worker_id=lease_owner, run_id=run.run_id),
+        )
         assert claimed is not None
-        scheduler.mark_failed(work_item_id=item.work_item_id, expected_lease_owner=lease_owner)
+        scheduler.mark_failed(
+            work_item_id=item.work_item_id,
+            expected_lease_owner=lease_owner,
+            member_token=member_token_for(scheduler._engine, worker_id=lease_owner),
+        )
         return item.work_item_id
 
     a_id = _make_failed("failed-run-A", 0)
@@ -363,7 +413,11 @@ def test_has_peer_owned_work_false_for_solo_leader_own_rows() -> None:
     """An N=1 leader's own LEASED rows are NOT peer-owned → False."""
     setup, scheduler = _single_run()
     _enqueue_ready(setup, scheduler, sequence=0)
-    claimed = scheduler.claim_ready(run_id=setup.run_id, lease_owner=LEASE_OWNER_LEADER, lease_seconds=300)
+    claimed = scheduler.claim_ready(
+        lease_owner=LEASE_OWNER_LEADER,
+        lease_seconds=300,
+        member_token=member_token_for(scheduler._engine, worker_id=LEASE_OWNER_LEADER, run_id=setup.run_id),
+    )
     assert claimed is not None  # own LEASED row
     assert scheduler.has_peer_owned_work(run_id=setup.run_id, caller_owner=LEASE_OWNER_LEADER) is False
 
@@ -415,6 +469,7 @@ def test_has_peer_owned_work_true_for_peer_pending_sink_even_after_lease_lapses(
                 lease_expires_at=read_landscape_transaction_time(conn) + timedelta(seconds=300),
             )
         )
+    register_test_worker(setup.db, run_id=setup.run_id, worker_id=PEER_OWNER)
     scheduler.mark_pending_sink(
         work_item_id=wid,
         row_payload_json=_PAYLOAD,
@@ -424,6 +479,7 @@ def test_has_peer_owned_work_true_for_peer_pending_sink_even_after_lease_lapses(
         error_hash=None,
         error_message=None,
         expected_lease_owner=PEER_OWNER,
+        member_token=member_token_for(scheduler._engine, worker_id=PEER_OWNER),
     )
     # No active peer LEASE remains, but the PENDING_SINK row still carries the peer.
     assert scheduler.peer_active_leases(run_id=setup.run_id, caller_owner=LEASE_OWNER_LEADER) == ()
@@ -447,25 +503,30 @@ def test_has_peer_owned_work_is_run_scoped() -> None:
         config={}, canonical_version="v1", run_id="peer-owned-B", openrouter_catalog_sha256="0" * 64, openrouter_catalog_source="bundled"
     )
     node = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     register_test_node(factory.data_flow, run.run_id, NODE_ID)
     row, token = factory.data_flow.create_row_with_token(
-        run_id=run.run_id, source_node_id=node.node_id, row_index=0, data={"id": 0}, source_row_index=0, ingest_sequence=0
+        source_node_id=node.node_id,
+        row_index=0,
+        data={"id": 0},
+        source_row_index=0,
+        ingest_sequence=0,
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     item = scheduler.enqueue_ready(
-        run_id=run.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=NODE_ID,
         step_index=1,
         ingest_sequence=0,
         row_payload_json=_PAYLOAD,
+        member_token=leader_member_token(factory, run.run_id),
     )
     with db.engine.begin() as conn:
         conn.execute(

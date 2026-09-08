@@ -37,7 +37,15 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import FieldContract, SchemaContract
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    leader_member_token,
+    leader_token_for,
+    make_factory,
+    make_landscape_db,
+    make_recorder_with_run,
+)
 
 # Minimal contract for tests that only care about token lifecycle, not contract content.
 _MINIMAL_CONTRACT = SchemaContract(mode="OBSERVED", fields=(), locked=True)
@@ -224,15 +232,14 @@ class TestTokenOutcomeContractProperties:
         """Create a run with a source row and token for testing outcomes."""
         setup = make_recorder_with_run(canonical_version="1.0", source_plugin_name="test_source")
         db, factory, run_id, source_node_id = setup.db, setup.factory, setup.run_id, setup.source_node_id
-        row = factory.data_flow.create_row(
-            run_id=run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node_id,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         return db, factory, run_id, token.token_id
 
     def test_completed_requires_sink_name(self) -> None:
@@ -243,6 +250,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -256,6 +265,8 @@ class TestTokenOutcomeContractProperties:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name=sink,
+            member_token=leader_member_token(factory, run_id),
+            work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
         )
         assert outcome_id is not None
         db.close()
@@ -268,6 +279,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -282,6 +295,8 @@ class TestTokenOutcomeContractProperties:
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
+            member_token=leader_member_token(factory, run_id),
+            work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
         )
         db.close()
 
@@ -293,6 +308,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -304,6 +321,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -315,6 +334,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.BATCH_CONSUMED,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -330,6 +351,8 @@ class TestTokenOutcomeContractProperties:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="default",
+            member_token=leader_member_token(factory, run_id),
+            work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
         )
         db.close()
 
@@ -344,6 +367,8 @@ class TestTokenOutcomeContractProperties:
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.EXPAND_PARENT,
+            member_token=leader_member_token(factory, run_id),
+            work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
         )
         db.close()
 
@@ -355,6 +380,8 @@ class TestTokenOutcomeContractProperties:
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=None,
                 path=TerminalPath.BUFFERED,
+                member_token=leader_member_token(factory, run_id),
+                work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
             )
         db.close()
 
@@ -365,6 +392,8 @@ class TestTokenOutcomeContractProperties:
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.FILTER_DROPPED,
+            member_token=leader_member_token(factory, run_id),
+            work_item=claim_test_work_item(factory, member_token=leader_member_token(factory, run_id), token_id=token_id, node_id=None),
         )
         assert outcome_id is not None
         db.close()
@@ -388,12 +417,12 @@ class TestSchemaContractRoundTripProperties:
     def _record_source(factory: RecorderFactory, run_id: str) -> str:
         """Register a source node and its run_sources row; return the node id."""
         source = factory.data_flow.register_node(
-            run_id=run_id,
             plugin_name="test",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=_make_schema_config(),
+            coordination_token=leader_token_for(factory.data_flow._db, run_id),
         )
         factory.run_lifecycle.record_run_source(
             source_node_id=source.node_id,
@@ -529,24 +558,23 @@ class TestReferentialIntegrityProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
             for i in range(n_rows):
-                row = factory.data_flow.create_row(
-                    run_id=run.run_id,
+                _row, _initial_token = factory.data_flow.create_row_with_token(
                     source_node_id=source.node_id,
                     row_index=i,
                     data={"i": i},
                     source_row_index=i,
                     ingest_sequence=i,
+                    coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
                 )
-                factory.data_flow.create_token(row_id=row.row_id)
 
             # Verify no orphan tokens
             with db.connection() as conn:
@@ -570,22 +598,22 @@ class TestReferentialIntegrityProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
             for i in range(n_rows):
-                factory.data_flow.create_row(
-                    run_id=run.run_id,
+                factory.data_flow.create_row_with_token(
                     source_node_id=source.node_id,
                     row_index=i,
                     data={"i": i},
                     source_row_index=i,
                     ingest_sequence=i,
+                    coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
                 )
 
             # Verify no orphan rows
@@ -610,29 +638,32 @@ class TestReferentialIntegrityProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, parent = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=0,
                 data={"v": 1},
                 source_row_index=0,
                 ingest_sequence=0,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            parent = factory.data_flow.create_token(row_id=row.row_id)
 
             branches = [f"b_{i}" for i in range(branch_count)]
             children, _fork_group_id = factory.data_flow.fork_token(
                 parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 branches=branches,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=parent.token_id, node_id=None
+                ),
             )
 
             assert len(children) == branch_count
@@ -648,28 +679,31 @@ class TestReferentialIntegrityProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, parent = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=0,
                 data={"v": 1},
                 source_row_index=0,
                 ingest_sequence=0,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            parent = factory.data_flow.create_token(row_id=row.row_id)
 
             with pytest.raises(ValueError, match="at least one branch"):
                 factory.data_flow.fork_token(
                     parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
                     row_id=row.row_id,
                     branches=[],
+                    member_token=leader_member_token(factory, run.run_id),
+                    work_item=claim_test_work_item(
+                        factory, member_token=leader_member_token(factory, run.run_id), token_id=parent.token_id, node_id=None
+                    ),
                 )
 
     @given(count=st.integers(min_value=1, max_value=5))
@@ -683,24 +717,24 @@ class TestReferentialIntegrityProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, parent = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=0,
                 data={"v": 1},
                 source_row_index=0,
                 ingest_sequence=0,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            parent = factory.data_flow.create_token(row_id=row.row_id)
 
             children, expand_group_id = factory.data_flow.expand_token(
+                member_token=leader_member_token(factory, run.run_id),
                 parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 child_payloads=[{"item": i} for i in range(count)],
@@ -779,29 +813,29 @@ class TestRowHashProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
-            row1 = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row1, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=0,
                 data=data,
                 source_row_index=0,
                 ingest_sequence=0,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            row2 = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row2, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=1,
                 data=data,
                 source_row_index=1,
                 ingest_sequence=1,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
             assert row1.source_data_hash == row2.source_data_hash
@@ -820,29 +854,29 @@ class TestRowHashProperties:
                 canonical_version="1.0",
             )
             source = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="src",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=_make_schema_config(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
-            row1 = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row1, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=0,
                 data=data1,
                 source_row_index=0,
                 ingest_sequence=0,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            row2 = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row2, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source.node_id,
                 row_index=1,
                 data=data2,
                 source_row_index=1,
                 ingest_sequence=1,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
             assert row1.source_data_hash != row2.source_data_hash

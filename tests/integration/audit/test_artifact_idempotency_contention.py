@@ -11,6 +11,8 @@ from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from tests.fixtures.landscape import leader_coordination_token, member_token_for
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -30,17 +32,24 @@ def _register_contending_artifact(
         ready.put(proposed_artifact_id)
         if not start.wait(timeout=15):
             raise TimeoutError("artifact contention start gate was not released")
-        artifact = factory.execution.register_artifact(
-            run_id="run-artifact-contention",
-            state_id="state-artifact-contention",
-            sink_node_id="sink-artifact-contention",
-            artifact_type="csv",
-            path="/output/contention.csv",
-            content_hash="sha256:contention",
-            size_bytes=128,
-            artifact_id=proposed_artifact_id,
-            idempotency_key="run-artifact-contention:row-artifact-contention:csv_sink",
-        )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, "run-artifact-contention"),
+            window_seconds=80.0,
+            verb="register_artifact",
+        ) as conn:
+            artifact = factory.execution.artifacts.register_artifact(
+                run_id="run-artifact-contention",
+                state_id="state-artifact-contention",
+                sink_node_id="sink-artifact-contention",
+                artifact_type="csv",
+                path="/output/contention.csv",
+                content_hash="sha256:contention",
+                size_bytes=128,
+                artifact_id=proposed_artifact_id,
+                idempotency_key="run-artifact-contention:row-artifact-contention:csv_sink",
+                conn=conn,
+            )
         results.put(("ok", artifact.artifact_id))
     except BaseException as exc:
         results.put(("error", f"{type(exc).__name__}: {exc}"))
@@ -61,8 +70,9 @@ def _seed_contention_database(db_path: Path) -> str:
             openrouter_catalog_sha256="0" * 64,
             openrouter_catalog_source="bundled",
         )
+        authority = leader_coordination_token(factory, run.run_id)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -71,7 +81,7 @@ def _seed_contention_database(db_path: Path) -> str:
             schema_config=_DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=authority,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -79,20 +89,20 @@ def _seed_contention_database(db_path: Path) -> str:
             node_id="sink-artifact-contention",
             schema_config=_DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
+            coordination_token=authority,
             source_node_id="source-artifact-contention",
             row_index=0,
             data={"value": 1},
             row_id="row-artifact-contention",
+            token_id="token-artifact-contention",
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row.row_id, token_id="token-artifact-contention")
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id="sink-artifact-contention",
-            run_id=run.run_id,
+            member_token=member_token_for(db.engine, worker_id=authority.worker_id),
             step_index=0,
             input_data={"value": 1},
             state_id="state-artifact-contention",

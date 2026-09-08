@@ -8,7 +8,14 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import TerminalOutcome, TerminalPath
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
-from tests.fixtures.landscape import make_factory, make_landscape_db
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    leader_member_token,
+    leader_token_for,
+    make_factory,
+    make_landscape_db,
+)
 
 
 @pytest.fixture
@@ -230,7 +237,6 @@ class TestRecordTokenOutcome:
 
         # Register source node
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="source_1",
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
@@ -238,19 +244,17 @@ class TestRecordTokenOutcome:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         # Create row and token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id="source_1",
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
-        )
-        token = factory.data_flow.create_token(
-            row_id=row.row_id,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         return run, token
@@ -263,6 +267,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         assert outcome_id is not None
@@ -276,6 +284,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.GATE_ROUTED,
             sink_name="errors",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         assert outcome_id is not None
@@ -289,7 +301,6 @@ class TestRecordTokenOutcome:
 
         # Create an aggregation node (required for batches)
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="agg_node_1",
             plugin_name="test_aggregation",
             node_type=NodeType.TRANSFORM,
@@ -297,12 +308,12 @@ class TestRecordTokenOutcome:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         # Create a batch (required for batch_id FK)
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
-            aggregation_node_id="agg_node_1",
+            aggregation_node_id="agg_node_1", coordination_token=leader_coordination_token(factory, run.run_id)
         )
 
         # First record BUFFERED (non-terminal) with required batch_id
@@ -311,6 +322,10 @@ class TestRecordTokenOutcome:
             outcome=None,
             path=TerminalPath.BUFFERED,
             batch_id=batch.batch_id,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         # Then record terminal outcome with same batch_id
@@ -319,6 +334,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
             batch_id=batch.batch_id,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         assert outcome_id is not None
@@ -341,6 +360,10 @@ class TestRecordTokenOutcome:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="output",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         # Second terminal outcome should fail
@@ -350,6 +373,10 @@ class TestRecordTokenOutcome:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,
                 sink_name="errors",
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
         assert isinstance(exc_info.value.__cause__, IntegrityError)
 
@@ -368,7 +395,6 @@ class TestOutcomeContractValidation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="src",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -376,9 +402,16 @@ class TestOutcomeContractValidation:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(run.run_id, "src", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            0,
+            {"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
+        )
         return run, token
 
     def test_completed_requires_sink_name(self, factory, run_with_token) -> None:
@@ -390,6 +423,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_routed_requires_sink_name(self, factory, run_with_token) -> None:
@@ -401,6 +438,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.GATE_ROUTED,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_forked_forbids_every_discriminator_field(self, factory, run_with_token) -> None:
@@ -417,6 +458,10 @@ class TestOutcomeContractValidation:
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         with pytest.raises(ValueError, match=r"\(TRANSIENT, FORK_PARENT\).*forbids"):
@@ -425,6 +470,10 @@ class TestOutcomeContractValidation:
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.FORK_PARENT,
                 batch_id="batch-1",
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_failed_requires_error_hash(self, factory, run_with_token) -> None:
@@ -436,6 +485,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.UNROUTED,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_quarantined_requires_error_hash(self, factory, run_with_token) -> None:
@@ -447,6 +500,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.QUARANTINED_AT_SOURCE,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_coalesced_forbids_every_field_except_sink_name(self, factory, run_with_token) -> None:
@@ -462,6 +519,10 @@ class TestOutcomeContractValidation:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.COALESCED,
             sink_name="default",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
     def test_expanded_forbids_every_discriminator_field(self, factory, run_with_token) -> None:
@@ -478,6 +539,10 @@ class TestOutcomeContractValidation:
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.EXPAND_PARENT,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         with pytest.raises(ValueError, match=r"\(TRANSIENT, EXPAND_PARENT\).*forbids"):
@@ -486,6 +551,10 @@ class TestOutcomeContractValidation:
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.EXPAND_PARENT,
                 batch_id="batch-1",
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_buffered_requires_batch_id(self, factory, run_with_token) -> None:
@@ -497,6 +566,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=None,
                 path=TerminalPath.BUFFERED,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_consumed_in_batch_requires_batch_id(self, factory, run_with_token) -> None:
@@ -508,6 +581,10 @@ class TestOutcomeContractValidation:
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.BATCH_CONSUMED,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     def test_dropped_by_filter_requires_no_extra_fields(self, factory, run_with_token) -> None:
@@ -518,6 +595,10 @@ class TestOutcomeContractValidation:
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.FILTER_DROPPED,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -533,7 +614,6 @@ class TestGetTokenOutcome:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="src",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -541,14 +621,25 @@ class TestGetTokenOutcome:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(run.run_id, "src", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            0,
+            {"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
+        )
         outcome_id = factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="out",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
         return run, token, outcome_id
 
@@ -585,7 +676,6 @@ class TestExplainIncludesOutcome:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="src",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -593,14 +683,25 @@ class TestExplainIncludesOutcome:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(run.run_id, "src", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            0,
+            {"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
+        )
         factory.data_flow.record_token_outcome(
             ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="out",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         result = explain(factory.query, factory.data_flow, run.run_id, token_id=token.token_id)
@@ -617,7 +718,6 @@ class TestExplainIncludesOutcome:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
             node_id="src",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -625,9 +725,16 @@ class TestExplainIncludesOutcome:
             config={},
             determinism=Determinism.DETERMINISTIC,
             schema_config=SchemaConfig.from_dict({"mode": "observed"}),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(run.run_id, "src", 0, {"x": 1}, source_row_index=0, ingest_sequence=0)
-        token = factory.data_flow.create_token(row.row_id)
+        _row, token = factory.data_flow.create_row_with_token(
+            "src",
+            0,
+            {"x": 1},
+            source_row_index=0,
+            ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
+        )
         # No outcome recorded
 
         result = explain(factory.query, factory.data_flow, run.run_id, token_id=token.token_id)

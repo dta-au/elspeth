@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import insert
+from sqlalchemy import insert, update
 
 from elspeth.contracts import NodeType, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.audit import TokenRef
@@ -32,7 +32,7 @@ from elspeth.core.landscape.schema import (
     token_lineage_frames_table,
     tokens_table,
 )
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import leader_token_for, make_landscape_db
 
 RUN_ID = "run-group-lineage-1"
 NOW = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
@@ -49,10 +49,18 @@ def payload_json() -> str:
 
 def seed_run(db: LandscapeDB, *, status: RunStatus = RunStatus.FAILED) -> None:
     """Seed one run, its three nodes (source / coalesce / opener), and row-1."""
+    RecorderFactory(db).run_lifecycle.begin_run(
+        run_id=RUN_ID,
+        config={},
+        canonical_version="v1",
+        openrouter_catalog_sha256="0" * 64,
+        openrouter_catalog_source="bundled",
+    )
     with db.engine.begin() as conn:
         conn.execute(
-            insert(runs_table).values(
-                run_id=RUN_ID,
+            update(runs_table)
+            .where(runs_table.c.run_id == RUN_ID)
+            .values(
                 started_at=NOW,
                 config_hash="cfg",
                 settings_json="{}",
@@ -210,7 +218,8 @@ def seed_loss(
 
 def terminalize(db: LandscapeDB, token_id: str) -> None:
     """Write a completed FAILURE/UNROUTED terminal outcome for the token."""
-    RecorderFactory(db).data_flow.record_token_outcome(
+    RecorderFactory(db).data_flow.record_token_outcome_leader(
+        coordination_token=leader_token_for(db, RUN_ID),
         ref=TokenRef(token_id=token_id, run_id=RUN_ID),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.UNROUTED,

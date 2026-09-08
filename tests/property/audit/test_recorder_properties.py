@@ -37,7 +37,14 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape import LandscapeDB
-from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db
+from tests.fixtures.landscape import (
+    claim_test_work_item,
+    leader_coordination_token,
+    leader_member_token,
+    leader_token_for,
+    make_factory,
+    make_landscape_db,
+)
 from tests.strategies.json import row_data
 
 # =============================================================================
@@ -246,13 +253,13 @@ class TestNodeRecordingProperties:
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name=plugin_name,
             node_type=node_type,
             plugin_version="1.0.0",
             config={"test": True},
             determinism=determinism,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         # Verify persisted state
@@ -275,13 +282,13 @@ class TestNodeRecordingProperties:
         node_ids = set()
         for i in range(n_nodes):
             node = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name=f"plugin_{i}",
                 node_type=NodeType.TRANSFORM,
                 plugin_version="1.0.0",
                 config={"index": i},
                 sequence=i,
                 schema_config=create_dynamic_schema(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
             node_ids.add(node.node_id)
 
@@ -303,21 +310,21 @@ class TestNodeRecordingProperties:
         node_config = {"field": "value", "number": 42}
 
         node1 = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_plugin",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config=node_config,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         node2 = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_plugin",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config=node_config,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         assert node1.config_hash == node2.config_hash, "Identical configs should produce identical hashes"
@@ -340,21 +347,21 @@ class TestRowRecordingProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _initial_token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=row_index,
             data=data,
             source_row_index=row_index,
             ingest_sequence=row_index,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         # Verify row is persisted
@@ -371,23 +378,23 @@ class TestRowRecordingProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         rows = []
         for i in range(n_rows):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source_node.node_id,
                 row_index=i,
                 data={"value": i},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
             rows.append(row)
 
@@ -407,23 +414,23 @@ class TestRowRecordingProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         row_ids = set()
         for i in range(n_rows):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            row, _initial_token = factory.data_flow.create_row_with_token(
                 source_node_id=source_node.node_id,
                 row_index=i,
                 data={"value": i},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
             row_ids.add(row.row_id)
 
@@ -447,24 +454,22 @@ class TestTokenRecordingProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Verify token is persisted and linked
         assert verify_token_exists(db, token.token_id), "Token was not persisted"
@@ -479,26 +484,26 @@ class TestTokenRecordingProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _initial_token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         token_ids = set()
         for _ in range(n_tokens):
-            token = factory.data_flow.create_token(row_id=row.row_id)
+            token = factory.data_flow.create_token(row_id=row.row_id, coordination_token=leader_coordination_token(factory, run.run_id))
             token_ids.add(token.token_id)
 
         assert len(token_ids) == n_tokens, f"Expected {n_tokens} unique token IDs, got {len(token_ids)}. ID collision!"
@@ -521,23 +526,22 @@ class TestTokenOutcomeProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Record COMPLETED outcome (requires sink_name)
         outcome_id = factory.data_flow.record_token_outcome(
@@ -545,6 +549,10 @@ class TestTokenOutcomeProperties:
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="default",
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         assert outcome_id is not None
@@ -566,23 +574,22 @@ class TestTokenOutcomeProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Record QUARANTINED outcome (requires error_hash)
         error_hash = stable_hash({"reason": "validation_failed"})
@@ -591,6 +598,10 @@ class TestTokenOutcomeProperties:
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.QUARANTINED_AT_SOURCE,
             error_hash=error_hash,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
 
         assert outcome_id is not None
@@ -612,29 +623,32 @@ class TestTokenOutcomeProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         for i in range(n_rows):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id=source_node.node_id,
                 row_index=i,
                 data={"value": i},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="default",
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
         # Verify count
@@ -675,22 +689,21 @@ class TestTokenOutcomeProperties:
 
         run = factory.run_lifecycle.begin_run(config={"sources": {"primary": {"plugin": "test"}}}, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         with pytest.raises(ValueError, match=required_field):
             factory.data_flow.record_token_outcome(
@@ -698,6 +711,10 @@ class TestTokenOutcomeProperties:
                 outcome=outcome,
                 path=path,
                 **kwargs,
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
     @pytest.mark.parametrize(
@@ -742,37 +759,36 @@ class TestTokenOutcomeProperties:
 
         run = factory.run_lifecycle.begin_run(config={"sources": {"primary": {"plugin": "test"}}}, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         if path in {TerminalPath.BATCH_CONSUMED, TerminalPath.BUFFERED}:
             aggregation_node = factory.data_flow.register_node(
-                run_id=run.run_id,
                 plugin_name="test_aggregation",
                 node_type=NodeType.AGGREGATION,
                 plugin_version="1.0.0",
                 config={},
                 schema_config=create_dynamic_schema(),
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
             batch_id = kwargs["batch_id"]
             factory.execution.create_batch(
-                run_id=run.run_id,
                 aggregation_node_id=aggregation_node.node_id,
                 batch_id=batch_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
             )
 
         outcome_id = factory.data_flow.record_token_outcome(
@@ -780,6 +796,10 @@ class TestTokenOutcomeProperties:
             outcome=outcome,
             path=path,
             **kwargs,
+            member_token=leader_member_token(factory, run.run_id),
+            work_item=claim_test_work_item(
+                factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+            ),
         )
         assert outcome_id is not None
 
@@ -807,39 +827,38 @@ class TestNodeStateProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         transform_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config={},
             sequence=1,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=transform_node.node_id,
-            run_id=run.run_id,
             step_index=0,
             input_data=data,
+            member_token=leader_member_token(factory, run.run_id),
         )
 
         assert state.status == NodeStateStatus.OPEN
@@ -860,39 +879,38 @@ class TestNodeStateProperties:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         transform_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config={},
             sequence=1,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _row, token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=transform_node.node_id,
-            run_id=run.run_id,
             step_index=0,
             input_data=data,
+            member_token=leader_member_token(factory, run.run_id),
         )
 
         output_data = {**data, "processed": True}
@@ -901,6 +919,7 @@ class TestNodeStateProperties:
             status=NodeStateStatus.COMPLETED,
             output_data=output_data,
             duration_ms=10.5,
+            member_token=leader_member_token(factory, run.run_id),
         )
 
         assert completed.status == NodeStateStatus.COMPLETED
@@ -925,22 +944,22 @@ class TestForeignKeyIntegrity:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         for i in range(n_rows):
-            factory.data_flow.create_row(
-                run_id=run.run_id,
+            factory.data_flow.create_row_with_token(
                 source_node_id=source_node.node_id,
                 row_index=i,
                 data={"value": i},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
 
         # Verify all rows reference valid run
@@ -965,25 +984,25 @@ class TestForeignKeyIntegrity:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _initial_token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data={"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         for _ in range(n_tokens):
-            factory.data_flow.create_token(row_id=row.row_id)
+            factory.data_flow.create_token(row_id=row.row_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Verify all tokens reference valid row
         with db.connection() as conn:
@@ -1007,29 +1026,32 @@ class TestForeignKeyIntegrity:
 
         run = factory.run_lifecycle.begin_run(config=config, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         for i in range(n_outcomes):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
                 source_node_id=source_node.node_id,
                 row_index=i,
                 data={"value": i},
                 source_row_index=i,
                 ingest_sequence=i,
+                coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             factory.data_flow.record_token_outcome(
                 ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="default",
+                member_token=leader_member_token(factory, run.run_id),
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_member_token(factory, run.run_id), token_id=token.token_id, node_id=None
+                ),
             )
 
         # Verify all outcomes reference valid token
@@ -1063,30 +1085,30 @@ class TestHashDeterminism:
 
         run = factory.run_lifecycle.begin_run(config={"sources": {"primary": {"plugin": "test"}}}, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row1 = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row1, _initial_token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row2 = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row2, _initial_token = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=1,
             data=data,
             source_row_index=1,
             ingest_sequence=1,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
         assert row1.source_data_hash == row2.source_data_hash, (
@@ -1102,48 +1124,47 @@ class TestHashDeterminism:
 
         run = factory.run_lifecycle.begin_run(config={"sources": {"primary": {"plugin": "test"}}}, canonical_version="1.0")
         source_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
             config={},
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
         transform_node = factory.data_flow.register_node(
-            run_id=run.run_id,
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
             config={},
             sequence=1,
             schema_config=create_dynamic_schema(),
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token1 = factory.data_flow.create_row_with_token(
             source_node_id=source_node.node_id,
             row_index=0,
             data=data,
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
         )
-        token1 = factory.data_flow.create_token(row_id=row.row_id)
-        token2 = factory.data_flow.create_token(row_id=row.row_id)
+        token2 = factory.data_flow.create_token(row_id=row.row_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         state1 = factory.execution.begin_node_state(
             token_id=token1.token_id,
             node_id=transform_node.node_id,
-            run_id=run.run_id,
             step_index=0,
             input_data=data,
+            member_token=leader_member_token(factory, run.run_id),
         )
 
         state2 = factory.execution.begin_node_state(
             token_id=token2.token_id,
             node_id=transform_node.node_id,
-            run_id=run.run_id,
             step_index=0,
             input_data=data,
+            member_token=leader_member_token(factory, run.run_id),
         )
 
         assert state1.input_hash == state2.input_hash, "Identical input data should produce identical input hashes"

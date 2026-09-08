@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.fixtures.landscape import leader_coordination_token
 
 from elspeth.contracts import NodeType, RoutingMode
 from elspeth.contracts.schema import SchemaConfig
@@ -23,7 +24,7 @@ class TestRecorderFactoryNodes:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -44,7 +45,7 @@ class TestRecorderFactoryNodes:
 
         # Both enum and string should work
         node_from_enum = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform1",
             node_type=NodeType.TRANSFORM,  # Enum
             plugin_version="1.0.0",
@@ -52,7 +53,7 @@ class TestRecorderFactoryNodes:
             schema_config=DYNAMIC_SCHEMA,
         )
         node_from_str = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform2",
             node_type=NodeType.TRANSFORM,  # Also enum now
             plugin_version="1.0.0",
@@ -72,7 +73,7 @@ class TestRecorderFactoryNodes:
 
         with pytest.raises(TypeError, match=r"node_type must be NodeType, got str: 'transfom'"):
             factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 plugin_name="bad",
                 node_type="transfom",  # type: ignore[arg-type]  # Intentionally wrong type to test validation
                 plugin_version="1.0.0",
@@ -86,7 +87,7 @@ class TestRecorderFactoryNodes:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -94,7 +95,7 @@ class TestRecorderFactoryNodes:
             schema_config=DYNAMIC_SCHEMA,
         )
         transform = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -103,7 +104,7 @@ class TestRecorderFactoryNodes:
         )
 
         edge = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id=source.node_id,
             to_node_id=transform.node_id,
             label="continue",
@@ -119,7 +120,7 @@ class TestRecorderFactoryNodes:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -127,7 +128,7 @@ class TestRecorderFactoryNodes:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -151,7 +152,7 @@ class TestRecorderFactoryEdges:
 
         # Register nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source_1",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
@@ -160,7 +161,7 @@ class TestRecorderFactoryEdges:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="sink_1",
             plugin_name="csv",
             node_type=NodeType.SINK,
@@ -171,7 +172,7 @@ class TestRecorderFactoryEdges:
 
         # Register edge
         edge = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id="source_1",
             to_node_id="sink_1",
             label="continue",
@@ -207,7 +208,7 @@ class TestRecorderFactoryEdges:
 
         # Register nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="csv",
             node_type=NodeType.SOURCE,
@@ -216,7 +217,7 @@ class TestRecorderFactoryEdges:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="gate",
             plugin_name="threshold",
             node_type=NodeType.GATE,
@@ -225,7 +226,7 @@ class TestRecorderFactoryEdges:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="sink_high",
             plugin_name="csv",
             node_type=NodeType.SINK,
@@ -234,7 +235,7 @@ class TestRecorderFactoryEdges:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="sink_low",
             plugin_name="csv",
             node_type=NodeType.SINK,
@@ -245,21 +246,21 @@ class TestRecorderFactoryEdges:
 
         # Register edges
         factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id="source",
             to_node_id="gate",
             label="continue",
             mode=RoutingMode.MOVE,
         )
         factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id="gate",
             to_node_id="sink_high",
             label="high",
             mode=RoutingMode.MOVE,
         )
         factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id="gate",
             to_node_id="sink_low",
             label="low",
@@ -284,7 +285,7 @@ class TestSchemaRecording:
         schema_config = SchemaConfig.from_dict({"mode": "observed"})
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -311,7 +312,7 @@ class TestSchemaRecording:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -341,7 +342,7 @@ class TestSchemaRecording:
         )
 
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -372,7 +373,7 @@ class TestSchemaRecording:
             }
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",

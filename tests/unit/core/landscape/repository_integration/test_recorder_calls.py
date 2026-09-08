@@ -9,14 +9,38 @@ from tempfile import TemporaryDirectory
 
 import pytest
 from sqlalchemy.exc import IntegrityError
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import WorkerMembershipToken
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.row_data import CallDataState
 from elspeth.core.payload_store import FilesystemPayloadStore
+
+
+def _state_member(factory: RecorderFactory, state_id: str) -> WorkerMembershipToken:
+    state = factory.execution.get_node_state(state_id)
+    assert state is not None
+    token = factory.query.get_token(state.token_id)
+    assert token is not None
+    return leader_coordination_token(factory, token.run_id).membership
+
+
+def _state_claim(factory: RecorderFactory, state_id: str) -> TokenWorkItem:
+    state = factory.execution.get_node_state(state_id)
+    assert state is not None
+    return claim_test_work_item(
+        factory,
+        member_token=_state_member(factory, state_id),
+        token_id=state.token_id,
+        node_id=state.node_id,
+        step_index=state.step_index,
+    )
 
 
 class TestRecordCall:
@@ -34,26 +58,25 @@ class TestRecordCall:
         schema = SchemaConfig.from_dict({"mode": "observed"})
         run = landscape_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = landscape_factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=schema,
         )
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"input": "test"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = landscape_factory.data_flow.create_token(row_id=row.row_id)
         state = landscape_factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(landscape_factory, run.run_id).membership,
             step_index=0,
             input_data={"input": "test"},
         )
@@ -63,6 +86,8 @@ class TestRecordCall:
         """Test recording a successful LLM call."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -85,6 +110,8 @@ class TestRecordCall:
         """Test recording a failed call with error details."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.ERROR,
@@ -102,6 +129,8 @@ class TestRecordCall:
         """Test recording multiple calls for the same state."""
         call1 = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -110,6 +139,8 @@ class TestRecordCall:
         )
         call2 = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=1,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -139,6 +170,8 @@ class TestRecordCall:
 
         landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -181,6 +214,8 @@ class TestRecordCall:
 
         landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.ERROR,
@@ -214,6 +249,8 @@ class TestRecordCall:
         """Test recording calls with payload store references."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -241,6 +278,8 @@ class TestRecordCall:
         # First call succeeds
         landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -252,6 +291,8 @@ class TestRecordCall:
         with pytest.raises(LandscapeRecordError) as exc_info:
             landscape_factory.execution.record_call(
                 state_id=state_id,
+                member_token=_state_member(landscape_factory, state_id),
+                work_item=_state_claim(landscape_factory, state_id),
                 call_index=0,  # Same index - rejected at DB level
                 call_type=CallType.LLM,
                 status=CallStatus.SUCCESS,
@@ -260,25 +301,28 @@ class TestRecordCall:
             )
         assert isinstance(exc_info.value.__cause__, IntegrityError)
 
-    def test_invalid_state_id_raises_integrity_error(self, landscape_factory: RecorderFactory) -> None:
-        """Test that invalid state_id raises LandscapeRecordError with FK cause."""
-        from elspeth.core.landscape.errors import LandscapeRecordError
-
-        with pytest.raises(LandscapeRecordError) as exc_info:
+    def test_invalid_state_id_raises_integrity_error(self, landscape_factory: RecorderFactory, state_id: str) -> None:
+        """A valid claim cannot authorize a call against a missing state."""
+        member = _state_member(landscape_factory, state_id)
+        claim = _state_claim(landscape_factory, state_id)
+        with pytest.raises(AuditIntegrityError, match="state"):
             landscape_factory.execution.record_call(
                 state_id="nonexistent_state_id",
+                member_token=member,
+                work_item=claim,
                 call_index=0,
                 call_type=CallType.LLM,
                 status=CallStatus.SUCCESS,
                 request_data=RawCallPayload({"prompt": "Test"}),
                 response_data=RawCallPayload({"response": "Test"}),
             )
-        assert isinstance(exc_info.value.__cause__, IntegrityError)
 
     def test_record_http_call(self, landscape_factory: RecorderFactory, state_id: str) -> None:
         """Test recording an HTTP call type."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.SUCCESS,
@@ -294,6 +338,8 @@ class TestRecordCall:
         """Test recording a SQL call type."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.SQL,
             status=CallStatus.SUCCESS,
@@ -308,6 +354,8 @@ class TestRecordCall:
         """Test recording a filesystem call type."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.FILESYSTEM,
             status=CallStatus.SUCCESS,
@@ -322,6 +370,8 @@ class TestRecordCall:
         """Test recording a call without latency information."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -336,6 +386,8 @@ class TestRecordCall:
         """Test recording an error call with no response data."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.HTTP,
             status=CallStatus.ERROR,
@@ -354,6 +406,8 @@ class TestRecordCall:
         """Test that created_at timestamp is automatically set."""
         call = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -369,6 +423,8 @@ class TestRecordCall:
 
         call1 = landscape_factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(landscape_factory, state_id),
+            work_item=_state_claim(landscape_factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -380,32 +436,33 @@ class TestRecordCall:
         schema = SchemaConfig.from_dict({"mode": "observed"})
         run = landscape_factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = landscape_factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=schema,
         )
-        row = landscape_factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"input": "test"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = landscape_factory.data_flow.create_token(row_id=row.row_id)
         state2 = landscape_factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(landscape_factory, run.run_id).membership,
             step_index=0,
             input_data={"input": "test"},
         )
 
         call2 = landscape_factory.execution.record_call(
             state_id=state2.state_id,
+            member_token=_state_member(landscape_factory, state2.state_id),
+            work_item=_state_claim(landscape_factory, state2.state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -432,26 +489,25 @@ class TestCallPayloadPersistence:
         schema = SchemaConfig.from_dict({"mode": "observed"})
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=schema,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"input": "test"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"input": "test"},
         )
@@ -468,6 +524,8 @@ class TestCallPayloadPersistence:
             response_data = {"content": "Hello!", "model": "gpt-4"}
             call = factory.execution.record_call(
                 state_id=state_id,
+                member_token=_state_member(factory, state_id),
+                work_item=_state_claim(factory, state_id),
                 call_index=0,
                 call_type=CallType.LLM,
                 status=CallStatus.SUCCESS,
@@ -495,6 +553,8 @@ class TestCallPayloadPersistence:
             request_data = {"model": "gpt-4", "prompt": "Hello, world!"}
             call = factory.execution.record_call(
                 state_id=state_id,
+                member_token=_state_member(factory, state_id),
+                work_item=_state_claim(factory, state_id),
                 call_index=0,
                 call_type=CallType.LLM,
                 status=CallStatus.SUCCESS,
@@ -513,6 +573,8 @@ class TestCallPayloadPersistence:
 
         call = factory.execution.record_call(
             state_id=state_id,
+            member_token=_state_member(factory, state_id),
+            work_item=_state_claim(factory, state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -540,6 +602,8 @@ class TestCallPayloadPersistence:
             explicit_ref = "explicit-reference-123"
             call = factory.execution.record_call(
                 state_id=state_id,
+                member_token=_state_member(factory, state_id),
+                work_item=_state_claim(factory, state_id),
                 call_index=0,
                 call_type=CallType.LLM,
                 status=CallStatus.SUCCESS,
@@ -561,6 +625,8 @@ class TestCallPayloadPersistence:
 
             call = factory.execution.record_call(
                 state_id=state_id,
+                member_token=_state_member(factory, state_id),
+                work_item=_state_claim(factory, state_id),
                 call_index=0,
                 call_type=CallType.HTTP,
                 status=CallStatus.ERROR,
@@ -610,7 +676,7 @@ class TestFindCallByRequestHashRunIsolation:
 
         # Register node with specified node_id
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -620,19 +686,18 @@ class TestFindCallByRequestHashRunIsolation:
         )
 
         # Create row, token, and state
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"input": "test"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={"input": "test"},
         )
@@ -640,6 +705,8 @@ class TestFindCallByRequestHashRunIsolation:
         # Record the call
         call = factory.execution.record_call(
             state_id=state.state_id,
+            member_token=_state_member(factory, state.state_id),
+            work_item=_state_claim(factory, state.state_id),
             call_index=0,
             call_type=CallType.LLM,
             status=CallStatus.SUCCESS,
@@ -728,7 +795,7 @@ class TestFindCallByRequestHashRunIsolation:
         schema = SchemaConfig.from_dict({"mode": "observed"})
         run_b = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run_b.run_id,
+            coordination_token=leader_coordination_token(factory, run_b.run_id),
             plugin_name="llm_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

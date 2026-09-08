@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import pytest
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 from elspeth.contracts import CallStatus, CallType, NodeType
 from elspeth.contracts.call_data import RawCallPayload
@@ -38,10 +39,20 @@ def _record_after_effect(
     db = LandscapeDB(db_url)
     try:
         factory = RecorderFactory(db)
+        leader = leader_coordination_token(factory, "call-race")
         if parent_kind == "state":
-            proposed_index = factory.execution.allocate_call_index(parent_id)
+            state = factory.execution.get_node_state(parent_id)
+            assert state is not None
+            claim = claim_test_work_item(
+                factory,
+                member_token=leader.membership,
+                token_id=state.token_id,
+                node_id=state.node_id,
+                step_index=state.step_index,
+            )
+            proposed_index = factory.execution.allocate_call_index(parent_id, member_token=leader.membership, work_item=claim)
         else:
-            proposed_index = factory.execution.allocate_operation_call_index(parent_id)
+            proposed_index = factory.execution.allocate_operation_call_index(parent_id, coordination_token=leader)
         ready.put((worker_id, proposed_index))
         if not release.wait(timeout=30):
             results.put((worker_id, "release-timeout", proposed_index, None))
@@ -63,6 +74,8 @@ def _record_after_effect(
                     proposed_index,
                     CallType.HTTP,
                     CallStatus.SUCCESS,
+                    member_token=leader.membership,
+                    work_item=claim,
                     request_data=RawCallPayload({"worker": worker_id}),
                     response_data=RawCallPayload({"ok": True}),
                 )
@@ -74,6 +87,7 @@ def _record_after_effect(
                     request_data=RawCallPayload({"worker": worker_id}),
                     response_data=RawCallPayload({"ok": True}),
                     call_index=proposed_index,
+                    coordination_token=leader,
                 )
         except Exception as exc:  # pragma: no cover - asserted in parent
             results.put((worker_id, type(exc).__name__, proposed_index, None))
@@ -88,8 +102,9 @@ def _seed_parent(db_url: str, parent_kind: Literal["state", "operation"]) -> str
     try:
         factory = RecorderFactory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="call-race")
+        leader = leader_coordination_token(factory, "call-race")
         factory.data_flow.register_node(
-            run_id="call-race",
+            coordination_token=leader,
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -98,10 +113,10 @@ def _seed_parent(db_url: str, parent_kind: Literal["state", "operation"]) -> str
             schema_config=_SCHEMA,
         )
         if parent_kind == "operation":
-            return factory.execution.begin_operation("call-race", "source-0", "source_load").operation_id
+            return factory.execution.begin_operation("source-0", "source_load", coordination_token=leader).operation_id
 
         factory.data_flow.register_node(
-            run_id="call-race",
+            coordination_token=leader,
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -109,21 +124,22 @@ def _seed_parent(db_url: str, parent_kind: Literal["state", "operation"]) -> str
             node_id="transform-0",
             schema_config=_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            "call-race",
+        _, token = factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"value": 1},
             source_row_index=0,
             ingest_sequence=0,
+            coordination_token=leader,
         )
-        token = factory.data_flow.create_token(row.row_id)
+        # Both child recorders write for the same admitted worker and exact claim.
+        claim_test_work_item(factory, member_token=leader.membership, token_id=token.token_id, node_id="transform-0")
         return factory.execution.begin_node_state(
             token.token_id,
             "transform-0",
-            "call-race",
             0,
             {"value": 1},
+            member_token=leader.membership,
         ).state_id
     finally:
         db.close()

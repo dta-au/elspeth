@@ -20,7 +20,7 @@ from textwrap import dedent
 from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import select
-from tests.fixtures.landscape import make_factory, make_landscape_db, make_recorder_with_run
+from tests.fixtures.landscape import leader_coordination_token, make_factory, make_landscape_db, make_recorder_with_run
 
 from elspeth.contracts import (
     ContractAuditRecord,
@@ -101,7 +101,7 @@ class TestValidationErrorWithContractDetails:
 
         # Now test storing validation error with contract violation in audit trail
         setup = make_recorder_with_run(canonical_version="sha256-rfc8785-v1")
-        db, run_id = setup.db, setup.run_id
+        db = setup.db
         source_node_id = setup.source_node_id
 
         # Create a contract violation for testing
@@ -115,7 +115,7 @@ class TestValidationErrorWithContractDetails:
 
         # Record validation error with contract violation
         error_id = setup.data_flow.record_validation_error(
-            run_id=run_id,
+            coordination_token=setup.coordination_token,
             node_id=source_node_id,
             row_data={"id": 2, "amount": "not_int"},
             error="Type mismatch: expected int, got str for field 'amount'",
@@ -150,7 +150,7 @@ class TestValidationErrorWithContractDetails:
 
         # Record validation error without contract_violation
         error_id = factory.data_flow.record_validation_error(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id=None,
             row_data={"field": "value"},
             error="Generic validation error",
@@ -297,7 +297,7 @@ class TestContractSurvivesAuditRoundTrip:
         # Register node with contracts
         schema_config = SchemaConfig(mode="flexible", fields=None)
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",

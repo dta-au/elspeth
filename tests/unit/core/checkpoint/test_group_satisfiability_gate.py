@@ -38,6 +38,7 @@ from tests.fixtures.group_lineage import (
     seed_run,
     terminalize,
 )
+from tests.fixtures.landscape import leader_member_token, make_factory
 
 _FORK_BINDINGS = GroupBindingView(
     fork_branch_closers={"path_a": "merger", "path_b": "merger"},
@@ -57,13 +58,13 @@ _SCOPE_BINDINGS = GroupBindingView(
 
 def _enqueue_journal_row(db: LandscapeDB, *, token_id: str, node_id: str) -> None:
     TokenSchedulerRepository(db.engine).enqueue_ready(
-        run_id=RUN_ID,
         token_id=token_id,
         row_id="row-1",
         node_id=node_id,
         step_index=1,
         ingest_sequence=0,
         row_payload_json=payload_json(),
+        member_token=leader_member_token(make_factory(db), RUN_ID),
     )
 
 

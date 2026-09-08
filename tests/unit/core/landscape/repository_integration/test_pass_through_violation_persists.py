@@ -17,7 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 import sqlalchemy as sa
-from tests.fixtures.landscape import make_recorder_with_run
+from tests.fixtures.landscape import leader_token_for, make_recorder_with_run
 
 from elspeth.contracts import TokenInfo, TransformProtocol, TransformResult
 from elspeth.contracts.enums import OutputMode, TerminalOutcome, TerminalPath
@@ -51,13 +51,15 @@ def _make_processor() -> RowProcessor:
         source_on_success="default",
         traversal=traversal,
         scheduler=setup.factory.scheduler,
+        coordination_token=setup.coordination_token,
     )
 
 
 def _register(processor: RowProcessor, tokens: list[TokenInfo]) -> None:
     for idx, token in enumerate(tokens):
-        processor._data_flow.create_row(
-            run_id="test-run",
+        processor._data_flow.create_row_with_token(
+            coordination_token=leader_token_for(processor._data_flow._db, "test-run"),
+            token_id=token.token_id,
             source_node_id="source-0",
             row_index=idx,
             data=token.row_data.to_dict(),
@@ -65,7 +67,6 @@ def _register(processor: RowProcessor, tokens: list[TokenInfo]) -> None:
             source_row_index=idx,
             ingest_sequence=idx,
         )
-        processor._data_flow.create_token(row_id=token.row_id, token_id=token.token_id)
 
 
 def _mk_transform() -> Mock:

@@ -18,6 +18,8 @@ from elspeth.contracts.enums import BatchStatus, NodeStateStatus, TerminalOutcom
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 
 _DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 _ERROR_HASH = "abcd1234" * 8
@@ -27,28 +29,27 @@ def _build_base_run(factory: RecorderFactory) -> tuple[str, str, str]:
     """Create a run, source node, row, and token."""
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
         config={},
         schema_config=_DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id=source.node_id,
         row_index=0,
         data={"x": 1},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row_id=row.row_id)
     return run.run_id, source.node_id, token.token_id
 
 
 def _register_sink_node(factory: RecorderFactory, run_id: str, *, name: str = "failsink") -> str:
     node = factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name=name,
         node_type=NodeType.SINK,
         plugin_version="1.0",
@@ -69,25 +70,33 @@ def _record_completed_sink_state_with_artifact(
     state = factory.execution.begin_node_state(
         token_id=token_id,
         node_id=sink_node_id,
-        run_id=run_id,
+        member_token=leader_coordination_token(factory, run_id).membership,
         step_index=step_index,
         input_data={},
     )
     factory.execution.complete_node_state(
+        member_token=leader_coordination_token(factory, run_id).membership,
         state_id=state.state_id,
         status=NodeStateStatus.COMPLETED,
         output_data={"written": True},
         duration_ms=1.0,
     )
-    artifact = factory.execution.register_artifact(
-        run_id=run_id,
-        state_id=state.state_id,
-        sink_node_id=sink_node_id,
-        artifact_type="test",
-        path=f"memory://failsink/{token_id}/{step_index}",
-        content_hash="deadbeef" * 8,
-        size_bytes=0,
-    )
+    with fenced_leader_transaction(
+        factory.data_flow._db.engine,
+        token=leader_coordination_token(factory, run_id),
+        window_seconds=80.0,
+        verb="register_artifact",
+    ) as conn:
+        artifact = factory.execution.artifacts.register_artifact(
+            run_id=run_id,
+            state_id=state.state_id,
+            sink_node_id=sink_node_id,
+            artifact_type="test",
+            path=f"memory://failsink/{token_id}/{step_index}",
+            content_hash="deadbeef" * 8,
+            size_bytes=0,
+            conn=conn,
+        )
     return state.state_id, artifact.artifact_id
 
 
@@ -104,7 +113,8 @@ class TestI1cFailsinkPaired:
             sink_node_id=sink_node_id,
         )
 
-        outcome_id = landscape_factory.data_flow.record_token_outcome(
+        outcome_id = landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -120,7 +130,8 @@ class TestI1cFailsinkPaired:
         run_id, _source_node_id, token_id = _build_base_run(landscape_factory)
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*failsink"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -136,11 +147,12 @@ class TestI1cFailsinkPaired:
         state = landscape_factory.execution.begin_node_state(
             token_id=token_id,
             node_id=sink_node_id,
-            run_id=run_id,
+            member_token=leader_coordination_token(landscape_factory, run_id).membership,
             step_index=0,
             input_data={},
         )
         landscape_factory.execution.complete_node_state(
+            member_token=leader_coordination_token(landscape_factory, run_id).membership,
             state_id=state.state_id,
             status=NodeStateStatus.COMPLETED,
             output_data={"written": True},
@@ -148,7 +160,8 @@ class TestI1cFailsinkPaired:
         )
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*artifact"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -170,7 +183,8 @@ class TestI1cFailsinkPaired:
         )
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*node"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -199,7 +213,8 @@ class TestI1cFailsinkPaired:
         )
 
         with pytest.raises(AuditIntegrityError, match=r"I1c.*artifact"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.TRANSIENT,
                 path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -221,15 +236,14 @@ class TestI1cFailsinkPaired:
             token_id=token_id,
             sink_node_id=failsink_node_id,
         )
-        other_row = landscape_factory.data_flow.create_row(
-            run_id=run_id,
+        _other_row, other_token = landscape_factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             source_node_id=source_node_id,
             row_index=1,
             data={"x": 2},
             source_row_index=1,
             ingest_sequence=1,
         )
-        other_token = landscape_factory.data_flow.create_token(row_id=other_row.row_id)
         _other_state_id, wrong_artifact_id = _record_completed_sink_state_with_artifact(
             landscape_factory,
             run_id=run_id,
@@ -238,7 +252,8 @@ class TestI1cFailsinkPaired:
             step_index=1,
         )
 
-        outcome_id = landscape_factory.data_flow.record_token_outcome(
+        outcome_id = landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.SINK_FALLBACK_TO_FAILSINK,
@@ -260,11 +275,12 @@ class TestI3DiscardNoFailsink:
         state = landscape_factory.execution.begin_node_state(
             token_id=token_id,
             node_id=primary_sink_node_id,
-            run_id=run_id,
+            member_token=leader_coordination_token(landscape_factory, run_id).membership,
             step_index=0,
             input_data={},
         )
         landscape_factory.execution.complete_node_state(
+            member_token=leader_coordination_token(landscape_factory, run_id).membership,
             state_id=state.state_id,
             status=NodeStateStatus.FAILED,
             error=ExecutionError(
@@ -275,7 +291,8 @@ class TestI3DiscardNoFailsink:
             duration_ms=1.0,
         )
 
-        outcome_id = landscape_factory.data_flow.record_token_outcome(
+        outcome_id = landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.SINK_DISCARDED,
@@ -296,7 +313,8 @@ class TestI3DiscardNoFailsink:
         )
 
         with pytest.raises(AuditIntegrityError, match=r"I3.*discard"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
@@ -308,7 +326,8 @@ class TestI3DiscardNoFailsink:
         run_id, _source_node_id, token_id = _build_base_run(landscape_factory)
 
         with pytest.raises(ValueError, match="sink_name"):
-            landscape_factory.data_flow.record_token_outcome(
+            landscape_factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(landscape_factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,
@@ -322,7 +341,8 @@ class TestI1aForkParentDeferred:
 
     def _build_fork_parent_orphan(self, landscape_factory: RecorderFactory) -> tuple[str, str]:
         run_id, _source_node_id, token_id = _build_base_run(landscape_factory)
-        landscape_factory.data_flow.record_token_outcome(
+        landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.FORK_PARENT,
@@ -341,12 +361,17 @@ class TestI1aForkParentDeferred:
     def test_fork_parent_with_child_not_flagged(self, landscape_factory: RecorderFactory) -> None:
         run_id, _source_node_id, parent_token_id = _build_base_run(landscape_factory)
         parent_row_id, _owner_run_id = landscape_factory.data_flow._resolve_token_ownership(parent_token_id)
+        member = leader_coordination_token(landscape_factory, run_id).membership
+        work_item = claim_test_work_item(landscape_factory, member_token=member, token_id=parent_token_id, node_id=_source_node_id)
         children, _fork_group_id = landscape_factory.data_flow.fork_token(
+            member_token=member,
+            work_item=work_item,
             parent_ref=TokenRef(token_id=parent_token_id, run_id=run_id),
             row_id=parent_row_id,
             branches=["branch_a", "branch_b"],
         )
-        landscape_factory.data_flow.record_token_outcome(
+        landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=children[0].token_id, run_id=run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
@@ -371,11 +396,12 @@ class TestI1bBatchConsumedDeferred:
         run_id, source_node_id, token_id = _build_base_run(landscape_factory)
         batch_id = "batch_orphan_001"
         landscape_factory.execution.create_batch(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             aggregation_node_id=source_node_id,
             batch_id=batch_id,
         )
-        landscape_factory.data_flow.record_token_outcome(
+        landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,
@@ -394,15 +420,17 @@ class TestI1bBatchConsumedDeferred:
         run_id, source_node_id, token_id = _build_base_run(landscape_factory)
         batch_id = "batch_complete_001"
         landscape_factory.execution.create_batch(
-            run_id=run_id,
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             aggregation_node_id=source_node_id,
             batch_id=batch_id,
         )
         landscape_factory.execution.complete_batch(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             batch_id=batch_id,
             status=BatchStatus.COMPLETED,
         )
-        landscape_factory.data_flow.record_token_outcome(
+        landscape_factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(landscape_factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.TRANSIENT,
             path=TerminalPath.BATCH_CONSUMED,

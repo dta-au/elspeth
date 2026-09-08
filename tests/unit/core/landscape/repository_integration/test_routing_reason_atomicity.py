@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import select
-from tests.fixtures.landscape import leader_coordination_token
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, leader_token_for
 
 from elspeth.contracts import NodeType, RoutingMode, RoutingSpec, RunStatus
 from elspeth.contracts.errors import AuditIntegrityError, ConfigGateReason
@@ -24,7 +24,8 @@ from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.landscape.factory import RecorderFactory
-from elspeth.core.landscape.schema import routing_events_table
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping
+from elspeth.core.landscape.schema import routing_events_table, token_work_items_table
 from elspeth.core.payload_store import FilesystemPayloadStore
 
 RUN_ID = "routing-atomic-run"
@@ -47,7 +48,7 @@ def _seed_routing_state(db_url: str) -> None:
         factory = RecorderFactory(db)
         factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=RUN_ID)
         factory.data_flow.register_node(
-            run_id=RUN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -56,7 +57,7 @@ def _seed_routing_state(db_url: str) -> None:
             schema_config=SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=RUN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             plugin_name="gate",
             node_type=NodeType.GATE,
             plugin_version="1.0",
@@ -65,7 +66,7 @@ def _seed_routing_state(db_url: str) -> None:
             schema_config=SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=RUN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -74,7 +75,7 @@ def _seed_routing_state(db_url: str) -> None:
             schema_config=SCHEMA,
         )
         factory.data_flow.register_edge(
-            run_id=RUN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             from_node_id=GATE_ID,
             to_node_id=SINK_ID,
             label="accepted",
@@ -82,30 +83,33 @@ def _seed_routing_state(db_url: str) -> None:
             edge_id=EDGE_ID,
         )
         factory.data_flow.register_edge(
-            run_id=RUN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             from_node_id=GATE_ID,
             to_node_id=SINK_ID,
             label="rejected",
             mode=RoutingMode.MOVE,
             edge_id=EDGE_B_ID,
         )
-        factory.data_flow.create_row(
-            RUN_ID,
+        factory.data_flow.create_row_with_token(
             SOURCE_ID,
             0,
             {"route": "accepted"},
             row_id=ROW_ID,
+            token_id=TOKEN_ID,
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(ROW_ID, token_id=TOKEN_ID)
         factory.execution.begin_node_state(
             TOKEN_ID,
             GATE_ID,
-            RUN_ID,
             0,
             {"route": "accepted"},
             state_id=STATE_ID,
+            member_token=leader_coordination_token(factory, RUN_ID).membership,
+        )
+        claim_test_work_item(
+            factory, member_token=leader_coordination_token(factory, RUN_ID).membership, token_id=TOKEN_ID, node_id=GATE_ID
         )
 
 
@@ -113,23 +117,26 @@ def _seed_additional_routing_state(db_url: str) -> None:
     """Add a second state in the seeded run for cross-state ownership races."""
     with LandscapeDB.from_url(db_url, create_tables=False) as db:
         factory = RecorderFactory(db)
-        factory.data_flow.create_row(
-            RUN_ID,
+        factory.data_flow.create_row_with_token(
             SOURCE_ID,
             1,
             {"route": "accepted"},
             row_id="row-1",
+            token_id="token-1",
+            coordination_token=leader_coordination_token(factory, RUN_ID),
             source_row_index=1,
             ingest_sequence=1,
         )
-        factory.data_flow.create_token("row-1", token_id="token-1")
         factory.execution.begin_node_state(
             "token-1",
             GATE_ID,
-            RUN_ID,
             0,
             {"route": "accepted"},
             state_id=STATE_B_ID,
+            member_token=leader_coordination_token(factory, RUN_ID).membership,
+        )
+        claim_test_work_item(
+            factory, member_token=leader_coordination_token(factory, RUN_ID).membership, token_id="token-1", node_id=GATE_ID
         )
 
 
@@ -156,7 +163,9 @@ class _CrashAfterStore(PayloadStore):
 def _crash_between_reason_store_and_event_insert(db_url: str, payload_dir: str) -> None:
     with LandscapeDB.from_url(db_url, create_tables=False) as db:
         factory = RecorderFactory(db, payload_store=_CrashAfterStore(payload_dir))
-        factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        factory.execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+        )
     os._exit(74)
 
 
@@ -166,7 +175,9 @@ def _record_concurrently(db_url: str, payload_dir: str, barrier: Any, results: A
             store = FilesystemPayloadStore(Path(payload_dir))
             factory = RecorderFactory(db, payload_store=store)
             barrier.wait(timeout=30)
-            event = factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+            event = factory.execution.record_routing_event(
+                STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+            )
             results.put(
                 (
                     "ok",
@@ -198,6 +209,17 @@ def _record_decision_with_sqlite_lock_pause(
 ) -> None:
     """Record one single/group decision, optionally pausing with write authority."""
     with LandscapeDB.from_url(db_url, create_tables=False) as db:
+        store = FilesystemPayloadStore(Path(payload_dir))
+        factory = RecorderFactory(db, payload_store=store)
+        member = leader_coordination_token(factory, RUN_ID).membership
+        state = factory.execution.get_node_state(state_id)
+        assert state is not None
+        # Read the claim seeded before contention; the writer itself must acquire
+        # and validate authority under the observed lock, not a fixture preflight.
+        with db.read_only_connection() as conn:
+            claim = item_from_mapping(
+                conn.execute(select(token_work_items_table).where(token_work_items_table.c.token_id == state.token_id)).mappings().one()
+            )
 
         def observe_begin_attempt(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:  # type: ignore[no-untyped-def]
             if statement.strip().upper() == "BEGIN IMMEDIATE":
@@ -212,8 +234,6 @@ def _record_decision_with_sqlite_lock_pause(
         sqlalchemy_event.listen(db.engine, "before_cursor_execute", observe_begin_attempt)
         sqlalchemy_event.listen(db.engine, "after_cursor_execute", observe_lock_acquired)
 
-        store = FilesystemPayloadStore(Path(payload_dir))
-        factory = RecorderFactory(db, payload_store=store)
         try:
             if decision_kind == "group":
                 recorded = factory.execution.record_routing_events(
@@ -223,6 +243,8 @@ def _record_decision_with_sqlite_lock_pause(
                         RoutingSpec(edge_id=EDGE_B_ID, mode=RoutingMode.MOVE),
                     ],
                     reason=REASON,
+                    member_token=member,
+                    work_item=claim,
                 )
             else:
                 recorded = [
@@ -231,6 +253,7 @@ def _record_decision_with_sqlite_lock_pause(
                         EDGE_ID,
                         RoutingMode.MOVE,
                         reason=REASON,
+                        member_token=member,
                         event_id=event_id,
                         routing_group_id=routing_group_id,
                         ordinal=ordinal,
@@ -295,7 +318,9 @@ def test_crash_after_reason_store_restarts_to_exact_event(tmp_path: Path) -> Non
             assert conn.execute(select(routing_events_table.c.event_id)).all() == []
 
         restarted = RecorderFactory(db, payload_store=store)
-        event = restarted.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        event = restarted.execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+        )
         assert event.reason_hash == expected_ref
         assert event.reason_ref == expected_ref
         assert store.retrieve(expected_ref) == b'{"condition":"row[\'route\'] == \'accepted\'","result":"true"}'
@@ -341,9 +366,11 @@ def test_spawned_identical_writers_converge_and_export_exact_reason(tmp_path: Pa
         assert rows[0].reason_ref == expected_ref
         assert store.retrieve(rows[0].reason_ref) == b'{"condition":"row[\'route\'] == \'accepted\'","result":"true"}'
 
-        RecorderFactory(db).run_lifecycle.complete_run(
-            RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID)
-        )
+        factory = RecorderFactory(db)
+        member = leader_coordination_token(factory, RUN_ID).membership
+        claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
+        factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
         routing_exports = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
         assert len(routing_exports) == 1
         assert routing_exports[0]["event_id"] == rows[0].event_id
@@ -362,10 +389,20 @@ def test_multi_then_single_is_refused_without_shrinking_decision(tmp_path: Path)
             RoutingSpec(edge_id=EDGE_ID, mode=RoutingMode.MOVE),
             RoutingSpec(edge_id=EDGE_B_ID, mode=RoutingMode.MOVE),
         ]
-        original = factory.execution.record_routing_events(STATE_ID, routes, reason=REASON)
+        original = factory.execution.record_routing_events(
+            STATE_ID,
+            routes,
+            reason=REASON,
+            member_token=leader_token_for(db, RUN_ID).membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_token_for(db, RUN_ID).membership, token_id=TOKEN_ID, node_id=GATE_ID
+            ),
+        )
 
         with pytest.raises(AuditIntegrityError, match="complete routing decision"):
-            factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+            factory.execution.record_routing_event(
+                STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+            )
 
         assert factory.query.get_routing_events(STATE_ID) == original
 
@@ -377,7 +414,9 @@ def test_single_then_multi_is_refused_without_extending_decision(tmp_path: Path)
     _seed_routing_state(db_url)
     with LandscapeDB.from_url(db_url, create_tables=False) as db:
         factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(payload_dir))
-        original = factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        original = factory.execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+        )
 
         with pytest.raises(AuditIntegrityError, match="complete routing decision"):
             factory.execution.record_routing_events(
@@ -387,6 +426,10 @@ def test_single_then_multi_is_refused_without_extending_decision(tmp_path: Path)
                     RoutingSpec(edge_id=EDGE_B_ID, mode=RoutingMode.MOVE),
                 ],
                 reason=REASON,
+                member_token=leader_token_for(db, RUN_ID).membership,
+                work_item=claim_test_work_item(
+                    factory, member_token=leader_token_for(db, RUN_ID).membership, token_id=TOKEN_ID, node_id=GATE_ID
+                ),
             )
 
         assert factory.query.get_routing_events(STATE_ID) == [original]
@@ -595,7 +638,9 @@ def test_legacy_single_default_retry_returns_random_id_row(tmp_path: Path) -> No
 
     with LandscapeDB.from_url(db_url, create_tables=False) as reopened:
         factory = RecorderFactory(reopened, payload_store=store)
-        retried = factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        retried = factory.execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(reopened, RUN_ID).membership
+        )
         assert retried.event_id == "legacy-random-single-event-0"
         assert retried.routing_group_id == "legacy-random-single-group"
         assert factory.query.get_routing_events(STATE_ID) == [retried]
@@ -624,6 +669,7 @@ def test_legacy_group_only_retry_returns_random_event_id_without_append(tmp_path
             EDGE_ID,
             RoutingMode.MOVE,
             reason=REASON,
+            member_token=leader_token_for(reopened, RUN_ID).membership,
             routing_group_id="caller-stable-legacy-group",
         )
         assert retried.event_id == "legacy-random-event-0"
@@ -651,7 +697,9 @@ def test_default_retry_rejects_random_event_id_in_current_deterministic_group(tm
     with LandscapeDB.from_url(db_url, create_tables=False) as reopened:
         factory = RecorderFactory(reopened, payload_store=store)
         with pytest.raises(AuditIntegrityError, match="durable event differs"):
-            factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+            factory.execution.record_routing_event(
+                STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(reopened, RUN_ID).membership
+            )
         durable = factory.query.get_routing_events(STATE_ID)
         assert len(durable) == 1
         assert durable[0].event_id == "random-event-in-current-group-0"
@@ -681,6 +729,7 @@ def test_legacy_retry_with_explicit_event_id_remains_strict(tmp_path: Path) -> N
                 EDGE_ID,
                 RoutingMode.MOVE,
                 reason=REASON,
+                member_token=leader_token_for(reopened, RUN_ID).membership,
                 event_id="explicit-different-event-id",
                 routing_group_id="caller-stable-strict-group",
             )
@@ -714,6 +763,10 @@ def test_legacy_multi_default_retry_returns_random_id_group(tmp_path: Path) -> N
                 RoutingSpec(edge_id=EDGE_B_ID, mode=RoutingMode.MOVE),
             ],
             reason=REASON,
+            member_token=leader_token_for(reopened, RUN_ID).membership,
+            work_item=claim_test_work_item(
+                factory, member_token=leader_token_for(reopened, RUN_ID).membership, token_id=TOKEN_ID, node_id=GATE_ID
+            ),
         )
         assert [event.event_id for event in retried] == ["legacy-random-multi-event-0", "legacy-random-multi-event-1"]
         assert {event.routing_group_id for event in retried} == {"legacy-random-multi-group"}
@@ -740,7 +793,9 @@ def test_multiple_legacy_groups_fail_closed_without_append(tmp_path: Path) -> No
     with LandscapeDB.from_url(db_url, create_tables=False) as reopened:
         factory = RecorderFactory(reopened, payload_store=store)
         with pytest.raises(AuditIntegrityError, match="multiple durable routing groups"):
-            factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+            factory.execution.record_routing_event(
+                STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(reopened, RUN_ID).membership
+            )
         assert len(factory.query.get_routing_events(STATE_ID)) == 2
 
 
@@ -762,7 +817,9 @@ def test_mismatched_legacy_reason_ref_is_rejected_without_append(tmp_path: Path)
     with LandscapeDB.from_url(db_url, create_tables=False) as reopened:
         factory = RecorderFactory(reopened, payload_store=store)
         with pytest.raises(AuditIntegrityError, match="durable event differs"):
-            factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+            factory.execution.record_routing_event(
+                STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(reopened, RUN_ID).membership
+            )
         durable = factory.query.get_routing_events(STATE_ID)
         assert len(durable) == 1
         assert durable[0].event_id == "legacy-dangling-event-0"
@@ -783,7 +840,9 @@ def test_journal_captures_final_reason_ref_on_insert_without_update(tmp_path: Pa
         dump_to_jsonl_path=str(journal_path),
     ) as db:
         factory = RecorderFactory(db, payload_store=FilesystemPayloadStore(payload_dir))
-        event = factory.execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        event = factory.execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+        )
 
     records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
     routing_writes = [record for record in records if "ROUTING_EVENTS" in record["statement"].upper()]
@@ -808,10 +867,13 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
             EDGE_ID,
             RoutingMode.MOVE,
             reason=REASON,
+            member_token=leader_token_for(db, RUN_ID).membership,
         )
-        RecorderFactory(db).run_lifecycle.complete_run(
-            RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID)
-        )
+        factory = RecorderFactory(db)
+        member = leader_coordination_token(factory, RUN_ID).membership
+        claim = claim_test_work_item(factory, member_token=member, token_id=TOKEN_ID, node_id=GATE_ID)
+        factory.scheduler.mark_terminal(member_token=member, work_item_id=claim.work_item_id, expected_lease_owner=member.worker_id)
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(RecorderFactory(db), RUN_ID))
         source_export = [record for record in LandscapeExporter(db).export_run(RUN_ID) if record["record_type"] == "routing_event"]
 
     backup_path = tmp_path / "audit.backup.db"
@@ -837,6 +899,7 @@ def test_sqlite_backup_restore_preserves_exported_reason_and_retry_identity(tmp_
             EDGE_ID,
             RoutingMode.MOVE,
             reason=REASON,
+            member_token=leader_token_for(restored_db, RUN_ID).membership,
         )
         assert retried.event_id == event.event_id
         assert retried.reason_ref == event.reason_ref
@@ -850,6 +913,8 @@ def test_without_payload_store_records_hash_only(tmp_path: Path) -> None:
     _seed_routing_state(db_url)
 
     with LandscapeDB.from_url(db_url, create_tables=False) as db:
-        event = RecorderFactory(db).execution.record_routing_event(STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON)
+        event = RecorderFactory(db).execution.record_routing_event(
+            STATE_ID, EDGE_ID, RoutingMode.MOVE, reason=REASON, member_token=leader_token_for(db, RUN_ID).membership
+        )
         assert event.reason_hash == stable_hash(REASON)
         assert event.reason_ref is None

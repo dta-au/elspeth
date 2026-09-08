@@ -11,6 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.core.landscape.database import LandscapeDB
@@ -18,7 +20,7 @@ from elspeth.core.landscape.exporter import LandscapeExporter
 from elspeth.core.payload_store import FilesystemPayloadStore
 from elspeth.engine.orchestrator import Orchestrator, PipelineConfig
 from tests.fixtures.base_classes import as_sink, as_source, as_transform
-from tests.fixtures.landscape import make_factory
+from tests.fixtures.landscape import claim_test_work_item, make_factory
 from tests.fixtures.pipeline import build_linear_pipeline
 from tests.fixtures.plugins import CollectSink, PassTransform
 
@@ -31,6 +33,8 @@ def _run_pipeline(
     tmp_path: Path,
     source_data: list[dict[str, Any]],
     transforms: list[Any] | None = None,
+    *,
+    seed_errors: bool = False,
 ) -> tuple[str, LandscapeDB, FilesystemPayloadStore, CollectSink]:
     """Run a linear pipeline and return (run_id, db, payload_store, sink)."""
     db = LandscapeDB(f"sqlite:///{tmp_path}/audit.db")
@@ -47,7 +51,56 @@ def _run_pipeline(
     )
 
     orchestrator = Orchestrator(db)
-    result = orchestrator.run(config, graph=graph, payload_store=payload_store)
+    with pytest.MonkeyPatch.context() as patch:
+        if seed_errors:
+            initialize = orchestrator._initialize_database_phase
+
+            def initialize_with_export_evidence(*args, **kwargs):
+                factory, run, authority = initialize(*args, **kwargs)
+                complete = factory.run_lifecycle.complete_run
+
+                def complete_with_export_evidence(*complete_args, **complete_kwargs):
+                    nodes = factory.data_flow.get_nodes(run.run_id)
+                    source_node = next(node for node in nodes if node.node_type.value == "source")
+                    transform_node = next(node for node in nodes if node.node_type.value == "transform")
+                    factory.data_flow.record_validation_error(
+                        coordination_token=authority,
+                        node_id=source_node.node_id,
+                        row_data={"id": "bad_source_row"},
+                        error="missing required field",
+                        schema_mode="fixed",
+                        destination="quarantine",
+                    )
+                    _row, token = factory.data_flow.create_row_with_token(
+                        coordination_token=authority,
+                        source_node_id=source_node.node_id,
+                        row_index=len(source_data),
+                        source_row_index=len(source_data),
+                        ingest_sequence=len(source_data),
+                        data={"id": "bad_transform_row"},
+                    )
+                    item = claim_test_work_item(
+                        factory, member_token=authority.membership, token_id=token.token_id, node_id=transform_node.node_id
+                    )
+                    factory.data_flow.record_transform_error(
+                        ref=TokenRef(token_id=token.token_id, run_id=run.run_id),
+                        member_token=authority.membership,
+                        work_item=item,
+                        transform_id=transform_node.node_id,
+                        row_data={"id": "bad_transform_row"},
+                        error_details={"reason": "test_error", "message": "boom"},
+                        destination="discard",
+                    )
+                    factory.scheduler.mark_terminal(
+                        member_token=authority.membership, work_item_id=item.work_item_id, expected_lease_owner=authority.worker_id
+                    )
+                    return complete(*complete_args, **complete_kwargs)
+
+                patch.setattr(factory.run_lifecycle, "complete_run", complete_with_export_evidence)
+                return factory, run, authority
+
+            patch.setattr(orchestrator, "_initialize_database_phase", initialize_with_export_evidence)
+        result = orchestrator.run(config, graph=graph, payload_store=payload_store)
     assert result.status == RunStatus.COMPLETED
     return result.run_id, db, payload_store, sink
 
@@ -134,7 +187,7 @@ class TestExportReimport:
     def test_export_data_matches_direct_queries(self, tmp_path: Path) -> None:
         """Export a run, compare record counts with direct SQL queries."""
         source_data = [{"id": f"row_{i}", "value": i * 10} for i in range(5)]
-        run_id, db, _payload_store, _sink = _run_pipeline(tmp_path, source_data)
+        run_id, db, _payload_store, _sink = _run_pipeline(tmp_path, source_data, seed_errors=True)
 
         # Get counts from direct repository queries
         factory = make_factory(db)
@@ -142,24 +195,10 @@ class TestExportReimport:
         direct_nodes = factory.data_flow.get_nodes(run_id)
         direct_edges = factory.data_flow.get_edges(run_id)
         direct_tokens = factory.query.get_all_tokens_for_run(run_id)
-        transform_node = next(node for node in direct_nodes if node.node_type.value == "transform")
-        factory.data_flow.record_validation_error(
-            run_id=run_id,
-            node_id=direct_nodes[0].node_id,
-            row_data={"id": "bad_source_row"},
-            error="missing required field",
-            schema_mode="fixed",
-            destination="quarantine",
-        )
-        factory.data_flow.record_transform_error(
-            ref=TokenRef(token_id=direct_tokens[0].token_id, run_id=run_id),
-            transform_id=transform_node.node_id,
-            row_data={"id": "bad_transform_row"},
-            error_details={"reason": "test_error", "message": "boom"},
-            destination="discard",
-        )
         direct_validation_errors = factory.data_flow.get_validation_errors_for_run(run_id)
         direct_transform_errors = factory.data_flow.get_transform_errors_for_run(run_id)
+        assert len(direct_validation_errors) == 1
+        assert len(direct_transform_errors) == 1
 
         # Get counts from export
         exporter = LandscapeExporter(db)

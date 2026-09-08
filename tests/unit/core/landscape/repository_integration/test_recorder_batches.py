@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts import BatchStatus, Determinism, NodeType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -20,7 +24,7 @@ class TestRecorderFactoryBatches:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         agg_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="batch_agg",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -30,7 +34,7 @@ class TestRecorderFactoryBatches:
         )
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg_node.node_id,
         )
 
@@ -43,7 +47,7 @@ class TestRecorderFactoryBatches:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         agg_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="batch_agg",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -53,25 +57,32 @@ class TestRecorderFactoryBatches:
         )
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg_node.node_id,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=agg_node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
-        member = factory.execution.add_batch_member(
-            batch_id=batch.batch_id,
-            token_id=token.token_id,
-            ordinal=0,
-        )
+        with fenced_leader_transaction(
+            landscape_db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_batch_membership",
+        ) as conn:
+            member = add_batch_member_guarded(
+                conn,
+                batch_id=batch.batch_id,
+                token_id=token.token_id,
+                ordinal=0,
+                expected_run_id=run.run_id,
+            )
 
         assert member.batch_id == batch.batch_id
         assert member.token_id == token.token_id
@@ -86,7 +97,7 @@ class TestRecorderFactoryBatches:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         agg_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="batch_agg",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -96,11 +107,12 @@ class TestRecorderFactoryBatches:
         )
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg_node.node_id,
         )
 
         completed = factory.execution.complete_batch(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             batch_id=batch.batch_id,
             status=BatchStatus.COMPLETED,
             trigger_reason="count=10",
@@ -116,7 +128,7 @@ class TestRecorderFactoryBatches:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         agg_node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="batch_agg",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -127,30 +139,38 @@ class TestRecorderFactoryBatches:
 
         # Create batch in draft
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg_node.node_id,
         )
         assert batch.status == "draft"
 
         # Add members
         for i in range(3):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _, token = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=agg_node.node_id,
                 row_index=i,
                 data={"idx": i},
                 source_row_index=i,
                 ingest_sequence=i,
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
-            factory.execution.add_batch_member(
-                batch_id=batch.batch_id,
-                token_id=token.token_id,
-                ordinal=i,
-            )
+            with fenced_leader_transaction(
+                landscape_db.engine,
+                token=leader_coordination_token(factory, run.run_id),
+                window_seconds=300,
+                verb="test_batch_membership",
+            ) as conn:
+                add_batch_member_guarded(
+                    conn,
+                    batch_id=batch.batch_id,
+                    token_id=token.token_id,
+                    ordinal=i,
+                    expected_run_id=run.run_id,
+                )
 
         # Move to executing
         factory.execution.update_batch_status(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             batch_id=batch.batch_id,
             status=BatchStatus.EXECUTING,
         )
@@ -160,6 +180,7 @@ class TestRecorderFactoryBatches:
 
         # Complete with trigger_reason
         factory.execution.complete_batch(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             batch_id=batch.batch_id,
             status=BatchStatus.COMPLETED,
             trigger_reason="count=3",
@@ -175,7 +196,7 @@ class TestRecorderFactoryBatches:
         factory = RecorderFactory(landscape_db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         agg = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="sum_agg",
             node_type=NodeType.AGGREGATION,
             plugin_version="1.0",
@@ -185,14 +206,16 @@ class TestRecorderFactoryBatches:
         )
 
         batch1 = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg.node_id,
         )
         batch2 = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=agg.node_id,
         )
-        factory.execution.complete_batch(batch2.batch_id, BatchStatus.COMPLETED)
+        factory.execution.complete_batch(
+            batch2.batch_id, BatchStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Get only draft batches
         drafts = factory.execution.get_batches(run.run_id, status=BatchStatus.DRAFT)
@@ -210,7 +233,7 @@ class TestBatchRecoveryQueries:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         # Register a node so batches can reference it
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -222,21 +245,30 @@ class TestBatchRecoveryQueries:
 
         # Create batches in various states
         draft_batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
         executing_batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
-        factory.execution.update_batch_status(executing_batch.batch_id, BatchStatus.EXECUTING)
+        factory.execution.update_batch_status(
+            executing_batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         completed_batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
-        factory.execution.update_batch_status(completed_batch.batch_id, BatchStatus.EXECUTING)
-        factory.execution.complete_batch(completed_batch.batch_id, BatchStatus.COMPLETED, trigger_reason="count")
+        factory.execution.update_batch_status(
+            completed_batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
+        factory.execution.complete_batch(
+            completed_batch.batch_id,
+            BatchStatus.COMPLETED,
+            trigger_reason="count",
+            coordination_token=leader_coordination_token(factory, run.run_id),
+        )
 
         # Act
         incomplete = factory.execution.get_incomplete_batches(run.run_id)
@@ -253,7 +285,7 @@ class TestBatchRecoveryQueries:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -264,11 +296,15 @@ class TestBatchRecoveryQueries:
         )
 
         failed_batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
-        factory.execution.update_batch_status(failed_batch.batch_id, BatchStatus.EXECUTING)
-        factory.execution.complete_batch(failed_batch.batch_id, BatchStatus.FAILED)
+        factory.execution.update_batch_status(
+            failed_batch.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
+        factory.execution.complete_batch(
+            failed_batch.batch_id, BatchStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         incomplete = factory.execution.get_incomplete_batches(run.run_id)
 
@@ -281,7 +317,7 @@ class TestBatchRecoveryQueries:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -291,9 +327,15 @@ class TestBatchRecoveryQueries:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        batch1 = factory.execution.create_batch(run_id=run.run_id, aggregation_node_id="agg_node")
-        batch2 = factory.execution.create_batch(run_id=run.run_id, aggregation_node_id="agg_node")
-        batch3 = factory.execution.create_batch(run_id=run.run_id, aggregation_node_id="agg_node")
+        batch1 = factory.execution.create_batch(
+            coordination_token=leader_coordination_token(factory, run.run_id), aggregation_node_id="agg_node"
+        )
+        batch2 = factory.execution.create_batch(
+            coordination_token=leader_coordination_token(factory, run.run_id), aggregation_node_id="agg_node"
+        )
+        batch3 = factory.execution.create_batch(
+            coordination_token=leader_coordination_token(factory, run.run_id), aggregation_node_id="agg_node"
+        )
 
         incomplete = factory.execution.get_incomplete_batches(run.run_id)
 
@@ -312,7 +354,7 @@ class TestBatchRetry:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -324,14 +366,18 @@ class TestBatchRetry:
 
         # Create and fail a batch
         original = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
-        factory.execution.update_batch_status(original.batch_id, BatchStatus.EXECUTING)
-        factory.execution.complete_batch(original.batch_id, BatchStatus.FAILED)
+        factory.execution.update_batch_status(
+            original.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
+        factory.execution.complete_batch(
+            original.batch_id, BatchStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Act: Retry the batch
-        retried = factory.execution.retry_batch(original.batch_id)
+        retried = factory.execution.retry_batch(original.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Assert: New batch with incremented attempt
         assert retried.batch_id != original.batch_id  # New batch ID
@@ -345,7 +391,7 @@ class TestBatchRetry:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -355,7 +401,7 @@ class TestBatchRetry:
             schema_config=DYNAMIC_SCHEMA,
         )
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -365,30 +411,39 @@ class TestBatchRetry:
         )
 
         original = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
 
         # Create tokens for members
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token1 = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token1 = factory.data_flow.create_token(row_id=row.row_id)
-        token2 = factory.data_flow.create_token(row_id=row.row_id)
+        token2 = factory.data_flow.create_token(row_id=row.row_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Add members to original
-        factory.execution.add_batch_member(original.batch_id, token1.token_id, ordinal=0)
-        factory.execution.add_batch_member(original.batch_id, token2.token_id, ordinal=1)
-        factory.execution.update_batch_status(original.batch_id, BatchStatus.EXECUTING)
-        factory.execution.complete_batch(original.batch_id, BatchStatus.FAILED)
+        with fenced_leader_transaction(
+            landscape_db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_batch_membership",
+        ) as conn:
+            add_batch_member_guarded(conn, batch_id=original.batch_id, token_id=token1.token_id, ordinal=0, expected_run_id=run.run_id)
+            add_batch_member_guarded(conn, batch_id=original.batch_id, token_id=token2.token_id, ordinal=1, expected_run_id=run.run_id)
+        factory.execution.update_batch_status(
+            original.batch_id, BatchStatus.EXECUTING, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
+        factory.execution.complete_batch(
+            original.batch_id, BatchStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id)
+        )
 
         # Act
-        retried = factory.execution.retry_batch(original.batch_id)
+        retried = factory.execution.retry_batch(original.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Assert: Members copied
         members = factory.execution.get_batch_members(retried.batch_id)
@@ -404,7 +459,7 @@ class TestBatchRetry:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="agg_node",
             plugin_name="test_agg",
             node_type=NodeType.AGGREGATION,
@@ -415,13 +470,13 @@ class TestBatchRetry:
         )
 
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id="agg_node",
         )
         # Batch is in draft status
 
         with pytest.raises(AuditIntegrityError, match="can only retry failed batches"):
-            factory.execution.retry_batch(batch.batch_id)
+            factory.execution.retry_batch(batch.batch_id, coordination_token=leader_coordination_token(factory, run.run_id))
 
     def test_retry_batch_raises_for_nonexistent_batch(self, landscape_db: LandscapeDB) -> None:
         """Raises for nonexistent batch ID."""
@@ -430,4 +485,5 @@ class TestBatchRetry:
         factory = RecorderFactory(landscape_db)
 
         with pytest.raises(AuditIntegrityError, match="batch nonexistent-batch-id not found"):
-            factory.execution.retry_batch("nonexistent-batch-id")
+            run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+            factory.execution.retry_batch("nonexistent-batch-id", coordination_token=leader_coordination_token(factory, run.run_id))

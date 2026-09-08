@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.fixtures.stores import MockPayloadStore
 
 from elspeth.contracts.audit import TokenRef
@@ -12,7 +13,9 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import SchemaContract
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -29,7 +32,7 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -37,8 +40,8 @@ class TestRecorderFactoryTokens:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"value": 42},
@@ -61,7 +64,7 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -70,8 +73,8 @@ class TestRecorderFactoryTokens:
         )
 
         test_data = {"name": "Alice", "value": 42}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=test_data,
@@ -88,23 +91,21 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"value": 42},
             source_row_index=0,
             ingest_sequence=0,
         )
-
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         assert token.token_id is not None
         assert token.row_id == row.row_id
@@ -115,28 +116,34 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork to two branches
         child_tokens, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["stats", "classifier"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent_token.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         assert len(child_tokens) == 2
@@ -157,28 +164,34 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork to two branches
         child_tokens, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["stats", "classifier"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent_token.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # P1: Verify token_parents entries for each child
@@ -197,26 +210,32 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Coalesce back together
@@ -225,6 +244,7 @@ class TestRecorderFactoryTokens:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         assert merged.token_id is not None
@@ -236,28 +256,34 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork with step_in_pipeline
         child_tokens, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["stats", "classifier"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent_token.token_id,
+                node_id=source.node_id,
+            ),
             step_in_pipeline=2,
         )
 
@@ -282,22 +308,21 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Empty branches should be rejected
         with pytest.raises(ValueError, match="at least one branch"):
@@ -305,6 +330,13 @@ class TestRecorderFactoryTokens:
                 parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
                 row_id=row.row_id,
                 branches=[],  # Empty!
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                work_item=claim_test_work_item(
+                    factory,
+                    member_token=leader_coordination_token(factory, run.run_id).membership,
+                    token_id=parent_token.token_id,
+                    node_id=source.node_id,
+                ),
             )
 
     def test_coalesce_tokens_with_step_in_pipeline(self) -> None:
@@ -313,26 +345,32 @@ class TestRecorderFactoryTokens:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
             step_in_pipeline=1,
         )
 
@@ -343,6 +381,7 @@ class TestRecorderFactoryTokens:
             merged_payload={"merged": True},
             step_in_pipeline=3,
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Verify step_in_pipeline is stored
@@ -365,7 +404,7 @@ class TestExpandToken:
         # Setup: create run, node, row, and parent token
         run = factory.run_lifecycle.begin_run(config={"test": True}, canonical_version="1.0")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="json_explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -373,15 +412,14 @@ class TestExpandToken:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"items": [1, 2, 3]},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Act: expand parent into 3 children
         children, _expand_group_id = factory.data_flow.expand_token(
@@ -390,6 +428,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}, {"item": 3}],
             step_in_pipeline=2,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         # Assert: 3 children created
@@ -419,7 +458,7 @@ class TestExpandToken:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="1.0")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0.0",
@@ -427,15 +466,14 @@ class TestExpandToken:
             determinism=Determinism.IO_READ,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         with pytest.raises(ValueError, match="at least 1"):
             factory.data_flow.expand_token(
@@ -444,6 +482,7 @@ class TestExpandToken:
                 child_payloads=[],
                 step_in_pipeline=1,
                 output_contract=_MINIMAL_CONTRACT,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
             )
 
     def test_expand_token_stores_step_in_pipeline(self) -> None:
@@ -453,7 +492,7 @@ class TestExpandToken:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="1.0")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -461,15 +500,14 @@ class TestExpandToken:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={"list": [1, 2]},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
 
         children, _expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
@@ -477,6 +515,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}],
             step_in_pipeline=5,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         # Verify step_in_pipeline stored
@@ -494,7 +533,7 @@ class TestExpandToken:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="1.0")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="singleton",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -502,15 +541,14 @@ class TestExpandToken:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
 
         children, expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
@@ -518,6 +556,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}],
             step_in_pipeline=1,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         assert len(children) == 1
@@ -536,7 +575,7 @@ class TestExpandToken:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="1.0")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0.0",
@@ -544,15 +583,14 @@ class TestExpandToken:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
 
         children, _expand_group_id = factory.data_flow.expand_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
@@ -560,6 +598,7 @@ class TestExpandToken:
             child_payloads=[{"item": 1}, {"item": 2}],
             step_in_pipeline=3,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         # Retrieve each child and verify expand_group_id matches
@@ -587,28 +626,34 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork to two branches
         _children, fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["stats", "classifier"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent_token.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Verify parent has FORKED outcome recorded atomically
@@ -632,28 +677,34 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Fork to three branches
         children, fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent_token.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["alpha", "beta", "gamma"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent_token.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # D2 flip: expected_branches_json is retired from token_outcomes; the
@@ -674,7 +725,7 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -682,15 +733,14 @@ class TestAtomicTokenOperations:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Expand to 3 children (default: record_parent_outcome=True)
         _children, expand_group_id = factory.data_flow.expand_token(
@@ -699,6 +749,7 @@ class TestAtomicTokenOperations:
             child_payloads=[{"item": 1}, {"item": 2}, {"item": 3}],
             step_in_pipeline=2,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         # Verify parent has EXPANDED outcome recorded atomically
@@ -722,7 +773,7 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="explode",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -730,15 +781,14 @@ class TestAtomicTokenOperations:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Expand to 5 children
         _children, expand_group_id = factory.data_flow.expand_token(
@@ -747,6 +797,7 @@ class TestAtomicTokenOperations:
             child_payloads=[{"item": i} for i in range(5)],
             step_in_pipeline=2,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
         )
 
         # D2 flip: expected_branches_json is retired from token_outcomes; the
@@ -767,26 +818,32 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Coalesce the two fork children
@@ -795,6 +852,7 @@ class TestAtomicTokenOperations:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Verify merged token has join_group_id
@@ -818,26 +876,32 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Step 1: Coalesce creates merged token + parent links
@@ -846,6 +910,7 @@ class TestAtomicTokenOperations:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Step 2: Record COALESCED outcomes on each parent (as CoalesceExecutor does)
@@ -854,7 +919,8 @@ class TestAtomicTokenOperations:
         # the merged TOKEN's own column (ruling 20), not a per-parent outcome field.
         assert merged.join_group_id is not None
         for child in children:
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 ref=TokenRef(token_id=child.token_id, run_id=run.run_id),
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.COALESCED,
@@ -879,26 +945,32 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["x", "y", "z"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Coalesce all three fork children
@@ -907,6 +979,7 @@ class TestAtomicTokenOperations:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Verify token_parents entries
@@ -927,26 +1000,32 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         merged = factory.data_flow.coalesce_tokens(
@@ -954,6 +1033,7 @@ class TestAtomicTokenOperations:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # join_group_id must be set on the merged token itself
@@ -970,7 +1050,7 @@ class TestAtomicTokenOperations:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="aggregator",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -978,21 +1058,23 @@ class TestAtomicTokenOperations:
             determinism=Determinism.DETERMINISTIC,
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent_token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        parent_token = factory.data_flow.create_token(row_id=row.row_id)
         batch = factory.execution.create_batch(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             aggregation_node_id=node.node_id,
             batch_id="batch-expand",
         )
-        factory.execution.add_batch_member(batch.batch_id, parent_token.token_id, 0)
+        with fenced_leader_transaction(
+            db.engine, token=leader_coordination_token(factory, run.run_id), window_seconds=300, verb="test_batch_parent"
+        ) as conn:
+            add_batch_member_guarded(conn, batch_id=batch.batch_id, token_id=parent_token.token_id, ordinal=0, expected_run_id=run.run_id)
 
         # The batch-specific terminal path is recorded in the same transaction
         # as the expanded children.
@@ -1002,6 +1084,7 @@ class TestAtomicTokenOperations:
             child_payloads=[{"item": 1}, {"item": 2}],
             step_in_pipeline=2,
             output_contract=_MINIMAL_CONTRACT,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             parent_path=TerminalPath.BATCH_CONSUMED,
             parent_batch_id=batch.batch_id,
         )

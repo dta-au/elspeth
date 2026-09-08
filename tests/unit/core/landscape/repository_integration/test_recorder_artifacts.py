@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
+
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.schema import SchemaConfig
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 
 # Dynamic schema for tests that don't care about specific fields
 DYNAMIC_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
@@ -23,39 +26,45 @@ class TestRecorderFactoryArtifacts:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=sink.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
-        artifact = factory.execution.register_artifact(
-            run_id=run.run_id,
-            state_id=state.state_id,
-            sink_node_id=sink.node_id,
-            artifact_type="csv",
-            path="/output/result.csv",
-            content_hash="abc123",
-            size_bytes=1024,
-        )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_artifact_registration",
+        ) as conn:
+            artifact = factory.execution.artifacts.register_artifact(
+                conn=conn,
+                run_id=run.run_id,
+                state_id=state.state_id,
+                sink_node_id=sink.node_id,
+                artifact_type="csv",
+                path="/output/result.csv",
+                content_hash="abc123",
+                size_bytes=1024,
+            )
 
         assert artifact.artifact_id is not None
         assert artifact.path_or_uri == "/output/result.csv"
@@ -68,48 +77,61 @@ class TestRecorderFactoryArtifacts:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=sink.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
-        factory.execution.register_artifact(
-            run_id=run.run_id,
-            state_id=state.state_id,
-            sink_node_id=sink.node_id,
-            artifact_type="csv",
-            path="/output/a.csv",
-            content_hash="hash1",
-            size_bytes=100,
-        )
-        factory.execution.register_artifact(
-            run_id=run.run_id,
-            state_id=state.state_id,
-            sink_node_id=sink.node_id,
-            artifact_type="csv",
-            path="/output/b.csv",
-            content_hash="hash2",
-            size_bytes=200,
-        )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_artifact_registration",
+        ) as conn:
+            factory.execution.artifacts.register_artifact(
+                conn=conn,
+                run_id=run.run_id,
+                state_id=state.state_id,
+                sink_node_id=sink.node_id,
+                artifact_type="csv",
+                path="/output/a.csv",
+                content_hash="hash1",
+                size_bytes=100,
+            )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_artifact_registration",
+        ) as conn:
+            factory.execution.artifacts.register_artifact(
+                conn=conn,
+                run_id=run.run_id,
+                state_id=state.state_id,
+                sink_node_id=sink.node_id,
+                artifact_type="csv",
+                path="/output/b.csv",
+                content_hash="hash2",
+                size_bytes=200,
+            )
 
         artifacts = factory.execution.get_artifacts(run.run_id)
         assert len(artifacts) == 2
@@ -132,42 +154,48 @@ class TestRecorderFactoryArtifacts:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=sink.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
         # Register artifact with idempotency key
         idem_key = f"{run.run_id}:{row.row_id}:csv_sink"
-        artifact = factory.execution.register_artifact(
-            run_id=run.run_id,
-            state_id=state.state_id,
-            sink_node_id=sink.node_id,
-            artifact_type="csv",
-            path="/output/result.csv",
-            content_hash="abc123",
-            size_bytes=1024,
-            idempotency_key=idem_key,
-        )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_artifact_registration",
+        ) as conn:
+            artifact = factory.execution.artifacts.register_artifact(
+                conn=conn,
+                run_id=run.run_id,
+                state_id=state.state_id,
+                sink_node_id=sink.node_id,
+                artifact_type="csv",
+                path="/output/result.csv",
+                content_hash="abc123",
+                size_bytes=1024,
+                idempotency_key=idem_key,
+            )
 
         assert artifact.idempotency_key == idem_key, (
             "register_artifact should return Artifact with idempotency_key set. "
@@ -196,40 +224,46 @@ class TestRecorderFactoryArtifacts:
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=sink.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=sink.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
         # Register artifact WITHOUT idempotency key
-        artifact = factory.execution.register_artifact(
-            run_id=run.run_id,
-            state_id=state.state_id,
-            sink_node_id=sink.node_id,
-            artifact_type="csv",
-            path="/output/result.csv",
-            content_hash="abc123",
-            size_bytes=1024,
-        )
+        with fenced_leader_transaction(
+            db.engine,
+            token=leader_coordination_token(factory, run.run_id),
+            window_seconds=300,
+            verb="test_artifact_registration",
+        ) as conn:
+            artifact = factory.execution.artifacts.register_artifact(
+                conn=conn,
+                run_id=run.run_id,
+                state_id=state.state_id,
+                sink_node_id=sink.node_id,
+                artifact_type="csv",
+                path="/output/result.csv",
+                content_hash="abc123",
+                size_bytes=1024,
+            )
 
         assert artifact.idempotency_key is None, "register_artifact without idempotency_key should return None for that field"
 
@@ -241,7 +275,7 @@ class TestRecorderFactoryArtifacts:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -250,8 +284,8 @@ class TestRecorderFactoryArtifacts:
         )
 
         for i in range(3):
-            factory.data_flow.create_row(
-                run_id=run.run_id,
+            factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run.run_id),
                 source_node_id=source.node_id,
                 row_index=i,
                 data={"idx": i},
@@ -272,15 +306,15 @@ class TestRecorderFactoryArtifacts:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
@@ -289,11 +323,17 @@ class TestRecorderFactoryArtifacts:
         )
 
         # Create initial token and fork
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         _children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         tokens = factory.query.get_tokens(row.row_id)
@@ -308,7 +348,7 @@ class TestRecorderFactoryArtifacts:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         node1 = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -316,35 +356,34 @@ class TestRecorderFactoryArtifacts:
             schema_config=DYNAMIC_SCHEMA,
         )
         node2 = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=node1.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Create states at two nodes
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node1.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
         factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=node2.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=1,
             input_data={},
         )

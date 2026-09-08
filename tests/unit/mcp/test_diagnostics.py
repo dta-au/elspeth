@@ -42,7 +42,7 @@ def _create_completed_run_with_quarantine(
     """Create a completed run with one quarantined token."""
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -50,16 +50,16 @@ def _create_completed_run_with_quarantine(
         node_id=f"source-{run_id}",
         schema_config=_DYNAMIC_SCHEMA,
     )
-    row = factory.data_flow.create_row(
-        run_id=run_id,
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run_id),
         source_node_id=f"source-{run_id}",
         row_index=0,
         data={"col": "bad-value"},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id)
-    factory.data_flow.record_token_outcome(
+    factory.data_flow.record_token_outcome_leader(
+        coordination_token=leader_coordination_token(factory, run_id),
         ref=TokenRef(token_id=token.token_id, run_id=run_id),
         outcome=TerminalOutcome.FAILURE,
         path=TerminalPath.QUARANTINED_AT_SOURCE,
@@ -202,7 +202,7 @@ def test_diagnose_reports_high_error_completed_with_failures_runs() -> None:
     run_id = "high-error-mixed-run"
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
     factory.data_flow.register_node(
-        run_id=run_id,
+        coordination_token=leader_coordination_token(factory, run_id),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -212,12 +212,12 @@ def test_diagnose_reports_high_error_completed_with_failures_runs() -> None:
     )
     for index in range(11):
         factory.data_flow.record_validation_error(
-            run_id,
             "source",
             {"bad": f"value-{index}"},
             "missing field",
             "observed",
             "quarantine",
+            coordination_token=leader_coordination_token(factory, run_id),
         )
     factory.run_lifecycle.complete_run(RunStatus.COMPLETED_WITH_FAILURES, coordination_token=leader_coordination_token(factory, run_id))
 

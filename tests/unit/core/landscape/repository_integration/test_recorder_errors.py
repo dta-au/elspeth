@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import UTC
 from typing import TYPE_CHECKING
 
-from tests.fixtures.landscape import leader_coordination_token
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, leader_token_for
 
+from elspeth.contracts import RunStatus
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.schema import SchemaConfig
 
@@ -35,7 +35,7 @@ class TestTransformErrorRecording:
 
         # Create source node
         data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_token_for(db, run_id),
             plugin_name="test_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -45,33 +45,18 @@ class TestTransformErrorRecording:
             sequence=0,
         )
         # Create row
-        row = data_flow.create_row(
-            run_id=run_id,
+        data_flow.create_row_with_token(
+            token_id=token_id,
+            coordination_token=leader_token_for(db, run_id),
             source_node_id="source_test",
             row_index=1,
             data={"id": "test"},
             source_row_index=1,
             ingest_sequence=1,
         )
-        # Create token with specified ID
-        from datetime import datetime
-
-        from elspeth.core.landscape.schema import tokens_table
-
-        with db.write_connection() as conn:
-            conn.execute(
-                tokens_table.insert().values(
-                    token_id=token_id,
-                    row_id=row.row_id,
-                    run_id=run_id,
-                    step_in_pipeline=0,
-                    created_at=datetime.now(UTC),
-                )
-            )
-            conn.commit()
         # Create transform node for transform_id FK
         data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader_token_for(db, run_id),
             plugin_name="test_transform",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -96,6 +81,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_123", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_123",
+                node_id="field_mapper",
+            ),
             transform_id="field_mapper",
             row_data={"id": 42, "value": "bad"},
             error_details={"reason": "validation_failed", "error": "Division by zero"},
@@ -123,6 +115,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_456", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_456",
+                node_id="field_mapper",
+            ),
             transform_id="field_mapper",
             row_data={"id": 42, "value": "bad"},
             error_details={"reason": "validation_failed", "error": "Division by zero", "field": "divisor"},
@@ -166,6 +165,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_789", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_789",
+                node_id="processor",
+            ),
             transform_id="processor",
             row_data=row_data,
             error_details={"reason": "validation_failed", "error": "Processing failed"},
@@ -197,6 +203,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_999", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_999",
+                node_id="gate",
+            ),
             transform_id="gate",
             row_data={"id": 1},
             error_details={"reason": "validation_failed", "error": "Gate evaluation failed"},
@@ -237,6 +250,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_nan", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_nan",
+                node_id="processor",
+            ),
             transform_id="processor",
             row_data=row_data,
             error_details={"reason": "float_overflow", "error": "Cannot divide by zero"},
@@ -278,6 +298,13 @@ class TestTransformErrorRecording:
 
         error_id = factory.data_flow.record_transform_error(
             ref=TokenRef(token_id="tok_inf", run_id=run.run_id),
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id="tok_inf",
+                node_id="processor",
+            ),
             transform_id="processor",
             row_data=row_data,
             error_details={"reason": "float_overflow", "error": "Value too large"},
@@ -312,6 +339,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
         factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         loaded = factory.run_lifecycle.get_run(run.run_id)
@@ -333,6 +361,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
         factory.run_lifecycle.set_export_status(ExportStatus.PENDING, coordination_token=leader_coordination_token(factory, run.run_id))
 
         runs = factory.run_lifecycle.list_runs()
@@ -352,6 +381,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # First fail with an error
         factory.run_lifecycle.set_export_status(
@@ -377,6 +407,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # First fail with an error
         factory.run_lifecycle.set_export_status(
@@ -399,6 +430,7 @@ class TestExportStatusEnumCoercion:
         factory = RecorderFactory(db)
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
+        factory.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))
 
         # Pass enum directly
         factory.run_lifecycle.set_export_status(ExportStatus.COMPLETED, coordination_token=leader_coordination_token(factory, run.run_id))

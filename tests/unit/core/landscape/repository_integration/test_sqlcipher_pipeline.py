@@ -43,7 +43,7 @@ class TestPipelineWithSQLCipherLandscape:
 
             # Register a source node
             source_node = factory.data_flow.register_node(
-                run_id=run_id,
+                coordination_token=leader_coordination_token(factory, run_id),
                 plugin_name="csv",
                 node_type=NodeType.SOURCE,
                 plugin_version="1.0",
@@ -52,8 +52,8 @@ class TestPipelineWithSQLCipherLandscape:
             )
 
             # Create a row
-            row = factory.data_flow.create_row(
-                run_id=run_id,
+            row, _ = factory.data_flow.create_row_with_token(
+                coordination_token=leader_coordination_token(factory, run_id),
                 source_node_id=source_node.node_id,
                 row_index=0,
                 data={"customer_id": "C001", "amount": 42.0},

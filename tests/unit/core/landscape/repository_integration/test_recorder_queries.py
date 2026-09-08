@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token
 from tests.fixtures.stores import MockPayloadStore
 
 from elspeth.contracts import NodeType, RoutingMode
@@ -27,15 +28,15 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -67,22 +68,21 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # Retrieve by ID
         retrieved = factory.query.get_token(token.token_id)
@@ -107,15 +107,15 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
@@ -124,11 +124,17 @@ class TestRecorderFactoryQueryMethods:
         )
 
         # Create parent token and fork
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Coalesce the children
@@ -137,6 +143,7 @@ class TestRecorderFactoryQueryMethods:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Get parents of coalesced token
@@ -154,15 +161,15 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db, payload_store=MockPayloadStore())
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, parent = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
@@ -171,11 +178,17 @@ class TestRecorderFactoryQueryMethods:
         )
 
         # Create parent token and fork into branches
-        parent = factory.data_flow.create_token(row_id=row.row_id)
         forked_children, _fork_group_id = factory.data_flow.fork_token(
             parent_ref=TokenRef(token_id=parent.token_id, run_id=run.run_id),
             row_id=row.row_id,
             branches=["a", "b"],
+            member_token=leader_coordination_token(factory, run.run_id).membership,
+            work_item=claim_test_work_item(
+                factory,
+                member_token=leader_coordination_token(factory, run.run_id).membership,
+                token_id=parent.token_id,
+                node_id=source.node_id,
+            ),
         )
 
         # Coalesce the forked children back together
@@ -184,6 +197,7 @@ class TestRecorderFactoryQueryMethods:
             row_id=row.row_id,
             merged_payload={"merged": True},
             merged_contract=_MINIMAL_CONTRACT,
+            coordination_token=leader_coordination_token(factory, run.run_id),
         )
 
         # Forward lineage: given a consumed parent, find what it merged into
@@ -207,22 +221,21 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
 
         # A fresh token has no children
         children = factory.query.get_token_children(token.token_id)
@@ -236,7 +249,7 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db)
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         gate = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="gate",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -244,7 +257,7 @@ class TestRecorderFactoryQueryMethods:
             schema_config=DYNAMIC_SCHEMA,
         )
         sink = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -252,31 +265,31 @@ class TestRecorderFactoryQueryMethods:
             schema_config=DYNAMIC_SCHEMA,
         )
         edge = factory.data_flow.register_edge(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             from_node_id=gate.node_id,
             to_node_id=sink.node_id,
             label="output",
             mode=RoutingMode.MOVE,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        _, token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=gate.node_id,
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        token = factory.data_flow.create_token(row_id=row.row_id)
         state = factory.execution.begin_node_state(
             token_id=token.token_id,
             node_id=gate.node_id,
-            run_id=run.run_id,
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             step_index=0,
             input_data={},
         )
 
         # Record routing event (using new API with auto-generated routing_group_id)
         factory.execution.record_routing_event(
+            member_token=leader_coordination_token(factory, run.run_id).membership,
             state_id=state.state_id,
             edge_id=edge.edge_id,
             mode=RoutingMode.MOVE,
@@ -297,15 +310,15 @@ class TestRecorderFactoryQueryMethods:
         factory = RecorderFactory(db)  # No payload store
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},

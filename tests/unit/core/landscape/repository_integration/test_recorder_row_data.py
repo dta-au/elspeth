@@ -4,6 +4,8 @@
 import json
 from pathlib import Path
 
+from tests.fixtures.landscape import leader_coordination_token
+
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.schema import SchemaConfig
@@ -44,15 +46,15 @@ class TestGetRowDataExplicitStates:
         # Create run and row - payload will not be stored
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
             config={},
             schema_config=DYNAMIC_SCHEMA,
         )
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -75,7 +77,7 @@ class TestGetRowDataExplicitStates:
         factory_with_store = RecorderFactory(db, payload_store=payload_store)
         run = factory_with_store.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory_with_store.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory_with_store, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -85,8 +87,8 @@ class TestGetRowDataExplicitStates:
 
         # create_row auto-stores payload via configured payload_store
         test_data = {"field": "value"}
-        row = factory_with_store.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory_with_store.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory_with_store, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=test_data,
@@ -110,7 +112,7 @@ class TestGetRowDataExplicitStates:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -120,8 +122,8 @@ class TestGetRowDataExplicitStates:
 
         # create_row auto-stores payload via configured payload_store
         test_data = {"field": "value"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=test_data,
@@ -145,7 +147,7 @@ class TestGetRowDataExplicitStates:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -155,8 +157,8 @@ class TestGetRowDataExplicitStates:
 
         # create_row auto-stores payload via configured payload_store
         test_data = {"field": "value", "number": 42}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=test_data,
@@ -193,7 +195,7 @@ class TestGetRowDataTier1Corruption:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -203,8 +205,8 @@ class TestGetRowDataTier1Corruption:
 
         # create_row auto-stores payload via configured payload_store
         test_data = {"field": "value"}
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=test_data,
@@ -242,7 +244,7 @@ class TestGetRowDataTier1Corruption:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -251,8 +253,8 @@ class TestGetRowDataTier1Corruption:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"placeholder": "ignored"},
@@ -284,7 +286,7 @@ class TestGetRowDataTier1Corruption:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -293,8 +295,8 @@ class TestGetRowDataTier1Corruption:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _ = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"placeholder": "ignored"},

@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import update
-from tests.fixtures.landscape import landscape_database_now, leader_coordination_token
+from tests.fixtures.landscape import landscape_database_now, leader_coordination_token, leader_token_for, member_token_for
 from tests.helpers.state_engine import (
     EXCLUDED_STATE_ENGINE_TABLES,
     STATE_ENGINE_TABLES,
@@ -59,7 +59,6 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         leader_worker_id=worker_id,
     )
     source = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="test_source",
         node_type=NodeType.SOURCE,
         plugin_version="1",
@@ -67,9 +66,9 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         node_id="source",
         sequence=0,
         schema_config=_OBSERVED_SCHEMA,
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     transform = factory.data_flow.register_node(
-        run_id=run.run_id,
         plugin_name="test_transform",
         node_type=NodeType.TRANSFORM,
         plugin_version="1",
@@ -77,6 +76,7 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         node_id="transform",
         sequence=1,
         schema_config=_OBSERVED_SCHEMA,
+        coordination_token=leader_token_for(factory.data_flow._db, run.run_id),
     )
     factory.run_lifecycle.record_run_source(
         source_node_id=source.node_id,
@@ -86,18 +86,16 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         lifecycle_state="loaded",
         coordination_token=leader_coordination_token(factory, run.run_id),
     )
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id=source.node_id,
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"id": 1},
     )
-    token = factory.data_flow.create_token(row.row_id)
     now = landscape_database_now(db.engine)
     item = factory.scheduler.enqueue_ready(
-        run_id=run.run_id,
         token_id=token.token_id,
         row_id=row.row_id,
         node_id=transform.node_id,
@@ -106,11 +104,12 @@ def seeded_run(tmp_path: Path) -> Generator[_SeededRun, None, None]:
         row_payload_json=factory.scheduler.serialize_row_payload(
             PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
         ),
+        member_token=member_token_for(db.engine, worker_id=worker_id, run_id=run.run_id),
     )
     claimed = factory.scheduler.claim_ready(
-        run_id=run.run_id,
         lease_owner=worker_id,
         lease_seconds=30,
+        member_token=member_token_for(factory.scheduler._engine, worker_id=worker_id, run_id=run.run_id),
     )
     assert claimed is not None and claimed.work_item_id == item.work_item_id
 
@@ -169,11 +168,10 @@ def test_durable_image_reports_only_allowlisted_delta(seeded_run: _SeededRun) ->
         )
     before = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
     seeded_run.factory.scheduler.heartbeat_lease(
-        run_id=seeded_run.run_id,
+        member_token=member_token_for(seeded_run.db.engine, worker_id=seeded_run.worker_id, run_id=seeded_run.run_id),
         work_item_id=seeded_run.work_item_id,
         lease_owner=seeded_run.worker_id,
         lease_seconds=60,
-        membership_fenced=True,
     )
     after = capture_state_engine_image(seeded_run.factory, run_id=seeded_run.run_id)
 

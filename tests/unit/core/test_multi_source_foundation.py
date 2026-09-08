@@ -15,26 +15,32 @@ from sqlalchemy.sql.compiler import SQLCompiler
 
 from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import NodeType, RoutingMode
-from elspeth.contracts.coordination import CoordinationToken
+from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.core.config import SourceSettings
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import (
     metadata,
     nodes_table,
     rows_table,
     run_coordination_table,
     run_sources_table,
+    run_workers_table,
     runs_table,
     token_work_items_table,
     tokens_table,
 )
-from tests.fixtures.landscape import assert_stamped_between, expire_lease, landscape_database_now, leader_coordination_token
-
-# Epoch-1 token for "run-1" — _insert_scheduler_owner_records seeds the matching seat.
-_COORD_TOKEN_RUN1 = CoordinationToken(run_id="run-1", worker_id="test-leader", leader_epoch=1)
+from tests.fixtures.landscape import (
+    assert_stamped_between,
+    expire_lease,
+    expire_worker,
+    landscape_database_now,
+    leader_coordination_token,
+    member_token_for,
+)
 
 _SchedulerTransition = Literal["blocked", "terminal", "failed"]
 
@@ -548,7 +554,7 @@ def test_record_run_source_rejects_non_source_node() -> None:
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="test", run_id="run-non-source-node")
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="passthrough",
         node_type=NodeType.TRANSFORM,
         plugin_version="test",
@@ -578,7 +584,7 @@ def test_record_run_source_rejects_unknown_lifecycle_state() -> None:
     factory = RecorderFactory(db)
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="test", run_id="run-invalid-source-lifecycle")
     factory.data_flow.register_node(
-        run_id=run.run_id,
+        coordination_token=leader_coordination_token(factory, run.run_id),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="test",
@@ -728,7 +734,7 @@ def test_run_lifecycle_records_per_source_contract_and_resolution() -> None:
     assert '"Refund ID":"id"' in rows[1].field_resolution_json
 
 
-def test_data_flow_create_row_accepts_source_row_index_and_ingest_sequence() -> None:
+def test_data_flow_create_row_with_token_accepts_source_row_index_and_ingest_sequence() -> None:
     from elspeth.core.landscape import LandscapeDB, RecorderFactory
 
     db = LandscapeDB("sqlite:///:memory:")
@@ -752,16 +758,16 @@ def test_data_flow_create_row_accepts_source_row_index_and_ingest_sequence() -> 
                 )
             )
 
-    factory.data_flow.create_row(
-        run_id=run.run_id,
+    factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id="source_orders",
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"id": "order-1"},
     )
-    factory.data_flow.create_row(
-        run_id=run.run_id,
+    factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, run.run_id),
         source_node_id="source_refunds",
         row_index=1,
         source_row_index=0,
@@ -1418,7 +1424,7 @@ def test_scheduler_claims_ready_work_and_recovers_expired_leases() -> None:
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1428,7 +1434,7 @@ def test_scheduler_claims_ready_work_and_recovers_expired_leases() -> None:
         on_success_sink="default",
     )
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
     assert claimed.lease_owner == "worker-a"
@@ -1438,16 +1444,16 @@ def test_scheduler_claims_ready_work_and_recovers_expired_leases() -> None:
     assert restored.to_dict() == {"id": 1, "total": 10}
     assert restored.contract.version_hash() == contract.version_hash()
 
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is None
+    assert repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30) is None
 
     expire_lease(engine, item.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner="worker-b",
+    expire_worker(engine, "worker-a", seconds_ago=3600)
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 1
 
-    reclaimed = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    reclaimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30)
     assert reclaimed is not None
     assert reclaimed.status is TokenWorkStatus.LEASED
     assert reclaimed.lease_owner == "worker-b"
@@ -1484,11 +1490,11 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
         node_ids=("normalize",),
     )
 
-    caller_owner = "row-processor:run-1:caller-uuid"
+    caller_owner = _scheduler_leader(engine).worker_id
     prior_owner = "row-processor:run-1:prior-crashed-uuid"
 
     caller_item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-caller",
         row_id="row-caller",
         node_id="normalize",
@@ -1497,7 +1503,7 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
         row_payload_json=payload,
     )
     prior_item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-prior",
         row_id="row-prior",
         node_id="normalize",
@@ -1507,12 +1513,12 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
     )
 
     caller_claim = repo.claim_ready(
-        run_id="run-1",
+        member_token=_scheduler_member(engine, caller_owner),
         lease_owner=caller_owner,
         lease_seconds=30,
     )
     prior_claim = repo.claim_ready(
-        run_id="run-1",
+        member_token=_scheduler_member(engine, prior_owner),
         lease_owner=prior_owner,
         lease_seconds=30,
     )
@@ -1529,9 +1535,12 @@ def test_scheduler_recover_expired_leases_skips_caller_owned_leases() -> None:
     # mid-iteration — its lease must NOT be recovered.
     expire_lease(engine, caller_claim.work_item_id)
     expire_lease(engine, prior_claim.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner=caller_owner,
+    # Age both registry heartbeats so the caller exclusion is the only
+    # protection for the leader's item, independently of registry liveness.
+    expire_worker(engine, caller_owner, seconds_ago=3600)
+    expire_worker(engine, prior_owner, seconds_ago=3600)
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 1, "Only the prior worker's lease should have been recovered"
 
@@ -1595,7 +1604,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1604,7 +1613,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
         row_payload_json=payload,
     )
     # Worker-a leases the row, then its lease expires.
-    first_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    first_claim = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert first_claim is not None
     # Promote the row to a PENDING_SINK-shaped state with an expired lease so
     # the recovery sweep's SELECT will observe it as a PENDING_SINK candidate.
@@ -1620,6 +1629,11 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
             )
         )
 
+    expire_worker(engine, "worker-a", seconds_ago=3600)
+    _scheduler_member(engine, "peer-claimant")
+    # Keep registry liveness out of this CAS proof: the fresh item deadline
+    # must itself prevent the reaper from overwriting the raced lease.
+    expire_worker(engine, "peer-claimant", seconds_ago=3600)
     raced = False
     raced_at = landscape_database_now(engine)
     fresh_expires_at = raced_at + timedelta(seconds=300)
@@ -1643,7 +1657,7 @@ def test_scheduler_recover_expired_leases_skips_pending_sink_row_with_fresh_leas
             ),
         )
 
-    recovered = repo.recover_expired_leases_legacy_unfenced(run_id="run-1", caller_owner="worker-sweeper")
+    recovered = repo.recover_expired_leases(coordination_token=_scheduler_leader(engine))
     assert raced is True
     # With the fix, the UPDATE's ``lease_expires_at < now`` predicate spots the
     # peer's fresh lease and matches zero rows; without it, ``recovered`` would
@@ -1683,7 +1697,7 @@ def test_scheduler_recover_expired_leases_reaps_null_owner_wedged_row() -> None:
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1713,9 +1727,8 @@ def test_scheduler_recover_expired_leases_reaps_null_owner_wedged_row() -> None:
         )
         conn.exec_driver_sql("PRAGMA ignore_check_constraints = OFF")
 
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner="worker-sweeper",
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 1
     with engine.connect() as conn:
@@ -1739,7 +1752,7 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1747,17 +1760,17 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    first_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    first_claim = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert first_claim is not None
     assert first_claim.work_item_id == item.work_item_id
 
     expire_lease(engine, item.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner="worker-b",
+    expire_worker(engine, "worker-a", seconds_ago=3600)
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 1
-    second_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    second_claim = repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30)
     assert second_claim is not None
     assert second_claim.work_item_id != item.work_item_id
     assert second_claim.attempt == item.attempt + 1
@@ -1766,6 +1779,7 @@ def test_scheduler_claimed_transition_rejects_stale_lease_owner_after_reclaim(tr
         _apply_scheduler_transition(
             repo,
             transition,
+            member_token=_scheduler_member(engine, "worker-a"),
             work_item_id=second_claim.work_item_id,
             expected_lease_owner="worker-a",
         )
@@ -1810,7 +1824,7 @@ def test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_pee
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1818,6 +1832,8 @@ def test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_pee
         ingest_sequence=0,
         row_payload_json=payload,
     )
+    _scheduler_member(engine, "worker-a")
+    _scheduler_member(engine, "worker-racer")
     raced = False
 
     @event.listens_for(engine, "before_cursor_execute")
@@ -1837,7 +1853,7 @@ def test_scheduler_claim_ready_returns_none_when_selected_row_was_claimed_by_pee
             ),
         )
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
 
     assert raced is True
     assert claimed is None
@@ -1864,7 +1880,7 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1872,9 +1888,10 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    first_claim = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    first_claim = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert first_claim is not None
     repo.mark_pending_sink(
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -1884,6 +1901,7 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
         error_message=None,
         expected_lease_owner="worker-a",
     )
+    _scheduler_member(engine, "worker-racer")
     raced = False
 
     @event.listens_for(engine, "before_cursor_execute")
@@ -1903,7 +1921,9 @@ def test_scheduler_claim_pending_sink_returns_none_when_selected_row_was_claimed
             ),
         )
 
-    claimed = repo.claim_pending_sink(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    claimed = repo.claim_pending_sink(
+        coordination_token=_scheduler_leader(engine), lease_owner=_scheduler_leader(engine).worker_id, lease_seconds=30
+    )
 
     assert raced is True
     assert claimed is None
@@ -1939,7 +1959,7 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
     )
 
     first = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -1948,7 +1968,7 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-2",
         row_id="row-2",
         node_id="normalize",
@@ -1957,8 +1977,8 @@ def test_scheduler_claim_ready_two_workers_claim_distinct_items() -> None:
         row_payload_json=payload,
     )
 
-    claimed_a = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
-    claimed_b = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    claimed_a = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
+    claimed_b = repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30)
 
     assert claimed_a is not None
     assert claimed_b is not None
@@ -2040,8 +2060,8 @@ def test_scheduler_claim_ready_tiebreaks_by_work_item_id_on_same_tick() -> None:
             )
         )
 
-    first = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
-    second = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    first = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
+    second = repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30)
     assert first is not None and second is not None
     # Lex-min wins the tie.
     assert first.work_item_id == "wi-aaa"
@@ -2052,20 +2072,22 @@ def _apply_scheduler_transition(
     repo,
     transition: _SchedulerTransition,
     *,
+    member_token: WorkerMembershipToken,
     work_item_id: str,
     expected_lease_owner: str = "worker-a",
 ):
     if transition == "blocked":
         return repo.mark_blocked(
+            member_token=member_token,
             work_item_id=work_item_id,
             queue_key="queue:inbound",
             barrier_key="barrier:row-1",
             expected_lease_owner=expected_lease_owner,
         )
     if transition == "terminal":
-        return repo.mark_terminal(work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
+        return repo.mark_terminal(member_token=member_token, work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
     if transition == "failed":
-        return repo.mark_failed(work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
+        return repo.mark_failed(member_token=member_token, work_item_id=work_item_id, expected_lease_owner=expected_lease_owner)
     raise AssertionError(f"Unhandled scheduler transition {transition!r}")
 
 
@@ -2095,8 +2117,10 @@ def _insert_scheduler_owner_records(
     run_id: str = "run-1",
     token_specs: tuple[tuple[str, str, int], ...] = (("token-1", "row-1", 0),),
     node_ids: tuple[str, ...] = ("normalize",),
-    source_node_id: str = "source-0",
+    source_node_id: str | None = None,
 ) -> None:
+    source_node_id = source_node_id or f"source:{run_id}"
+    coordination = RunCoordinationRepository(engine)
     now = datetime.now(UTC)
     with engine.begin() as conn:
         if conn.execute(select(runs_table.c.run_id).where(runs_table.c.run_id == run_id)).scalar_one_or_none() is None:
@@ -2153,21 +2177,37 @@ def _insert_scheduler_owner_records(
                         created_at=now,
                     )
                 )
-        # Epoch-1 coordination seat for mark_pending_sink_terminal (slice-4 REQUIRED).
-        # Idempotent: only insert if no seat exists yet (multi-run tests call this helper twice).
+        # Register the leader's membership and seat through the production API.
         if (
             conn.execute(select(run_coordination_table.c.run_id).where(run_coordination_table.c.run_id == run_id)).scalar_one_or_none()
             is None
         ):
-            conn.execute(
-                insert(run_coordination_table).values(
-                    run_id=run_id,
-                    leader_worker_id="test-leader",
-                    leader_epoch=1,
-                    leader_heartbeat_expires_at=now + timedelta(hours=1),
-                    updated_at=now,
-                )
+            coordination.register_run_leader_on(
+                conn,
+                run_id=run_id,
+                worker_id=f"leader:{run_id}",
+                window_seconds=3600,
             )
+
+
+def _scheduler_leader(engine: Tier1Engine, run_id: str = "run-1") -> CoordinationToken:
+    leader = RunCoordinationRepository(engine).live_leader(run_id=run_id)
+    assert leader is not None
+    return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
+
+
+def _scheduler_member(engine: Tier1Engine, worker_id: str, run_id: str = "run-1") -> WorkerMembershipToken:
+    """Admit a fixture worker once; existing membership is never renewed or revived."""
+    with engine.connect() as conn:
+        exists = conn.execute(select(run_workers_table.c.worker_id).where(run_workers_table.c.worker_id == worker_id)).first()
+    if exists is not None:
+        return member_token_for(engine, worker_id=worker_id, run_id=run_id)
+    return RunCoordinationRepository(engine).admit_follower(
+        run_id=run_id,
+        worker_id=worker_id,
+        config_hash="config",
+        window_seconds=3600,
+    )
 
 
 def _enqueue_scheduler_test_item(repo, *, engine, token_id: str = "token-1", ingest_sequence: int = 0):
@@ -2180,7 +2220,7 @@ def _enqueue_scheduler_test_item(repo, *, engine, token_id: str = "token-1", ing
     )
     payload = repo.serialize_row_payload(PipelineRow({"id": ingest_sequence + 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     return repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id=token_id,
         row_id=f"row-{ingest_sequence + 1}",
         node_id="normalize",
@@ -2203,7 +2243,7 @@ def test_scheduler_repository_rejects_token_from_other_run() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"token_id='token-cross'.*run_id='run-A'"):
         repo.enqueue_ready(
-            run_id="run-A",
+            member_token=_scheduler_leader(engine, "run-A").membership,
             token_id="token-cross",
             row_id="row-cross",
             node_id="normalize",
@@ -2226,7 +2266,7 @@ def test_scheduler_repository_rejects_node_from_other_run() -> None:
 
     with pytest.raises(AuditIntegrityError, match=r"node_id='normalize'.*run_id='run-A'"):
         repo.enqueue_ready(
-            run_id="run-A",
+            member_token=_scheduler_leader(engine, "run-A").membership,
             token_id="token-1",
             row_id="row-1",
             node_id="normalize",
@@ -2248,7 +2288,7 @@ def test_scheduler_repository_rejects_ready_work_with_wrong_ingest_sequence() ->
 
     with pytest.raises(AuditIntegrityError, match=r"row_id='row-1'.*ingest_sequence=7.*not scheduled ingest_sequence=8"):
         repo.enqueue_ready(
-            run_id="run-1",
+            member_token=_scheduler_leader(engine).membership,
             token_id="token-1",
             row_id="row-1",
             node_id="normalize",
@@ -2269,7 +2309,7 @@ def test_scheduler_repository_allows_terminal_cursor_without_fake_node() -> None
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-terminal",
         row_id="row-terminal",
         node_id=None,
@@ -2279,7 +2319,7 @@ def test_scheduler_repository_allows_terminal_cursor_without_fake_node() -> None
     )
 
     assert item.node_id is None
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-terminal", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-terminal"), lease_owner="worker-terminal", lease_seconds=30)
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
     assert claimed.node_id is None
@@ -2298,7 +2338,7 @@ def test_scheduler_repository_idempotently_accepts_duplicate_enqueue_with_identi
     )
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2310,7 +2350,7 @@ def test_scheduler_repository_idempotently_accepts_duplicate_enqueue_with_identi
     assert item.run_id == "run-1"
     assert item.token_id == "token-1"
     duplicate = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2335,7 +2375,7 @@ def test_scheduler_repository_rejects_duplicate_enqueue_with_incompatible_cursor
         PipelineRow({"id": 1, "secret": "do-not-leak"}, SchemaContract(mode="OBSERVED", fields=(), locked=True))
     )
     repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2346,7 +2386,7 @@ def test_scheduler_repository_rejects_duplicate_enqueue_with_incompatible_cursor
 
     with pytest.raises(LandscapeRecordError) as exc_info:
         repo.enqueue_ready(
-            run_id="run-1",
+            member_token=_scheduler_leader(engine).membership,
             token_id="token-1",
             row_id="row-1",
             node_id="normalize",
@@ -2374,7 +2414,9 @@ def test_scheduler_transitions_raise_for_missing_work_item(transition: _Schedule
     _enqueue_scheduler_test_item(repo, engine=engine)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to .*work_item_id='missing-{transition}'"):
-        _apply_scheduler_transition(repo, transition, work_item_id=f"missing-{transition}")
+        _apply_scheduler_transition(
+            repo, transition, member_token=_scheduler_member(engine, "worker-a"), work_item_id=f"missing-{transition}"
+        )
 
 
 @pytest.mark.parametrize("transition", ["blocked", "terminal", "failed"])
@@ -2385,13 +2427,13 @@ def test_scheduler_transitions_raise_when_work_item_already_in_target_status(tra
     repo = TokenSchedulerRepository(engine)
     landscape_database_now(engine)
     item = _enqueue_scheduler_test_item(repo, engine=engine)
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
 
-    _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
+    _apply_scheduler_transition(repo, transition, member_token=_scheduler_member(engine, "worker-a"), work_item_id=item.work_item_id)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to '{transition.upper()}'.*work_item_id='{item.work_item_id}'"):
-        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
+        _apply_scheduler_transition(repo, transition, member_token=_scheduler_member(engine, "worker-a"), work_item_id=item.work_item_id)
 
 
 @pytest.mark.parametrize("transition", ["blocked", "terminal"])
@@ -2404,7 +2446,7 @@ def test_scheduler_transitions_raise_when_work_item_is_not_leased(transition: _S
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     with pytest.raises(AuditIntegrityError, match=f"transition to '{transition.upper()}'.*expected status LEASED"):
-        _apply_scheduler_transition(repo, transition, work_item_id=item.work_item_id)
+        _apply_scheduler_transition(repo, transition, member_token=_scheduler_member(engine, "worker-a"), work_item_id=item.work_item_id)
 
 
 def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
@@ -2415,12 +2457,13 @@ def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
     landscape_database_now(engine)
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
     assert claimed.lease_owner == "worker-a"
     assert claimed.lease_expires_at is not None
 
     failed = repo.mark_failed(
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
         expected_lease_owner="worker-a",
     )
@@ -2430,7 +2473,7 @@ def test_scheduler_marks_failed_clears_lease_and_blocks_reclaim() -> None:
     assert failed.lease_expires_at is None
     assert repo.count_active_work(run_id="run-1") == 0
     assert repo.active_row_ids(run_id="run-1") == frozenset()
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30) is None
+    assert repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30) is None
 
 
 def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() -> None:
@@ -2449,7 +2492,7 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     )
 
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2457,12 +2500,13 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
     assert claimed.status is TokenWorkStatus.LEASED
 
     now + timedelta(seconds=10)
     blocked = repo.mark_blocked(
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
         queue_key="queue:inbound",
         barrier_key="barrier:row-1",
@@ -2474,20 +2518,19 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
     restarted_repo = TokenSchedulerRepository(engine)
     assert restarted_repo.count_active_work(run_id="run-1") == 1
     assert restarted_repo.active_row_ids(run_id="run-1") == frozenset({"row-1"})
-    assert restarted_repo.claim_ready(run_id="run-1", lease_owner="worker-c", lease_seconds=30) is None
+    assert restarted_repo.claim_ready(member_token=_scheduler_member(engine, "worker-c"), lease_owner="worker-c", lease_seconds=30) is None
 
     completed = repo.mark_blocked_barrier_terminal(
-        run_id="run-1",
         barrier_key="barrier:row-1",
         token_ids=("token-1",),
-        coordination_token=_COORD_TOKEN_RUN1,
+        coordination_token=_scheduler_leader(engine),
     )
     assert completed == 1
     assert restarted_repo.count_active_work(run_id="run-1") == 0
     assert restarted_repo.active_row_ids(run_id="run-1") == frozenset()
 
     second = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-2",
         row_id="row-2",
         node_id="normalize",
@@ -2495,18 +2538,21 @@ def test_scheduler_requeues_blocks_and_marks_terminal_with_leased_ownership() ->
         ingest_sequence=1,
         row_payload_json=payload,
     )
-    claimed_second = repo.claim_ready(run_id="run-1", lease_owner="worker-d", lease_seconds=30)
+    claimed_second = repo.claim_ready(member_token=_scheduler_member(engine, "worker-d"), lease_owner="worker-d", lease_seconds=30)
     assert claimed_second is not None
     assert claimed_second.work_item_id == second.work_item_id
 
-    terminal = repo.mark_terminal(work_item_id=second.work_item_id, expected_lease_owner="worker-d")
+    terminal = repo.mark_terminal(
+        member_token=_scheduler_member(engine, "worker-d"), work_item_id=second.work_item_id, expected_lease_owner="worker-d"
+    )
     assert terminal.status is TokenWorkStatus.TERMINAL
     with pytest.raises(AuditIntegrityError, match=f"work_item_id='{second.work_item_id}'"):
         repo.mark_terminal(
+            member_token=_scheduler_member(engine, "worker-d"),
             work_item_id=second.work_item_id,
             expected_lease_owner="worker-d",
         )
-    assert repo.claim_ready(run_id="run-1", lease_owner="worker-c", lease_seconds=30) is None
+    assert repo.claim_ready(member_token=_scheduler_member(engine, "worker-c"), lease_owner="worker-c", lease_seconds=30) is None
 
 
 def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> None:
@@ -2524,7 +2570,7 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         node_ids=("coalesce_merge",),
     )
     first = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-row-1-branch-a",
         row_id="row-1",
         node_id="coalesce_merge",
@@ -2533,7 +2579,7 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         row_payload_json=payload,
     )
     second = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-row-2-branch-a",
         row_id="row-2",
         node_id="coalesce_merge",
@@ -2541,20 +2587,22 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
         ingest_sequence=1,
         row_payload_json=payload,
     )
-    first_claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    first_claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert first_claimed is not None
     assert first_claimed.work_item_id == first.work_item_id
     repo.mark_blocked(
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=first.work_item_id,
         queue_key=None,
         barrier_key="merge",
         expected_lease_owner="worker-a",
     )
 
-    second_claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    second_claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-b"), lease_owner="worker-b", lease_seconds=30)
     assert second_claimed is not None
     assert second_claimed.work_item_id == second.work_item_id
     repo.mark_blocked(
+        member_token=_scheduler_member(engine, "worker-b"),
         work_item_id=second.work_item_id,
         queue_key=None,
         barrier_key="merge",
@@ -2562,10 +2610,9 @@ def test_scheduler_barrier_completion_only_terminalizes_consumed_tokens() -> Non
     )
 
     completed = repo.mark_blocked_barrier_terminal(
-        run_id="run-1",
         barrier_key="merge",
         token_ids=("token-row-1-branch-a",),
-        coordination_token=_COORD_TOKEN_RUN1,
+        coordination_token=_scheduler_leader(engine),
     )
 
     assert completed == 1
@@ -2595,11 +2642,12 @@ def test_scheduler_unresolved_work_excludes_durable_sink_handoffs() -> None:
     assert repo.count_unresolved_work(run_id="run-1") == 1
     assert repo.summarize_unresolved_work(run_id="run-1") == ("status=ready, queue=None, barrier=None, count=1",)
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
     assert repo.count_unresolved_work(run_id="run-1") == 1
 
     repo.mark_pending_sink(
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
         row_payload_json=payload,
         sink_name="sink-a",
@@ -2613,16 +2661,17 @@ def test_scheduler_unresolved_work_excludes_durable_sink_handoffs() -> None:
     assert repo.summarize_unresolved_work(run_id="run-1") == ()
     assert repo.count_active_work(run_id="run-1") == 1
 
-    reclaimed = repo.claim_pending_sink(run_id="run-1", lease_owner="worker-b", lease_seconds=30)
+    reclaimed = repo.claim_pending_sink(
+        coordination_token=_scheduler_leader(engine), lease_owner=_scheduler_leader(engine).worker_id, lease_seconds=30
+    )
     assert reclaimed is not None
     assert reclaimed.pending_sink_name == "sink-a"
     assert repo.count_unresolved_work(run_id="run-1") == 0
 
     terminalized = repo.mark_pending_sink_terminal(
-        run_id="run-1",
         token_id="token-1",
-        expected_lease_owner="worker-b",
-        coordination_token=_COORD_TOKEN_RUN1,
+        expected_lease_owner=_scheduler_leader(engine).worker_id,
+        coordination_token=_scheduler_leader(engine),
     )
     assert terminalized == 1
     assert repo.count_unresolved_work(run_id="run-1") == 0
@@ -2640,7 +2689,7 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
     payload = repo.serialize_row_payload(PipelineRow({"id": 1}, SchemaContract(mode="OBSERVED", fields=(), locked=True)))
     _insert_scheduler_owner_records(engine, token_specs=(("token-1", "row-1", 0),), node_ids=("normalize",))
     item = repo.enqueue_ready(
-        run_id="run-1",
+        member_token=_scheduler_leader(engine).membership,
         token_id="token-1",
         row_id="row-1",
         node_id="normalize",
@@ -2648,11 +2697,12 @@ def test_scheduler_mark_blocked_rejects_missing_release_keys() -> None:
         ingest_sequence=0,
         row_payload_json=payload,
     )
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
 
     with pytest.raises(AuditIntegrityError, match=rf"work_item_id='{item.work_item_id}'.*queue_key.*barrier_key"):
         repo.mark_blocked(
+            member_token=_scheduler_member(engine, "worker-a"),
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key=None,
@@ -2701,7 +2751,7 @@ def test_scheduler_schema_rejects_cross_run_token_reference() -> None:
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-A")
     factory.data_flow.register_node(
-        run_id="run-A",
+        coordination_token=leader_coordination_token(factory, "run-A"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2709,19 +2759,18 @@ def test_scheduler_schema_rejects_cross_run_token_reference() -> None:
         node_id="source-0",
         schema_config=schema_config,
     )
-    row_a = factory.data_flow.create_row(
-        run_id="run-A",
+    row_a, token_a = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, "run-A"),
         source_node_id="source-0",
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"value": 1},
     )
-    token_a = factory.data_flow.create_token(row_a.row_id)
 
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
     factory.data_flow.register_node(
-        run_id="run-B",
+        coordination_token=leader_coordination_token(factory, "run-B"),
         plugin_name="normalize",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -2758,7 +2807,7 @@ def test_scheduler_schema_rejects_cross_run_node_reference() -> None:
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-A")
     factory.data_flow.register_node(
-        run_id="run-A",
+        coordination_token=leader_coordination_token(factory, "run-A"),
         plugin_name="normalize",
         node_type=NodeType.TRANSFORM,
         plugin_version="1.0",
@@ -2768,7 +2817,7 @@ def test_scheduler_schema_rejects_cross_run_node_reference() -> None:
     )
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-B")
     factory.data_flow.register_node(
-        run_id="run-B",
+        coordination_token=leader_coordination_token(factory, "run-B"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2776,15 +2825,14 @@ def test_scheduler_schema_rejects_cross_run_node_reference() -> None:
         node_id="source-0",
         schema_config=schema_config,
     )
-    row_b = factory.data_flow.create_row(
-        run_id="run-B",
+    row_b, token_b = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, "run-B"),
         source_node_id="source-0",
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"value": 1},
     )
-    token_b = factory.data_flow.create_token(row_b.row_id)
     now = datetime.now(UTC)
 
     with pytest.raises(IntegrityError), db.write_connection() as conn:
@@ -2812,7 +2860,7 @@ def test_scheduler_schema_allows_null_node_for_terminal_cursor() -> None:
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
     factory.data_flow.register_node(
-        run_id="run-1",
+        coordination_token=leader_coordination_token(factory, "run-1"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2820,15 +2868,14 @@ def test_scheduler_schema_allows_null_node_for_terminal_cursor() -> None:
         node_id="source-0",
         schema_config=schema_config,
     )
-    row = factory.data_flow.create_row(
-        run_id="run-1",
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, "run-1"),
         source_node_id="source-0",
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"value": 1},
     )
-    token = factory.data_flow.create_token(row.row_id)
     now = datetime.now(UTC)
 
     with db.write_connection() as conn:
@@ -2856,7 +2903,7 @@ def test_scheduler_schema_rejects_duplicate_null_node_terminal_identity() -> Non
     schema_config = SchemaConfig.from_dict({"mode": "observed"})
     factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id="run-1")
     factory.data_flow.register_node(
-        run_id="run-1",
+        coordination_token=leader_coordination_token(factory, "run-1"),
         plugin_name="csv",
         node_type=NodeType.SOURCE,
         plugin_version="1.0",
@@ -2864,15 +2911,14 @@ def test_scheduler_schema_rejects_duplicate_null_node_terminal_identity() -> Non
         node_id="source-0",
         schema_config=schema_config,
     )
-    row = factory.data_flow.create_row(
-        run_id="run-1",
+    row, token = factory.data_flow.create_row_with_token(
+        coordination_token=leader_coordination_token(factory, "run-1"),
         source_node_id="source-0",
         row_index=0,
         source_row_index=0,
         ingest_sequence=0,
         data={"value": 1},
     )
-    token = factory.data_flow.create_token(row.row_id)
     now = datetime.now(UTC)
 
     with db.write_connection() as conn:
@@ -2920,7 +2966,7 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
 
     for index, token_id in enumerate(("token-a", "token-b")):
         item = repo.enqueue_ready(
-            run_id="run-1",
+            member_token=_scheduler_leader(engine).membership,
             token_id=token_id,
             row_id=f"row-{index}",
             node_id="coalesce_merge",
@@ -2928,10 +2974,13 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
             ingest_sequence=index,
             row_payload_json=payload,
         )
-        claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)
+        claimed = repo.claim_ready(
+            member_token=_scheduler_member(engine, f"worker-{index}"), lease_owner=f"worker-{index}", lease_seconds=30
+        )
         assert claimed is not None
         assert claimed.work_item_id == item.work_item_id
         repo.mark_blocked(
+            member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
@@ -2940,10 +2989,9 @@ def test_scheduler_barrier_terminal_raises_when_live_tokens_missing_from_durable
 
     with pytest.raises(AuditIntegrityError, match=r"live consumed 3 token.*durable BLOCKED rows.*2 matching.*missing token_ids.*token-c"):
         repo.mark_blocked_barrier_terminal(
-            run_id="run-1",
             barrier_key="merge",
             token_ids=("token-a", "token-b", "token-c"),
-            coordination_token=_COORD_TOKEN_RUN1,
+            coordination_token=_scheduler_leader(engine),
         )
 
     with engine.connect() as conn:
@@ -2975,7 +3023,7 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
 
     for index, token_id in enumerate(("durable-a", "durable-b", "durable-c")):
         item = repo.enqueue_ready(
-            run_id="run-1",
+            member_token=_scheduler_leader(engine).membership,
             token_id=token_id,
             row_id=f"row-{index}",
             node_id="coalesce_merge",
@@ -2983,10 +3031,13 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
             ingest_sequence=index,
             row_payload_json=payload,
         )
-        claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)
+        claimed = repo.claim_ready(
+            member_token=_scheduler_member(engine, f"worker-{index}"), lease_owner=f"worker-{index}", lease_seconds=30
+        )
         assert claimed is not None
         assert claimed.work_item_id == item.work_item_id
         repo.mark_blocked(
+            member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
@@ -2995,10 +3046,9 @@ def test_scheduler_barrier_terminal_raises_when_durable_blocked_token_set_is_dis
 
     with pytest.raises(AuditIntegrityError, match=r"live consumed 3 token.*0 matching.*missing token_ids.*live-a"):
         repo.mark_blocked_barrier_terminal(
-            run_id="run-1",
             barrier_key="merge",
             token_ids=("live-a", "live-b", "live-c"),
-            coordination_token=_COORD_TOKEN_RUN1,
+            coordination_token=_scheduler_leader(engine),
         )
 
     with engine.connect() as conn:
@@ -3031,7 +3081,7 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
 
     for index, token_id in enumerate(("token-a", "token-b")):
         item = repo.enqueue_ready(
-            run_id="run-1",
+            member_token=_scheduler_leader(engine).membership,
             token_id=token_id,
             row_id=f"row-{index}",
             node_id="coalesce_merge",
@@ -3039,10 +3089,13 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
             ingest_sequence=index,
             row_payload_json=payload,
         )
-        claimed = repo.claim_ready(run_id="run-1", lease_owner=f"worker-{index}", lease_seconds=30)
+        claimed = repo.claim_ready(
+            member_token=_scheduler_member(engine, f"worker-{index}"), lease_owner=f"worker-{index}", lease_seconds=30
+        )
         assert claimed is not None
         assert claimed.work_item_id == item.work_item_id
         repo.mark_blocked(
+            member_token=_scheduler_member(engine, f"worker-{index}"),
             work_item_id=item.work_item_id,
             queue_key=None,
             barrier_key="merge",
@@ -3051,10 +3104,9 @@ def test_scheduler_barrier_terminal_rejects_empty_live_token_set() -> None:
 
     with pytest.raises(AuditIntegrityError, match="requires at least one live token_id"):
         repo.mark_blocked_barrier_terminal(
-            run_id="run-1",
             barrier_key="merge",
             token_ids=(),
-            coordination_token=_COORD_TOKEN_RUN1,
+            coordination_token=_scheduler_leader(engine),
         )
 
     with engine.connect() as conn:
@@ -3090,18 +3142,17 @@ def test_scheduler_heartbeat_lease_extends_expires_at_for_held_lease() -> None:
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     before_claim = landscape_database_now(engine)
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     after_claim = landscape_database_now(engine)
     assert claimed is not None
     assert_stamped_between(claimed.lease_expires_at, start=before_claim, end=after_claim, offset=timedelta(seconds=30))
 
     before_heartbeat = landscape_database_now(engine)
     new_expires_at = repo.heartbeat_lease(
-        run_id="run-1",
+        member_token=_scheduler_member(engine, "worker-a"),
         work_item_id=item.work_item_id,
         lease_owner="worker-a",
         lease_seconds=30,
-        membership_fenced=False,
     )
     after_heartbeat = landscape_database_now(engine)
     assert_stamped_between(new_expires_at, start=before_heartbeat, end=after_heartbeat, offset=timedelta(seconds=30))
@@ -3139,25 +3190,25 @@ def test_scheduler_heartbeat_lease_prevents_peer_reaper_from_reaping_alive_slow_
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     caller_owner = "row-processor:run-1:alive-slow"
-    peer_owner = "row-processor:run-1:peer-reaper"
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner=caller_owner, lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, caller_owner), lease_owner=caller_owner, lease_seconds=30)
     assert claimed is not None
 
     # Simulate alive-but-slow: the 30 s lease has already lapsed on the
     # database clock when the worker heartbeats; the heartbeat moves the
     # deadline 30 s past database time, so the peer's sweep finds nothing.
     expire_lease(engine, item.work_item_id)
+    # A stale registry heartbeat prevents the separate worker-liveness guard
+    # from masking the item heartbeat's protection in this test.
+    expire_worker(engine, caller_owner, seconds_ago=3600)
     repo.heartbeat_lease(
-        run_id="run-1",
+        member_token=_scheduler_member(engine, caller_owner),
         work_item_id=item.work_item_id,
         lease_owner=caller_owner,
         lease_seconds=30,
-        membership_fenced=False,
     )
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner=peer_owner,
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 0, "Heartbeat-fresh lease must NOT be reaped by peer"
 
@@ -3191,16 +3242,15 @@ def test_scheduler_heartbeat_lease_does_not_block_reaping_dead_worker() -> None:
     _enqueue_scheduler_test_item(repo, engine=engine)
 
     dead_owner = "row-processor:run-1:dead-worker"
-    peer_owner = "row-processor:run-1:peer-reaper"
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner=dead_owner, lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, dead_owner), lease_owner=dead_owner, lease_seconds=30)
     assert claimed is not None
 
     # No heartbeat call — the dead worker never wakes up to extend its lease.
     expire_lease(engine, claimed.work_item_id)
-    recovered = repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner=peer_owner,
+    expire_worker(engine, dead_owner, seconds_ago=3600)
+    recovered = repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
     assert recovered == 1
 
@@ -3237,29 +3287,27 @@ def test_scheduler_heartbeat_lease_raises_lease_lost_when_lease_was_reaped() -> 
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
     dead_owner = "row-processor:run-1:dead-worker"
-    peer_owner = "row-processor:run-1:peer-reaper"
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner=dead_owner, lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, dead_owner), lease_owner=dead_owner, lease_seconds=30)
     assert claimed is not None
 
     # Peer reaps the expired lease while the (no-longer-dead, just slow)
     # worker is still in-flight. The reaper rewrites work_item_id under a
     # bumped attempt.
     expire_lease(engine, item.work_item_id)
-    repo.recover_expired_leases_legacy_unfenced(
-        run_id="run-1",
-        caller_owner=peer_owner,
+    expire_worker(engine, dead_owner, seconds_ago=3600)
+    repo.recover_expired_leases(
+        coordination_token=_scheduler_leader(engine),
     )
 
     # Slow worker wakes up and tries to heartbeat its old work_item_id /
     # lease_owner — CAS rowcount=0 → SchedulerLeaseLostError.
     with pytest.raises(SchedulerLeaseLostError) as exc_info:
         repo.heartbeat_lease(
-            run_id="run-1",
+            member_token=_scheduler_member(engine, dead_owner),
             work_item_id=item.work_item_id,
             lease_owner=dead_owner,
             lease_seconds=30,
-            membership_fenced=False,
         )
     assert exc_info.value.work_item_id == item.work_item_id
     assert exc_info.value.lease_owner == dead_owner
@@ -3280,17 +3328,16 @@ def test_scheduler_heartbeat_lease_raises_lease_lost_for_non_owner_caller() -> N
     landscape_database_now(engine)
     item = _enqueue_scheduler_test_item(repo, engine=engine)
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner="worker-a", lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, "worker-a"), lease_owner="worker-a", lease_seconds=30)
     assert claimed is not None
 
     # Worker-B tries to heartbeat a lease owned by worker-a.
     with pytest.raises(SchedulerLeaseLostError):
         repo.heartbeat_lease(
-            run_id="run-1",
+            member_token=_scheduler_member(engine, "worker-b"),
             work_item_id=item.work_item_id,
             lease_owner="worker-b",
             lease_seconds=30,
-            membership_fenced=False,
         )
 
 
@@ -3314,7 +3361,7 @@ def test_scheduler_heartbeat_lease_composes_with_peer_active_leases() -> None:
     original_owner = "row-processor:run-1:original"
     peer_owner = "row-processor:run-1:peer"
 
-    claimed = repo.claim_ready(run_id="run-1", lease_owner=original_owner, lease_seconds=30)
+    claimed = repo.claim_ready(member_token=_scheduler_member(engine, original_owner), lease_owner=original_owner, lease_seconds=30)
     assert claimed is not None
 
     # With the 30 s lease live on the database clock, peer_active_leases
@@ -3332,11 +3379,10 @@ def test_scheduler_heartbeat_lease_composes_with_peer_active_leases() -> None:
 
     # The original heartbeats — the lease is refreshed past database time.
     repo.heartbeat_lease(
-        run_id="run-1",
+        member_token=_scheduler_member(engine, original_owner),
         work_item_id=item.work_item_id,
         lease_owner=original_owner,
         lease_seconds=30,
-        membership_fenced=False,
     )
 
     # After the heartbeat, peer_active_leases reports the original as active

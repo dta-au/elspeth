@@ -115,7 +115,7 @@ class TestReproducibilityGradeComputation:
 
         # All deterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -124,7 +124,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -133,7 +133,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="seeded_sampler",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -142,7 +142,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -168,7 +168,7 @@ class TestReproducibilityGradeComputation:
 
         # Mix of deterministic and nondeterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -177,7 +177,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_classifier",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -186,7 +186,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -212,7 +212,7 @@ class TestReproducibilityGradeComputation:
 
         # Register deterministic nodes
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -221,7 +221,7 @@ class TestReproducibilityGradeComputation:
             schema_config=DYNAMIC_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -258,7 +258,7 @@ class TestReproducibilityGradeComputation:
 
         # Nondeterministic pipeline
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -301,7 +301,7 @@ class TestReproducibilityGradeComputation:
 
         # Deterministic pipeline
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -373,7 +373,7 @@ class TestReproducibilityGradeComputation:
 
         # Nondeterministic pipeline
         node = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="llm_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -415,7 +415,7 @@ class TestReproducibilityGradeComputation:
 
         # Register nodes WITHOUT specifying determinism - should default to DETERMINISTIC
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -424,7 +424,7 @@ class TestReproducibilityGradeComputation:
             # determinism not specified - should default to DETERMINISTIC
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="field_mapper",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

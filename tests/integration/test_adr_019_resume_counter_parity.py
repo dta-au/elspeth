@@ -626,19 +626,22 @@ def test_resume_derives_rows_coalesce_failed_from_durable_audit() -> None:
     register_test_node(factory.data_flow, "run-adr019", "coalesce-merge_paths", node_type=NodeType.COALESCE, plugin_name="coalesce")
 
     def _fail_barrier(row_id: str, token_id: str, state_id: str, sequence: int) -> None:
-        factory.data_flow.create_row(
-            "run-adr019",
+        factory.data_flow.create_row_with_token(
             "source-0",
             0,
             {"value": 1},
             row_id=row_id,
+            token_id=token_id,
+            coordination_token=setup.coordination_token,
             source_row_index=sequence,
             ingest_sequence=sequence,
         )
-        factory.data_flow.create_token(row_id, token_id=token_id)
-        factory.execution.begin_node_state(token_id, "coalesce-merge_paths", "run-adr019", 0, {"value": 1}, state_id=state_id)
+        factory.execution.begin_node_state(
+            token_id, "coalesce-merge_paths", 0, {"value": 1}, state_id=state_id, member_token=setup.coordination_token.membership
+        )
         factory.execution.complete_node_state(
             state_id=state_id,
+            member_token=setup.coordination_token.membership,
             status=NodeStateStatus.FAILED,
             error=CoalesceFailureReason(
                 failure_reason="quorum_not_met_at_timeout",

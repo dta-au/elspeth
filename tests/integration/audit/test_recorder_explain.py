@@ -24,7 +24,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.results import TransformResult
 from elspeth.testing import make_pipeline_row
 from tests.fixtures.base_classes import _TestSchema
-from tests.fixtures.landscape import make_landscape_db
+from tests.fixtures.landscape import leader_coordination_token, make_landscape_db
 from tests.fixtures.plugins import CollectSink
 from tests.integration.pipeline.orchestrator.test_branch_transforms import _build_branch_pipeline
 
@@ -48,7 +48,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -59,8 +59,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test", "value": 42}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -95,7 +95,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -106,8 +106,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test"}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -140,7 +140,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -151,8 +151,8 @@ class TestExplainGracefulDegradation:
         # create_row auto-stores payload via configured payload_store
         row_data = {"name": "test", "value": 123}
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,
@@ -198,7 +198,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -206,8 +206,8 @@ class TestExplainGracefulDegradation:
             schema_config=DYNAMIC_SCHEMA,
         )
 
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -240,7 +240,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -249,8 +249,8 @@ class TestExplainGracefulDegradation:
         )
 
         # Create row — no payload_store configured, so source_data_ref will be None
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -280,7 +280,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -289,8 +289,8 @@ class TestExplainGracefulDegradation:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -329,7 +329,7 @@ class TestExplainGracefulDegradation:
 
         run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
         source = factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -338,8 +338,8 @@ class TestExplainGracefulDegradation:
         )
 
         # create_row auto-stores valid canonical JSON via payload_store
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data={"name": "test"},
@@ -378,7 +378,7 @@ class TestExplainGracefulDegradation:
         run2 = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
 
         source = factory.data_flow.register_node(
-            run_id=run1.run_id,
+            coordination_token=leader_coordination_token(factory, run1.run_id),
             plugin_name="csv_source",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -388,8 +388,8 @@ class TestExplainGracefulDegradation:
 
         # Create row in run1 (create_row auto-stores payload)
         row_data = {"name": "test"}
-        row = factory.data_flow.create_row(
-            run_id=run1.run_id,
+        row, _token = factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run1.run_id),
             source_node_id=source.node_id,
             row_index=0,
             data=row_data,

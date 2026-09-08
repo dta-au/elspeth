@@ -281,11 +281,12 @@ class TestSignedExportDeterminism:
 
         # Create a run with multiple records of each type
         run = factory.run_lifecycle.begin_run(config={"test": True}, canonical_version="v1")
+        authority = leader_coordination_token(factory, run.run_id)
 
         # Multiple nodes
         for i in range(3):
             factory.data_flow.register_node(
-                run_id=run.run_id,
+                coordination_token=authority,
                 node_id=f"node_{i}",
                 plugin_name="test",
                 node_type=NodeType.TRANSFORM,
@@ -297,7 +298,7 @@ class TestSignedExportDeterminism:
         # Multiple edges
         for i in range(2):
             factory.data_flow.register_edge(
-                run_id=run.run_id,
+                coordination_token=authority,
                 from_node_id=f"node_{i}",
                 to_node_id=f"node_{i + 1}",
                 label="continue",
@@ -306,24 +307,24 @@ class TestSignedExportDeterminism:
 
         # Multiple rows with tokens
         for i in range(3):
-            row = factory.data_flow.create_row(
-                run_id=run.run_id,
+            _row, token = factory.data_flow.create_row_with_token(
+                coordination_token=authority,
                 source_node_id="node_0",
                 row_index=i,
                 data={"value": i * 10},
                 source_row_index=i,
                 ingest_sequence=i,
             )
-            token = factory.data_flow.create_token(row_id=row.row_id)
             state = factory.execution.begin_node_state(
                 token_id=token.token_id,
                 node_id="node_0",
-                run_id=run.run_id,
+                member_token=authority.membership,
                 step_index=0,
                 input_data={"x": i},
             )
             factory.execution.complete_node_state(
                 state.state_id,
+                member_token=authority.membership,
                 status=NodeStateStatus.COMPLETED,
                 output_data={"result": i * 20},
                 duration_ms=5.0,

@@ -19,7 +19,7 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.schema import node_states_table, token_outcomes_table
-from tests.fixtures.landscape import register_test_node
+from tests.fixtures.landscape import leader_coordination_token, member_token_for, register_test_node
 
 
 def _try_complete_node_state(
@@ -61,23 +61,25 @@ def _build_discard_candidate(db_path: Path) -> tuple[LandscapeDB, RecorderFactor
     run = factory.run_lifecycle.begin_run(config={}, canonical_version="v1")
     source_id = register_test_node(factory.data_flow, run.run_id, "source", node_type=NodeType.SOURCE, plugin_name="source")
     sink_id = register_test_node(factory.data_flow, run.run_id, "sink", node_type=NodeType.SINK, plugin_name="sink")
-    row = factory.data_flow.create_row(
-        run_id=run.run_id,
+    authority = leader_coordination_token(factory, run.run_id)
+    member = member_token_for(db.engine, worker_id=authority.worker_id)
+    _row, token = factory.data_flow.create_row_with_token(
+        coordination_token=authority,
         source_node_id=source_id,
         row_index=0,
         data={"value": 1},
         source_row_index=0,
         ingest_sequence=0,
     )
-    token = factory.data_flow.create_token(row.row_id)
     state = factory.execution.begin_node_state(
         token_id=token.token_id,
         node_id=sink_id,
-        run_id=run.run_id,
+        member_token=member,
         step_index=0,
         input_data={"value": 1},
     )
     factory.execution.complete_node_state(
+        member_token=member,
         state_id=state.state_id,
         status=NodeStateStatus.FAILED,
         error=ExecutionError(exception="discard", exception_type="TestDiscard", phase="sink_write"),
@@ -130,7 +132,8 @@ def test_sqlite_process_cannot_mutate_node_state_between_validation_and_insert(
 
     monkeypatch.setattr(outcomes, "_validate_cross_table_invariants", pause_after_validation)
     try:
-        factory.data_flow.record_token_outcome(
+        factory.data_flow.record_token_outcome_leader(
+            coordination_token=leader_coordination_token(factory, run_id),
             ref=TokenRef(token_id=token_id, run_id=run_id),
             outcome=TerminalOutcome.FAILURE,
             path=TerminalPath.SINK_DISCARDED,
@@ -166,7 +169,8 @@ def test_sqlite_writer_lock_contention_uses_landscape_error_taxonomy(tmp_path: P
     holder.execute("BEGIN IMMEDIATE")
     try:
         with pytest.raises(LandscapeRecordError, match=r"transaction boundary.*OperationalError") as exc_info:
-            factory.data_flow.record_token_outcome(
+            factory.data_flow.record_token_outcome_leader(
+                coordination_token=leader_coordination_token(factory, run_id),
                 ref=TokenRef(token_id=token_id, run_id=run_id),
                 outcome=TerminalOutcome.FAILURE,
                 path=TerminalPath.SINK_DISCARDED,

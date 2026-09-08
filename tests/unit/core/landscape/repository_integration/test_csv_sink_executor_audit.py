@@ -65,15 +65,14 @@ class TestCSVSinkExecutorAuditChain:
 
         # ── Setup: real row + token in the database ──
         row_data = {"id": 1, "name": "Alice"}
-        row = setup.data_flow.create_row(
-            run_id=setup.run_id,
+        row, db_token = setup.data_flow.create_row_with_token(
+            coordination_token=setup.coordination_token,
             source_node_id=setup.source_node_id,
             row_index=0,
             data=row_data,
             source_row_index=0,
             ingest_sequence=0,
         )
-        db_token = setup.data_flow.create_token(row_id=row.row_id)
 
         contract = create_observed_contract(row_data)
         token = TokenInfo(

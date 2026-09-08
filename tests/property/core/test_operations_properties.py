@@ -28,10 +28,12 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from elspeth.contracts.audit import Operation
+from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.secret_scrub import scrub_payload_for_audit
 from elspeth.core.landscape import ExecutionRepository
 from elspeth.core.operations import track_operation
+from tests.fixtures.mock_audit import mock_audit_authority
 
 OperationType = Literal["source_load", "sink_write"]
 
@@ -47,9 +49,12 @@ class FakePluginContext:
     Only the operation_id field matters for track_operation.
     """
 
-    run_id: str = "test-run"
+    run_id: str = "run-1"
     config: dict[str, Any] = field(default_factory=dict)
     operation_id: str | None = None
+
+    def require_coordination_token(self) -> CoordinationToken:
+        return mock_audit_authority(self.run_id)["coordination_token"]
 
 
 @dataclass
@@ -74,15 +79,16 @@ class FakeRecorder:
 
     def begin_operation(
         self,
-        run_id: str,
         node_id: str,
         operation_type: OperationType,
         input_data: dict[str, Any] | None = None,
+        *,
+        coordination_token: CoordinationToken,
     ) -> Operation:
         self._op_counter += 1
         return Operation(
             operation_id=f"op_{self._op_counter:04d}",
-            run_id=run_id,
+            run_id=coordination_token.run_id,
             node_id=node_id,
             operation_type=operation_type,
             started_at=datetime.now(UTC),
@@ -96,6 +102,8 @@ class FakeRecorder:
         output_data: dict[str, Any] | None = None,
         error: str | None = None,
         duration_ms: float = 0.0,
+        *,
+        coordination_token: CoordinationToken,
     ) -> None:
         if self._fail_on_complete:
             raise RuntimeError(self._complete_error_message)

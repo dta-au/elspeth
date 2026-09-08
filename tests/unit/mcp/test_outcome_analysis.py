@@ -4,7 +4,7 @@ from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.enums import FrameKind, NodeType, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import LineageFrame
 from elspeth.mcp.analyzers.reports import get_outcome_analysis, get_run_summary
-from tests.fixtures.landscape import make_recorder_with_run, register_test_node
+from tests.fixtures.landscape import leader_token_for, make_recorder_with_run, register_test_node
 
 
 def _record_token(
@@ -17,20 +17,20 @@ def _record_token(
     path: TerminalPath,
     **fields,
 ) -> None:
-    row = data_flow.create_row(
-        run_id=setup_run_id,
+    _row, token = data_flow.create_row_with_token(
         source_node_id=source_node_id,
         row_index=row_index,
         data={"row": row_index},
         source_row_index=row_index,
         ingest_sequence=row_index,
+        coordination_token=leader_token_for(data_flow._db, setup_run_id),
     )
-    token = data_flow.create_token(row.row_id)
-    data_flow.record_token_outcome(
+    data_flow.record_token_outcome_leader(
         ref=TokenRef(token_id=token.token_id, run_id=setup_run_id),
         outcome=outcome,
         path=path,
         **fields,
+        coordination_token=leader_token_for(data_flow._db, setup_run_id),
     )
 
 
@@ -79,13 +79,13 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     setup = make_recorder_with_run(run_id="fork-join-count-run", source_node_id="source-0")
     register_test_node(setup.data_flow, setup.run_id, "sink-0", node_type=NodeType.SINK, plugin_name="csv_sink")
 
-    row = setup.data_flow.create_row(
-        run_id=setup.run_id,
+    row, _initial_token = setup.data_flow.create_row_with_token(
         source_node_id=setup.source_node_id,
         row_index=0,
         data={"row": 0},
         source_row_index=0,
         ingest_sequence=0,
+        coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
     )
 
     # One fork group with two children — DISTINCT group_id at kind=fork must count
@@ -93,40 +93,46 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     branch_a = setup.data_flow.create_token(
         row.row_id,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_a"),),
+        coordination_token=setup.coordination_token,
     )
     branch_b = setup.data_flow.create_token(
         row.row_id,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-1", member_key="path_b"),),
+        coordination_token=setup.coordination_token,
     )
     for token in (branch_a, branch_b):
-        setup.data_flow.record_token_outcome(
+        setup.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-0",
+            coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
         )
 
     # A second, unrelated fork group — DISTINCT must count it separately (total 2).
     branch_c = setup.data_flow.create_token(
         row.row_id,
         lineage_path=(LineageFrame(kind=FrameKind.FORK, group_id="fg-2", member_key="path_c"),),
+        coordination_token=setup.coordination_token,
     )
-    setup.data_flow.record_token_outcome(
+    setup.data_flow.record_token_outcome_leader(
         ref=TokenRef(token_id=branch_c.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.SUCCESS,
         path=TerminalPath.DEFAULT_FLOW,
         sink_name="sink-0",
+        coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
     )
 
     # One merged token carrying join_group_id — the crafted-token seam is legal here
     # because join_operations reads tokens.join_group_id directly, not a coalesce
     # transaction's derived state.
-    merged = setup.data_flow.create_token(row.row_id, join_group_id="jg-1")
-    setup.data_flow.record_token_outcome(
+    merged = setup.data_flow.create_token(row.row_id, join_group_id="jg-1", coordination_token=setup.coordination_token)
+    setup.data_flow.record_token_outcome_leader(
         ref=TokenRef(token_id=merged.token_id, run_id=setup.run_id),
         outcome=TerminalOutcome.SUCCESS,
         path=TerminalPath.DEFAULT_FLOW,
         sink_name="sink-0",
+        coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
     )
 
     # One expand group with two members — expand_operations counts DISTINCT
@@ -134,17 +140,20 @@ def test_outcome_analysis_fork_and_join_counts_read_lineage_frames_and_tokens() 
     member_1 = setup.data_flow.create_token(
         row.row_id,
         lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="m1"),),
+        coordination_token=setup.coordination_token,
     )
     member_2 = setup.data_flow.create_token(
         row.row_id,
         lineage_path=(LineageFrame(kind=FrameKind.EXPAND, group_id="eg-1", member_key="m2"),),
+        coordination_token=setup.coordination_token,
     )
     for token in (member_1, member_2):
-        setup.data_flow.record_token_outcome(
+        setup.data_flow.record_token_outcome_leader(
             ref=TokenRef(token_id=token.token_id, run_id=setup.run_id),
             outcome=TerminalOutcome.SUCCESS,
             path=TerminalPath.DEFAULT_FLOW,
             sink_name="sink-0",
+            coordination_token=leader_token_for(setup.data_flow._db, setup.run_id),
         )
 
     setup.run_lifecycle.complete_run(RunStatus.COMPLETED, coordination_token=setup.coordination_token)

@@ -419,7 +419,7 @@ class TestCheckpointTopologyHashAtomicity:
         # Register nodes in database
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -429,7 +429,7 @@ class TestCheckpointTopologyHashAtomicity:
             schema_config=schema_config,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="transform_a",
             plugin_name="test",
             node_type=NodeType.TRANSFORM,
@@ -440,15 +440,14 @@ class TestCheckpointTopologyHashAtomicity:
         )
 
         # Create row for checkpoint
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={"test": "data"},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Compute expected hash for current graph state
         # BUG-COMPAT-01: CheckpointManager now uses full topology hash (not upstream-only)
@@ -502,7 +501,7 @@ class TestCheckpointTopologyHashAtomicity:
         # Register source node
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -513,15 +512,14 @@ class TestCheckpointTopologyHashAtomicity:
         )
 
         # Create row/token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         with pytest.raises(TypeError, match="draft must be CheckpointDraft"):
             checkpoint_mgr.create_checkpoint(
@@ -607,15 +605,14 @@ class TestResumeCheckpointCleanup:
             )
 
         # Create row and token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id,
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
             source_node_id="source",
             row_index=0,
             data={"id": 1},
             source_row_index=0,
             ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Create checkpoint
         checkpoint = _create_checkpoint(
@@ -701,7 +698,7 @@ class TestCanResumeErrorHandling:
         # Register nodes
         schema_config = SchemaConfig(mode="observed", fields=None)
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="source",
             plugin_name="test",
             node_type=NodeType.SOURCE,
@@ -711,7 +708,7 @@ class TestCanResumeErrorHandling:
             schema_config=schema_config,
         )
         factory.data_flow.register_node(
-            run_id=run.run_id,
+            coordination_token=leader_coordination_token(factory, run.run_id),
             node_id="transform",
             plugin_name="test",
             node_type=NodeType.TRANSFORM,
@@ -722,10 +719,14 @@ class TestCanResumeErrorHandling:
         )
 
         # Create row/token
-        row = factory.data_flow.create_row(
-            run_id=run.run_id, source_node_id="source", row_index=0, data={}, source_row_index=0, ingest_sequence=0
+        factory.data_flow.create_row_with_token(
+            coordination_token=leader_coordination_token(factory, run.run_id),
+            source_node_id="source",
+            row_index=0,
+            data={},
+            source_row_index=0,
+            ingest_sequence=0,
         )
-        factory.data_flow.create_token(row_id=row.row_id)
 
         # Mark run as failed
         factory.run_lifecycle.update_run_status(status=RunStatus.FAILED, coordination_token=leader_coordination_token(factory, run.run_id))

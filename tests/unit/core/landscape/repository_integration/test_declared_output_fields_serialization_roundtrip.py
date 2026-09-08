@@ -49,8 +49,9 @@ def _setup_landscape(*, run_id: str, row_id: str, token_id: str, node_id: str):
         node_type=NodeType.TRANSFORM,
         plugin_name="DeclaredOutputFieldsTransform",
     )
-    row = setup.factory.data_flow.create_row(
-        run_id=run_id,
+    setup.factory.data_flow.create_row_with_token(
+        coordination_token=setup.coordination_token,
+        token_id=token_id,
         source_node_id="source-0",
         row_index=0,
         data={"source": "v"},
@@ -58,7 +59,6 @@ def _setup_landscape(*, run_id: str, row_id: str, token_id: str, node_id: str):
         source_row_index=0,
         ingest_sequence=0,
     )
-    setup.factory.data_flow.create_token(row_id=row.row_id, token_id=token_id)
     return setup
 
 
@@ -66,13 +66,14 @@ def _record_failure(setup, *, token_id: str, node_id: str, run_id: str, error: E
     state = setup.factory.execution.begin_node_state(
         token_id=token_id,
         node_id=node_id,
-        run_id=run_id,
+        member_token=setup.coordination_token.membership,
         step_index=1,
         input_data={"source": "v"},
     )
     setup.factory.execution.complete_node_state(
         state.state_id,
         NodeStateStatus.FAILED,
+        member_token=setup.coordination_token.membership,
         duration_ms=1.0,
         error=error,
     )
