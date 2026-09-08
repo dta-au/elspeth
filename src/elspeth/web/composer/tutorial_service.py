@@ -22,6 +22,7 @@ from sqlalchemy import func, select, update
 from elspeth.contracts import CallType
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.plugin_capabilities import PluginCapability
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.canonical import stable_hash
 from elspeth.core.landscape.schema import (
     artifacts_table,
@@ -174,6 +175,25 @@ async def _close_tutorial_execute_lease_before_transfer(
         raise cancellation from None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "the saved tutorial draft's CompositionState: node plugin options are free-form configuration "
+        "authored through the composer and stored verbatim, never schema-validated by the composer, so a "
+        "persisted llm node may omit the optional 'profile' option or carry one that predates the "
+        "currently configured tutorial profile"
+    ),
+    source_param="state",
+    suppresses=("R1",),
+    invariant=(
+        "returns one sanitized (code, message) blocker for a draft it refuses and None only for a draft it "
+        "accepts; an llm node with no authored profile option reads as None, which cannot equal the "
+        "non-None configured tutorial_profile checked immediately above, so it is refused with "
+        "tutorial_profile_unavailable rather than substituting a usable profile; never raises on a "
+        "malformed or incomplete saved draft"
+    ),
+    non_raising=True,
+)
 def _tutorial_launch_blocker(
     *,
     state: CompositionState,

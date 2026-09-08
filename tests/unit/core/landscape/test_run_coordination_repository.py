@@ -53,6 +53,7 @@ from elspeth.core.landscape.database_clock import read_landscape_transaction_tim
 from elspeth.core.landscape.run_coordination_repository import (
     CoordinationEventRow,
     RunCoordinationRepository,
+    SeatReleaseOutcome,
     fenced_leader_transaction,
     record_coordination_events,
     verify_and_extend_leader_fence,
@@ -770,7 +771,7 @@ class TestReleaseSeatAndLiveLeader:
         token = register_run_leader(repo, run_id=RUN_ID, worker_id=mint_worker_id(RUN_ID), window_seconds=WINDOW)
 
         before = landscape_database_now(engine)
-        repo.release_seat(token=token)
+        assert repo.release_seat(token=token) is SeatReleaseOutcome.RELEASED
         after = landscape_database_now(engine)
 
         seat = _seat_row(engine)
@@ -789,7 +790,7 @@ class TestReleaseSeatAndLiveLeader:
         seat_after_first = _seat_row(engine)
         worker_after_first = _worker_row(engine, token.worker_id)
 
-        repo.release_seat(token=token)  # no error: the leader fence refuses the vacated seat
+        assert repo.release_seat(token=token) is SeatReleaseOutcome.FENCE_REFUSED  # the fence refuses the vacated seat
 
         # Zero mutation; the only new row is the fence's own refusal evidence.
         assert _seat_row(engine) == seat_after_first
@@ -858,7 +859,14 @@ class TestReleaseSeatAndLiveLeader:
         ]
 
     def test_release_requires_active_membership_in_token_run(self, engine: Tier1Engine, repo: RunCoordinationRepository) -> None:
-        """A seat identity cannot authorize departure of membership owned by another run."""
+        """A seat identity cannot authorize departure of membership owned by another run.
+
+        The seat passes its own epoch fence, so the missing run-scoped active
+        membership is a durable-image contradiction rather than a race: nothing
+        departs or evicts a leader's own row while it holds the seat. It must
+        fail closed with ``AuditIntegrityError`` — never return quietly — while
+        still leaving zero durable mutation behind.
+        """
         foreign_run_id = "run-coord-foreign-membership"
         _seed_run(engine)
         _seed_run(engine, run_id=foreign_run_id)
@@ -882,9 +890,10 @@ class TestReleaseSeatAndLiveLeader:
         }
         events_before = {RUN_ID: _events(engine), foreign_run_id: _events(engine, foreign_run_id)}
 
-        repo.release_seat(
-            token=CoordinationToken(run_id=RUN_ID, worker_id=foreign.worker_id, leader_epoch=original.leader_epoch),
-        )
+        with pytest.raises(AuditIntegrityError, match="no active run_workers row"):
+            repo.release_seat(
+                token=CoordinationToken(run_id=RUN_ID, worker_id=foreign.worker_id, leader_epoch=original.leader_epoch),
+            )
 
         assert {RUN_ID: _seat_row(engine), foreign_run_id: _seat_row(engine, foreign_run_id)} == seat_before
         assert {

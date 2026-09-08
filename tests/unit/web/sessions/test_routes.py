@@ -15329,3 +15329,168 @@ async def test_get_state_yaml_is_409_while_another_compose_is_live(tmp_path) -> 
         assert client.get(f"/api/sessions/{session_id}/state/yaml").status_code != 409
     finally:
         service.session_operation_authority.release(reader)
+
+
+@pytest.mark.parametrize("recovery_handler", ["convergence", "plugin_crash", "runtime_preflight"])
+def test_recovery_partial_state_custody_integrity_failure_is_not_contained(tmp_path, recovery_handler: str) -> None:
+    """``GuidedCustodyIntegrityError`` from a recovery partial-state write must abort.
+
+    The three recovery handlers in ``routes/_helpers.py``
+    (``_handle_convergence_error``, ``_handle_plugin_crash``,
+    ``_handle_runtime_preflight_failure``) contain a *persistence* failure so a
+    secondary DB fault cannot mask the primary 422/500 — that containment is
+    scoped to ``SQLAlchemyError`` and is pinned by the sibling
+    ``partial_state_save_failed`` tests in this file.
+
+    ``GuidedCustodyIntegrityError`` is not a persistence fault. It is registered
+    Tier-1 (``@tier_1_error`` in ``contracts/errors.py``) and subclasses
+    ``AuditIntegrityError``: the guided reviewed-source custody could not be
+    proven against the live sources, so the audit trail's source provenance is
+    unprovable. Per ADR-008 that class must bubble and abort rather than be
+    reduced to a ``partial_state_save_error`` string on an otherwise-normal
+    error body. It therefore reaches the app-level ``AuditIntegrityError``
+    handler, which emits the fail-closed ``audit_integrity_error`` 500 with a
+    correlatable ``request_id``.
+    """
+    from elspeth.contracts.errors import GuidedCustodyIntegrityError
+    from elspeth.web.composer.protocol import ComposerConvergenceError
+
+    partial = _make_authoring_valid_partial("custody-unbindable-recovery")
+    mock_composer = SimpleNamespace()
+    if recovery_handler == "convergence":
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerConvergenceError(max_turns=5, budget_exhausted="composition", partial_state=partial),
+        )
+    elif recovery_handler == "plugin_crash":
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            side_effect=ComposerPluginCrashError(ValueError("plugin bug"), partial_state=partial),
+        )
+    else:
+        mock_composer.compose = AsyncMock(
+            spec=ComposerService.compose,
+            return_value=ComposerResult(message="ok", state=partial, runtime_preflight=None),
+        )
+
+    app, service = _make_app(tmp_path)
+    app.state.composer_service = mock_composer
+
+    async def _raise_custody(*_args, **_kwargs):
+        raise GuidedCustodyIntegrityError("guided blob source mapping is inconsistent")
+
+    service.save_composition_state = _raise_custody  # type: ignore[method-assign]
+
+    # ``raise_server_exceptions=True``: this harness app is a bare ``FastAPI()``
+    # without production's app-level ``AuditIntegrityError`` handler, so the
+    # escaping Tier-1 error is observable directly rather than as its 500.
+    client = TestClient(app)
+    session_id = client.post("/api/sessions", json={"title": "Custody"}).json()["id"]
+
+    async def _preflight_boom(state, *, settings, secret_service, user_id, session_id, **_policy_context):
+        raise RuntimeError("preflight crashed before save")
+
+    if recovery_handler == "runtime_preflight":
+        # ``compose`` returned, so send_message's own custody arm can attach
+        # failed-turn metadata and name the refusal as ``audit_integrity_error``
+        # — an explicit Tier-1 envelope, not a recovery-body downgrade.
+        with (
+            patch("elspeth.web.sessions.routes._helpers._runtime_preflight_for_state", side_effect=_preflight_boom),
+        ):
+            response = client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build me a pipeline"})
+        assert response.status_code == 500, response.text
+        detail = response.json()["detail"]
+        assert detail["error_type"] == "audit_integrity_error", detail
+        assert "partial_state_save_failed" not in response.text
+        assert "partial_state_save_error" not in response.text
+        return
+
+    # ``compose`` raised, so there is no compose result to describe a failed
+    # turn from: the custody refusal must keep unwinding out of the route.
+    with pytest.raises(GuidedCustodyIntegrityError):
+        client.post(f"/api/sessions/{session_id}/messages", json={"content": "Build me a pipeline"})
+
+
+@pytest.mark.asyncio
+async def test_send_message_shielded_llm_call_persist_completes_under_a_real_outer_cancel(tmp_path, monkeypatch) -> None:
+    """The first ``contextlib.suppress(asyncio.CancelledError)`` in send_message.
+
+    ``test_send_message_persists_cancelled_llm_call_audit_sidecar`` proves the
+    sidecar row lands on the cancelled path, but the composer's own
+    ``CancelledError`` never cancels the ROUTE task there, so ``await
+    asyncio.shield(...)`` returns normally and the suppression arm is not
+    exercised. This test cancels the route task while the shielded
+    ``_persist_llm_calls`` is in flight, which is the only way the suppressed
+    ``CancelledError`` is actually raised.
+
+    Two things are pinned. (1) Completion semantics: the shielded coroutine is
+    NOT cancelled — it runs to completion and the audit sidecar row is durable,
+    which is why absorbing the outer await's re-raise loses no work. (2) The
+    cancel chain is restored: the handler's own terminal ``raise`` re-raises the
+    original ``CancelledError``, so the request still finishes as cancelled.
+    """
+    from elspeth.web.sessions.routes import messages as messages_module
+
+    app, service = _make_progress_route_app(tmp_path)
+    llm_call = _llm_call(
+        status=ComposerLLMCallStatus.CANCELLED,
+        model_returned=None,
+        prompt_tokens=None,
+        completion_tokens=None,
+        total_tokens=None,
+        provider_request_id=None,
+        error_class="CancelledError",
+        error_message="CancelledError",
+    )
+    cancelled = _cancelled_error_with_llm_call(llm_call)
+
+    class _CancellingComposer:
+        async def compose(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise cancelled
+
+    app.state.composer_service = _CancellingComposer()
+
+    entered_persist = asyncio.Event()
+    release_persist = asyncio.Event()
+    persist_completed = asyncio.Event()
+    real_persist = messages_module._persist_llm_calls
+
+    async def _paused_persist(*args, **kwargs):
+        entered_persist.set()
+        await release_persist.wait()
+        result = await real_persist(*args, **kwargs)
+        persist_completed.set()
+        return result
+
+    monkeypatch.setattr(messages_module, "_persist_llm_calls", _paused_persist)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        request_task = asyncio.create_task(
+            client.post(
+                f"/api/sessions/{service.session.id}/messages",
+                json={"content": "Will be cancelled inside the shielded persist"},
+            )
+        )
+        await asyncio.wait_for(entered_persist.wait(), timeout=3)
+        request_task.cancel()
+        await asyncio.sleep(0)
+        release_persist.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+        # The shielded child was never cancelled: it finished its write.
+        await asyncio.wait_for(persist_completed.wait(), timeout=3)
+
+    llm_audit_rows = _llm_call_audit_rows(service.messages)
+    assert len(llm_audit_rows) == 1
+    _row, tool_call = llm_audit_rows[0]
+    assert tool_call["call"]["status"] == "cancelled"
+    assert tool_call["call"]["messages_hash"] == llm_call.messages_hash
+
+    # Discriminator for the suppression itself: the handler's remaining
+    # cancellation bookkeeping runs only because the suppress absorbed the
+    # shield's re-raise. Without it the CancelledError would leave the handler
+    # at that line and no cancelled snapshot would ever be published.
+    snapshot = await app.state.composer_progress_registry.get_latest(str(service.session.id))
+    assert snapshot.phase == "cancelled"
+    assert snapshot.reason == "client_cancelled"

@@ -5175,6 +5175,40 @@ class TestB7ExceptionHandling:
             assert "exc_msg" not in call_kwargs[1]
             assert call_kwargs[1]["exc_class_chain"] == ["RuntimeError"]
 
+    @pytest.mark.parametrize(
+        "signal_factory",
+        [lambda: KeyboardInterrupt("ctrl-c"), lambda: SystemExit(1)],
+        ids=["keyboard_interrupt", "system_exit"],
+    )
+    def test_done_callback_skips_the_last_resort_diagnostic_for_shutdown_signals(
+        self,
+        service: ExecutionServiceImpl,
+        real_loop: asyncio.AbstractEventLoop,
+        signal_factory: Callable[[], BaseException],
+    ) -> None:
+        """A signal is an interpreter-directed shutdown, not a run failure.
+
+        ``_run_pipeline`` already treats KeyboardInterrupt / SystemExit as
+        shutdown: it skips the failed-status write and the
+        ``run_pipeline_failed`` operator diagnostic and emits
+        ``skipping_status_update_on_signal`` instead. This callback mirrors
+        that decision, and the mirroring is only safe because authority
+        release does NOT hang off the classification — the lease is closed on
+        every path before the branch is reached.
+        """
+        lease = _execute_lease()
+        future: Future[Any] = Future()
+        future.set_exception(signal_factory())
+        service._loop = real_loop
+
+        with patch("elspeth.web.execution.service.slog") as mock_slog:
+            service._on_pipeline_done(future, session_operation_lease=lease)
+            completion = next(iter(service._lease_completion_futures))
+            real_loop.run_until_complete(asyncio.wrap_future(completion, loop=real_loop))
+            mock_slog.error.assert_not_called()
+
+        assert lease.closed
+
     def test_done_callback_walks_exception_chain(self, service: ExecutionServiceImpl, real_loop: asyncio.AbstractEventLoop) -> None:
         """Chained exceptions surface as a class-name chain — no payloads.
 
@@ -8867,6 +8901,58 @@ class TestTransformProviderConfigPathRestriction:
         with patch.object(service, "_run_pipeline"):
             run_id = await _execute(service, session_id=session_id)
         assert isinstance(run_id, UUID)
+
+    @pytest.mark.asyncio
+    async def test_non_mapping_provider_config_is_skipped_without_disarming_the_scan(
+        self,
+        service: ExecutionServiceImpl,
+        mock_session_service: MagicMock,
+        mock_settings: MagicMock,
+    ) -> None:
+        """A non-Mapping ``provider_config`` is skipped, and the scan keeps going.
+
+        Pins the ``continue`` arm of the nested path allowlist scan: a value
+        that is not a Mapping cannot carry ``persist_directory`` at all, so it
+        is outside this gate's subject set — but skipping it must not abandon
+        the remaining nodes. The offending node is ordered SECOND so a
+        ``break``/``return`` in place of ``continue`` turns this test red.
+        """
+        mock_settings.data_dir = "/tmp/elspeth_data"
+        state = mock_session_service.get_current_state.return_value
+        state.source = None
+        state.outputs = None
+        state.nodes = [
+            {
+                "id": "rag-malformed",
+                "node_type": "transform",
+                "plugin": "rag_retrieval",
+                "input": "transform_in",
+                "on_success": "results",
+                "on_error": "discard",
+                "options": {
+                    "provider": "chroma",
+                    "provider_config": "/etc/cron.d/backdoor",
+                },
+            },
+            {
+                "id": "rag-escaping",
+                "node_type": "transform",
+                "plugin": "rag_retrieval",
+                "input": "transform_in",
+                "on_success": "results",
+                "on_error": "discard",
+                "options": {
+                    "provider": "chroma",
+                    "provider_config": {"persist_directory": "/etc/cron.d/backdoor"},
+                },
+            },
+        ]
+        state.edges = None
+
+        from elspeth.web.execution.errors import PathAllowlistViolationError
+
+        with pytest.raises(PathAllowlistViolationError, match="rag-escaping"):
+            await _execute(service, session_id=uuid4())
 
     @pytest.mark.asyncio
     async def test_azure_search_managed_identity_provider_config_rejected_before_run(

@@ -25,6 +25,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import Request
 from starlette.routing import Route
 
 from elspeth.web.auth.models import UserIdentity
@@ -58,6 +59,39 @@ def _candidate_artifact(path: Path) -> RunOutputArtifact:
         downloadable=True,
         storage_kind="sink_file",
     )
+
+
+def _request_with_headers(headers: dict[str, str]) -> Request:
+    """Build a minimal ASGI request carrying only the given request headers."""
+    return Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/runs/x/outputs/y/content",
+            "headers": [(key.lower().encode("latin-1"), value.encode("latin-1")) for key, value in headers.items()],
+        }
+    )
+
+
+def test_requested_byte_range_rejects_a_malformed_range_header() -> None:
+    """A present-but-unparsable Range header must 416, never fall back to the whole file."""
+    request = _request_with_headers({"Range": "rows=2-5"})
+    with pytest.raises(HTTPException) as caught:
+        execution_routes._requested_byte_range(request=request, size_bytes=10)
+    assert caught.value.status_code == 416
+    detail: object = caught.value.detail
+    assert detail == {"error_type": "range_not_satisfiable"}
+
+
+def test_requested_byte_range_returns_none_when_the_client_sent_no_range_header() -> None:
+    """Absence of the optional header is legal and must read as 'no range'."""
+    assert execution_routes._requested_byte_range(_request_with_headers({}), size_bytes=10) is None
+
+
+def test_requested_byte_range_parses_a_satisfiable_range_header() -> None:
+    byte_range = execution_routes._requested_byte_range(_request_with_headers({"Range": "bytes=2-5"}), size_bytes=10)
+    assert byte_range is not None
+    assert (byte_range.start, byte_range.end_inclusive) == (2, 5)
 
 
 def test_artifact_path_resolution_fault_is_not_reported_as_allowlist_rejection(monkeypatch, tmp_path) -> None:
@@ -1107,6 +1141,102 @@ class TestRunOutputPreviewEndpoint:
 
         assert response.status_code == 200
         assert response.json()["preview_text"] == '{"legacy":true}\n'
+
+    @pytest.mark.asyncio
+    async def test_preview_skips_an_absent_candidate_and_serves_the_later_spelling(self, monkeypatch, tmp_path) -> None:
+        """An absent earlier candidate must not mask a later spelling that exists.
+
+        Pins the missing-file arm of the candidate loop in
+        ``_verified_artifact_preview_head_from_candidates``: the decoded
+        spelling of a percent-encoded ``file://`` row does not exist on disk at
+        all (no decoy), so ``_verified_artifact_preview_head`` raises
+        ``_ArtifactPurgedOrMovedError`` for it; the loop must retain that error
+        and try the raw spelling rather than re-raising immediately.
+        """
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        legacy_raw_file = outputs_dir / "results%3Ftoken=literal.jsonl"
+        decoded_candidate = outputs_dir / "results?token=literal.jsonl"
+        audited_bytes = b'{"legacy":true}\n'
+        legacy_raw_file.write_bytes(audited_bytes)
+        assert not decoded_candidate.exists()
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[
+                RunOutputArtifact(
+                    artifact_id="art-legacy",
+                    sink_node_id="results",
+                    artifact_type="file",
+                    path_or_uri=f"file://{outputs_dir}/results%3Ftoken=literal.jsonl",
+                    content_hash=hashlib.sha256(audited_bytes).hexdigest(),
+                    size_bytes=len(audited_bytes),
+                    created_at=datetime.now(UTC),
+                    exists_now=True,
+                    downloadable=True,
+                    storage_kind="sink_file",
+                    producer_kind="node_state",
+                    produced_by_state_id="state-legacy",
+                    sink_effect_id=None,
+                    publication_performed=True,
+                    publication_evidence_kind="legacy_returned",
+                )
+            ],
+            run_id=run_id,
+        )
+
+        settings = _FakeSettings(data_dir=str(tmp_path))
+
+        app = _create_test_app(execution_service=svc, settings=settings)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/runs/{run_id}/outputs/art-legacy/preview")
+
+        assert response.status_code == 200
+        assert response.json()["preview_text"] == '{"legacy":true}\n'
+
+    @pytest.mark.asyncio
+    async def test_preview_reports_purged_when_every_candidate_is_absent(self, monkeypatch, tmp_path) -> None:
+        """With no candidate present the retained missing-file error must surface as 410."""
+        run_id = uuid4()
+        outputs_dir = tmp_path / "outputs" / str(_TEST_SESSION_ID)
+        outputs_dir.mkdir(parents=True)
+        audited_bytes = b'{"legacy":true}\n'
+
+        svc = _execution_service_for_status(run_id)
+        _install_manifest_loader(
+            monkeypatch,
+            artifacts=[
+                RunOutputArtifact(
+                    artifact_id="art-legacy",
+                    sink_node_id="results",
+                    artifact_type="file",
+                    path_or_uri=f"file://{outputs_dir}/results%3Ftoken=literal.jsonl",
+                    content_hash=hashlib.sha256(audited_bytes).hexdigest(),
+                    size_bytes=len(audited_bytes),
+                    created_at=datetime.now(UTC),
+                    exists_now=True,
+                    downloadable=True,
+                    storage_kind="sink_file",
+                    producer_kind="node_state",
+                    produced_by_state_id="state-legacy",
+                    sink_effect_id=None,
+                    publication_performed=True,
+                    publication_evidence_kind="legacy_returned",
+                )
+            ],
+            run_id=run_id,
+        )
+
+        settings = _FakeSettings(data_dir=str(tmp_path))
+
+        app = _create_test_app(execution_service=svc, settings=settings)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get(f"/api/runs/{run_id}/outputs/art-legacy/preview")
+
+        assert response.status_code == 410
+        assert response.json()["detail"]["error_type"] == "artifact_purged_or_moved"
 
     @pytest.mark.asyncio
     async def test_409_when_preview_file_content_drifts_under_same_size(self, monkeypatch, tmp_path) -> None:

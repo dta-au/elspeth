@@ -27,6 +27,7 @@ from elspeth.contracts.composer_interpretation import (
     InterpretationSource,
 )
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus, ComposerLLMCall, ComposerLLMCallStatus
+from elspeth.contracts.composer_progress import ComposerProgressEvent, ComposerProgressSink
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.guided.chat_solver import Step1SourceChatResolution
@@ -43,11 +44,18 @@ from elspeth.web.sessions._guided_step_chat import (
     StepChatResult,
 )
 from elspeth.web.sessions.engine import create_session_engine
-from elspeth.web.sessions.models import guided_operations_table
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.models import guided_operation_events_table, guided_operations_table
+from elspeth.web.sessions.protocol import (
+    CompositionStateData,
+    GuidedOperationFailureCommand,
+    GuidedOperationFence,
+    GuidedOperationFenceLostError,
+)
 from elspeth.web.sessions.routes._helpers import _initial_composition_state_with_guided_session
 from elspeth.web.sessions.routes.composer import guided as guided_route
+from elspeth.web.sessions.routes.composer import guided_chat_atomic
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
+from elspeth.web.sessions.routes.guided_operations import reserve_or_replay_guided_operation
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.schemas import GuidedChatRequest
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -1042,6 +1050,247 @@ def test_settlement_failure_rolls_back_chat_state_but_persists_failure_evidence_
     assert operation["response_hash"] is None
     assert secret_canary not in str(dict(operation))
     _assert_one_llm_failure_audit(composer_test_client, session_id, marker=marker)
+
+
+def _blocking_provider(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    """Install a provider that parks forever so the request can be cancelled."""
+    started = asyncio.Event()
+
+    async def hanging_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable — the parked provider never completes")
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", hanging_provider, raising=False)
+    return started
+
+
+def _guided_operation_row(client: TestClient, session_id: str, operation_id: str):
+    with client.app.state.session_engine.connect() as connection:
+        return (
+            connection.execute(
+                select(guided_operations_table).where(
+                    guided_operations_table.c.session_id == session_id,
+                    guided_operations_table.c.operation_id == operation_id,
+                )
+            )
+            .mappings()
+            .one()
+        )
+
+
+def test_cancellation_settlement_fence_loss_keeps_the_cancellation_and_writes_nothing(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fence loss during the cancellation settlement is the one silent arm.
+
+    ``fail_guided_operation_with_audit`` verifies the exact fence
+    (``require_guided_operation_fence_on_connection``) as the FIRST thing
+    inside its locked transaction, so ``GuidedOperationFenceLostError`` is
+    raised before any row is written: this worker has no authority to settle
+    and nothing partial was recorded. A genuinely lost fence is lost for BOTH
+    of this request's settlement writers, so the enclosing ``finally``'s
+    ``guided_operation_lease_guard`` observes it too — its own
+    ``fail_guided_operation`` on the same fence raises and only sets
+    ``guided_authority_lost``. The request therefore writes NO failure event
+    of its own and keeps unwinding as cancelled. Every OTHER settlement
+    failure is the sibling arm's ``AuditIntegrityError``, which is what
+    ``test_cancellation_settlement_failure_surfaces_as_an_integrity_error``
+    below pins.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _chat_body(turn)
+    service = client.app.state.session_service
+    started = _blocking_provider(monkeypatch)
+    settlement_fence_lost = False
+    guard_fence_lost = False
+
+    async def lose_failure_fence(command: GuidedOperationFailureCommand, *, session_operation_context: object) -> None:
+        nonlocal settlement_fence_lost
+        del session_operation_context
+        settlement_fence_lost = True
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def lose_guard_fence(fence: GuidedOperationFence, **_kwargs: object) -> None:
+        nonlocal guard_fence_lost
+        guard_fence_lost = True
+        raise GuidedOperationFenceLostError(fence)
+
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", lose_failure_fence)
+    monkeypatch.setattr(service, "fail_guided_operation", lose_guard_fence)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            request_task.cancel("cancellation survives a lost settlement fence")
+            with pytest.raises(asyncio.CancelledError, match="cancellation survives a lost settlement fence"):
+                await request_task
+
+    asyncio.run(drive())
+
+    # Both writers must actually have observed the loss: without these a
+    # refactor that stops calling ``finish_active_exception`` would leave the
+    # empty-actor assertion below trivially green.
+    assert settlement_fence_lost
+    assert guard_fence_lost
+    # What the durable row says is the winner's business, not this request's;
+    # the claim under audit is that THIS request recorded nothing.
+    with client.app.state.session_engine.connect() as connection:
+        settling_actors = (
+            connection.execute(
+                select(guided_operation_events_table.c.actor).where(
+                    guided_operation_events_table.c.session_id == session_id,
+                    guided_operation_events_table.c.operation_id == body["operation_id"],
+                    guided_operation_events_table.c.event_kind == "failed",
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert list(settling_actors) == []
+
+
+def test_cancellation_settlement_failure_surfaces_as_an_integrity_error(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The discriminating sibling of the swallowed fence-loss arm."""
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _chat_body(turn)
+    service = client.app.state.session_service
+    started = _blocking_provider(monkeypatch)
+
+    async def break_settlement(_command: GuidedOperationFailureCommand, *, session_operation_context: object) -> None:
+        del session_operation_context
+        raise RuntimeError("injected cancellation-settlement write failure")
+
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", break_settlement)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            request_task.cancel("an unrecorded cancellation must not stay quiet")
+            with pytest.raises(AuditIntegrityError, match="could not record its cancellation settlement"):
+                await request_task
+
+    asyncio.run(drive())
+
+
+def test_cancelled_progress_publish_defect_surfaces_instead_of_riding_the_cancellation(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A broken first-party progress sink must not hide behind a cancellation.
+
+    The composer progress registry is an in-process ELSPETH write, so a
+    failure publishing the cancelled-phase snapshot is a defect in code
+    ELSPETH owns. The cancellation is already settled durably by then, so the
+    defect is the only unrecorded thing left: the route logs the correlated
+    diagnostic and lets the failure surface rather than reporting a quiet
+    cancellation over a broken registry.
+    """
+    from structlog.testing import capture_logs
+
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _chat_body(turn)
+    started = _blocking_provider(monkeypatch)
+    registry = client.app.state.composer_progress_registry
+    real_bind = registry.bind_request
+
+    def failing_cancelled_bind(**kwargs: Any) -> ComposerProgressSink:
+        sink = real_bind(**kwargs)
+
+        async def _publish(event: ComposerProgressEvent) -> None:
+            if event.phase == "cancelled":
+                raise RuntimeError("injected progress registry defect")
+            await sink(event)
+
+        return _publish
+
+    monkeypatch.setattr(registry, "bind_request", failing_cancelled_bind)
+
+    async def drive() -> None:
+        async with AsyncClient(transport=ASGITransport(app=client.app), base_url="http://test") as async_client:
+            request_task = asyncio.create_task(async_client.post(f"/api/sessions/{session_id}/guided/chat", json=body))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            request_task.cancel("a progress-sink defect outranks the cancellation")
+            with pytest.raises(RuntimeError, match="injected progress registry defect"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(drive())
+
+    diagnostics = [entry for entry in logs if entry.get("event") == "guided.cancelled_progress_publish_failed"]
+    assert len(diagnostics) == 1, "the defect must still be recorded before it surfaces"
+    assert diagnostics[0]["exc_class"] == "RuntimeError"
+    assert diagnostics[0]["site"] == "post_guided_chat.cancelled_progress"
+    operation = _guided_operation_row(client, session_id, body["operation_id"])
+    assert operation["status"] == "failed", "the cancellation settlement precedes the progress publish"
+
+
+def test_failure_settlement_fence_loss_without_a_joinable_winner_fails_closed(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The broad handler's fence-loss arm rejoins; it never reports success.
+
+    Losing the fence at the failure write means this worker cannot record the
+    outcome, so it re-enters ``reserve_or_replay_guided_operation`` with
+    ``reserve_if_absent=False`` to take the winner's terminal answer instead.
+    When that lookup finds nothing joinable the request fails closed with an
+    ``AuditIntegrityError`` — the arm has no path that returns a success the
+    operation record does not carry.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    turn = client.get(f"/api/sessions/{session_id}/guided").json()["next_turn"]
+    body = _chat_body(turn)
+    service = client.app.state.session_service
+    real_reserve: Any = reserve_or_replay_guided_operation
+    fence_lost = False
+    winner_lookups = 0
+
+    async def failing_provider(**_kwargs: object) -> GuidedChatProviderOutcome:
+        raise RuntimeError("injected ordinary provider failure")
+
+    async def lose_failure_fence(command: GuidedOperationFailureCommand, *, session_operation_context: object) -> None:
+        nonlocal fence_lost
+        del session_operation_context
+        fence_lost = True
+        raise GuidedOperationFenceLostError(command.fence)
+
+    async def lose_guard_fence(fence: GuidedOperationFence, **_kwargs: object) -> None:
+        # A genuinely lost fence is lost for BOTH settlement writers, so the
+        # lease guard's own terminal proof observes it too and defers to the
+        # winner instead of raising its "never became terminal" integrity error.
+        raise GuidedOperationFenceLostError(fence)
+
+    async def winner_lookup(**kwargs: Any) -> Any:
+        nonlocal winner_lookups
+        if fence_lost and "reserve_if_absent" in kwargs and kwargs["reserve_if_absent"] is False:
+            winner_lookups += 1
+            return None
+        return await real_reserve(**kwargs)
+
+    monkeypatch.setattr(guided_route, "_run_guided_chat_provider_attempt", failing_provider, raising=False)
+    monkeypatch.setattr(service, "fail_guided_operation_with_audit", lose_failure_fence)
+    monkeypatch.setattr(service, "fail_guided_operation", lose_guard_fence)
+    monkeypatch.setattr(guided_chat_atomic, "reserve_or_replay_guided_operation", winner_lookup)
+
+    with pytest.raises(AuditIntegrityError, match="fence was lost without a joinable winner"):
+        client.post(f"/api/sessions/{session_id}/guided/chat", json=body)
+
+    assert fence_lost
+    assert winner_lookups == 1
 
 
 def test_provider_head_drift_fails_closed_without_settling_chat(

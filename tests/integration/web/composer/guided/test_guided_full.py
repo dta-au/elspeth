@@ -2023,3 +2023,187 @@ def test_late_older_guided_plan_progress_cannot_overwrite_the_newer_operation(
         phase="complete",
         reason="composer_complete",
     )
+
+
+def test_guided_full_main_fence_winner_lookup_integrity_failure_aborts_instead_of_being_contained(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Tier-1 failure in the fence-loss winner lookup must bubble, not be noted.
+
+    The lookup validates durable state, so ``reserve_or_replay_guided_operation``
+    can raise ``AuditIntegrityError``. ADR-008 registers that class Tier-1: it
+    outranks the fence-loss primary (an ordinary concurrency outcome with a
+    replayable terminal envelope) and must abort rather than be reduced to a
+    bounded ``guided.plan_failure_settlement_secondary_failure`` diagnostic.
+    """
+    from structlog.testing import capture_logs
+
+    class _FenceLosingPlanner:
+        async def plan_guided_full_pipeline(self, **kwargs):
+            await kwargs["progress"](
+                ComposerProgressEvent(
+                    phase="calling_model",
+                    headline="The guided planner is preparing a proposal.",
+                    evidence=("A bounded test provider call is active.",),
+                )
+            )
+            raise GuidedOperationFenceLostError(kwargs["operation_fence"])
+
+    real_reserve = reserve_or_replay_guided_operation
+
+    async def integrity_failure_on_lookup(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise AuditIntegrityError("guided winner lookup could not verify the durable operation row")
+        return await real_reserve(**kwargs)
+
+    composer_test_client.app.state.composer_service = _FenceLosingPlanner()
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", integrity_failure_on_lookup)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided lookup integrity"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a1"
+
+    async def lose_fence() -> None:
+        async with AsyncClient(transport=ASGITransport(app=composer_test_client.app), base_url="http://test") as client:
+            with pytest.raises(AuditIntegrityError, match="could not verify the durable operation row"):
+                await client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Lose the fence, then fail the lookup."},
+                )
+
+    with capture_logs() as logs:
+        asyncio.run(lose_fence())
+
+    # Contained-and-noted is exactly what must NOT happen for a Tier-1 fault.
+    assert [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"] == []
+
+
+def test_guided_full_settled_cancellation_replay_failure_does_not_publish_a_fabricated_outcome(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed post-settlement replay must not assert an outcome it never read.
+
+    The settlement is durable, so the terminal event stays ``phase="complete"``.
+    But the replay is the only thing that knows whether the planner PROPOSED or
+    DECLINED, so substituting ``joined = None`` and publishing the
+    ``declined=False`` copy would tell the operator "the guided pipeline
+    proposal is ready for review" about a request that may have been declined.
+    The ordinary (non-Tier-1) replay fault stays contained and noted; the copy
+    must simply not claim the outcome.
+    """
+    from structlog.testing import capture_logs
+
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    async def replay_boom(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise RuntimeError("SENSITIVE_REPLAY_DETAIL")
+        return await reserve_or_replay_guided_operation(**kwargs)
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_boom)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled replay fault"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a2"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            # The primary cancellation survives the contained replay fault.
+            with pytest.raises(asyncio.CancelledError):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_after_commit())
+
+    secondary_events = [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"]
+    assert len(secondary_events) == 1
+    assert secondary_events[0]["site"] == "completed_cancellation_replay"
+    assert secondary_events[0]["primary_failure_code"] == "durable_complete"
+    assert "SENSITIVE_REPLAY_DETAIL" not in str(secondary_events)
+
+    registry = composer_test_client.app.state.composer_progress_registry
+    snapshot = asyncio.run(registry.get_latest(str(session["id"])))
+    assert snapshot.phase == "complete"
+    assert snapshot.reason == "composer_complete"
+    # The fabricated "declined=False" copy must not be published.
+    assert snapshot.headline == "The guided pipeline request finished."
+    assert "ready for review" not in snapshot.headline
+
+
+def test_guided_full_settled_cancellation_replay_integrity_failure_aborts_instead_of_being_contained(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tier-1 in the post-settlement replay bubbles instead of being noted."""
+    from structlog.testing import capture_logs
+
+    service = composer_test_client.app.state.session_service
+    real_stage = service.stage_guided_full_pipeline_proposal
+    settlement_committed = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def committed_then_paused(command, *, session_operation_context):
+        result = await real_stage(
+            command,
+            session_operation_context=_assert_compose_context_for(session_operation_context, session["id"]),
+        )
+        settlement_committed.set()
+        await release_settlement.wait()
+        return result
+
+    async def replay_integrity_failure(**kwargs):
+        if kwargs.get("reserve_if_absent") is False:
+            raise AuditIntegrityError("guided replay could not verify the durable operation row")
+        return await reserve_or_replay_guided_operation(**kwargs)
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", committed_then_paused)
+    monkeypatch.setattr(guided_plan_route, "reserve_or_replay_guided_operation", replay_integrity_failure)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided settled replay integrity"}).json()
+    operation_id = "00000000-0000-4000-8000-0000000000a3"
+
+    async def cancel_after_commit() -> None:
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Settle before cancellation is observed."},
+                )
+            )
+            await asyncio.wait_for(settlement_committed.wait(), timeout=3)
+            request_task.cancel()
+            await asyncio.sleep(0)
+            release_settlement.set()
+            with pytest.raises(AuditIntegrityError, match="could not verify the durable operation row"):
+                await request_task
+
+    with capture_logs() as logs:
+        asyncio.run(cancel_after_commit())
+
+    assert [event for event in logs if event.get("event") == "guided.plan_failure_settlement_secondary_failure"] == []

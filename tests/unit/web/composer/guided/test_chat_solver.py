@@ -4468,6 +4468,80 @@ async def test_applied_component_chat_revision_is_form_directed_without_mutation
 
 
 @pytest.mark.asyncio
+async def test_step_1_empty_specialised_result_falls_through_to_the_advisory_solve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Step-1 empty-member discrimination is what routes to the advisory call.
+
+    ``run_guided_chat_provider_attempt`` discriminates the eight-member
+    ``Step1SourceChatResult`` union on its ONE member that declares no
+    ``chat`` field: ``GuidedStepChatEmptyResult`` is the only outcome that
+    must NOT be returned to the caller, because there is no terminal channel
+    in it. The route falls through to ``solve_step_chat_with_auto_drop``
+    instead, which supplies the advisory reply.
+
+    The Step-1 resolver is doubled one level BELOW the discrimination (the
+    module-level ``resolve_step_1_source_chat_with_auto_drop`` binding), so
+    the flagged discrimination itself still executes — unlike a double on
+    ``_run_guided_chat_provider_attempt``, which would skip it entirely.
+    """
+    guided = SimpleNamespace(
+        active_edit_target=None,
+        source_order=(),
+        reviewed_sources={},
+        output_order=(),
+        reviewed_outputs={},
+        pending_source_intents={},
+        deferred_intents=(),
+        terminal=None,
+    )
+    advisory_calls: list[dict[str, Any]] = []
+
+    async def empty_step_1_resolver(**_kwargs: Any) -> Any:
+        return guided_step_chat_module.GuidedStepChatEmptyResult()
+
+    async def advisory_provider(**kwargs: Any) -> _FakeLLMResponse:
+        advisory_calls.append(dict(kwargs))
+        return _ok_response("Use the wizard plugin picker to choose an input type.")
+
+    monkeypatch.setattr(
+        guided_chat_atomic_module,
+        "resolve_step_1_source_chat_with_auto_drop",
+        empty_step_1_resolver,
+    )
+    monkeypatch.setattr(chat_solver, "_litellm_acompletion", advisory_provider)
+
+    outcome = await guided_chat_atomic_module.run_guided_chat_provider_attempt(
+        session_id=uuid4(),
+        user=SimpleNamespace(user_id="user"),
+        step=GuidedStep.STEP_1_SOURCE,
+        guided=guided,
+        state=SimpleNamespace(sources={}, nodes=(), outputs=(), edges=()),
+        message="What kind of input should I use?",
+        settings=SimpleNamespace(
+            composer_model="test/model",
+            composer_temperature=None,
+            composer_discovery_reasoning_effort="none",
+            composer_seed=None,
+            composer_max_discovery_turns=1,
+            composer_max_tool_calls_per_turn=16,
+            composer_timeout_seconds=30.0,
+            composer_endpoint_base_url=None,
+            composer_endpoint_api_key=None,
+        ),
+        catalog=SimpleNamespace(list_sources=lambda: (SimpleNamespace(name="csv"),)),
+        plugin_snapshot=None,
+        secret_service=None,
+        recorder=BufferingRecorder(),
+        progress=None,
+    )
+
+    assert len(advisory_calls) == 1, "the empty member must fall through to the advisory solve"
+    assert type(outcome) is guided_step_chat_module.GuidedStepChatOnlyResult
+    assert outcome.chat.assistant_message == "Use the wizard plugin picker to choose an input type."
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["source", "sink"])
 async def test_source_and_sink_solvers_return_only_the_closed_stable_intent_management_action(
     monkeypatch: pytest.MonkeyPatch,

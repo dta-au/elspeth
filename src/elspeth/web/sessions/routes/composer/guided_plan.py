@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 from uuid import UUID, uuid4
 
+import elspeth.contracts.errors as contract_errors
 from elspeth.contracts.blobs import (
     BlobContentMissingError,
     BlobError,
@@ -105,6 +106,25 @@ def _guided_full_complete_progress_event(*, declined: bool = False) -> ComposerP
         headline="The guided pipeline proposal is ready for review.",
         evidence=("The proposal and its audit evidence were settled atomically.",),
         likely_next="Review the proposed pipeline before accepting it.",
+        reason="composer_complete",
+    )
+
+
+def _guided_full_complete_outcome_unreadable_progress_event() -> ComposerProgressEvent:
+    """Terminalize a durably settled operation whose recorded outcome is unread.
+
+    Emitted only from the completed-settlement cancellation path when the
+    post-settlement replay lookup fails for an ordinary (non-Tier-1) reason.
+    The settlement itself is proven durable by the
+    ``_GUIDED_ATOMIC_SETTLEMENT_COMPLETED`` marker, so ``phase="complete"`` is
+    honest; what is NOT known is whether the planner proposed or declined, so
+    this copy asserts neither.
+    """
+    return ComposerProgressEvent(
+        phase="complete",
+        headline="The guided pipeline request finished.",
+        evidence=("The result was saved, but it could not be read back before this request ended.",),
+        likely_next="Reload the session to see the saved result.",
         reason="composer_complete",
     )
 
@@ -580,6 +600,14 @@ async def post_guided_plan(
                 reserve_if_absent=False,
                 takeover_expired=False,
             )
+        except contract_errors.TIER_1_ERRORS:
+            # The winner lookup validates durable state, so it can raise
+            # ``AuditIntegrityError`` (and its custody subclass). ADR-008
+            # requires a registered Tier-1 failure to bubble and abort: it
+            # outranks the fence-loss primary, which is an ordinary
+            # concurrency outcome with a replayable terminal envelope. Only
+            # the ordinary lookup faults below are contained.
+            raise
         except Exception as lookup_exc:
             lookup_failed = True
             _note_guided_full_secondary_failure(
@@ -622,6 +650,7 @@ async def post_guided_plan(
         return joined
     except asyncio.CancelledError as exc:
         if _GUIDED_ATOMIC_SETTLEMENT_COMPLETED in exc.__dict__ and exc.__dict__[_GUIDED_ATOMIC_SETTLEMENT_COMPLETED] is True:
+            replay_outcome_unreadable = False
             try:
                 (joined, _cancelled_during_replay) = await _await_with_deferred_cancellation(
                     reserve_or_replay_guided_operation(
@@ -634,7 +663,15 @@ async def post_guided_plan(
                         takeover_expired=False,
                     )
                 )
+            except contract_errors.TIER_1_ERRORS:
+                # The replay validates the durable settlement, so it can raise
+                # ``AuditIntegrityError`` (and its custody subclass). ADR-008
+                # requires a registered Tier-1 failure to bubble and abort
+                # rather than be reduced to a last-resort diagnostic — it
+                # outranks the cancellation this handler is unwinding.
+                raise
             except Exception as replay_exc:
+                replay_outcome_unreadable = True
                 _note_guided_full_secondary_failure(
                     request=request,
                     primary_failure_code="durable_complete",
@@ -644,7 +681,15 @@ async def post_guided_plan(
                 joined = None
             await _await_with_deferred_cancellation(
                 progress(
-                    _guided_full_complete_progress_event(
+                    # The settlement is durable either way, but a failed replay
+                    # leaves the recorded OUTCOME unread. Publishing the
+                    # ``declined=False`` copy here would assert "the guided
+                    # pipeline proposal is ready for review" on a request that
+                    # may in fact have been declined — a fabricated result, not
+                    # a sentinel. Terminalize honestly instead.
+                    _guided_full_complete_outcome_unreadable_progress_event()
+                    if replay_outcome_unreadable
+                    else _guided_full_complete_progress_event(
                         declined=type(joined) is GuidedPlanDeclinedResponse,
                     )
                 )

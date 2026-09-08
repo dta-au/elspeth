@@ -714,9 +714,10 @@ async def run_guided_chat_provider_attempt(
         # union (``Step1SourceChatResult``) and every other member is read for
         # ``.chat`` and returned. ``type(...) is not GuidedStepChatEmptyResult``
         # gives mypy no negative-arm narrowing, so the exact-type form forfeits
-        # the static proof that ``.chat`` exists (measured: 8 union-attr /
-        # return-value errors). The positive ``type(...) is`` checks a few lines
-        # down discriminate single members and stay exact.
+        # the static proof that ``.chat`` exists (measured 2026-09-09: 4
+        # union-attr / arg-type / return-value errors on this file alone). The
+        # positive ``type(...) is`` checks a few lines down discriminate single
+        # members and stay exact.
         if not isinstance(source_outcome, GuidedStepChatEmptyResult):
             if revision_form == "source":
                 assistant_message = (
@@ -2427,10 +2428,15 @@ async def post_guided_chat_schema8(
                         )
                     )
                 except GuidedOperationFenceLostError:
-                    # Fence lost during cancellation settlement: another
-                    # worker owns the operation's durable outcome, so this
-                    # request has nothing left to record and keeps unwinding
-                    # as cancelled.
+                    # Fence lost during cancellation settlement. The fence is
+                    # verified as the first statement inside the settlement's
+                    # locked transaction, so the raise precedes every write:
+                    # this worker has no authority here and recorded nothing
+                    # partial. The same lost fence is observed by the
+                    # enclosing ``finally``'s lease guard, whose own
+                    # ``fail_guided_operation`` on this fence raises too and
+                    # only sets ``guided_authority_lost`` — so the request
+                    # writes nothing at all and keeps unwinding as cancelled.
                     pass
                 except Exception as settlement_exc:
                     # The failure settlement is a durable audit write. A
@@ -2447,11 +2453,17 @@ async def post_guided_chat_schema8(
                             )
                         )
                     except Exception as progress_exc:
-                        # First-party progress sink: a failed cancelled-phase
-                        # publication can leave an active-phase snapshot
-                        # visible until session archival clears the registry,
-                        # so the failure is recorded rather than silent while
-                        # the cancellation stays the declared outcome.
+                        # The progress sink is an in-process, first-party
+                        # registry write, so a failure here is an ELSPETH
+                        # defect rather than an environment fault. The
+                        # cancellation was already settled durably above, so
+                        # the defect is the only thing left unrecorded: log the
+                        # correlated diagnostic first, then let it surface.
+                        # Reporting a quiet 499 over a broken registry write
+                        # would hide a first-party bug behind a routine
+                        # cancellation — the sibling guided PLAN route
+                        # publishes its terminal event unguarded for the same
+                        # reason.
                         _log_last_resort_diagnostic(
                             slog.error,
                             "guided.cancelled_progress_publish_failed",
@@ -2460,6 +2472,7 @@ async def post_guided_chat_schema8(
                             site="post_guided_chat.cancelled_progress",
                             frames=_safe_frame_strings(progress_exc),
                         )
+                        raise
                 if _is_client_disconnect_cancel(exc):
                     raise HTTPException(status_code=499, detail="Client disconnected while the guided chat turn was running.") from exc
                 raise

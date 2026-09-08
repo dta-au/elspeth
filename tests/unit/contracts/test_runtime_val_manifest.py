@@ -1984,3 +1984,28 @@ def test_plain_primitive_and_bool_constants_pass_through_unchanged() -> None:
 
     for value in ("x", 3, 1.5, True, False, None):
         assert _try_normalize_code_constant(value) is value
+
+
+def test_complex_subclass_constant_normalizes_distinct_from_its_base() -> None:
+    """A complex SUBCLASS must not hash identically to the bare complex value.
+
+    Every other container/carrier arm of the normalizer records subclass
+    identity through ``builtin_subclass``; the complex arm collapsed it, so a
+    carrier change was invisible to the resume-trust manifest. The real and
+    imaginary parts are read through ``complex.__complex__`` so a subclass that
+    overrides ``real``/``imag`` cannot forge the base value either.
+    """
+    from elspeth.contracts.runtime_val_manifest import _try_normalize_code_constant
+
+    class ManifestProbeComplex(complex):
+        @property
+        def real(self) -> float:
+            return 999.0
+
+    plain = _try_normalize_code_constant(complex(3, 4))
+    normalized = _try_normalize_code_constant(ManifestProbeComplex(3, 4))
+
+    assert plain == {"complex": [3.0, 4.0]}
+    assert normalized != plain
+    assert normalized["builtin_subclass"]["value"] == plain
+    assert "ManifestProbeComplex" in normalized["builtin_subclass"]["type"]

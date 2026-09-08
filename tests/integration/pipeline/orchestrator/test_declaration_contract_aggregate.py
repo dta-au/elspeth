@@ -91,7 +91,11 @@ def test_aggregate_declaration_contract_violation_reaches_orchestrator(payload_s
         sinks={"default": as_sink(sinks["default"])},
     )
 
-    orchestrator = Orchestrator(LandscapeDB("sqlite:///:memory:"))
+    # ``in_memory()`` (StaticPool, one shared DBAPI connection): a plain
+    # ``sqlite:///:memory:`` URL gives every connection its own empty database,
+    # so the heartbeat thread's connection saw no ``run_workers`` table and its
+    # beats silently never landed until the heartbeat started failing closed.
+    orchestrator = Orchestrator(LandscapeDB.in_memory())
     with pytest.raises(AggregateDeclarationContractViolation) as exc_info:
         orchestrator.run(config, graph=graph, payload_store=payload_store)
 

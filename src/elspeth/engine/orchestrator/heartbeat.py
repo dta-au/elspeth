@@ -23,11 +23,15 @@ communicates through :class:`threading.Event` flags:
 
 Design invariants enforced here:
 
-- **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` (SQLite
-  busy-timeout) is logged at DEBUG and counted toward the ``heartbeat_degraded``
-  threshold ``k``; the thread never sets the latch on a DB error.
-- **Never self-terminate on DB errors** — the per-tick try/except swallows
-  contention and continues looping; unexpected errors latch a fatal failure
+- **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` whose DBAPI
+  message is SQLite write-lock contention (``_is_lock_contention``) is logged
+  at DEBUG and counted toward the ``heartbeat_degraded`` threshold ``k``; the
+  thread never sets the latch on contention. An ``OperationalError`` that is
+  NOT contention (unable to open the database file, disk I/O error, a readonly
+  database) is an audit-store failure carrying no liveness evidence, and
+  latches like any other non-contention failure.
+- **Never self-terminate on DB errors** — the per-tick try/except contains
+  contention and continues looping; every other error latches a fatal failure
   for the drain thread. A failure of the thread's own clock or diagnostic
   channel also latches a fatal cause before the thread exits. Tier-1 integrity errors
   (e.g. a vanished ``run_workers`` row) are corruption, not contention — they
@@ -54,7 +58,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol
 
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError
 
 # Module import (not a from-import of TIER_1_ERRORS): the tuple is lazily
 # materialized via PEP 562 __getattr__, so only live attribute access sees
@@ -77,6 +81,32 @@ logger = logging.getLogger(__name__)
 # a ``heartbeat_degraded`` coordination event so a later eviction is
 # diagnosable as "could not reach the DB" rather than "process died".
 _DEFAULT_DEGRADED_THRESHOLD: int = 3
+
+
+def _is_lock_contention(exc: OperationalError) -> bool:
+    """True only for SQLite write-lock contention (SQLITE_BUSY / SQLITE_LOCKED).
+
+    ``begin_write`` takes the WAL write lock at BEGIN IMMEDIATE and raises
+    ``OperationalError("database is locked")`` after the 5000 ms busy_timeout
+    poll; SQLITE_LOCKED renders as "database table is locked". Both driver
+    messages end in "is locked" and neither says anything about this worker's
+    liveness, which is what makes the BUSY = liveness-unknown arm legitimate.
+
+    The message is read from the DBAPI exception (``exc.orig``), never from
+    ``str(exc)``: SQLAlchemy's rendering appends ``[SQL: <statement>]``, so a
+    statement that merely mentions a lock would read as contention. An
+    ``OperationalError`` carrying no DBAPI exception at all proves nothing
+    about contention and is reported as non-contention — this predicate gates
+    a fatal latch, so its unknown case must fail closed.
+
+    Every other ``OperationalError`` — unable to open the database file, disk
+    I/O error, a readonly database — is an audit-store failure rather than
+    contention, and the heartbeat must not silently count it as a busy tick.
+    """
+    origin = exc.orig
+    if origin is None:
+        return False
+    return "is locked" in str(origin).lower()
 
 
 class _HeartbeatRepository(Protocol):
@@ -300,9 +330,13 @@ class RunHeartbeatThread:
            vanished registry row) → corruption, not contention: latch the
            exception for ``check_and_raise()`` to re-raise at the next drain
            boundary (fail closed); never raises on this thread's stack.
-        4. SQLITE_BUSY ``OperationalError`` → liveness-unknown; DEBUG log,
-           count toward degraded threshold, continue.
-        5. Any other exception (programming error / repository contract
+        4. Write-lock contention ``OperationalError`` (``_is_lock_contention``:
+           the DBAPI message is SQLITE_BUSY / SQLITE_LOCKED) → liveness-unknown;
+           DEBUG log, count toward degraded threshold, continue.
+        5. Any other ``OperationalError`` (unable to open the database file,
+           disk I/O error, readonly database) → an audit-store failure with no
+           liveness evidence: latch it for the drain thread and log it.
+        6. Any other exception (programming error / repository contract
            regression) → latch the failure for the drain thread and log it.
 
         ADR-030 §B: ``snapshot.worker_role`` discriminates leader vs follower
@@ -368,6 +402,22 @@ class RunHeartbeatThread:
                 exc_info=exc,
             )
         except OperationalError as exc:
+            if not _is_lock_contention(exc):
+                # NOT contention: an operational failure of the audit store
+                # itself (unable to open the database file, disk I/O error, a
+                # readonly database). It carries no evidence about this
+                # worker's liveness, so counting it as a busy tick would let
+                # the run keep traversing while its beat never lands. Fail
+                # closed at the next drain boundary, like every other
+                # non-contention failure this thread sees.
+                self._capture_fatal(exc)
+                logger.error(
+                    "run_heartbeat: non-contention operational failure for worker %r in run %r — failing closed at next drain boundary",
+                    self._token.worker_id,
+                    self._token.run_id,
+                    exc_info=exc,
+                )
+                return
             # BUSY = liveness-unknown (design §A.3): count toward degraded
             # threshold but never crash and never set the latch.
             self._consecutive_busy += 1
@@ -392,7 +442,18 @@ class RunHeartbeatThread:
             )
 
     def _emit_degraded(self) -> None:
-        """Emit ``heartbeat_degraded`` event; best-effort, never raises."""
+        """Emit the ``heartbeat_degraded`` event; latches any failure, never raises.
+
+        ``record_heartbeat_degraded`` delegates to the repository's
+        best-effort recorder, which already catches every ``SQLAlchemyError``
+        and reports it as the declared ``LOST_TO_DB_FAULT`` result, so audit
+        -store unavailability never reaches this frame. Anything that does
+        reach it is a breach of that owned contract rather than a DB
+        availability event, and is latched for ``check_and_raise`` at the next
+        drain boundary. Raising on this stack instead would kill the beat
+        thread before it can latch coordination-lost, so the latch is the
+        fail-closed form available here.
+        """
         try:
             self._repo.record_heartbeat_degraded(
                 run_id=self._token.run_id,
@@ -403,12 +464,9 @@ class RunHeartbeatThread:
         except contract_errors.TIER_1_ERRORS as exc:
             self._capture_fatal(exc)
             logger.error("run_heartbeat: degraded event integrity failed", exc_info=exc)
-        except SQLAlchemyError:
-            # A diagnostic write failure cannot stop liveness updates, but
-            # must remain visible when the normal repository reporter fails.
-            logger.error("run_heartbeat: degraded event could not be recorded", exc_info=True)
         except Exception as exc:
-            # Programming and Tier-1 failures are not DB availability. The
+            # Every remaining failure — a broken repository contract, a
+            # programming fault — is authoritative, not DB availability. The
             # caller is an exception handler, so re-raising here would kill
             # the beat thread instead of notifying its owner.
             self._capture_fatal(exc)

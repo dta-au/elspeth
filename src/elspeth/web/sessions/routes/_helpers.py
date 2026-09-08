@@ -2853,6 +2853,17 @@ async def _handle_convergence_error(
         # state.to_dict() or CompositionStateData(...) is a Tier 1 invariant
         # bug and must propagate. This catch is the SQLAlchemy persistence
         # layer only.
+        #
+        # ``GuidedCustodyIntegrityError`` is deliberately NOT caught here (nor
+        # in the two sibling recovery handlers). It is registered Tier-1 and
+        # subclasses ``AuditIntegrityError``: the guided reviewed-source
+        # custody could not be proven against the live sources, so the audit
+        # trail's source provenance is unprovable. ADR-008 requires that class
+        # to bubble and abort — it reaches the app-level ``AuditIntegrityError``
+        # handler and its fail-closed 500 — rather than be reduced to a
+        # ``partial_state_save_error`` string on an ordinary recovery body.
+        # Pinned by
+        # tests/unit/web/sessions/test_routes.py::test_recovery_partial_state_custody_integrity_failure_is_not_contained.
         try:
             state_data, _validation = await _state_data_from_composer_state(
                 exc.partial_state,
@@ -2877,17 +2888,6 @@ async def _handle_convergence_error(
             )
             persisted_state_id = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
-        except GuidedCustodyIntegrityError as custody_err:
-            # The partial state's guided custody cannot bind (write gate) or
-            # cannot project (legacy tip): keep the recovery body, name the
-            # loss the same way the save-failure arm does.
-            slog.error(
-                f"{log_prefix}_partial_state_custody_unbindable",
-                session_id=str(session_id),
-                exc_class=type(custody_err).__name__,
-            )
-            response_body["partial_state_save_failed"] = True
-            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — ``IntegrityError`` alone would
             # let ``OperationalError`` (lock timeout / pool disconnect /
@@ -3037,14 +3037,6 @@ async def _handle_plugin_crash(
             )
             persisted_state_id_pc = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
-        except GuidedCustodyIntegrityError as custody_err:
-            slog.error(
-                f"{log_prefix}_plugin_crash_partial_state_custody_unbindable",
-                session_id=str(session_id),
-                exc_class=type(custody_err).__name__,
-            )
-            response_body["partial_state_save_failed"] = True
-            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # Full SQLAlchemyError family — a narrow ``IntegrityError``
             # catch would let ``OperationalError`` / ``ProgrammingError`` /
@@ -3285,14 +3277,6 @@ async def _handle_runtime_preflight_failure(
             )
             persisted_state_id_rpf = partial_record.id
             response_body["partial_state"] = _recovery_partial_state_response(partial_record)
-        except GuidedCustodyIntegrityError as custody_err:
-            slog.error(
-                f"{log_prefix}_runtime_preflight_partial_state_custody_unbindable",
-                session_id=str(session_id),
-                exc_class=type(custody_err).__name__,
-            )
-            response_body["partial_state_save_failed"] = True
-            response_body["partial_state_save_error"] = type(custody_err).__name__
         except SQLAlchemyError as save_err:
             # See sibling helpers for redaction rationale (exc_info
             # omitted; class name only on the response body).

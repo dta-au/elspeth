@@ -15,7 +15,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from elspeth.contracts.errors import AuditIntegrityError
+from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.sessions.routes.composer import guided as guided_route
+from elspeth.web.sessions.routes.composer import guided_chat_atomic
 from elspeth.web.sessions.routes.composer.guided_chat_atomic import GuidedChatProviderOutcome
 from tests.integration.web.composer.guided.test_step_chat import _create_session
 from tests.unit.web._sync_asgi_client import SyncASGITestClient as TestClient
@@ -243,6 +246,82 @@ def test_incompatible_upload_reports_a_type_mismatch_without_binding(
     assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
     assert body["next_turn"] == form
     assert body["composition_state"]["sources"] == {}
+
+
+def test_rejected_uploaded_bind_degrades_to_a_not_applied_turn(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transition rejection inside the bind leaves the wizard exactly as it was.
+
+    ``_prepare_step_1_uploaded_source_bind`` answers the live Step-1 turn
+    through the ordinary schema-8 transition machinery
+    (``transition_source_plugin_selection`` / ``transition_source_schema_form``
+    and the authority builders behind them), so its rejection set is the same
+    closed four — ``PluginConfigError``, ``InvariantError``, ``TypeError``,
+    ``ValueError``. The route degrades to the not-applied 200 the sibling
+    transition arm produces, keeps the authoritative turn, and leaves the file
+    uploaded.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    blob_id = _upload_inventory_csv(client, session_id)
+    provider_calls = _refuse_provider(monkeypatch)
+    initial_turn = _guided(client, session_id)["next_turn"]
+
+    def reject_bind(**_kwargs: object) -> object:
+        raise InvariantError("injected uploaded-bind transition rejection")
+
+    monkeypatch.setattr(guided_chat_atomic, "_prepare_step_1_uploaded_source_bind", reject_bind)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(initial_turn, _UPLOAD_SENTINEL.format(filename="inventory.csv")),
+    )
+
+    assert response.status_code == 200, response.json()
+    body = response.json()
+    assert provider_calls == []
+    assert body["assistant_message_kind"] == "synthetic_failure"
+    assert body["guided_session"]["chat_history"][-1]["synthetic_failure_reason"] == "not_applied"
+    assert "still uploaded" in body["assistant_message"]
+    assert body["next_turn"] == initial_turn
+    assert body["composition_state"]["sources"] == {}
+    blobs = asyncio.run(client.app.state.blob_service.list_blobs(UUID(session_id)))
+    assert [str(blob.id) for blob in blobs] == [blob_id]
+
+
+def test_uploaded_bind_integrity_failure_fails_the_operation_closed(
+    composer_test_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bind's own integrity checks are NOT part of the rejection set.
+
+    ``_prepare_step_1_uploaded_source_bind`` raises ``AuditIntegrityError``
+    when its custody or projection invariants break (escaped step, missing
+    blob custody, no projected form, lost server-held plugin). That type is
+    outside the four-member transition rejection set, so it must fail the
+    operation closed instead of settling as a token-consuming degraded turn.
+    """
+    client = composer_test_client
+    session_id = _create_session(client)
+    _upload_inventory_csv(client, session_id)
+    _refuse_provider(monkeypatch)
+    initial_turn = _guided(client, session_id)["next_turn"]
+
+    def break_bind(**_kwargs: object) -> object:
+        raise AuditIntegrityError("injected uploaded-bind custody failure")
+
+    monkeypatch.setattr(guided_chat_atomic, "_prepare_step_1_uploaded_source_bind", break_bind)
+
+    response = client.post(
+        f"/api/sessions/{session_id}/guided/chat",
+        json=_chat_body(initial_turn, _UPLOAD_SENTINEL.format(filename="inventory.csv")),
+    )
+
+    assert response.status_code == 500, response.json()
+    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    assert _guided(client, session_id)["composition_state"]["sources"] == {}
 
 
 class TestSourceFormBlobPrefillFallback:

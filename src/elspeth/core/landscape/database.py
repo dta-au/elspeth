@@ -1182,6 +1182,24 @@ class LandscapeDB:
             )
 
     @staticmethod
+    @trust_boundary(
+        tier=3,
+        source=(
+            "an operator-supplied SQLite database URL — external configuration whose parsed query "
+            "mapping carries SQLAlchemy's declared str | tuple[str, ...] value union, a tuple encoding "
+            "a repeated parameter"
+        ),
+        source_param="url",
+        suppresses=("R5",),
+        invariant=(
+            "raises ValueError before create_engine, and therefore before the creator callback can "
+            "open or create the database file, when a query parameter occurs more than once or when a "
+            "boolean connect option is not a SQLAlchemy true/false spelling; never selects one "
+            "occurrence of a repeated parameter and never substitutes a default for a malformed value"
+        ),
+        test_ref="tests/unit/core/landscape/test_database_sqlcipher.py::TestSQLCipherCreateAndRead::test_repeated_query_parameter_rejected_by_the_engine_boundary",
+        test_fingerprint="5ae47b055575fa9536683396a3ef178314149483b4672eea0c51566c53e479be",
+    )
     def _create_sqlcipher_engine(url: str, passphrase: str, *, read_only: bool = False) -> Engine:
         """Create a SQLAlchemy engine backed by SQLCipher (AES-256 encryption).
 

@@ -5895,13 +5895,33 @@ def _check_schema_contracts(
             return False
         return schema_config is not None and not schema_config.is_observed
 
+    @trust_boundary(
+        tier=3,
+        source="the composer sources mapping (source name -> SourceSpec) admitted un-typed from persisted session payloads",
+        source_param="source_map",
+        suppresses=("R1",),
+        invariant=(
+            "a ``source:``-namespaced producer id naming no declared source resolves to None "
+            "(type unknown) instead of inventing a SourceSpec or a field type; such a draft is "
+            "rejected by the reserved-node-id checks in CompositionState.validate, not here; "
+            "never raises on an absent source name"
+        ),
+        non_raising=True,
+    )
     def _resolved_producer_field_type(
         producer: ProducerEntry,
         field_name: str,
         *,
+        source_map: Mapping[str, SourceSpec],
         visited: frozenset[str] = frozenset(),
     ) -> str | None:
-        """Resolve a declared type through truthful value-preserving forwarders."""
+        """Resolve a declared type through truthful value-preserving forwarders.
+
+        ``source_map`` is threaded in as a parameter rather than read from the
+        enclosing closure so the Tier-3 boundary declaration above can name it:
+        boundary metadata does not cross a nested-function scope, and
+        ``source_param`` must name a real parameter of the decorated function.
+        """
         if producer.producer_id in visited:
             return None
         owner = _producer_owner(producer)
@@ -5981,11 +6001,16 @@ def _check_schema_contracts(
         )
         if upstream is None:
             return None
-        return _resolved_producer_field_type(
+        # Annotated because the recursive reference resolves to the DECORATED
+        # name, whose type mypy cannot infer from inside the function it is
+        # still defining; the annotation restores the declared return type.
+        upstream_type: str | None = _resolved_producer_field_type(
             upstream,
             field_name,
+            source_map=source_map,
             visited=visited | {producer.producer_id},
         )
+        return upstream_type
 
     def _edge_field_type_conflict(producer: ProducerEntry, consumer: NodeSpec | OutputSpec) -> ValidationEntry | None:
         """Mirror the runtime's Phase-2 edge TYPE check on declared field specs.
@@ -6069,7 +6094,7 @@ def _check_schema_contracts(
         for field_def in consumer_schema_config.fields:
             if field_def.field_type == "any":
                 continue
-            producer_type = _resolved_producer_field_type(producer, field_def.name)
+            producer_type = _resolved_producer_field_type(producer, field_def.name, source_map=source_map)
             if producer_type is not None and producer_type != field_def.field_type:
                 mismatches.append((field_def.name, field_def.field_type, producer_type))
         if not mismatches:

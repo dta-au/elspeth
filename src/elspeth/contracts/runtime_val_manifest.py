@@ -276,7 +276,13 @@ def _try_normalize_code_constant(value: object, *, seen: frozenset[int] = frozen
             return _UNSUPPORTED_MANIFEST_VALUE
         return {"regex": {"pattern": normalized_pattern, "flags": value.flags}}
     if isinstance(value, complex):
-        return {"complex": [value.real, value.imag]}
+        # Read the pair through the base ``__complex__`` so a subclass that
+        # overrides ``real``/``imag`` cannot substitute the recorded value.
+        base_complex = complex.__complex__(value)
+        normalized_complex = {"complex": [base_complex.real, base_complex.imag]}
+        if type(value) is complex:
+            return normalized_complex
+        return _preserve_builtin_subclass_identity(value, normalized_base_value=normalized_complex)
     if type(value) is slice:
         normalized_bounds = {
             "start": _try_normalize_code_constant(value.start),

@@ -13369,6 +13369,60 @@ def test_coalesce_non_string_branch_connection_is_rejected_at_composition_time()
     assert any("must be a string (got int)" in message for message in messages), messages
 
 
+def test_coalesce_non_string_branch_name_is_rejected_at_composition_time() -> None:
+    """The branch NAME operand of the same intrinsic type check.
+
+    ``_routing_label_errors`` skips a pair whose branch name is not a string,
+    so the rejection must come from the intrinsic coalesce shape check, which
+    runs ``type(value) is not str`` over the branch name and the branch
+    connection in one loop. This test plants the name operand; its sibling
+    above plants the connection operand.
+    """
+    state = CompositionState(
+        source=None,
+        nodes=(),
+        edges=(),
+        outputs=(),
+        metadata=PipelineMetadata(),
+        version=1,
+    )
+    state = state.with_source(SourceSpec(plugin="csv", on_success="g_in", options={}, on_validation_failure="discard"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="g",
+            node_type="gate",
+            plugin=None,
+            input="g_in",
+            on_success=None,
+            on_error=None,
+            condition="True",
+            routes={"true": "fork", "false": "fork"},
+            fork_to=("x",),
+        )
+    )
+    state = state.with_node(_tier_rem_node(id="tx", input="x", on_success="cx"))
+    state = state.with_node(
+        _tier_rem_node(
+            id="c",
+            node_type="coalesce",
+            plugin=None,
+            input="cx",
+            on_success="main",
+            on_error=None,
+            branches={7: "cx"},
+            policy="require_all",
+            merge="union",
+        )
+    )
+    state = state.with_output(OutputSpec(name="main", plugin="csv", options={}, on_write_failure="discard"))
+
+    result = state.validate()
+
+    assert not result.is_valid
+    messages = [e.message for e in result.errors if e.error_code == "coalesce_branches_invalid"]
+    assert any("branch name must be a string (got int)" in message for message in messages), messages
+
+
 def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules() -> None:
     """The composer's template advisory rules abstain on unparseable templates;
     the raising rejection is owned by LLMConfig (pydantic ValidationError at

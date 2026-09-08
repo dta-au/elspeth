@@ -1809,9 +1809,16 @@ def _constraint_conjunction_contradiction(
                 exact_identity_counts[identity] = exact_identity_counts.get(identity, 0) + 1
             else:
                 unidentified_exact_count += 1
-        ambiguous_identities = {
-            identity for subject_key in ambiguous_keys for identity in required_plugin_identities.get(subject_key, set())
-        }
+        # Direct index, not a defaulted read: every ambiguous key reached
+        # ``required_component_kinds`` through ``require_subject`` with a
+        # ``PluginSubject``, and ``subject_identity`` returns a non-None
+        # identity for every one of those, so ``require_subject`` recorded it.
+        # A StableSubject subject_key, and both routing-target keys, are
+        # classified exact above and never reach this set. A missing entry here
+        # would therefore be a classification or accumulation invariant break,
+        # which must surface as a KeyError rather than silently shrink the
+        # identity population the count arithmetic compares against.
+        ambiguous_identities = {identity for subject_key in ambiguous_keys for identity in required_plugin_identities[subject_key]}
 
         relevant_identities = set(exact_identity_counts) | ambiguous_identities
         relevant_identities.update(

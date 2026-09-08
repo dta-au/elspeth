@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -124,6 +126,135 @@ def test_each_required_wire_field_is_required(missing: str) -> None:
 
     assert error is not None
     assert missing in error
+
+
+@pytest.mark.parametrize("field_name", ("semantic_contracts", "warnings", "blockers"))
+@pytest.mark.parametrize("element", ("advisory", 7, ["nested"], None))
+def test_wire_payload_rejects_a_non_mapping_advisory_element(field_name: str, element: object) -> None:
+    """Pin the element shape check the confirm_wiring boundary declares.
+
+    The sequence helper proves only the container and hands back the same
+    sequence, and the JSON check admits scalars and sequences, so each element
+    of ``semantic_contracts`` / ``warnings`` / ``blockers`` is discriminated
+    here. A malformed element returns a path-rooted error string; it never
+    raises and is never carried into the reviewed turn.
+    """
+
+    payload: dict[str, object] = dict(_wire_payload())
+    payload[field_name] = [element]
+
+    assert validate_payload(TurnType.CONFIRM_WIRING, payload) == f"payload.{field_name}[0] must be a mapping"
+
+
+_COALESCE_NODE: dict[str, Any] = {
+    "stable_id": "00000000-0000-4000-8000-00000000000a",
+    "label": "node-1",
+    "node_type": "coalesce",
+    "plugin": None,
+    "behavior": {
+        "kind": "coalesce",
+        "branch_aliases": ["branch-1", "branch-2"],
+        "policy": "require_all",
+        "merge": "union",
+        "timeout_seconds": None,
+    },
+    "node_options_summary": [],
+    "required_fields": [],
+    "guaranteed_fields": [],
+    "row_cardinality": {"input": "one", "output": "one", "expected_output_count": None},
+    "structured_output_fields": [],
+}
+
+_SUMMARY_NODE: dict[str, Any] = {
+    **_COALESCE_NODE,
+    "node_type": "transform",
+    "plugin": "llm",
+    "behavior": {"kind": "transform"},
+    "node_options_summary": [{"key": "prompt_template", "value": "Evaluate the row", "tier": "essential"}],
+}
+
+
+def _wire_payload_with_node(node: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = deepcopy(dict(_wire_payload()))
+    payload["nodes"] = [deepcopy(dict(node))]
+    return payload
+
+
+def _assign(payload: dict[str, Any], path: tuple[str | int, ...], value: object) -> None:
+    target: Any = payload
+    for step in path[:-1]:
+        target = target[step]
+    target[path[-1]] = value
+
+
+@pytest.mark.parametrize("unhashable", (["none"], {"kind": "none"}), ids=("list", "dict"))
+@pytest.mark.parametrize(
+    ("build", "path", "expected"),
+    (
+        pytest.param(
+            _wire_payload,
+            ("sources", 0, "row_cardinality", "input"),
+            "payload.sources[0].row_cardinality is outside the closed cardinality vocabulary",
+            id="source-cardinality-input",
+        ),
+        pytest.param(
+            _wire_payload,
+            ("sources", 0, "row_cardinality", "output"),
+            "payload.sources[0].row_cardinality is outside the closed cardinality vocabulary",
+            id="source-cardinality-output",
+        ),
+        pytest.param(
+            lambda: _wire_payload_with_node(_SUMMARY_NODE),
+            ("nodes", 0, "node_type"),
+            "payload.nodes[0].node_type is not in the closed node vocabulary",
+            id="node-type",
+        ),
+        pytest.param(
+            lambda: _wire_payload_with_node(_COALESCE_NODE),
+            ("nodes", 0, "behavior", "policy"),
+            "payload.nodes[0].behavior.policy is outside the closed vocabulary",
+            id="coalesce-policy",
+        ),
+        pytest.param(
+            lambda: _wire_payload_with_node(_COALESCE_NODE),
+            ("nodes", 0, "behavior", "merge"),
+            "payload.nodes[0].behavior.merge is outside the closed vocabulary",
+            id="coalesce-merge",
+        ),
+        pytest.param(
+            lambda: _wire_payload_with_node(_SUMMARY_NODE),
+            ("nodes", 0, "node_options_summary", 0, "key"),
+            "payload.nodes[0].node_options_summary[0].key is outside the node option summary allowlist",
+            id="option-summary-key",
+        ),
+        pytest.param(
+            _wire_payload,
+            ("connections", 0, "flow", "kind"),
+            "payload.connections[0].flow.kind is outside the closed flow vocabulary",
+            id="flow-kind",
+        ),
+    ),
+)
+def test_an_unhashable_vocabulary_value_is_refused_by_error_string_not_by_typeerror(
+    build: Callable[[], Mapping[str, Any]],
+    path: tuple[str | int, ...],
+    expected: str,
+    unhashable: object,
+) -> None:
+    """Every closed-vocabulary test on the wire boundary is type-guarded first.
+
+    ``_exact_nested_mapping`` proves a payload fragment's KEY SET, never its
+    value types, so each authored value reaching a ``frozenset``/``dict``/
+    ``set`` membership test would raise ``TypeError: unhashable type`` for a
+    list or mapping. ``_validate_wire_payload`` declares ``non_raising=True``;
+    these are every such site reachable from it, and each must answer with its
+    own path-rooted vocabulary error instead.
+    """
+
+    payload = deepcopy(dict(build()))
+    _assign(payload, path, deepcopy(unhashable))
+
+    assert validate_payload(TurnType.CONFIRM_WIRING, payload) == expected
 
 
 def test_connection_preserves_stable_endpoints_and_flow() -> None:

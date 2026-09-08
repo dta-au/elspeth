@@ -766,8 +766,18 @@ async def test_guided_start_rejects_client_supplied_profile_object_without_echo(
 
 @pytest.mark.asyncio
 async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp_path) -> None:
-    from structlog.testing import capture_logs
+    """A Tier-1 failure aborts unconverted, yet still settles the operation.
 
+    ADR-008 forbids replacing a registered Tier-1 error with the closed
+    ``guided_operation_terminal_failure`` HTTPException, so the first attempt
+    unwinds as ``AuditIntegrityError`` (this app is assembled without the
+    app-level handler that turns it into the fail-closed 500 in production).
+    The route's Tier-1 arm is a bare re-raise; settlement is the lease guard's
+    ``finally`` (``_GuidedOperationLeaseGuard.finish``), which records the
+    escaping exception as ``integrity_error`` so the retry on the same
+    operation id reads the durable row and answers the deterministic coded
+    envelope — with no diagnostic text from the original error in it.
+    """
     from elspeth.contracts.errors import AuditIntegrityError
 
     app, service = _make_app(tmp_path)
@@ -777,14 +787,14 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
     payload = {"profile": "tutorial", "intent": _START_INTENT, "operation_id": operation_id}
 
     with (
-        capture_logs() as logs,
         patch.object(
             service,
             "seed_or_complete_guided_start_operation",
             side_effect=AuditIntegrityError("secret diagnostic must not escape"),
         ),
+        pytest.raises(AuditIntegrityError, match="secret diagnostic must not escape"),
     ):
-        first = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
+        client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
     replay = client.post(f"/api/sessions/{session.id}/guided/start", json=payload)
 
     expected = {
@@ -794,19 +804,49 @@ async def test_guided_start_integrity_failure_is_terminal_and_safe_to_replay(tmp
             "detail": "The operation failed an integrity check.",
         }
     }
-    assert first.status_code == replay.status_code == 500
-    assert first.json() == replay.json() == expected
-    event = next(entry for entry in logs if entry.get("event") == "guided.operation_terminal_failure")
-    assert event["exc_class"] == "AuditIntegrityError"
-    assert event["site"] == "post_guided_start"
-    assert "secret diagnostic" not in repr(event)
-    # The correlation field is always emitted. This app is assembled without
-    # ``RequestIdMiddleware`` (see ``_make_app``), so the honest value here is
-    # None — and the read must stay lenient: an ``AttributeError`` raised while
-    # gathering a LOG field would escape this ``except`` block and abandon the
-    # reserved fence instead of settling the operation as failed.
-    assert "request_id" in event
-    assert event["request_id"] is None
+    assert replay.status_code == 500
+    assert replay.json() == expected
+    assert "secret diagnostic" not in replay.text
+
+
+@pytest.mark.asyncio
+async def test_guided_start_tier_one_failure_survives_a_lost_fence_instead_of_rejoining(tmp_path) -> None:
+    """A settlement fence loss must not downgrade a Tier-1 abort into a rejoin.
+
+    The ordinary failure arm answers a lost settlement fence by continuing the
+    bounded rejoin loop, which can end in another attempt's replayed success.
+    A registered Tier-1 error may never take that path: the route's Tier-1 arm
+    re-raises bare, the lease guard's ``finally`` finds the fence gone while
+    settling and only records ``guided_authority_lost``, and the request still
+    aborts on the integrity signal it raised — the attempt body runs exactly
+    once.
+    """
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.protocol import GuidedOperationFenceLostError
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+
+    def _fence_lost(fence, **_kwargs):
+        raise GuidedOperationFenceLostError(fence)
+
+    with (
+        patch.object(
+            service,
+            "seed_or_complete_guided_start_operation",
+            side_effect=AuditIntegrityError("start custody proof is unreadable"),
+        ) as attempt,
+        patch.object(service, "fail_guided_operation", side_effect=_fence_lost) as settlement,
+        pytest.raises(AuditIntegrityError, match="start custody proof is unreadable"),
+    ):
+        client.post(
+            f"/api/sessions/{session.id}/guided/start",
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
+        )
+
+    assert attempt.call_count == 1, "a Tier-1 failure must not rejoin the operation"
+    assert settlement.call_count >= 1, "the lease guard must still attempt settlement on the way out"
 
 
 @pytest.mark.asyncio
@@ -860,14 +900,15 @@ async def test_guided_start_unclassified_failure_is_recorded_with_its_failure_co
 async def test_guided_start_terminal_failure_log_correlates_to_the_response_header(tmp_path) -> None:
     """R2-F16b: the ``X-Request-ID`` an operator quotes must find the log line.
 
-    The guided routes settle their terminal exception in-route and re-raise a
-    closed ``HTTPException``, so before this the only server-side record of a
-    guided 500 — ``guided.operation_terminal_failure`` — carried no correlation
-    id at all. The header pointed at nothing.
+    The ordinary (non Tier-1) guided failure settles its terminal exception
+    in-route and raises a closed ``HTTPException``, so before this the only
+    server-side record of a guided 500 —
+    ``guided.operation_terminal_failure`` — carried no correlation id at all.
+    The header pointed at nothing. A Tier-1 class cannot stand in here: it now
+    unwinds unconverted, so it produces no response to read the header from.
     """
     from structlog.testing import capture_logs
 
-    from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.middleware.request_id import RequestIdMiddleware
 
     app, service = _make_app(tmp_path)
@@ -880,7 +921,7 @@ async def test_guided_start_terminal_failure_log_correlates_to_the_response_head
         patch.object(
             service,
             "seed_or_complete_guided_start_operation",
-            side_effect=AuditIntegrityError("diagnostic must not escape"),
+            side_effect=RuntimeError("diagnostic must not escape"),
         ),
     ):
         response = client.post(

@@ -743,8 +743,8 @@ files:
   src/elspeth/web/composer/guided/prompts.py:
     Mapping[str, Any]: 1
   src/elspeth/web/composer/guided/protocol.py:
-    Mapping[str, Any]: 23
-    boundary: 5
+    Mapping[str, Any]: 22
+    boundary: 6
   src/elspeth/web/composer/guided/resolved.py:
     Mapping[str, Any]: 5
     dict[str, Any]: 7
@@ -1008,10 +1008,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 866
+  Mapping[str, Any]: 865
   Mapping[str, object]: 284
   MutableMapping[str, Any]: 13
-  boundary: 63
+  boundary: 64
   dict[str, Any]: 1141
   dict[str, object]: 389
-  soft: 2693
+  soft: 2692

@@ -33,6 +33,7 @@ from starlette.types import Receive, Scope, Send
 
 from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.freeze import deep_thaw
+from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.web.async_workers import run_sync_in_worker
 from elspeth.web.auth.middleware import get_current_user
 from elspeth.web.auth.models import UserIdentity
@@ -340,6 +341,30 @@ def _parse_single_range(range_header: str | None, *, size_bytes: int) -> _ByteRa
         start=start,
         end_inclusive=min(end_inclusive, size_bytes - 1),
     )
+
+
+@trust_boundary(
+    tier=3,
+    source="the optional client-supplied HTTP Range request header on the artefact download endpoint; "
+    "clients may omit it, and any present value is attacker-controlled text",
+    source_param="request",
+    suppresses=("R1",),
+    invariant="returns None when the client sent no Range header, and raises HTTPException (416 "
+    "range_not_satisfiable) for any present header that is malformed or unsatisfiable against "
+    "size_bytes; never fabricates or clamps a range from an unparsable header",
+    test_ref="tests/unit/web/execution/test_outputs_routes.py::test_requested_byte_range_rejects_a_malformed_range_header",
+    test_fingerprint="a4ad3768a999a76d9f242f4c8a881d6f6f2496740a23bd3369ae0f1a3d610934",
+)
+def _requested_byte_range(request: Request, *, size_bytes: int) -> _ByteRange | None:
+    """Read the optional ``Range`` request header and parse it against ``size_bytes``.
+
+    Absence of the header is a legal client choice and must become ``None``
+    for the caller, so the read is a ``.get()`` on Tier-3 HTTP input rather
+    than an assertion about an owned mapping. Every present value goes
+    straight into :func:`_parse_single_range`, which rejects anything it
+    cannot parse with a 416 rather than guessing an offset.
+    """
+    return _parse_single_range(request.headers.get("range"), size_bytes=size_bytes)
 
 
 def _stream_temp_snapshot(path: Path, *, byte_range: _ByteRange | None = None) -> Iterator[bytes]:
@@ -1828,7 +1853,7 @@ def create_execution_router() -> APIRouter:
             snapshot_dir=Path(request.app.state.settings.data_dir) / ".run-output-snapshots",
         )
         try:
-            byte_range = _parse_single_range(request.headers.get("range"), size_bytes=snapshot.size_bytes)
+            byte_range = _requested_byte_range(request, size_bytes=snapshot.size_bytes)
         except HTTPException:
             _unlink_path(snapshot.path)
             raise

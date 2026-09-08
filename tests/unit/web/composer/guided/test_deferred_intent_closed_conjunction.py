@@ -858,6 +858,33 @@ def test_same_plugin_fallbacks_merge_for_cardinality_minimum() -> None:
     assert result == DeferredIntentAccepted(action=action)
 
 
+def test_every_ambiguous_required_subject_carries_a_recorded_plugin_identity() -> None:
+    """Pin the totality the ambiguous-identity read in the count arithmetic depends on.
+
+    An ambiguous subject key only ever reaches ``required_component_kinds``
+    through ``require_subject`` with a ``PluginSubject``, and that path always
+    records a plugin identity — so the arithmetic indexes
+    ``required_plugin_identities`` directly rather than defaulting to an empty
+    set. Two ambiguous subjects naming DIFFERENT transform plugins must
+    therefore contribute two identities against a node cap of one; a defaulted
+    empty read for either key would silently admit this set. The same-plugin
+    merge that keeps the read honest is pinned by
+    ``test_same_plugin_fallbacks_merge_for_cardinality_minimum``.
+    """
+
+    result = _validate(
+        _action(
+            _presence(_plugin_subject(name="normalize", subject_id="55555555-5555-4555-8555-555555555555"), True),
+            _presence(_plugin_subject(name="llm", subject_id="66666666-6666-4666-8666-666666666666"), True),
+            _count("node", "at_most", 1),
+            catalog_kind="transform",
+            catalog_name="normalize",
+        )
+    )
+
+    _assert_contradiction(result, rule="count_group_subsumption")
+
+
 def test_required_sink_plugin_may_inhabit_a_named_route_target() -> None:
     _assert_retained_conjunction_admitted(
         _routing(),

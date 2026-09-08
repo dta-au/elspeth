@@ -3134,3 +3134,65 @@ def test_pending_proposal_invalidation_rejects_a_non_mapping_guided_session() ->
 
     with pytest.raises(AuditIntegrityError, match="Guided session composer metadata must be an exact mapping"):
         _terminal_exit_command({"guided_session": ["not", "a", "mapping"]})
+
+
+def test_schema8_transition_rejects_a_non_mapping_schema_form_options_payload() -> None:
+    """The SCHEMA_FORM arm's shape gate rejects client-authored malformed input.
+
+    ``body.edited_values`` is Tier-3 request data: ``GuidedRespondRequest``
+    admits any ``dict[str, Any]``, so the closed ``{plugin, options}`` shape and
+    the element types are this boundary's to prove. A non-mapping ``options``
+    must be refused with ``ValueError`` before the value is promoted into the
+    owned ``SchemaFormResponse``, whose ``__post_init__`` re-validates and
+    freezes it. This is the honesty test for the ``@trust_boundary`` metadata on
+    ``_schema8_transition``.
+    """
+    guided_route = importlib.import_module("elspeth.web.sessions.routes.composer.guided")
+    from elspeth.web.sessions.schemas import GuidedRespondRequest
+
+    current_turn = {
+        "type": TurnType.SCHEMA_FORM.value,
+        "step_index": 0,
+        "payload": {"mode": "plugin_options", "plugin": "csv", "knobs": {"fields": []}, "prefilled": {}},
+    }
+    guided, _record, _turn_type, _payload_hash = guided_route._append_server_turn_record(
+        GuidedSession.initial(),
+        current_step=GuidedStep.STEP_1_SOURCE,
+        turn=current_turn,
+    )
+
+    body = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "edited_values": {"plugin": "csv", "options": "path=/tmp/x.csv"},
+        },
+        strict=True,
+    )
+
+    with pytest.raises(ValueError, match="schema_form plugin and options have invalid types"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body=body,
+            catalog=cast(Any, object()),
+            new_stable_id=uuid4(),
+        )
+
+    body_bad_plugin = GuidedRespondRequest.model_validate(
+        {
+            "operation_id": str(uuid4()),
+            "turn_token": "a" * 64,
+            "edited_values": {"plugin": ["csv"], "options": {}},
+        },
+        strict=True,
+    )
+
+    with pytest.raises(ValueError, match="schema_form plugin and options have invalid types"):
+        guided_route._schema8_transition(
+            guided,
+            current_turn,
+            body=body_bad_plugin,
+            catalog=cast(Any, object()),
+            new_stable_id=uuid4(),
+        )

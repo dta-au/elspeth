@@ -129,10 +129,6 @@ _IMMUTABLE_SUCCESS_RUN_STATUSES = (
 _EXPORT_SEAT_RUN_STATUSES = (*_TAKEOVER_FLIPPABLE_RUN_STATUSES, *_IMMUTABLE_SUCCESS_RUN_STATUSES)
 
 
-class _ReleaseMembershipMiss(Exception):
-    """Internal rollback signal for a seat without matching active membership."""
-
-
 def _utc(value: datetime) -> datetime:
     """Attach UTC to a naive datetime read back from SQLite (storage is UTC)."""
     if value.tzinfo is None:
@@ -273,6 +269,25 @@ class BestEffortEventOutcome(Enum):
 
     RECORDED = "recorded"
     LOST_TO_DB_FAULT = "lost_to_db_fault"
+
+
+class SeatReleaseOutcome(Enum):
+    """Declared result of :meth:`RunCoordinationRepository.release_seat`.
+
+    ``RELEASED`` is the transition: the seat was vacated, this worker's
+    membership row departed, and the ``leader_release`` event written in one
+    transaction. ``FENCE_REFUSED`` is the leader fence's refusal — the seat is
+    already vacant, or another epoch holds it — surfaced as a value rather
+    than swallowed, because the ``fence_refusal`` ledger row the fence writes
+    on a fresh connection is best-effort attribution (§A.2) and never a
+    durability guarantee. Zero mutation either way: the fence is the first
+    statement of the BEGIN IMMEDIATE transaction, so a refusal unwinds before
+    any payload write. Teardown callers may ignore the refusal deliberately;
+    it is a declared result, never a silent one.
+    """
+
+    RELEASED = "released"
+    FENCE_REFUSED = "fence_refused"
 
 
 def _record_best_effort_event(
@@ -926,20 +941,34 @@ class RunCoordinationRepository:
         )
         return CoordinationToken(run_id=run_id, worker_id=worker_id, leader_epoch=new_epoch)
 
-    def release_seat(self, *, token: CoordinationToken) -> None:
+    def release_seat(self, *, token: CoordinationToken) -> SeatReleaseOutcome:
         """Graceful leader shutdown: vacate the seat + depart own row, leader-fenced. Idempotent.
 
         The seat is a run-scoped row, so vacating it is a LEADER write
         (ADR-030 D4): the verify-and-extend epoch fence is the first statement
         and proves the caller still holds this epoch before the seat is
         cleared. A fence miss (already released, or deposed) is this verb's
-        declared no-op: release is teardown hygiene called from ``finally``
-        arms where a second leadership-lost signal would mask the first, so
-        the refusal is swallowed here and the ``fence_refusal`` event the
-        fence recorded is its durable evidence — zero mutation either way. A
-        missing run-scoped active membership rolls the whole transaction back
-        (fence extension included), so the seat clear, membership departure,
-        and evidence insert are one atomic transition.
+        declared no-op, returned as :attr:`SeatReleaseOutcome.FENCE_REFUSED`
+        rather than raised: release runs from ``finally`` arms where a second
+        leadership-lost signal would mask the first, and from
+        ``abandon_leaderless_run`` on its success path. Zero mutation either
+        way — the fence is the transaction's first statement — and the
+        ``fence_refusal`` ledger row is best-effort attribution, so the
+        returned outcome, not that row, is the caller's guaranteed signal.
+
+        A seat that passes its own epoch fence but has no matching active
+        run-scoped membership is a durable-image contradiction, not a race:
+        nothing departs or evicts a leader's own row while it holds the seat
+        (``evict_worker`` refuses the incumbent, and finalize's §D hygiene
+        departs followers only). It therefore raises
+        :class:`AuditIntegrityError`, the same fail-closed backstop the vacate
+        CAS above and ``depart_worker`` carry, and the whole transaction rolls
+        back (fence extension included) with zero mutation.
+
+        Raises:
+            AuditIntegrityError: The seat passed its epoch fence but the
+                vacate CAS or the run-scoped membership departure matched
+                other than exactly one row.
         """
         try:
             with fenced_leader_transaction(
@@ -973,7 +1002,15 @@ class RunCoordinationRepository:
                     .values(status="departed", departed_at=database_now)
                 )
                 if departed.rowcount != 1:
-                    raise _ReleaseMembershipMiss
+                    # An authoritative seat without its matching active member
+                    # is a corrupt durable image, not a benign absence: no verb
+                    # departs or evicts a leader's own row while it holds the
+                    # seat. Fail closed, exactly as the vacate CAS above does.
+                    raise AuditIntegrityError(
+                        f"release_seat: the seat for run {token.run_id!r} passed its epoch fence but worker "
+                        f"{token.worker_id!r} has no active run_workers row in that run; the departure UPDATE matched "
+                        f"{departed.rowcount} rows."
+                    )
                 record_coordination_event(
                     conn,
                     run_id=token.run_id,
@@ -983,13 +1020,13 @@ class RunCoordinationRepository:
                     recorded_at=database_now,
                     context={"worker_row_departed": True},
                 )
-        except _ReleaseMembershipMiss:
-            return
         except RunLeadershipLostError:
-            # Already released or deposed: the declared idempotent no-op. The
-            # fence recorded the refusal; the caller (a teardown arm) has no
-            # further action to take on this seat.
-            return
+            # Already released or deposed: the declared idempotent no-op,
+            # surfaced as an explicit result. The fence's own refusal row is
+            # best-effort, so this return value is the caller's only
+            # guaranteed signal that no release happened.
+            return SeatReleaseOutcome.FENCE_REFUSED
+        return SeatReleaseOutcome.RELEASED
 
     def live_leader(self, *, run_id: str) -> LeaderInfo | None:
         """Read-only seat read (§B.3). Implemented now; WIRED into the entry guard in slice 4.

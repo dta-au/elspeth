@@ -1092,6 +1092,22 @@ def _provider_safe_deferred_constraint(
     raise AuditIntegrityError("guided deferred constraint is outside the provider-safe closed projection")
 
 
+@observation_boundary(
+    tier=3,
+    source=(
+        "the reviewed components carried on GuidedSession: source and sink plugin options are free-form "
+        "configuration authored through the composer (planner tool calls or the guided schema_form), stored "
+        "verbatim and never schema-validated by the composer, so an optional 'schema' block may be absent or "
+        "of unguaranteed interior shape"
+    ),
+    source_param="guided",
+    suppresses=("R1",),
+    invariant=(
+        "projects only; a reviewed source that declares no schema block yields schema_mode None and an empty "
+        "declared_fields list rather than an invented observed/fixed schema authority, and no other fact is "
+        "substituted for the absent declaration; never raises on an absent or malformed schema option"
+    ),
+)
 def guided_redacted_planner_context(guided: GuidedSession) -> dict[str, object]:
     """Build the closed provider-visible summary without option values or rows."""
 

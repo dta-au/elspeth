@@ -1915,13 +1915,25 @@ async def post_guided_start(
             if settlement_failure is not None:
                 raise exc from settlement_failure
             raise
+        except contract_errors.TIER_1_ERRORS:
+            # ADR-008: a registered Tier-1 failure must bubble and abort, so
+            # this arm is the bare re-raise the whole-tree re-raise gate
+            # requires — it never becomes the closed HTTPException the broad
+            # arm below raises. Settlement is not this arm's job: the
+            # enclosing ``finally`` hands the escaping exception to
+            # ``lease_guard.finish_active_exception``, which settles the
+            # operation as ``integrity_error`` (``_guided_failure_code_for_exception``)
+            # so a retry on the same operation id replays a deterministic
+            # terminal envelope, and which only records ``guided_authority_lost``
+            # when that settlement finds the fence gone — a lost fence cannot
+            # downgrade a Tier-1 abort into the rejoin ``continue`` above.
+            raise
         except Exception as exc:
+            # No ``integrity_error`` arm: every registered Tier-1 class, which
+            # includes ``AuditIntegrityError``, is taken by the handler above
+            # and never reaches this classification.
             failure_code: GuidedOperationFailureCode = (
-                "stale_conflict"
-                if isinstance(exc, GuidedOperationSettlementConflictError)
-                else "integrity_error"
-                if isinstance(exc, AuditIntegrityError)
-                else "operation_failed"
+                "stale_conflict" if isinstance(exc, GuidedOperationSettlementConflictError) else "operation_failed"
             )
             if failure_code != "stale_conflict":
                 # Every failure that terminates this route, not just the
@@ -2659,6 +2671,21 @@ def _schema8_require_runnable_sink_options(
         raise SinkAdmissionRejectedError(collision_error)
 
 
+@trust_boundary(
+    tier=3,
+    source="client-authored GuidedRespondRequest turn-response fields (edited_values, chosen, custom_inputs, component_action) from the guided RESPOND HTTP body",
+    source_param="body",
+    suppresses=("R5",),
+    invariant=(
+        "raises ValueError when the submitted turn response does not match the current turn's "
+        "closed shape — for the SCHEMA_FORM arm, when edited_values is not exactly "
+        "{plugin, options} with a str plugin and a Mapping options — so no malformed client "
+        "payload reaches the owned SchemaFormResponse, whose __post_init__ re-validates and "
+        "freezes what this gate admits"
+    ),
+    test_ref="tests/unit/web/sessions/test_guided_atomic_settlement.py::test_schema8_transition_rejects_a_non_mapping_schema_form_options_payload",
+    test_fingerprint="06f4c779a4ca47611c4836224db1971637723c1a4c0200d8d4ef4ae7d48c5e5c",
+)
 def _schema8_transition(
     guided: GuidedSession,
     turn: Turn,

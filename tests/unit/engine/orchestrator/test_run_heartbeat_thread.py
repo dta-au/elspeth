@@ -10,9 +10,12 @@ Tests cover:
    with the correct ``worker_id``, ``now``, and ``window_seconds`` (the
    underlying repo verb handles the single-transaction guarantee; this test
    verifies the thread calls the verb correctly).
-2. **BUSY tolerated** — an ``OperationalError`` from ``worker_heartbeat`` is
-   NOT fatal, does NOT set the latch, and does NOT terminate the thread;
-   ``check_and_raise()`` must not raise after a busy tick.
+2. **BUSY tolerated** — a write-lock-contention ``OperationalError`` from
+   ``worker_heartbeat`` (SQLITE_BUSY / SQLITE_LOCKED, read off the DBAPI
+   cause) is NOT fatal, does NOT set the latch, and does NOT terminate the
+   thread; ``check_and_raise()`` must not raise after a busy tick. Any OTHER
+   ``OperationalError`` is an audit-store fault carrying no liveness evidence
+   and latches for the drain boundary.
 3. **heartbeat_degraded fires past threshold** — after ``k`` consecutive busy
    failures ``record_heartbeat_degraded`` is called exactly once with the
    correct ``failures`` count; does NOT re-fire on the (k+1)-th miss (the
@@ -30,6 +33,7 @@ Tests cover:
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -121,6 +125,17 @@ _DEPOSED_SNAPSHOT = CoordinationSnapshot(
     seat_live=True,
     worker_active=True,
 )
+
+
+def _busy_error(statement: str = "UPDATE run_workers SET heartbeat_expires_at=?") -> OperationalError:
+    """A realistic SQLITE_BUSY: ``begin_write``'s busy_timeout poll surfaces the DBAPI error.
+
+    ``heartbeat._is_lock_contention`` reads the message off ``exc.orig``, not
+    off ``str(exc)`` (whose rendering appends the statement text), so a
+    contention fixture MUST carry a DBAPI exception. An ``OperationalError``
+    without one is deliberately not contention.
+    """
+    return OperationalError(statement, None, sqlite3.OperationalError("database is locked"))
 
 
 def test_snapshot_rejects_inactive_membership() -> None:
@@ -269,7 +284,7 @@ class TestFatalIntegrityLatch:
         later = RuntimeError("later failure") if first_tier1 else AuditIntegrityError("later failure")
         repo = _StubRepo()
         if first_degraded:
-            repo.side_effect = OperationalError("locked", None, None)
+            repo.side_effect = _busy_error()
             repo.degraded_exception = first
         else:
             repo.side_effect = first
@@ -277,7 +292,7 @@ class TestFatalIntegrityLatch:
         thread._step_beat()
 
         if second_degraded:
-            repo.side_effect = OperationalError("locked", None, None)
+            repo.side_effect = _busy_error()
             repo.degraded_exception = later
         else:
             repo.side_effect = later
@@ -312,13 +327,62 @@ class TestBusyTolerated:
     def test_operational_error_does_not_set_latch(self) -> None:
         """SQLITE_BUSY does NOT set the coordination-lost latch."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("database is locked", None, None)
+        repo.side_effect = _busy_error()
 
         thread = _make_thread(repo, degraded_threshold=100)
         thread._step_beat()
 
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
+
+    @pytest.mark.parametrize(
+        "driver_message",
+        ["unable to open database file", "disk I/O error", "attempt to write a readonly database"],
+    )
+    def test_non_contention_operational_error_latches_fatal(self, driver_message: str, caplog: pytest.LogCaptureFixture) -> None:
+        """Only write-lock contention is liveness-unknown; other DB faults fail closed.
+
+        SQLITE_BUSY says nothing about this worker, which is what licenses the
+        swallow-and-continue arm. An audit store that cannot be opened, read or
+        written is a different fact: counting it as a busy tick would let the
+        run keep traversing while its beat never lands, so it is latched for
+        ``check_and_raise`` and the busy counter never advances.
+        """
+        repo = _StubRepo()
+        failure = OperationalError("UPDATE run_workers", None, sqlite3.OperationalError(driver_message))
+        repo.side_effect = failure
+
+        thread = _make_thread(repo, degraded_threshold=1)
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert len(repo.record_heartbeat_degraded_calls) == 0
+        assert not thread.coordination_lost
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
+        assert any("non-contention operational failure" in record.getMessage() and record.exc_info for record in caplog.records)
+
+    def test_operational_error_without_a_dbapi_cause_is_not_contention(self) -> None:
+        """No DBAPI exception means no evidence of contention: fail closed.
+
+        ``str(exc)`` on a SQLAlchemy error appends ``[SQL: <statement>]``, so
+        reading contention off the rendered string would let a statement that
+        merely mentions a lock pass as SQLITE_BUSY. The predicate reads
+        ``exc.orig``; with nothing there the unknown case must latch, not
+        continue.
+        """
+        repo = _StubRepo()
+        failure = OperationalError("database is locked", None, None)
+        repo.side_effect = failure
+
+        thread = _make_thread(repo, degraded_threshold=1)
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
 
     def test_any_exception_does_not_set_latch(self) -> None:
         """Any DB error is treated as liveness-unknown, never eviction."""
@@ -334,7 +398,7 @@ class TestBusyTolerated:
         """After a busy tick the thread can recover with a healthy beat."""
         repo = _StubRepo()
         repo.side_effects = [
-            OperationalError("database is locked", None, None),
+            _busy_error(),
             _HEALTHY_SNAPSHOT,
         ]
 
@@ -349,8 +413,8 @@ class TestBusyTolerated:
         """_consecutive_busy resets to 0 after a successful beat."""
         repo = _StubRepo()
         repo.side_effects = [
-            OperationalError("busy", None, None),
-            OperationalError("busy", None, None),
+            _busy_error(),
+            _busy_error(),
             _HEALTHY_SNAPSHOT,
         ]
 
@@ -375,7 +439,7 @@ class TestHeartbeatDegraded:
         from elspeth.contracts import tier_registry
 
         repo = _StubRepo()
-        repo.side_effect = OperationalError("busy", None, None)
+        repo.side_effect = _busy_error()
         thread = _make_thread(repo, degraded_threshold=1)
         with monkeypatch.context() as isolated:
             isolated.setattr(tier_registry, "_REGISTRY", list(tier_registry._REGISTRY))
@@ -400,7 +464,7 @@ class TestHeartbeatDegraded:
 
         error = AuditIntegrityError("broken ledger") if failure is None else failure
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
         repo.degraded_exception = error
         thread = _make_thread(repo, degraded_threshold=1)
 
@@ -413,7 +477,7 @@ class TestHeartbeatDegraded:
     def test_degraded_fires_at_threshold(self) -> None:
         """record_heartbeat_degraded is called when busy_count reaches k=3."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
 
         thread = _make_thread(repo, degraded_threshold=3)
 
@@ -434,7 +498,7 @@ class TestHeartbeatDegraded:
     def test_degraded_fires_again_on_subsequent_busy_beats(self) -> None:
         """Each beat past threshold keeps firing (failures grows monotonically)."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
 
         thread = _make_thread(repo, degraded_threshold=2)
         thread._step_beat()  # busy=1
@@ -448,7 +512,7 @@ class TestHeartbeatDegraded:
     def test_degraded_not_fired_below_threshold(self) -> None:
         """record_heartbeat_degraded is NOT called below the threshold."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
 
         thread = _make_thread(repo, degraded_threshold=5)
         for _ in range(4):
@@ -459,7 +523,7 @@ class TestHeartbeatDegraded:
     def test_degraded_event_error_does_not_propagate(self) -> None:
         """record_heartbeat_degraded raising does NOT crash the thread."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
         repo.degraded_exception = RuntimeError("degraded write failed")
 
         thread = _make_thread(repo, degraded_threshold=1)
@@ -467,23 +531,33 @@ class TestHeartbeatDegraded:
 
         assert not thread._coordination_lost_event.is_set()
 
-    def test_degraded_db_failure_is_logged_without_fatal_latch(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_degraded_db_failure_is_latched_as_a_broken_repository_contract(self, caplog: pytest.LogCaptureFixture) -> None:
+        """``record_heartbeat_degraded`` never raises a DB error by contract.
+
+        Its repository implementation catches every ``SQLAlchemyError`` and
+        reports the declared ``LOST_TO_DB_FAULT`` result, so a DB error
+        arriving here is a breach of an owned contract, not audit-store
+        unavailability. It is latched for the drain boundary rather than
+        absorbed — the thread itself still does not raise.
+        """
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
-        repo.degraded_exception = OperationalError("degraded write failed", None, None)
+        repo.side_effect = _busy_error()
+        failure = OperationalError("INSERT INTO run_coordination_events", None, sqlite3.OperationalError("disk I/O error"))
+        repo.degraded_exception = failure
         thread = _make_thread(repo, degraded_threshold=1)
 
         thread._step_beat()
 
-        thread.check_and_raise()
-        assert any(
-            record.getMessage() == "run_heartbeat: degraded event could not be recorded" and record.exc_info for record in caplog.records
-        )
+        assert not thread.coordination_lost
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
+        assert any(record.getMessage() == "run_heartbeat: degraded event invariant failed" and record.exc_info for record in caplog.records)
 
     def test_degraded_correct_worker_id_and_run_id(self) -> None:
         """Degraded event carries the thread's own worker_id and run_id."""
         repo = _StubRepo()
-        repo.side_effect = OperationalError("locked", None, None)
+        repo.side_effect = _busy_error()
 
         thread = _make_thread(repo, degraded_threshold=1)
         thread._step_beat()
@@ -604,7 +678,7 @@ class TestLifecycle:
 
         monkeypatch.setattr(heartbeat.logger, "debug", fail_log)
         repo = _StubRepo()
-        repo.side_effect = OperationalError("busy", None, None)
+        repo.side_effect = _busy_error()
         thread = RunHeartbeatThread(repo, member_token=_TOKEN)
         thread.start()
         thread.stop()
@@ -620,7 +694,7 @@ class TestLifecycle:
 
         failure = AuditIntegrityError("final beat corruption")
         repo = _StubRepo()
-        repo.side_effect = OperationalError("busy", None, None) if degraded else failure
+        repo.side_effect = _busy_error() if degraded else failure
         repo.degraded_exception = failure if degraded else None
         thread = RunHeartbeatThread(repo, member_token=_TOKEN, degraded_threshold=1)
         thread.start()

@@ -58,6 +58,21 @@ class TestSQLCipherCreateAndRead:
             LandscapeDB.from_url(f"sqlite:///{db_path}?{query}", passphrase="test-repeated-query")
         assert not db_path.exists()
 
+    def test_repeated_query_parameter_rejected_by_the_engine_boundary(self, tmp_path: Path) -> None:
+        """The @trust_boundary honesty test: the boundary itself refuses an ambiguous URL.
+
+        Calls ``_create_sqlcipher_engine`` directly through its ``url``
+        parameter — the decorated Tier-3 source — rather than through
+        ``from_url``, so the raising assertion is visible on the decorated
+        symbol and cannot be satisfied by an unrelated caller-side guard.
+        """
+        from elspeth.core.landscape.database import LandscapeDB
+
+        db_path = tmp_path / "boundary-ambiguous.db"
+        with pytest.raises(ValueError, match="SQLCipher URL query parameters must occur exactly once"):
+            LandscapeDB._create_sqlcipher_engine(f"sqlite:///{db_path}?timeout=1&timeout=2", "test-boundary-passphrase")
+        assert not db_path.exists()
+
     def test_sqlcipher_create_and_read(self, tmp_path: Path) -> None:
         from sqlalchemy import select
 

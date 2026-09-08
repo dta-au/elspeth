@@ -1141,14 +1141,17 @@ def _node_options_summary_error(value: object, path: str, *, plugin: str | None)
         assert pair is not None
         if "tier" in pair and pair["tier"] not in ("essential", "common", "advanced"):
             return f"{item_path}.tier is not a composer field tier"
-        if pair["key"] not in allowed:
+        # ``allowed`` is a mapping and ``seen`` a set, so the key must be
+        # proven hashable-by-type before either membership test: the pair
+        # parse above proves the KEY SET of the pair, not the value types.
+        if type(pair["key"]) is not str or pair["key"] not in allowed:
             return f"{item_path}.key is outside the node option summary allowlist"
         if pair["key"] in seen:
             return f"{item_path}.key duplicates another projected option"
         seen.add(pair["key"])
         if (error := _current_text_error(pair["value"], f"{item_path}.value", nonempty=True)) is not None:
             return error
-        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(cast(str, pair["key"])):
+        if len(cast(str, pair["value"])) > _node_option_summary_value_bound(pair["key"]):
             return f"{item_path}.value exceeds the bounded option summary length"
     return None
 
@@ -1696,6 +1699,26 @@ def _validate_string_mapping(value: object, path: str) -> str | None:
     return None
 
 
+@trust_boundary(
+    tier=3,
+    source=(
+        "guided confirm_wiring turn payload: LLM tool-call output or client-submitted wire content whose "
+        "top-level key set validate_payload has already proven, leaving every nested value of unknown shape"
+    ),
+    source_param="payload",
+    suppresses=("R5",),
+    invariant=(
+        "returns a path-rooted error string for any malformed nested value — including a semantic_contracts, "
+        "warnings, or blockers element that is not a Mapping — and None only when every projected component, "
+        "connection, contract, and confirmation flag is exactly shaped; never coerces, never raises. The "
+        "Mapping ABC element check is the parse, not a redundant guard: _current_sequence proves only the "
+        "container and returns that same sequence, and _public_json_error admits JSON scalars and sequences, "
+        "so an unchecked element would reach the item walk untyped. Every closed-vocabulary membership test "
+        "reachable from here is type-guarded before its frozenset/mapping lookup, so an authored list or "
+        "mapping is answered with that path's error string rather than raising TypeError: unhashable type"
+    ),
+    non_raising=True,
+)
 def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
     if (error := _canonical_uuid_error(payload["proposal_id"], "payload.proposal_id")) is not None:
         return error
@@ -1718,7 +1741,16 @@ def _validate_wire_payload(payload: Mapping[str, Any]) -> str | None:
         if nested_error is not None:
             return nested_error
         assert cardinality is not None
-        if cardinality["input"] not in cardinality_inputs or cardinality["output"] not in cardinality_outputs:
+        # The exact-key parse proves the KEYS only, never the value types, so
+        # both vocabulary tests are type-guarded first: a frozenset membership
+        # test on an authored list or mapping raises TypeError (unhashable),
+        # and this validator's contract is to return an error string.
+        if (
+            type(cardinality["input"]) is not str
+            or type(cardinality["output"]) is not str
+            or cardinality["input"] not in cardinality_inputs
+            or cardinality["output"] not in cardinality_outputs
+        ):
             return f"{path} is outside the closed cardinality vocabulary"
         count = cardinality["expected_output_count"]
         if count is not None and (nested_error := _canonical_integer_string_error(count, f"{path}.expected_output_count", positive=False)):
@@ -2001,7 +2033,10 @@ def _canonical_integer_string_error(value: object, path: str, *, positive: bool)
     non_raising=True,
 )
 def _validate_node_behavior(node_type: object, behavior: object, path: str) -> str | None:
-    if node_type not in _NODE_TYPES:
+    # Type-guarded before the frozenset test: ``node_type`` is an authored
+    # wire value, and a membership test on an unhashable list or mapping
+    # raises TypeError instead of returning this validator's error string.
+    if type(node_type) is not str or node_type not in _NODE_TYPES:
         return f"{path}.node_type is not in the closed node vocabulary"
     if not isinstance(behavior, Mapping):
         return f"{path}.behavior must be a mapping"
@@ -2146,9 +2181,11 @@ def _validate_node_behavior(node_type: object, behavior: object, path: str) -> s
     _, error = _validate_alias_sequence(behavior["branch_aliases"], kind="branch", path=f"{behavior_path}.branch_aliases", minimum=2)
     if error is not None:
         return error
-    if behavior["policy"] not in _COALESCE_POLICIES:
+    # Same type guard as the node_type vocabulary test above: the exact-key
+    # parse proves neither value's type, and an unhashable one would raise.
+    if type(behavior["policy"]) is not str or behavior["policy"] not in _COALESCE_POLICIES:
         return f"{behavior_path}.policy is outside the closed vocabulary"
-    if behavior["merge"] not in _COALESCE_MERGES:
+    if type(behavior["merge"]) is not str or behavior["merge"] not in _COALESCE_MERGES:
         return f"{behavior_path}.merge is outside the closed vocabulary"
     timeout_seconds = behavior["timeout_seconds"]
     if (
@@ -2214,10 +2251,10 @@ def _validate_proposal_endpoint(value: object, path: str, *, allow_discard: bool
         "returns a path-rooted error string for a non-mapping flow, a kind outside the closed _FLOW_KINDS "
         "vocabulary, or a key set that does not exactly match the one that kind declares, and None otherwise; "
         "never coerces, never raises. The discriminator read is ``value.get('kind')`` because the key set is "
-        "kind-dependent and therefore unproven at that point — an absent ``kind`` yields None, which is not a "
-        "member of _FLOW_KINDS and so returns the closed-vocabulary error instead of crashing this non-raising "
-        "validator. The Mapping ABC check is the parse: durable-load and replay flows arrive deep-frozen as "
-        "MappingProxyType"
+        "kind-dependent and therefore unproven at that point — an absent ``kind`` yields None, and a ``kind`` "
+        "of any non-string type is rejected by the type guard that precedes the _FLOW_KINDS test, so neither "
+        "reaches a frozenset membership test that would raise TypeError on an unhashable authored value. The "
+        "Mapping ABC check is the parse: durable-load and replay flows arrive deep-frozen as MappingProxyType"
     ),
     non_raising=True,
 )
@@ -2225,7 +2262,7 @@ def _validate_proposal_flow(value: object, path: str) -> str | None:
     if not isinstance(value, Mapping):
         return f"{path} must be a mapping"
     kind = value.get("kind")
-    if kind not in _FLOW_KINDS:
+    if type(kind) is not str or kind not in _FLOW_KINDS:
         return f"{path}.kind is outside the closed flow vocabulary"
     if kind in ("source_success", "node_success", "queue_continue", "coalesce_success", "row_union_success"):
         if (error := _exact_nested_keys(value, frozenset({"kind", "branch"}), path)) is not None:
