@@ -188,8 +188,8 @@ class BarrierJournalRepository:
 
         Returns the number of consumed rows terminalized.
         """
-        run_id = coordination_token.run_id
         require_coordination_token(coordination_token, verb="complete_barrier")
+        run_id = coordination_token.run_id
         if scope_row_id is not None and not require_exhaustive_release:
             raise AuditIntegrityError(
                 f"Scheduler barrier completion for run_id={run_id!r} barrier_key={barrier_key!r} received "
@@ -898,11 +898,11 @@ class BarrierJournalRepository:
         terminalization — not a new write path, the same one every in-claim
         disposition already uses.
         """
-        run_id = coordination_token.run_id
         require_coordination_token(
             coordination_token,
             verb="mark_blocked_barrier_terminal",
         )
+        run_id = coordination_token.run_id
         if not token_ids:
             raise AuditIntegrityError(
                 f"Scheduler barrier terminalization for run_id={run_id!r} barrier_key={barrier_key!r} "
