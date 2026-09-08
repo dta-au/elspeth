@@ -78,7 +78,10 @@ def _state(conn: Connection) -> _TransactionDeadlines | None:
 
 
 def _clear_deadlines(conn: Connection) -> None:
-    conn.info.pop(_STATE_KEY, None)
+    # Invalidation discards the underlying pool state. Accessing info while
+    # its transaction is still unwinding would attempt an illegal reconnect.
+    if not conn.invalidated:
+        conn.info.pop(_STATE_KEY, None)
 
 
 def rollback_failed_commit(conn: Connection) -> None:

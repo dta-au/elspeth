@@ -75,6 +75,8 @@ def discard_journal_transaction(conn: Connection) -> None:
     path, where initiating a second SQLAlchemy transaction lifecycle would
     interfere with the commit event currently being dispatched.
     """
+    if conn.invalidated:
+        return
     if _BUFFER_STACK_KEY in conn.info:
         stack: list[list[JournalRecord]] = conn.info[_BUFFER_STACK_KEY]
         stack.clear()

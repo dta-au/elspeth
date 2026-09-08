@@ -240,3 +240,22 @@ def test_journal_error_before_guard_rolls_back_and_clears_open_connection(engine
             conn.execute(_PROBE.insert().values(id=2))
     with engine.connect() as conn:
         assert list(conn.scalars(select(_PROBE.c.id))) == [2]
+
+
+@pytest.mark.parametrize("journal_enabled", [False, True])
+def test_body_invalidation_preserves_error_without_cleanup_reconnect(engine: Engine, tmp_path: Path, journal_enabled: bool) -> None:
+    if journal_enabled:
+        LandscapeJournal(str(tmp_path / "journal.jsonl"), fail_on_error=True).attach(engine)
+    connections: list[object] = []
+    event.listen(engine, "connect", lambda dbapi, record: connections.append(dbapi))
+    engine.dispose()
+    with engine.connect() as conn:
+        with pytest.raises(RuntimeError, match="original body failure"), conn.begin():
+            record_issued_deadline(conn, key=_KEY, expires_at=_NOW, window_seconds=10)
+            conn.invalidate()
+            raise RuntimeError("original body failure")
+        assert conn.invalidated
+        assert len(connections) == 1
+        with conn.begin():
+            assert not has_issued_deadline(conn, key=_KEY)
+    assert len(connections) == 2

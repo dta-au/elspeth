@@ -81,10 +81,13 @@ class _InspectorFake:
 class _CreateEngineFake:
     def __init__(self) -> None:
         self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+        # Construction is lazy: no PostgreSQL connection is opened, but the
+        # returned Engine supports the production event-listener contract.
+        self.engine = create_engine("postgresql+psycopg://db.example/audit")
 
-    def __call__(self, *args: object, **kwargs: object) -> object:
+    def __call__(self, *args: object, **kwargs: object) -> Engine:
         self.calls.append((args, kwargs))
-        return object()
+        return self.engine
 
     def assert_called_once_with(self, *args: object, **kwargs: object) -> None:
         assert self.calls == [(args, kwargs)]

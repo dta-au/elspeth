@@ -65,6 +65,7 @@ class _ConnectionDouble:
     """Small SQLAlchemy connection double for journal event handlers."""
 
     def __init__(self, buffer: list[Any] | None = None) -> None:
+        self.invalidated = False
         self.info: dict[str, Any] = {}
         if buffer is not None:
             self.info["landscape_journal_buffer_stack"] = [buffer]
