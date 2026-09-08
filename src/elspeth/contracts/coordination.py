@@ -46,14 +46,15 @@ __all__ = [
 
 # Run-level heartbeat cadence (design §A.3 :132: run_heartbeat_seconds = 15).
 # The slice-4 dedicated heartbeat thread sleeps this long between beats.
-# Must satisfy: window >= 4 x (beat + busy_timeout) = 4 x (15 + 5) = 80 s.
+# Nominal sizing: window >= 4 x (beat + busy_timeout) = 4 x (15 + 5) = 80 s.
 DEFAULT_RUN_HEARTBEAT_SECONDS: Final[float] = 15.0
 
-# Run-level liveness window (design §A.3): window >= 4 x (beat interval +
-# busy_timeout) = 4 x (15 s + 5 s) = 80 s at defaults. Sized against
-# worst-case write-lock occupancy, NOT the longest LLM call — the slice-4
-# heartbeat thread keeps an idle leader live; until then every fenced verb
-# extends the seat as a side effect (identity+epoch fence, never expiry).
+# Nominal run-level liveness window (design §A.3), sized as four times the sum
+# of the heartbeat interval and busy-timeout term. This is not a bound on a
+# whole transaction. ADR-047 starts the window at the final post-lock sample;
+# the remaining transaction tail consumes some of it before commit.
+# The dedicated heartbeat is independent of LLM-call duration. Leader-fenced
+# writes also renew the seat; ordinary member fences do not renew liveness.
 DEFAULT_RUN_LIVENESS_WINDOW_SECONDS: Final[float] = 80.0
 
 # Item-level stall budget (design §A.5 :140): a registry-LIVE worker holding
