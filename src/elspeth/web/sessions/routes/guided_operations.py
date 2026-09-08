@@ -642,9 +642,11 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         # ``GuidedOperationOutcome`` is a closed union of five exact,
         # unsubclassed frozen dataclasses this package owns, so the exact-type
         # form is the house idiom for the positive arms. The terminal guard
-        # below stays ``isinstance`` deliberately: ``type(x) is not C`` gives
-        # no negative-branch narrowing, and the ``GuidedOperationActive``
-        # reads after it need it.
+        # below is the nominal fail-closed check (ADR-032) over that closed
+        # union: anything that is not the one surviving member raises
+        # ``AuditIntegrityError`` rather than being polled. (Both ``isinstance``
+        # and ``type(x) is`` narrow the survivor under mypy; the choice is
+        # house form, not a typing constraint.)
         if type(outcome) is GuidedOperationClaimed or type(outcome) is GuidedOperationTakenOver:
             if session_lease is None:
                 raise AuditIntegrityError("Guided operation claim has no owning session lease")
