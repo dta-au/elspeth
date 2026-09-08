@@ -25,15 +25,18 @@ from sqlalchemy import insert, select
 from elspeth.contracts import NodeType
 from elspeth.contracts.coordination import CoordinationToken, WorkerMembershipToken
 from elspeth.contracts.payload_store import PayloadStore
+from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.data_flow_repository import DataFlowRepository
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.execution_repository import ExecutionRepository
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.item_fencing import fenced_item_transaction
 from elspeth.core.landscape.query_repository import QueryRepository
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.run_lifecycle_repository import RunLifecycleRepository
-from elspeth.core.landscape.schema import run_workers_table
+from elspeth.core.landscape.scheduler.work_items import item_from_mapping
+from elspeth.core.landscape.schema import run_workers_table, token_work_items_table
 from tests.fixtures.stores import MockPayloadStore
 
 # Shared default for schema_config across all factory-created nodes
@@ -463,6 +466,67 @@ def leader_coordination_token(factory: RecorderFactory, run_id: str) -> Coordina
     if leader is None:
         raise AssertionError(f"run {run_id!r} has no run_coordination seat; begin_run mints one — was the run created via raw SQL?")
     return CoordinationToken(run_id=run_id, worker_id=leader.leader_worker_id, leader_epoch=leader.leader_epoch)
+
+
+def leader_member_token(factory: RecorderFactory, run_id: str) -> WorkerMembershipToken:
+    """Read the current leader's actual worker registration."""
+    leader = leader_coordination_token(factory, run_id)
+    return member_token_for(factory._db.engine, worker_id=leader.worker_id, run_id=run_id)
+
+
+def claim_test_work_item(
+    factory: RecorderFactory,
+    *,
+    member_token: WorkerMembershipToken,
+    token_id: str,
+    node_id: str | None,
+    step_index: int = 0,
+    lease_seconds: int = 300,
+) -> TokenWorkItem:
+    """Claim existing test data through the scheduler for item-scoped audit writes.
+
+    New claims carry an empty audit-fixture payload, not a resumable runtime
+    row. Runtime execution tests must enqueue their real serialized payload.
+    An existing exact claim is verified without renewing or recovering it.
+    """
+    token = factory.query.get_token_for_run(member_token.run_id, token_id)
+    assert token is not None, f"token {token_id!r} does not belong to run {member_token.run_id!r}"
+    row = factory.query.get_row(token.row_id)
+    assert row is not None and row.run_id == member_token.run_id
+    assert row.ingest_sequence is not None
+    with factory._db.engine.connect() as conn:
+        existing = (
+            conn.execute(
+                select(token_work_items_table).where(
+                    token_work_items_table.c.run_id == member_token.run_id,
+                    token_work_items_table.c.token_id == token_id,
+                    token_work_items_table.c.node_id == node_id,
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if existing is None:
+        item = factory.scheduler.enqueue_ready_claimed(
+            member_token=member_token,
+            token_id=token_id,
+            row_id=token.row_id,
+            node_id=node_id,
+            step_index=step_index,
+            ingest_sequence=row.ingest_sequence,
+            row_payload_json="{}",
+            lease_owner=member_token.worker_id,
+            lease_seconds=lease_seconds,
+            lineage_path=token.lineage_path,
+        )
+    else:
+        item = item_from_mapping(existing)
+    assert item.status is TokenWorkStatus.LEASED, f"existing claim is {item.status}, not LEASED"
+    assert item.lease_owner == member_token.worker_id, "existing claim belongs to another worker"
+    assert item.step_index == step_index, "existing claim has a different step index"
+    with fenced_item_transaction(factory._db.engine, member_token=member_token, work_item=item, verb="claim_test_work_item"):
+        pass
+    return item
 
 
 def register_test_worker(
