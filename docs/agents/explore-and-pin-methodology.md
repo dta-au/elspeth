@@ -1,10 +1,19 @@
 # Explore-and-pin: closing a producer / consumer / teaching seam
 
-Status: method, executed twice. First on elspeth-68721c71d7 (planner
-repair-feedback teaching, merged into release/0.8.0 at 51435dbb5, 2026-09-02);
-second on elspeth-e405ad7cd2 (freeform tool-result envelope, 2026-09-04).
-Written so the next seam gets the same treatment without re-deriving the
-process. §17 sizes both runs and §19 carries what the second one cost.
+Status: method, executed three times, plus one sprint. First on
+elspeth-68721c71d7 (planner repair-feedback teaching, merged into release/0.8.0
+at 51435dbb5, 2026-09-02); second on elspeth-e405ad7cd2 (freeform tool-result
+envelope, merged at cbae1ef0c, 2026-09-04); third on elspeth-2cdf71397b
+(argument-side wire parity, cd45c3775); and as the fail-open-guard sprint over
+the web subsystem (landed 2026-09-05). The technique itself is now the
+`explore-and-pin` skill (`.claude/skills/explore-and-pin/SKILL.md`); this file
+is the long-form record. §17 sizes the runs and §19 carries what the second
+one cost.
+
+The lane, seat and merge-protocol language below is historical: those runs
+were executed as lanes under a metacontroller. The technique does not depend
+on any of it (John, 2026-09-08). Read "lane" as "the person or agent doing the
+work in its own worktree".
 
 ## 1. What the method is for
 
@@ -62,16 +71,16 @@ Seams closed or nominated so far:
 
 ## 3. Roles
 
-- **Agent (lane).** Runs every phase below in a dedicated worktree. Writes the
+- **Agent.** Runs every phase below in its own worktree. Writes the
   census, the matrix, the gate, the fixes, the review reports, and the
   evidence. Never ratifies a verdict, never signs anything, never holds the
   judge HMAC key.
 - **Operator.** Ratifies verdicts per row (phase 3), decides the merge
   window, fires any judge-signature bundle if the change moved allowlist
   state, and owns the live-trial go.
-- **Reviewers.** Three independent seats (adversarial, LLM, systems) spawned
-  by the lane for the go / no-go (phase 6). The originating reviewer signs off
-  every fix to their own finding.
+- **Reviewers.** Three independent charters (adversarial, LLM, systems) run
+  for the go / no-go (phase 6), as subagents or as separate passes. The
+  originating reviewer signs off every fix to their own finding.
 
 ## 4. Phase 0 — nominate and scope
 

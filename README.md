@@ -11,7 +11,8 @@
 > use-case-specific applications, but it is not yet ready for general production use.
 > Before relying on it, validate ELSPETH against your requirements and risk controls.
 > **AI Generated Code:** ELSPETH is an AI generated and reviewed rapid prototype that is
-> in active development. Limited user testing has been conducted with a small set of use cases only.
+> in active development with major systems subject to change. Limited user testing
+> has been conducted on a small set of use cases.
 
 Elspeth is a pipeline engine for building, validating, running, and auditing
 workflows where outputs need to be reviewed, explained, and reproduced. It
