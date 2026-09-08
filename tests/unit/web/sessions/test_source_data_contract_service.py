@@ -351,16 +351,13 @@ async def test_settlement_surfacer_mints_the_card_for_a_blocked_uploaded_source(
     (False, True),
     ids=("normal-settlement", "repair-backstop"),
 )
-async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
+async def test_settlement_surfacer_rejects_a_pending_legacy_v1_card(
     service,
     tmp_path: Path,
     only_missing_evidence: bool,
 ) -> None:
-    """A pre-upgrade pending card carries the old consequence copy.
-
-    Its graph demand is unchanged, but it must not be reused as a v2 review:
-    the old row is terminally abandoned and a current-v2 card is surfaced.
-    """
+    """A retired persisted contract fails closed without migrating audit rows."""
+    from elspeth.contracts.errors import AuditIntegrityError
     from elspeth.web.composer.service import surface_pending_interpretation_reviews_for_state
 
     csv_path = tmp_path / "upload.csv"
@@ -405,7 +402,7 @@ async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
             )
         )
 
-    with pytest.raises(InterpretationResolveError):
+    with pytest.raises(AuditIntegrityError):
         await service.resolve_interpretation_event(
             session_id=sid,
             event_id=legacy_event_id,
@@ -414,30 +411,29 @@ async def test_settlement_surfacer_supersedes_a_pending_legacy_v1_card(
             actor="alice",
         )
 
-    await surface_pending_interpretation_reviews_for_state(
-        state_from_record(state),
-        sessions_service=service,
-        session_id=str(sid),
-        session_operation_context=seed_live_compose_context(service._engine, sid),
-        current_state_id=str(state.id),
-        model_identifier="anthropic/test-model",
-        model_version="1",
-        provider="anthropic",
-        composer_skill_hash="0" * 64,
-        only_missing_evidence=only_missing_evidence,
-    )
+    with pytest.raises(AuditIntegrityError):
+        await surface_pending_interpretation_reviews_for_state(
+            state_from_record(state),
+            sessions_service=service,
+            session_id=str(sid),
+            session_operation_context=seed_live_compose_context(service._engine, sid),
+            current_state_id=str(state.id),
+            model_identifier="anthropic/test-model",
+            model_version="1",
+            provider="anthropic",
+            composer_skill_hash="0" * 64,
+            only_missing_evidence=only_missing_evidence,
+        )
 
     events = [
         event
         for event in await service.list_interpretation_events(sid, status="all")
         if event.kind is InterpretationKind.SOURCE_DATA_CONTRACT
     ]
-    assert sorted(event.choice for event in events) == [
-        InterpretationChoice.PENDING,
-        InterpretationChoice.SUPERSEDED,
+    assert [(event.id, event.choice, event.llm_draft) for event in events] == [
+        (legacy_event_id, InterpretationChoice.PENDING, legacy_draft)
     ]
-    pending = next(event for event in events if event.choice is InterpretationChoice.PENDING)
-    assert json.loads(pending.llm_draft or "")["contract_version"] == 2
+    assert (await service.get_current_state(sid)).id == state.id
 
 
 @pytest.mark.asyncio

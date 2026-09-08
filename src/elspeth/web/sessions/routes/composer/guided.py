@@ -4,6 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import uuid4
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.composer_planner_audit import ComposerPlannerAttempt
 from elspeth.contracts.errors import AuditIntegrityError, GuidedCustodyIntegrityError
 from elspeth.contracts.plugin_capabilities import PluginCapability
@@ -2253,40 +2254,32 @@ async def post_guided_convert(
                 session_operation_context=reserved.session_operation_context,
             )
             return _response_from_record(state_record_out)
-    except Exception as exc:
-        failure_code: GuidedOperationFailureCode = (
-            "stale_conflict"
-            if isinstance(exc, GuidedOperationSettlementConflictError)
-            else "integrity_error"
-            if isinstance(exc, AuditIntegrityError)
-            else "operation_failed"
-        )
-        if failure_code != "stale_conflict":
-            # Widened with post_guided_start, and for the same reason: an
-            # unclassified first-party bug used to settle as
-            # ``operation_failed`` with its traceback discarded and no
-            # server-side record of where it broke. ``stale_conflict`` stays
-            # out as an expected concurrency outcome.
-            slog.error(
-                "guided.operation_terminal_failure",
-                session_id=str(session_id),
-                user_id=user.user_id,
-                exc_class=type(exc).__name__,
-                failure_code=failure_code,
-                site="post_guided_convert",
-                frames=_safe_frame_strings(exc),
-                # See the post_guided_start site (R2-F16b): correlates this log
-                # line to the response's X-Request-ID; lenient read so a missing
-                # middleware cannot break the error path.
-                request_id=_failure_log_request_id(request),
-            )
+    except GuidedOperationSettlementConflictError:
         failed = await service.fail_guided_operation(
             reserved.fence,
-            failure_code=failure_code,
+            failure_code="stale_conflict",
             actor="composer_route",
             session_operation_context=reserved.session_operation_context,
         )
         raise_guided_operation_failure(failed)
+    except Exception as exc:
+        failure_code: GuidedOperationFailureCode = (
+            "integrity_error" if isinstance(exc, contract_errors.TIER_1_ERRORS) else "operation_failed"
+        )
+        try:
+            await service.fail_guided_operation(
+                reserved.fence,
+                failure_code=failure_code,
+                actor="composer_route",
+                session_operation_context=reserved.session_operation_context,
+            )
+        except BaseException as settlement_error:
+            if isinstance(exc, contract_errors.TIER_1_ERRORS):
+                raise exc from settlement_error
+            raise
+        # Settlement makes retries deterministic; it does not authorize
+        # converting the original framework failure into an HTTP exception.
+        raise
     finally:
         await lease_guard.finish_active_exception()
 

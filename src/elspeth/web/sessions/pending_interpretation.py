@@ -25,7 +25,6 @@ from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.composer.source_demand import (
     build_source_data_contract_draft,
-    parse_legacy_source_data_contract_fields,
     parse_source_data_contract_accepted_fields,
     sample_header_for_source,
     source_data_contract_artifact_hash,
@@ -1477,11 +1476,6 @@ def _resolve_source_data_contract(
     quarantined during source validation never reach that boundary check.
     """
     reviewed_fields = parse_source_data_contract_accepted_fields(llm_draft)
-    if reviewed_fields is None:
-        raise InterpretationPlaceholderConsumedError(
-            "resolve_interpretation_event: source_data_contract card uses a retired or malformed contract version; "
-            "reload the session and acknowledge the current review"
-        )
     source_name = source_name_from_component_id(affected_node_id)
     if source_name is None:
         raise InterpretationNodeMissingError(
@@ -1731,6 +1725,15 @@ class _SessionPendingInterpretationPlanner:
     """Canonical reconciliation planner; it can request validation but cannot perform DML."""
 
     @staticmethod
+    @trust_boundary(
+        tier=3,
+        source="composer-authored options retained in the pending interpretation state snapshot",
+        source_param="snapshot",
+        suppresses=("R1", "R5"),
+        invariant="Malformed non-null interpretation requirements raise InterpretationPlaceholderConsumedError before a review decision is produced.",
+        test_ref="tests/unit/web/sessions/test_interpretation_trust_boundaries.py::test_pending_interpretation_plan_rejects_malformed_requirements",
+        test_fingerprint="89f255fca82efd59b4ea5c646c231fd468fe88873e8e094b0f34944d645a33ac",
+    )
     def plan(
         command: SessionPendingInterpretationCommand,
         snapshot: SessionPendingInterpretationSnapshot,
@@ -1979,29 +1982,17 @@ class _SessionPendingInterpretationPlanner:
                 pending_draft = site.event.llm_draft
                 if type(pending_draft) is not str:
                     raise AuditIntegrityError("create_pending_interpretation_event: pending source_data_contract review has no draft")
-                current_fields = parse_source_data_contract_accepted_fields(pending_draft)
-                legacy_fields = parse_legacy_source_data_contract_fields(pending_draft)
-                if current_fields is None and legacy_fields is None:
-                    raise AuditIntegrityError(
-                        "create_pending_interpretation_event: pending source_data_contract review has a malformed draft"
-                    )
+                pending_fields = parse_source_data_contract_accepted_fields(pending_draft)
                 _pending_source_name, pending_demand = _source_data_contract_demand_from_state_record(
                     site.surfacing_state,
                     affected_node_id=affected_node_id,
                     context="create_pending_interpretation_event",
                 )
-                pending_fields = current_fields if current_fields is not None else legacy_fields
                 if pending_fields != pending_demand:
                     raise AuditIntegrityError(
                         "create_pending_interpretation_event: pending source_data_contract review draft disagrees "
                         "with its immutable surfacing-state demand"
                     )
-                if legacy_fields is not None:
-                    # V1 showed a materially different consequence. Preserve it
-                    # as superseded audit history and mint a v2 card; field
-                    # equality cannot reuse old copy as current user authority.
-                    rows_to_supersede.append(site.event.id)
-                    continue
             if not snapshot.review_disabled and matching_event_id is None and pending_identity == current_identity:
                 matching_event_id = site.event.id
             else:

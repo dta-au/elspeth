@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from elspeth.contracts import errors as contract_errors
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.contracts.trust_boundary import observation_boundary
@@ -12,7 +13,7 @@ from elspeth.web.composer.required_controls import (
 )
 from elspeth.web.composer.tools import is_approval_required_blob_store_only_mutation_tool
 from elspeth.web.coordination.lifecycle import SessionOperationLease
-from elspeth.web.sessions.protocol import StaleComposeStateError
+from elspeth.web.sessions.protocol import ProposalStateConflictError, StaleComposeStateError
 
 from .._helpers import (
     _DATA_ERROR_KEY,
@@ -110,6 +111,8 @@ async def _close_proposal_lease_after_commit(
     cleanup_error, cleanup_cancelled = await _drain_proposal_lease_close(lease)
     if cleanup_error is None:
         return cleanup_cancelled
+    if isinstance(cleanup_error, contract_errors.TIER_1_ERRORS):
+        raise cleanup_error
     if isinstance(cleanup_error, Exception):
         _log_last_resort_diagnostic(
             slog.error,
@@ -498,13 +501,13 @@ async def accept_composition_proposal(
                     # Accept/reject HTTP handlers, but non-route callers can
                     # still transition the proposal between our load above and
                     # this defensive auto-reject write. ``reject_composition_proposal``
-                    # raises ``ValueError`` for exactly that terminal-state case.
+                    # raises ``ProposalStateConflictError`` for that terminal-state case.
                     # When that fires, the desired end state — the proposal is no
                     # longer pending — is already satisfied, and the winning
                     # transition recorded its own lifecycle event.
                     # Fall through to the 422 below, which surfaces the real
                     # validation failure to the operator. We suppress ONLY
-                    # ``ValueError`` (the benign status-race signal); we deliberately
+                    # ``ProposalStateConflictError`` (the benign status-race signal); we deliberately
                     # do NOT suppress ``KeyError`` (proposal row missing): the row
                     # was loaded successfully above and proposals are never
                     # hard-deleted, so a missing row is corruption of our own data
@@ -520,7 +523,7 @@ async def accept_composition_proposal(
                         )
                         cancellation_deferred = cancellation_deferred or was_cancelled
                         durable_transition = True
-                    except ValueError:
+                    except ProposalStateConflictError:
                         pass
                     if cancellation_deferred:
                         raise asyncio.CancelledError

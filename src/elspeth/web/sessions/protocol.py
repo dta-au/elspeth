@@ -3031,6 +3031,10 @@ class RunAlreadyActiveError(Exception):
         super().__init__(f"Session {session_id} already has an active run")
 
 
+class ProposalStateConflictError(ValueError):
+    """An ordinary proposal is no longer pending at the rejection CAS."""
+
+
 class StaleComposeStateError(RuntimeError):
     """Compose result was based on a no-longer-current composition state.
 

@@ -262,6 +262,7 @@ from elspeth.web.sessions.protocol import (
     PreparedInterpretationEventDraft,
     ProposalEventRecord,
     ProposalLifecycleStatus,
+    ProposalStateConflictError,
     RunDiagnosticsAuditAuthority,
     RunDiagnosticsAuditDraft,
     RunDiagnosticsAuditMutationAuthority,
@@ -8196,7 +8197,7 @@ class SessionServiceImpl:
                 if row is None:
                     raise KeyError(pid)
                 if row.status != "pending":
-                    raise ValueError(f"Proposal {pid} must be pending to reject; got {row.status!r}")
+                    raise ProposalStateConflictError(f"Proposal {pid} must be pending to reject; got {row.status!r}")
 
                 transaction.composer.reject_pending_proposal(
                     proposal_id=pid,
