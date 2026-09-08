@@ -7402,7 +7402,7 @@ def _deadline_registration_covers_success(write: ast.Call, registration: ast.Cal
         if current_block is None:
             break
         predecessors = [*current_block[: current_block.index(current)], *predecessors]
-        parent = getattr(current, "_landscape_parent", None)
+        parent = next(_ancestors(current), None)
         if isinstance(parent, ast.If):
             parent_block = _admission_block(parent)
             if parent_block is None:
@@ -7500,7 +7500,7 @@ def _deadline_lock_predecessors(use, function):
         if block is None:
             return ()
         levels.append(tuple(block[: block.index(current)]))
-        parent = getattr(current, "_landscape_parent", None)
+        parent = next(_ancestors(current), None)
         if parent is function:
             break
         current = _admission_statement(parent)
@@ -7518,22 +7518,76 @@ def _deadline_lock_builtin(node, name, resolver, use):
     )
 
 
+def _deadline_source_line(node: ast.AST) -> int | None:
+    """Require an actual source position before proving assignment order."""
+    if not isinstance(node, (ast.expr, ast.stmt)):
+        return None
+    try:
+        line = node.lineno
+    except AttributeError:
+        return None
+    return line if type(line) is int and line > 0 else None
+
+
+@pytest.mark.parametrize(
+    "fault", ["unsupported_use", "missing_use", "missing_binding", "missing_later_rebind", "zero_line", "boolean_line"]
+)
+def test_deadline_alias_order_requires_complete_source_locations(fault):
+    unit = _parse_source(
+        "src/elspeth/located_alias.py",
+        "def inspect(value):\n    alias = value\n    observed = consume(alias)\n    alias += other\n    return observed\n",
+    )
+    resolver = _resolver_for_unit(unit)
+    owner = unit.tree.body[0]
+    assert isinstance(owner, ast.FunctionDef)
+    binding, observation, later_rebind = owner.body[:3]
+    assert isinstance(binding, ast.Assign) and isinstance(binding.value, ast.Name)
+    assert isinstance(observation, ast.Assign) and isinstance(observation.value, ast.Call)
+    assert isinstance(later_rebind, ast.AugAssign)
+    use = observation.value.args[0]
+    assert isinstance(use, ast.Name)
+    assert _deadline_lock_unalias(use, resolver, use, {}) is not None
+    if fault == "unsupported_use":
+        assert _deadline_lock_unalias(use, resolver, unit.tree, {}) is None
+        return
+    if fault == "missing_use":
+        del use.lineno
+    elif fault == "missing_binding":
+        del binding.value.lineno
+    elif fault == "missing_later_rebind":
+        del later_rebind.lineno
+    elif fault == "zero_line":
+        use.lineno = 0
+    elif fault == "boolean_line":
+        use.lineno = True
+    assert _deadline_lock_unalias(use, resolver, use, {}) is None
+
+
 def _deadline_lock_unalias(node, resolver, use, parameters, seen=frozenset()):
     """Return an expression together with its original lexical use site."""
     identity = (id(node), id(use))
     if identity in seen:
         return None
     seen = seen | {identity}
+    use_line = _deadline_source_line(use)
+    if use_line is None:
+        return None
     if not isinstance(node, ast.Name):
         return node, resolver, use
     owner = _owner_function(use)
     value = resolver.binding(node.id, use)
+    value_line = None if value is None else _deadline_source_line(value)
+    if value is not None and value_line is None:
+        return None
     for part in _walk_same_scope(owner) if owner is not None else ():
         if not isinstance(part, (ast.AugAssign, ast.NamedExpr, ast.Delete)):
             continue
-        if getattr(part, "lineno", 0) >= getattr(use, "lineno", 0):
+        part_line = _deadline_source_line(part)
+        if part_line is None:
+            return None
+        if part_line >= use_line:
             continue
-        if value is not None and getattr(part, "lineno", 0) < getattr(value, "lineno", 0):
+        if value_line is not None and part_line < value_line:
             continue
         if any(
             isinstance(target, ast.Name) and target.id == node.id and isinstance(target.ctx, (ast.Store, ast.Del))
@@ -7552,9 +7606,12 @@ def _deadline_lock_unalias(node, resolver, use, parameters, seen=frozenset()):
     # mistaken for the original parameter/with-bound connection.
     for part in _walk_same_scope(owner) if owner is not None else ():
         if isinstance(part, ast.Name) and part.id == node.id and isinstance(part.ctx, (ast.Store, ast.Del)):
-            if getattr(part, "lineno", 0) >= getattr(use, "lineno", 0):
+            part_line = _deadline_source_line(part)
+            if part_line is None:
+                return None
+            if part_line >= use_line:
                 continue
-            parent = getattr(part, "_landscape_parent", None)
+            parent = next(_ancestors(part), None)
             if isinstance(parent, ast.withitem) and parent.optional_vars is part:
                 continue
             return None
@@ -7650,7 +7707,7 @@ def _deadline_lock_term(node, resolver, use, parameters, seen=frozenset()):
     if isinstance(node, ast.Call):
         # A row materialized once by an assignment has a distinct evaluation
         # identity; separate query calls never collapse just because SQL matches.
-        parent = getattr(node, "_landscape_parent", None)
+        parent = next(_ancestors(node), None)
         if (
             isinstance(parent, (ast.Assign, ast.AnnAssign))
             and parent.value is node
@@ -8243,7 +8300,7 @@ def _deadline_dependency_mutation_violations_for_units(units: tuple[SourceUnit, 
             if not isinstance(node, ast.Call):
                 # Container/conditional laundering makes the receiver's later
                 # identity opaque. Current reviewed external callers need none.
-                parent = getattr(node, "_landscape_parent", None)
+                parent = next(_ancestors(node), None)
                 exception_types = isinstance(parent, ast.ExceptHandler) and parent.type is node
                 if not reviewed_module and not exception_types and isinstance(node, (ast.Dict, ast.List, ast.Set, ast.Tuple, ast.IfExp)):
                     pending = list(ast.iter_child_nodes(node))
@@ -8786,7 +8843,7 @@ def _deadline_finalization_caller_violations_for_units(units: tuple[SourceUnit, 
         for node in ast.walk(unit.tree):
             if not isinstance(node, ast.Attribute) or node.attr not in protected:
                 continue
-            parent = getattr(node, "_landscape_parent", None)
+            parent = next(_ancestors(node), None)
             # Closed direct-call set: extraction into an alias, reflection,
             # or a forwarding helper is an unproved additional authority edge.
             if not isinstance(parent, ast.Call) or parent.func is not node:
