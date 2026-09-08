@@ -14,7 +14,7 @@ at every authority sink that consumes it.
 
 Contract (rulings 9425/9444 on elspeth-0ff11aa42e):
 
-* one ``CURRENT_TIMESTAMP`` read per call, after the caller's locks —
+* one ``CURRENT_TIMESTAMP`` read per call —
   PostgreSQL returns the transaction-start instant (``transaction_timestamp``
   semantics: every read inside one transaction is the same instant and the
   in-SQL fence deadline is written from that same instant), SQLite returns
@@ -27,6 +27,12 @@ Contract (rulings 9425/9444 on elspeth-0ff11aa42e):
 * nothing here imports ``elspeth.web``: the Sessions clock
   (``clock_timestamp()``) is a distinct authority with the same contract, and
   the two domains never cross.
+
+PostgreSQL call placement does not refresh transaction time: even a read
+after acquiring a lock returns the instant at which the transaction started.
+A deadline derived from that instant loses residual life to lock waits and
+the remaining transaction body. ADR-047's 2026-09-08 erratum records this
+limitation (elspeth-8f97b3403e); the selected clock semantics are unchanged.
 
 SQLite's ``CURRENT_TIMESTAMP`` has whole-second resolution and no fraction.
 The in-SQL fence deadline (``run_coordination_repository``) is therefore
@@ -45,12 +51,12 @@ from elspeth.contracts.errors import AuditIntegrityError
 
 
 def read_landscape_transaction_time(conn: Connection) -> datetime:
-    """Return the Landscape database's current time as an aware UTC ``datetime``.
+    """Return the dialect's Landscape timestamp as an aware UTC ``datetime``.
 
-    Read once per write transaction, after the locks that make the decision
-    exclusive, and bind the returned value into every predicate and column of
-    that decision; the in-SQL fence expression is the only other place
-    database time appears.
+    Bind the returned value into the predicates and columns of the decision.
+    On PostgreSQL it is transaction-start time, irrespective of lock order;
+    it does not guarantee fresh remaining lease life at commit. The in-SQL
+    fence expression is the other place database time appears.
     """
     dialect = conn.dialect.name
     if dialect == "postgresql":
