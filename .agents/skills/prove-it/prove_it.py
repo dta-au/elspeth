@@ -50,10 +50,11 @@ REVIEW_NONE = "none"
 KINDS = ("test", "commit", "mutation", "file", "exit0", "nonzero")
 MAX_BLOCKS = 5  # the Stop hook releases a session after this many blocks so it cannot loop forever
 SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
-# RED is a FAILED ASSERTION, visible in the output. Exit 1 alone proves nothing: pytest, unittest and a plain script all
-# report an uncaught exception inside a test as exit 1 too. Keyed on the property "an assertion failed" (pytest's
-# `assert` / `Failed:` lines, unittest's `FAIL:`, the AssertionError itself), never on a list of crash exception names.
-RED_RE = re.compile(r"AssertionError|^E\s+assert\b|- assert\b|\bFailed: |^FAIL: ", re.MULTILINE)
+# RED is decided by the RUNNER, never by exit codes or output text (which the measured test controls): pytest is
+# launched with prove_it_red_plugin, which records each failed test's exception type. Under any other runner the
+# failure kind is not measurable and a mutation stays unproven for that stated reason.
+PLUGIN_PATH = Path(__file__).resolve().parent / "prove_it_red_plugin.py"
+PYTEST_RE = re.compile(r"\bpytest\b")
 
 
 def now() -> datetime:
@@ -251,6 +252,7 @@ class AssertionResult:
     proven: bool
     evidence: str
     where: str
+    digests: dict[str, str] = field(default_factory=dict)  # sha256 per path an in-place mutation measured; review refuses on drift
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -293,19 +295,43 @@ def _fresh_worktree(repo: Path, ref: str) -> Iterator[Path]:
         shutil.rmtree(root, ignore_errors=True)
 
 
-def _run(command: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
+def _run(command: str, cwd: Path, timeout: int, *, red_report: Path | None = None) -> tuple[int | None, str]:
+    """Run a command in ``cwd``. With ``red_report`` and a pytest command, inject the RED plugin so the runner records
+    each failure's kind to that file."""
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{cwd / 'src'}:{cwd / 'elspeth-lints' / 'src'}"
     # Python trusts a .pyc by source mtime (1 s granularity) + size: the pre-revert run would compile the FIX, and a
     # same-size revert in the same second would then execute the fix's bytecode and read as "did not go red".
     env["PYTHONDONTWRITEBYTECODE"] = "1"
+    argv = shlex.split(command)
+    if red_report is not None and PYTEST_RE.search(command):
+        env["PYTHONPATH"] += f":{PLUGIN_PATH.parent}"
+        env["PROVE_IT_RED_REPORT"] = str(red_report)
+        argv += ["-p", PLUGIN_PATH.stem]
     try:
-        proc = subprocess.run(shlex.split(command), cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return None, f"command not found: {exc}"
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
     return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
+
+
+def sha256_of(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _read_red_report(path: Path) -> list[dict[str, object]]:
+    """The plugin's records for one run: one dict per test that failed in its call phase. Empty if none did."""
+    if not path.is_file():
+        return []
+    records: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            loaded = json.loads(line)
+            if type(loaded) is dict:
+                records.append(loaded)
+    return records
 
 
 def _uncommitted(repo: Path, paths: list[str] | None = None) -> list[str]:
@@ -403,26 +429,35 @@ def _restore_in_place(repo: Path, snapshot: dict[str, bytes | None]) -> bool:
     return all(((repo / rel).read_bytes() if (repo / rel).exists() else None) == content for rel, content in snapshot.items())
 
 
-def _interpret_red(rc: int | None, tail: str, note: str) -> tuple[bool, str]:
-    """RED means the test FAILED AN ASSERTION: exit 1 AND a failed assertion visible in the output.
+def _interpret_red(rc: int | None, note: str, *, pytest_command: bool, failures: list[dict[str, object]]) -> tuple[bool, str]:
+    """RED means pytest itself recorded a FAILED ASSERTION in the reverted run.
 
-    0 = not red; any other exit = crashed; exit 1 without an assertion in the output = an uncaught exception that the
-    runner reported as a failure (pytest, unittest and plain scripts all do), which never ran the assertion either.
+    0 = not red. Under a non-pytest runner the failure kind is not measurable, so the mutation is unproven for that
+    reason. A pytest run whose recorded failures are all non-assertion exceptions (or that never reached a call
+    phase: a collection error) is a crash, never RED.
     """
     if rc is None:
-        return False, f"{note}; test could not run ({tail})"
+        return False, f"{note}; test could not run"
     if rc == 0:
         return False, f"{note}; test did not go red (exit 0): the test does not depend on the fix"
-    if rc != 1:
-        return False, f"{note}; test crashed rather than failed (exit {rc}): RED means a failed assertion (exit 1)"
-    if not RED_RE.search(tail):
+    if not pytest_command:
         return (
             False,
-            f"{note}; test failed with exit 1 but no failed assertion in its output (an uncaught exception is a crash, not RED): "
-            "assert what the fix adds exists (importlib.util.find_spec / hasattr) so the assertion is what fails; "
-            f"tail: {tail.strip()[-300:]}",
+            f"{note}; test went from exit 0 to exit {rc}, but whether it failed at an ASSERTION or crashed is not measurable "
+            "outside pytest (no structural report from the runner): run it under pytest",
         )
-    return True, f"{note}; test went red (exit 1, failed assertion)"
+    asserted = [r for r in failures if r.get("assertion")]
+    if not asserted:
+        kinds = sorted({str(r.get("type")) for r in failures}) or ["no test reached its call phase"]
+        outside = sorted({str(r.get("raised_in")) for r in failures if r.get("type") == "AssertionError" and r.get("raised_in")})
+        detail = f" (AssertionError raised outside the test files: {', '.join(outside)})" if outside else ""
+        return (
+            False,
+            f"{note}; test crashed rather than failed (exit {rc}): pytest recorded {', '.join(kinds)}{detail} and no failed "
+            "assertion of its own — assert what the fix adds exists (importlib.util.find_spec / hasattr) so the assertion is what fails",
+        )
+    where = ", ".join(str(r.get("nodeid")) for r in asserted[:3])
+    return True, f"{note}; test went red (exit {rc}): pytest recorded a failed assertion in {where}"
 
 
 def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) -> AssertionResult:
@@ -441,28 +476,38 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
                 "would write it THROUGH the link into another file; name the real file instead"
             )
             return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
-        pre_rc, pre_tail = _run(command, repo, timeout)
-        if pre_rc != 0:
-            evidence = f"command does not pass on the unmodified working directory (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
-            return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
-        snapshot = _revert_in_place(repo, paths)
+        report_dir = Path(tempfile.mkdtemp(prefix="prove-it-red-"))
         try:
-            rc, tail = _run(command, repo, timeout)
+            pre_rc, pre_tail = _run(command, repo, timeout, red_report=report_dir / "pre.jsonl")
+            if pre_rc != 0:
+                evidence = f"command does not pass on the unmodified working directory (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
+                return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
+            snapshot = _revert_in_place(repo, paths)
+            try:
+                rc, _ = _run(command, repo, timeout, red_report=report_dir / "red.jsonl")
+            finally:
+                restored = _restore_in_place(repo, snapshot)
+            failures = _read_red_report(report_dir / "red.jsonl")
         finally:
-            restored = _restore_in_place(repo, snapshot)
-        note = f"passes before the revert (exit 0); reverted {paths} to HEAD in place from a byte snapshot; restored " + (
-            "byte-identical" if restored else "WITH DIFFERENCES — inspect"
+            shutil.rmtree(report_dir, ignore_errors=True)
+        digests = {rel: sha256_of(repo / rel) for rel in paths if (repo / rel).is_file()}
+        note = (
+            f"passes before the revert (exit 0); reverted {paths} to HEAD in place from a byte snapshot; restored "
+            + ("byte-identical" if restored else "WITH DIFFERENCES — inspect")
+            + " (sha256 "
+            + ", ".join(f"{rel}={digest[:12]}" for rel, digest in digests.items())
+            + ")"
         )
-        proven, evidence = _interpret_red(rc, tail, note)
-        return AssertionResult(aid, "mutation", text, proven and restored, evidence, str(repo))
+        proven, evidence = _interpret_red(rc, note, pytest_command=bool(PYTEST_RE.search(command)), failures=failures)
+        return AssertionResult(aid, "mutation", text, proven and restored, evidence, str(repo), digests)
     if not base:
         evidence = "the fix is committed: name the pre-fix base with '@ <base>' so it can be reverted in a fresh worktree"
         return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
     base_sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
     if base_sha.returncode != 0:
         return AssertionResult(aid, "mutation", text, False, f"base {base} does not resolve", str(repo))
-    with _fresh_worktree(repo, tip) as tree:
-        pre_rc, pre_tail = _run(command, tree, timeout)
+    with _fresh_worktree(repo, tip) as tree, tempfile.TemporaryDirectory(prefix="prove-it-red-") as report_dir:
+        pre_rc, pre_tail = _run(command, tree, timeout, red_report=Path(report_dir) / "pre.jsonl")
         if pre_rc != 0:
             evidence = f"command does not pass on the unmodified tree at {tip[:12]} (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
             return AssertionResult(aid, "mutation", text, False, evidence, str(tree))
@@ -482,11 +527,12 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
                 shutil.rmtree(target)
             elif target.exists():
                 target.unlink()
-        rc, tail = _run(command, tree, timeout)
+        rc, _ = _run(command, tree, timeout, red_report=Path(report_dir) / "red.jsonl")
+        failures = _read_red_report(Path(report_dir) / "red.jsonl")
         note = f"passes at {tip[:12]} before the revert (exit 0); in a fresh worktree with {present} restored from {base}" + (
             f" and {absent} removed (absent at {base})" if absent else ""
         )
-        proven, evidence = _interpret_red(rc, tail, note)
+        proven, evidence = _interpret_red(rc, note, pytest_command=bool(PYTEST_RE.search(command)), failures=failures)
         return AssertionResult(aid, "mutation", text, proven, evidence, str(tree))
 
 
@@ -521,6 +567,16 @@ def record_review(repo: Path, claim_id: str, *, verdict: str, findings: str) -> 
     if not record.last_results:
         raise ValueError(f"claim {claim_id} has not been verified; run verify first")
     results = [AssertionResult(**r) for r in record.last_results]
+    drifted = sorted(
+        f"{rel} ({r.id})"
+        for r in results
+        for rel, digest in r.digests.items()
+        if not (repo / rel).is_file() or sha256_of(repo / rel) != digest
+    )
+    if drifted:
+        raise ValueError(
+            f"measured bytes changed since verify: {', '.join(drifted)} — re-run `verify --claim {claim_id}` before recording a review"
+        )
     return _write_verdict(repo, record, results, review=verdict, findings=findings)
 
 
@@ -627,6 +683,14 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 
 def _cmd_review(args: argparse.Namespace) -> int:
+    try:
+        return _cmd_review_inner(args)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, indent=2))
+        return 1
+
+
+def _cmd_review_inner(args: argparse.Namespace) -> int:
     findings = Path(args.findings).read_text(encoding="utf-8") if args.findings and Path(args.findings).is_file() else (args.findings or "")
     verdict = record_review(Path(args.repo), args.claim, verdict=args.verdict, findings=findings)
     print(json.dumps(verdict.as_dict(), indent=2))

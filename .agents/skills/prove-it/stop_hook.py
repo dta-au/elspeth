@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
-"""Claude Code Stop hook: refuse to let a session that did work stop without a prove-it PASS.
+"""Claude Code Stop hook: refuse to let a session that did work stop without a prove-it PASS or a withdrawal.
 
 Reads the hook payload on stdin (session_id, transcript_path, cwd), scans the session's transcript — and the
-transcripts of every subagent it spawned, under ``<transcript stem>/subagents/agent-*.jsonl`` — for WORK SIGNALS,
-and compares the newest one against the session's newest prove-it release: a ``PASS`` verdict or an explicit,
-reasoned withdrawal. Work newer than the last release blocks the stop with a reason that names the exact next
-command. Other sessions' claims are invisible.
+transcripts of every subagent it spawned, under ``<transcript stem>/subagents/agent-*.jsonl``, counted once that
+subagent's work is handed back (the parent's tool_result for a foreground Agent call, or a teammate's idle
+notification) — for WORK SIGNALS,
+and compares the newest one against the session's newest release: a ``PASS`` verdict or an explicit, reasoned
+withdrawal. Work newer than the last release blocks the stop with a reason that names the exact next command.
+Other sessions' claims are invisible.
 
-A work signal is anything that changes files or history: the editing tools; ``Workflow``; an MCP tool whose name
-carries a writing verb; a Bash command that commits, merges, pushes, resets or otherwise rewrites git state, copies,
-moves, removes or rewrites files, redirects output to a path, or runs inline Python that writes. Redirects to
-``/dev/null``, ``/tmp``, a scratchpad, a ``.log`` file, or a shell variable are treated as logs, not work — that
-narrow set is the hook's deliberate fail-open, listed here so it can be judged.
+The hook reads NO prose. It gates on one measurable fact — a work signal newer than the last release — whatever the
+final message says; a session that is waiting, or reporting honestly that it is not done, releases itself with
+``prove_it.py withdraw --reason '<why>'``. (A prose classifier was tried and measured on 1507 real sessions:
+58 % false positives, 6 % false negatives. The operator ruled it out on 2026-09-09.)
 
-The gate is on what the user is about to be told: the final assistant text is split into sentences and enforcement
-happens only when some sentence claims completion ("done", "fixed", "green", "merged", ...) WITHOUT a negation in
-that same sentence. A later sentence cannot take back an earlier claim; an honest "not yet green" is not a claim.
+A work signal is anything that changes files or history: the editing tools on a path inside a worktree of this
+repo; ``Workflow``; an MCP tool whose verb is NOT in a small read-only allowlist; a Bash command that commits,
+merges, pushes, pulls, resets or otherwise rewrites git state (or uses a git alias), copies, moves, removes or
+rewrites files, runs a formatter or fixer, a package manager, a filigree CLI verb outside its read set, ``elspeth
+run --execute`` or a canonical script with ``--execute``, redirects output to a path, or runs inline Python that
+writes or shells out. Redirects to ``/dev/null``, ``/tmp``, a ``scratchpad`` directory, or a shell variable are
+treated as logs, not work — that narrow set is the hook's deliberate fail-open, listed here so it can be judged.
+The Bash side is a heuristic and will always have gaps; the MCP and filigree sides are allowlists because their
+read sets are small and stable.
 
-After MAX_BLOCKS consecutive blocks for the same work the hook releases the session with a loud systemMessage — a
-gate that can loop forever is a denial of service, not a control — and says plainly that the work is NOT verified.
+After MAX_BLOCKS consecutive blocks since the same release the hook releases the session with a loud systemMessage —
+a gate that can loop forever is a denial of service, not a control — and says plainly that the work is NOT verified.
 
 Emits JSON on stdout: ``{"decision": "block", "reason": ...}`` or ``{}``/``{"systemMessage": ...}``.
 Never exits non-zero on its own errors: a broken hook must not trap every session.
@@ -37,48 +44,48 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 WORK_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit", "Workflow"}  # Workflow: orchestration whose agents edit
-MCP_WRITE_VERBS = {
-    "create", "update", "add", "remove", "delete", "set", "write", "stage", "annotate", "promote", "dismiss", "close",
-    "reopen", "start", "claim", "release", "register", "import", "ingest", "trigger", "patch", "upsert", "splice",
-    "save", "link", "unlink", "resolve", "supersede", "carry", "rekey", "restart", "reload", "undo", "archive",
-    "compact", "checkpoint", "move", "retarget", "enable", "disable", "cancel", "clear", "batch",
+MCP_READ_TOOLS = {"mcp__loomweave__entity_resolve"}  # exact names: 'resolve' is a writer verb in filigree (resolve_annotation)
+MCP_READ_VERBS = {
+    "get", "list", "find", "search", "status", "preview", "explain", "describe", "query", "at", "summary",
+    "diff", "timeline", "validate", "lookup", "show", "read", "count", "check", "context", "guide", "schema", "help",
+    "available", "path", "verify", "cost", "neighborhood", "callers", "source", "kind", "wardline", "hotspot",
 }  # fmt: skip
+GIT_PREFIX = r"(?:-C\s+\S+\s+|-c\s+\S+\s+|--git-dir=\S+\s+|--work-tree=\S+\s+)*"
+GIT_ALIAS_RE = re.compile(r"\bgit\s+(?:\S+\s+)*?-c\s+alias\.")  # an alias hides its verb: fail closed
 GIT_WRITE_RE = re.compile(
-    r"\bgit\s+(?:-C\s+\S+\s+|-c\s+\S+\s+)*"
-    r"(commit|merge|cherry-pick|rebase|am|apply|revert|push|reset|clean|restore|checkout|switch|rm|mv|add|tag"
-    r"|branch\s+-[dDmM]|worktree\s+(?:add|remove|prune|move)|update-ref|filter-branch|notes)\b"
+    r"\bgit\s+" + GIT_PREFIX + r"(commit|merge|cherry-pick|rebase|am|apply|revert|push|pull|reset|clean|restore|checkout|switch"
+    r"|rm|mv|add|tag|branch\s+(?:-[dDmMf]|--force|--delete|--move)|worktree\s+(?:add|remove|prune|move)|update-ref|update-index"
+    r"|symbolic-ref|filter-branch|notes|gc|prune|reflog\s+expire)\b"
 )
-GH_WRITE_RE = re.compile(
-    r"\bgh\s+(?:pr|issue|release|repo|api)\b.*?\b(merge|create|close|edit|ready|delete|comment|reopen"
-    r"|-X\s+(?:POST|PUT|PATCH|DELETE)|--method[= ](?:POST|PUT|PATCH|DELETE))\b"
-)
+GH_WRITE_RE = re.compile(r"\bgh\s+(?:pr|issue|release|repo)\b.*?\b(merge|create|close|edit|ready|delete|comment|reopen)\b")
+GH_API_WRITE_RE = re.compile(r"\bgh\s+api\b.*?(?:-X|--method)[= ]+(?:POST|PUT|PATCH|DELETE)\b")
 FILE_WRITE_RE = re.compile(
-    r"(?:^|[;&|(\s])(?:sudo\s+)?(cp|mv|rm|rmdir|mkdir|touch|ln|chmod|chown|install|patch|rsync|truncate|tee|shred|dd)\s"
+    r"(?:^|[;&|(\s])(?:sudo\s+)?(cp|mv|rm|rmdir|mkdir|touch|ln|chmod|chown|install|patch|rsync|truncate|tee|shred|dd|sponge|unzip|ed|ex)(?:\s|$)"
+    r"|\bfind\b.*\s-delete\b|\btar\s+(?:-?[a-zA-Z]*x[a-zA-Z]*)\b"
 )
 INPLACE_EDIT_RE = re.compile(r"\b(?:sed|perl)\s+(?:\S+\s+)*?-[a-zA-Z]*i\b")
+FIXER_RE = re.compile(
+    r"\b(?:ruff\s+format|ruff\s+check\b.*--fix|black|isort|autopep8|autoflake|prettier\b.*--write|eslint\b.*--fix|pre-commit\s+run"
+    r"|npm\s+(?:install|ci|update)|uv\s+(?:sync|lock|add|remove|pip\s+(?:install|uninstall))|pip\s+(?:install|uninstall)"
+    r"|alembic\s+(?:upgrade|downgrade)|sqlite3\b.*\b(?:DELETE|UPDATE|INSERT|DROP)\b)"
+)
+CANONICAL_EXECUTE_RE = re.compile(r"scripts/[\w./-]+\.sh\b.*--execute\b")
+ELSPETH_EXECUTE_RE = re.compile(r"\belspeth\s+run\b.*--execute\b")  # writes runtime data (AGENTS.md quick reference)
+FILIGREE_READ_VERBS = {
+    "list", "show", "search", "session-context", "status", "summary", "metrics", "schema", "type", "template", "help", "--help",
+    "ready", "blocked", "stale", "change-list", "comment-list", "label-list", "workflow-status", "dependency-critical-path", "version",
+}  # fmt: skip
+FILIGREE_RE = re.compile(r"\bfiligree\s+(?:-\S+\s+)*([a-z][\w-]*)")  # the CLI is AGENTS.md's documented MCP fallback
 PY_INLINE_RE = re.compile(r"\bpython[0-9.]*\s+(?:-c\b|-\s*<<)")
 PY_WRITE_RE = re.compile(
     r"write_text|write_bytes|\.write\(|open\([^)]*['\"][wax]|os\.(?:remove|rename|replace|unlink|makedirs|mkdir|rmdir)\b"
-    r"|shutil\.|Path\([^)]*\)\.(?:unlink|mkdir|rename|touch|replace)"
+    r"|shutil\.|Path\([^)]*\)\.(?:unlink|mkdir|rename|touch|replace)|subprocess\.|os\.(?:system|popen)\("
 )
-REDIRECT_RE = re.compile(r"(?:(?<![0-9<>])>{1,2}|&>{1,2})\s*(?!&)(\S+)")
-LOG_TARGET_RE = re.compile(r"""^["']?(?:\$|/dev/null|/tmp/|.*scratchpad|.*\.log["']?$)""")
+REDIRECT_RE = re.compile(r"(?:(?<![<>])[12]?>{1,2}|&>{1,2})\s*(?!&)(\S+)")
+# Logs, not work: a shell variable, /dev/null, /tmp, or a DIRECTORY segment containing "scratchpad". Targets are
+# normalised first so `/tmp/../home/...` and `src/scratchpad_utils.py` are not mistaken for logs.
+LOG_TARGET_RE = re.compile(r"^(?:\$|/dev/null$|/tmp/|(?:.*/)?[^/]*scratchpad[^/]*/)")
 LANE_MERGE_RE = re.compile(r"lane_manager\.py\s+merge\b")
-SELF_RE = re.compile(r"prove_it\.py|stop_hook\.py")
-
-SENTENCE_RE = re.compile(r"[.!?\n]+")
-NEGATED_RE = re.compile(
-    r"\b(?:not|never|cannot)\b|n't\b"
-    r"|\bun(?:done|fixed|finished|verified|proven|tested|merged|resolved|committed|changed|touched|able)\b"
-    r"|\bincomplete\b|\bstill\s+(?:fails?|failing|broken|red)\b|\bgiving up\b",
-    re.IGNORECASE,
-)
-COMPLETION_RE = re.compile(
-    r"\b(complete[ds]?|done|fixed|finished|pass(es|ed|ing)?|green|landed|merged|committed|resolved|implemented|verified|shipped"
-    r"|ready (for|to) (review|merge|ship)|no longer reproduces|all set)\b"
-    r"|(?<!how )\b(?:it|that|this|everything|all|now)\s+works\b|\bworks\s+(?:now|again|as expected)\b",
-    re.IGNORECASE,
-)
 
 
 def _load_prove_it() -> object:
@@ -97,82 +104,172 @@ def _parse_ts(text: str) -> datetime | None:
         return None
 
 
-def bash_is_work(command: str) -> bool:
-    """Does this shell command change files or git history? Fails toward YES; the log-target set is the only fail-open."""
-    if GIT_WRITE_RE.search(command) or GH_WRITE_RE.search(command) or LANE_MERGE_RE.search(command):
+def _is_log_target(target: str) -> bool:
+    cleaned = target.strip("\"'")
+    if cleaned.startswith("$"):
         return True
-    if SELF_RE.search(command):
-        return False  # the verifier's own commands (claim / verify / review / withdraw) are not work
-    if FILE_WRITE_RE.search(command) or INPLACE_EDIT_RE.search(command):
+    return bool(LOG_TARGET_RE.match(os.path.normpath(cleaned) + ("/" if cleaned.endswith("/") else "")))
+
+
+def bash_is_work(command: str) -> bool:
+    """Does this shell command change files or git history? Fails toward YES; the log-target set is the only fail-open.
+
+    Every check runs on the whole command: a command that also mentions the verifier's own script gets no exemption.
+    """
+    if GIT_WRITE_RE.search(command) or GIT_ALIAS_RE.search(command) or GH_WRITE_RE.search(command) or GH_API_WRITE_RE.search(command):
+        return True
+    if LANE_MERGE_RE.search(command) or ELSPETH_EXECUTE_RE.search(command):
+        return True
+    if FILE_WRITE_RE.search(command) or INPLACE_EDIT_RE.search(command) or FIXER_RE.search(command) or CANONICAL_EXECUTE_RE.search(command):
+        return True
+    if any(verb not in FILIGREE_READ_VERBS for verb in FILIGREE_RE.findall(command)):
         return True
     if PY_INLINE_RE.search(command) and PY_WRITE_RE.search(command):
         return True
-    return any(not LOG_TARGET_RE.match(target) for target in REDIRECT_RE.findall(command))
+    return any(not _is_log_target(target) for target in REDIRECT_RE.findall(command))
 
 
-def tool_is_work(name: str, tool_input: dict[str, object]) -> bool:
+def mcp_is_work(name: str) -> bool:
+    """An MCP tool is work unless its first or last name token is a read verb (or it is an exact read tool). The read
+    set is small and stable; a list of writers was incomplete three reviews running."""
+    if name in MCP_READ_TOOLS:
+        return False
+    tokens = name.split("__")[-1].split("_")
+    return not ({tokens[0], tokens[-1]} & MCP_READ_VERBS)
+
+
+def _under(path: str, roots: list[Path]) -> bool:
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return True  # unresolvable: fail closed
+    return any(resolved == root or root in resolved.parents for root in roots)
+
+
+def tool_is_work(name: str, tool_input: dict[str, object], worktrees: list[Path]) -> bool:
+    """``worktrees``: every registered worktree of the repo. An edit outside all of them (a memory note, another
+    project) is not this repo's work; an edit whose path is missing from the input counts (fail closed)."""
     if name in WORK_TOOLS:
+        target = tool_input.get("file_path") or tool_input.get("notebook_path")
+        if name != "Workflow" and type(target) is str and worktrees:
+            return _under(target, worktrees)
         return True
     if name == "Bash":
         return bash_is_work(str(tool_input.get("command", "")))
     if name.startswith("mcp__"):
-        return bool(set(name.split("__")[-1].split("_")) & MCP_WRITE_VERBS)
+        return mcp_is_work(name)
     return False
 
 
-def is_completion_claim(text: str) -> bool:
-    """True when some sentence claims completion and is not negated within that same sentence."""
-    return any(COMPLETION_RE.search(s) and not NEGATED_RE.search(s) for s in SENTENCE_RE.split(text))
+IDLE_FROM_RE = re.compile(r'"type"\s*:\s*"idle_notification".*?"from"\s*:\s*"([^"]+)"', re.S)
 
 
-def _scan_lines(transcript: Path) -> tuple[datetime | None, str]:
-    latest: datetime | None = None
-    last_text = ""
+def _idle_name(raw: str) -> str:
+    return re.sub(r"\s*\[[^\]]*\]\s*$", "", raw)  # a display suffix like "worker [3fa9c1]"
+
+
+class _Scan:
+    """One transcript's signals: newest work (at or before ``until``), idle notifications by name, tool results by id."""
+
+    def __init__(self) -> None:
+        self.latest: datetime | None = None
+        self.idle: dict[str, datetime] = {}
+        self.tool_results: dict[str, datetime] = {}
+
+
+def _scan_lines(transcript: Path, worktrees: list[Path], *, until: datetime | None = None) -> _Scan:
+    scan = _Scan()
     with transcript.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if '"tool_use"' not in line and '"text"' not in line:
+            if '"tool_use"' not in line and "idle_notification" not in line and '"tool_result"' not in line:
                 continue
             try:
                 raw = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if type(raw) is not dict or raw.get("type") != "assistant":
+            if type(raw) is not dict:
+                continue
+            when = _parse_ts(str(raw.get("timestamp", "")))
+            if when is None:
                 continue
             message = raw.get("message")
             content = message.get("content") if type(message) is dict else None
-            if type(content) is not list:
+            if raw.get("type") == "user":
+                if "idle_notification" in line:
+                    found = IDLE_FROM_RE.search(content if type(content) is str else json.dumps(content))
+                    if found:
+                        name = _idle_name(found.group(1))
+                        if name not in scan.idle or when > scan.idle[name]:
+                            scan.idle[name] = when
+                if type(content) is list:
+                    for block in content:
+                        if type(block) is dict and block.get("type") == "tool_result" and block.get("tool_use_id"):
+                            scan.tool_results[str(block["tool_use_id"])] = when
                 continue
-            texts = [
-                str(b.get("text", "")) for b in content if type(b) is dict and b.get("type") == "text" and str(b.get("text", "")).strip()
-            ]
-            if texts:
-                last_text = "\n".join(texts)
-            when = _parse_ts(str(raw.get("timestamp", "")))
-            if when is None:
+            if raw.get("type") != "assistant" or type(content) is not list:
+                continue
+            if until is not None and when > until:
                 continue
             for block in content:
                 if type(block) is not dict or block.get("type") != "tool_use":
                     continue
                 tool_input = block.get("input") if type(block.get("input")) is dict else {}
-                if tool_is_work(str(block.get("name", "")), tool_input) and (latest is None or when > latest):
-                    latest = when
-    return latest, last_text
+                if tool_is_work(str(block.get("name", "")), tool_input, worktrees) and (scan.latest is None or when > scan.latest):
+                    scan.latest = when
+    return scan
 
 
-def scan_transcript(transcript: Path) -> tuple[datetime | None, str]:
-    """(newest work-signal timestamp across the session and its subagents, the session's final assistant text).
+def _subagent_meta(transcript: Path) -> dict[str, object]:
+    meta = transcript.with_suffix(".meta.json")
+    if not meta.is_file():
+        return {}
+    try:
+        loaded = json.loads(meta.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return loaded if type(loaded) is dict else {}
 
-    (None, "") if the transcript is unreadable or quiet. Only the parent's final text is judged: a subagent's report
-    is addressed to the session, not to the user.
+
+def _handed_back(meta: dict[str, object], parent: _Scan) -> tuple[bool, datetime | None]:
+    """(hand-back channel known, hand-back time). A foreground Agent-tool subagent hands back through the parent's
+    tool_result for its spawning call (``toolUseId``); a teammate through an idle notification by name."""
+    tool_use_id = meta.get("toolUseId")
+    if type(tool_use_id) is str and tool_use_id:
+        return True, parent.tool_results.get(tool_use_id)
+    name = meta.get("name")
+    if (type(name) is str and name) or meta.get("taskKind") == "in_process_teammate":
+        return True, parent.idle.get(_idle_name(str(name or "")))
+    return False, None
+
+
+def _repo_worktrees(repo: Path) -> list[Path]:
+    proc = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"], capture_output=True, text=True, check=False)
+    roots = [Path(line.split(" ", 1)[1]).resolve() for line in proc.stdout.splitlines() if line.startswith("worktree ")]
+    return roots or [repo.resolve()]
+
+
+def scan_transcript(transcript: Path, repo: Path) -> datetime | None:
+    """Newest work-signal timestamp across the session and its subagents; None if the transcript is unreadable or quiet.
+
+    A subagent's signals count once its work is HANDED BACK — the parent's tool_result for a foreground Agent call,
+    or an idle notification for a teammate — and only up to that time: work still in a running subagent's hands
+    has not been handed back, so nothing can have been claimed on it, and a running subagent must not re-arm the
+    gate on every yield the parent makes while waiting. A subagent whose metadata names no hand-back channel is
+    counted in full (fail closed). One killed before handing back is invisible: the documented fail-open.
     """
     if not transcript.is_file():
-        return None, ""
-    latest, last_text = _scan_lines(transcript)
+        return None
+    worktrees = _repo_worktrees(repo)
+    parent = _scan_lines(transcript, worktrees)
+    latest = parent.latest
     for sub in sorted((transcript.parent / transcript.stem / "subagents").glob("agent-*.jsonl")):
-        sub_latest, _ = _scan_lines(sub)
+        known, handed_back = _handed_back(_subagent_meta(sub), parent)
+        if known and handed_back is None:
+            continue  # still running
+        sub_latest = _scan_lines(sub, worktrees, until=handed_back).latest
         if sub_latest is not None and (latest is None or sub_latest > latest):
             latest = sub_latest
-    return latest, last_text
+    return latest
 
 
 def _repo_for(cwd: str) -> Path:
@@ -204,11 +301,9 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
     session_id = str(payload.get("session_id") or "")
     cwd = str(payload.get("cwd") or os.getcwd())
     repo = _repo_for(cwd)
-    work, last_text = scan_transcript(Path(str(payload.get("transcript_path") or "")))
+    work = scan_transcript(Path(str(payload.get("transcript_path") or "")), repo)
     if work is None or not session_id:
         return {}
-    if not is_completion_claim(last_text):
-        return {}  # the user is not being told anything is complete (status, or an honest 'not done'); nothing to gate
     script = f"python {HERE / 'prove_it.py'}"
     claims = pi.claims_for_session(repo, session_id)
     verdict = pi.latest_verdict(repo, session_id=session_id)
@@ -231,11 +326,11 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
             f"prove-it: this session changed files or history (last signal {work.isoformat(timespec='seconds')}) and has no claim covering it. "
             "Do not tell the user the work is complete. Decompose the completion claim into falsifiable assertions and file it: "
             f"`{script} claim --claim '<one sentence>' --assert 'test: <cmd>' --assert 'commit: <sha> on <branch>' "
-            "--assert 'mutation: <test cmd> :: <fix paths> [@ <base>]' ...`, "
+            "--assert 'mutation: <pytest cmd> :: <fix paths> [@ <base>]' ...`, "
             f"then `{script} verify --claim <id>`, then spawn the adversarial reviewer and record "
             f"`{script} review --claim <id> --verdict PASS|FAIL --findings <file>`. "
-            f"To stop without claiming success: `{script} withdraw --claim <id> --reason '<what could not be substantiated>'`, "
-            f"or with no claim at all `{script} withdraw --reason '<why this work is not being claimed>'`."
+            f"To stop without claiming success (waiting, blocked, or honestly not done): `{script} withdraw --reason '<why this work is not being claimed>'`, "
+            f"or for a filed claim `{script} withdraw --claim <id> --reason '<what could not be substantiated>'`."
         )
     else:
         claim = open_claims[-1]
@@ -248,14 +343,12 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
                 "Spawn the reviewer subagent (goal: falsify every assertion from a fresh worktree), then "
                 f"`{script} review --claim {claim.claim_id} --verdict PASS|FAIL --findings <file>`."
             )
-        elif current.verdict == pi.VERDICT_FAIL:
+        else:  # FAIL — a PASS on a claim newer than the work would have released above, so nothing else reaches here
             reason = (
-                f"prove-it: verdict FAIL for claim {claim.claim_id} — unproven: {', '.join(current.unproven) or 'reviewer rejected'} (see {current.path}). "
+                f"prove-it: verdict {current.verdict} for claim {claim.claim_id} — unproven: {', '.join(current.unproven) or 'reviewer rejected'} (see {current.path}). "
                 f"Either fix and re-run `{script} verify --claim {claim.claim_id}`, or `{script} withdraw --claim {claim.claim_id} --reason '<why>'` "
                 "and report exactly which claims could not be substantiated. Never report success."
             )
-        else:
-            reason = f"prove-it: work newer than the PASS verdict at {current.checked_at}. File a new claim for the new work, verify it, and record the review."
     blocks = _bump_blocks(repo, session_id, newest[0].isoformat() if newest is not None else "none")
     if blocks > pi.MAX_BLOCKS:
         return {

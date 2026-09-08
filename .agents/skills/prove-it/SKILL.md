@@ -69,14 +69,30 @@ What it does, and why the working directory is never the instrument:
   on a different branch, or does not exist, is unproven.
 - `mutation:` first runs the command on the UNMODIFIED tree (it must exit 0:
   a command that cannot run, or that is red anyway, proves nothing), then
-  reverts the fix and requires the test to FAIL AT AN ASSERTION — exit 1
-  *and* a failed assertion visible in the output (`AssertionError`, pytest's
-  `assert …` line, unittest's `FAIL:`). Any other exit, or exit 1 with no
-  assertion in the output, is "crashed rather than failed" and is unproven:
-  every runner reports an uncaught exception as exit 1 too, so a test that
-  merely imports what the fix adds proves nothing about the fix. If the fix
-  adds a module or attribute, assert it exists (`importlib.util.find_spec`,
-  `hasattr`) so the assertion is what fails. Every run prove-it launches sets
+  reverts the fix and requires the test to FAIL AT AN ASSERTION **as reported
+  by the runner**: a pytest command is launched with `-p prove_it_red_plugin`,
+  which records every call-phase report whose OUTCOME is `failed`, and RED
+  means that report carried a `pytest.fail` or an `AssertionError` raised in a
+  test file (the test module, a `python_files` match, or a `conftest.py`). A
+  marked or imperative xfail is reported skipped and never counts; an
+  `AssertionError` raised inside production code is a crash — the test
+  asserted nothing itself. Exit codes and output text are never consulted —
+  every runner reports an uncaught exception as exit 1 too, and the test
+  controls its own output, so a test that prints a verdict and then crashes
+  is a crash. A test that merely imports what the fix
+  adds is "crashed rather than failed" and unproven; if the fix adds a module
+  or attribute, assert it exists (`importlib.util.find_spec`, `hasattr`) so
+  the assertion is what fails. Under any runner other than pytest the failure
+  kind is **not measurable** and the mutation stays unproven with exactly that
+  reason: the green-to-red flip is observed but not certified. An in-place
+  verdict records a sha256 per reverted path, and `review` refuses to record
+  a verdict if any of those bytes changed since `verify` — re-verify first.
+  The record
+  is proof against MISTAKES (a crash mistaken for a failure), not against a
+  test that deliberately forges it — the test runs in the plugin's process
+  and could append to the report file itself; deliberate fraud is what the
+  adversarial reviewer reads the test source for. Every run
+  prove-it launches sets
   `PYTHONDONTWRITEBYTECODE=1` (a stale `.pyc` of the same size and second
   would execute the fix's code after the revert). A symlink path is refused —
   name the real file. An uncommitted
@@ -138,25 +154,31 @@ your message must say the work is incomplete.
 ## The Stop hook
 
 `stop_hook.py` reads the session transcript — and every subagent transcript
-under `<session>/subagents/agent-*.jsonl`, so delegated work counts — for
-work signals: Edit/Write/NotebookEdit, `Workflow`, MCP tools whose name
-carries a writing verb, and Bash commands that commit/merge/push/reset git
-state, copy/move/remove/rewrite files, redirect output to a path, or run
-inline Python that writes. Redirects to `/dev/null`, `/tmp`, a scratchpad, a
-`.log` file or a shell variable are logs, not work: that is the hook's one
-deliberate fail-open. When some SENTENCE of the final message claims
-completion ("done", "fixed", "green", "committed", "merged", "complete",
-"passing" and the like) without a negation in that same sentence, it blocks
-the stop unless a PASS verdict or a withdrawal for this session is newer than
-the newest signal, and its block reason names the exact next command. A later
-sentence cannot take back an earlier claim ("Done and merged. The docs are
-incomplete." is gated). A final message that only reports status ("waiting
-for the gate", "next I will…"), or whose claiming sentence says the work is
-NOT done ("not yet green", "still fails", "incomplete", "giving up"), is not
-a claim and is not blocked: the gate is on what the user is told, not on
-yielding or on honesty. `withdraw --reason` with no `--claim` records that
-this session is not claiming its work at all — the block reason names both
-forms. After five blocks since the session's last release
+under `<session>/subagents/agent-*.jsonl`, so delegated work counts once it
+is handed back — the parent's tool_result for a foreground `Agent` call, or a
+teammate's idle notification (work still in a running subagent's hands must
+not re-arm the gate on every yield the parent makes while waiting; a subagent
+whose metadata names no hand-back channel is counted in full; one killed
+before handing back is the documented fail-open) — for work signals:
+Edit/Write/NotebookEdit on a path inside a worktree of this repo, `Workflow`,
+any MCP tool whose verb is not in a small read-only allowlist, and Bash
+commands that commit/merge/push/pull/reset git state or use a git alias,
+copy/move/remove/rewrite files, run a formatter, fixer or package manager, a
+filigree CLI verb outside its read set, `elspeth run --execute` or a canonical
+script with `--execute`, redirect output to a path, or run inline Python that
+writes or shells out. Redirects to `/dev/null`, `/tmp`, a `scratchpad`
+directory or a shell variable are logs, not work: that is the hook's one
+deliberate fail-open, and the Bash side is a heuristic that will always have
+gaps. The hook reads **no prose**. It blocks the stop whenever a work signal
+is newer than this session's last PASS verdict or withdrawal, whatever the
+final message says, and its block reason names the exact next command. A
+session that is waiting, blocked, or honestly not done releases itself with
+`withdraw --reason '<why>'` (no `--claim`), or `withdraw --claim <id>` for a
+filed claim — withdrawal is the honest exit, and the message to the user then
+says the work is not verified. (A classifier over the final message was
+tried; measured on 1507 real sessions it gated 58 % of honest messages and
+released 6 % of real claims, and the operator ruled it out on 2026-09-09.)
+After five blocks since the session's last release
 (a PASS or a withdrawal; doing more work does not re-arm it) the hook
 releases the session with a loud "NOT verified" message so a stuck session
 cannot loop forever — that release is a safety valve, not a verdict.

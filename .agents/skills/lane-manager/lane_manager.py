@@ -56,10 +56,12 @@ LIVE_WORKTREE = "alive-worktree-activity"
 DEAD = "dead"
 
 DEFAULT_WINDOW_SECONDS = 900
-# RED is a FAILED ASSERTION, visible in the output. Exit 1 alone proves nothing: pytest, unittest and a plain script all
-# report an uncaught exception inside a test as exit 1 too. Same rule and regex as prove-it's prove_it.py.
-RED_RE = re.compile(r"AssertionError|^E\s+assert\b|- assert\b|\bFailed: |^FAIL: ", re.MULTILINE)
+# RED is decided by the RUNNER, never by exit codes or output text (which the lane's test controls): pytest is
+# launched with prove-it's prove_it_red_plugin, which records each failed test's exception type. Under any other
+# runner the failure kind is not measurable and the lane is not verified, for that stated reason.
 SCRIPT_PATH = Path(__file__).resolve()
+PLUGIN_PATH = SCRIPT_PATH.parent.parent / "prove-it" / "prove_it_red_plugin.py"
+PYTEST_RE = re.compile(r"\bpytest\b")
 
 
 def stamp(epoch: float | None = None) -> str:
@@ -308,8 +310,8 @@ def render_brief(run: Run, lane: LaneStatus) -> str:
         f"Goal: {lane.description or lane.title}\n\n"
         "Rules:\n"
         f"1. Write the FAILING TEST FIRST in {tests}. Run `{lane.expected.test_command}` BEFORE touching the fix and confirm it "
-        "FAILS AT AN ASSERTION (AssertionError / FAIL in the output, exit 1) — not a crash: an uncaught exception also exits 1 "
-        "and proves nothing. If the fix adds a module or attribute, assert it exists first "
+        "FAILS AT AN ASSERTION under pytest — the verifier reads pytest's own record of the failure, never the exit code or the "
+        "output, so a crash (an uncaught exception also exits 1) proves nothing. If the fix adds a module or attribute, assert it exists first "
         "(`assert importlib.util.find_spec('x') is not None`, `assert hasattr(obj, 'name')`) so the base run fails at the "
         "assertion rather than at an import. Commit the test on its own.\n"
         f"2. Then fix the code in {files}; run the same test command until it exits 0; commit the fix.\n"
@@ -577,6 +579,7 @@ class Verification:
     suite_output_tail: str
     verified: bool
     reasons: list[str]
+    red_failures: list[dict[str, object]] = field(default_factory=list)  # what pytest recorded in the RED run
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -600,17 +603,36 @@ def _temp_worktree(repo: Path, sha: str, prefix: str) -> Iterator[Path]:
         shutil.rmtree(path.parent, ignore_errors=True)
 
 
-def _run_command(command: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
+def _run_command(command: str, cwd: Path, timeout: int, *, red_report: Path | None = None) -> tuple[int | None, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{cwd / 'src'}:{cwd / 'elspeth-lints' / 'src'}"
     env["PYTHONDONTWRITEBYTECODE"] = "1"  # a stale .pyc (same source size, same second) would run the wrong tree's code
+    argv = shlex.split(command)
+    if red_report is not None and PYTEST_RE.search(command):
+        if not PLUGIN_PATH.is_file():
+            return None, f"structural RED plugin missing: {PLUGIN_PATH}"
+        env["PYTHONPATH"] += f":{PLUGIN_PATH.parent}"
+        env["PROVE_IT_RED_REPORT"] = str(red_report)
+        argv += ["-p", PLUGIN_PATH.stem]
     try:
-        proc = subprocess.run(shlex.split(command), cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return None, f"command not found: {exc}"
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
     return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
+
+
+def _read_red_report(path: Path) -> list[dict[str, object]]:
+    if not path.is_file():
+        return []
+    records: list[dict[str, object]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            loaded = json.loads(line)
+            if type(loaded) is dict:
+                records.append(loaded)
+    return records
 
 
 def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: int = 7200) -> Verification:
@@ -646,6 +668,7 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
 
     red_rc: int | None = None
     red_tail = ""
+    red_failures: list[dict[str, object]] = []
     green_rc: int | None = None
     green_tail = ""
     suite_rc: int | None = None
@@ -656,18 +679,25 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
             if checkout.returncode != 0:
                 reasons.append(f"could not place test files on base: {checkout.stderr.strip()}")
             else:
-                red_rc, red_tail = _run_command(lane.expected.test_command, red_tree, test_timeout)
+                with tempfile.TemporaryDirectory(prefix="lane-red-report-") as report_dir:
+                    report_path = Path(report_dir) / "red.jsonl"
+                    red_rc, red_tail = _run_command(lane.expected.test_command, red_tree, test_timeout, red_report=report_path)
+                    red_failures = _read_red_report(report_path)
+                asserted = [r for r in red_failures if r.get("assertion")]
                 if red_rc == 0:
                     reasons.append("test does not fail on the base without the fix: not a failing-first test")
                 elif red_rc is None:
                     reasons.append(f"red run could not complete: {red_tail}")
-                elif red_rc != 1:
-                    reasons.append(f"test crashed on the base rather than failing (exit {red_rc}): RED means a failed assertion (exit 1)")
-                elif not RED_RE.search(red_tail):
+                elif not PYTEST_RE.search(lane.expected.test_command):
                     reasons.append(
-                        "test crashed on the base rather than failing: exit 1 but no failed assertion in the output (an uncaught "
-                        "exception, e.g. importing a module the fix adds); assert what the fix adds exists "
-                        "(importlib.util.find_spec / hasattr) so the assertion is what fails"
+                        f"test exited {red_rc} on the base, but whether it failed at an ASSERTION or crashed is not measurable "
+                        "outside pytest (no structural report from the runner): give the lane a pytest test command"
+                    )
+                elif not asserted:
+                    kinds = sorted({str(r.get("type")) for r in red_failures}) or ["no test reached its call phase"]
+                    reasons.append(
+                        f"test crashed on the base rather than failing (exit {red_rc}): pytest recorded {', '.join(kinds)} and no "
+                        "failed assertion; assert what the fix adds exists (importlib.util.find_spec / hasattr) so the assertion is what fails"
                     )
     if not reasons and branch_sha is not None:
         with _temp_worktree(repo, base_sha, "lane-green-") as tree:
@@ -699,6 +729,7 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
         red_exit_code=red_rc,
         red_output_tail=red_tail,
         green_exit_code=green_rc,
+        red_failures=red_failures,
         green_output_tail=green_tail,
         suite_command=run.suite_command,
         suite_exit_code=suite_rc,

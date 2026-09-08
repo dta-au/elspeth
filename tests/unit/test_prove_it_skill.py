@@ -55,8 +55,8 @@ def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=GIT_ENV).stdout
 
 
-TEST_CMD = f"{sys.executable} tests/test_target.py"
-GOOD_TEST = "assert open('src/target.py').read().strip() == 'VALUE = 2'\n"  # RED is a FAILED ASSERTION, visible in the output
+TEST_CMD = f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider"  # RED is structural: pytest records it
+GOOD_TEST = "def test_value():\n    assert open('src/target.py').read().strip() == 'VALUE = 2'\n"
 
 
 @pytest.fixture
@@ -205,7 +205,7 @@ def test_mutation_in_working_directory_reverts_only_the_fix_and_restores_it(repo
 
 def test_mutation_that_does_not_go_red_is_unproven_and_still_restores(repo: Path) -> None:
     (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")
-    (repo / "tests" / "test_target.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")  # a test that cannot fail
+    (repo / "tests" / "test_target.py").write_text("def test_nothing():\n    assert True\n", encoding="utf-8")  # cannot fail
     _git(repo, "commit", "-q", "-am", "test: neutered")
     claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py")
     (repo / "src" / "target.py").write_text("VALUE = 2  # still uncommitted\n", encoding="utf-8")
@@ -232,10 +232,12 @@ def test_mutation_of_a_committed_fix_reverts_in_a_fresh_worktree_not_the_checkou
 def test_mutation_of_a_committed_new_file_treats_absence_at_base_as_the_pre_fix_state(repo: Path) -> None:
     """A fix that ADDS a module cannot be checked out from the base; reverting it means deleting it."""
     (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
-    (repo / "tests" / "test_helper.py").write_text("import os\n\nassert os.path.exists('src/helper.py')\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(
+        "import os\n\n\ndef test_helper():\n    assert os.path.exists('src/helper.py')\n", encoding="utf-8"
+    )
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "feat: helper (new file)")
-    claim = _claim(repo, f"mutation: {sys.executable} tests/test_helper.py :: src/helper.py @ main")
+    claim = _claim(repo, f"mutation: {sys.executable} -m pytest tests/test_helper.py -q -p no:cacheprovider :: src/helper.py @ main")
     verdict = pi.verify_claim(repo, claim.claim_id)
     assert verdict.results[0].proven is True, verdict.results[0].evidence
     assert "absent" in verdict.results[0].evidence
@@ -265,7 +267,9 @@ def test_mutation_command_that_cannot_run_is_unproven_not_red(repo: Path) -> Non
 def test_mutation_precondition_is_measured_in_the_fresh_tree_not_the_checkout(repo: Path) -> None:
     """The checkout passes only because of an uncommitted edit OUTSIDE the fix paths; the tip does not. Unproven."""
     _commit_fix(repo)
-    (repo / "tests" / "test_target.py").write_text("assert open('src/target.py').read().strip() == 'VALUE = 3'\n", encoding="utf-8")
+    (repo / "tests" / "test_target.py").write_text(
+        "def test_value():\n    assert open('src/target.py').read().strip() == 'VALUE = 3'\n", encoding="utf-8"
+    )
     _git(repo, "commit", "-q", "-am", "test: wants 3 (red at the tip)")
     (repo / "tests" / "test_target.py").write_text(GOOD_TEST, encoding="utf-8")  # uncommitted: the checkout is green
     assert subprocess.run(shlex.split(TEST_CMD), cwd=repo, check=False).returncode == 0
@@ -275,6 +279,7 @@ def test_mutation_precondition_is_measured_in_the_fresh_tree_not_the_checkout(re
     assert "does not pass on the unmodified tree" in result.evidence, result.evidence
 
 
+PYTEST_HELPER = f"{sys.executable} -m pytest tests/test_helper.py -q -p no:cacheprovider"
 EXIT_1_CRASH_SHAPES = {
     "plain-script": ("import helper  # noqa: F401\n", f"{sys.executable} tests/test_helper.py"),
     "pytest-in-body-import": (
@@ -290,8 +295,9 @@ EXIT_1_CRASH_SHAPES = {
 
 @pytest.mark.parametrize("shape", sorted(EXIT_1_CRASH_SHAPES))
 def test_mutation_whose_reverted_run_dies_with_exit_1_but_no_failed_assertion_is_unproven(repo: Path, shape: str) -> None:
-    """Every common runner reports an uncaught exception as exit 1 (round two). RED is a FAILED ASSERTION visible in the
-    output; a test that merely imports what the fix adds proves nothing about the fix."""
+    """Every common runner reports an uncaught exception as exit 1. Under pytest the plugin records the failure kind, so a
+    test that merely imports what the fix adds is a CRASH; under any other runner the kind is NOT MEASURABLE and the
+    mutation is unproven for that stated reason — never proven on the strength of exit codes or output text."""
     body, command = EXIT_1_CRASH_SHAPES[shape]
     (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
     (repo / "tests" / "test_helper.py").write_text(body, encoding="utf-8")
@@ -301,6 +307,71 @@ def test_mutation_whose_reverted_run_dies_with_exit_1_but_no_failed_assertion_is
     result = pi.verify_claim(repo, claim.claim_id).results[0]
     assert result.proven is False, result.evidence
     assert "exit 1" in result.evidence and "assertion" in result.evidence.lower(), result.evidence
+    if shape == "pytest-in-body-import":
+        assert "crashed" in result.evidence and "ModuleNotFoundError" in result.evidence, result.evidence
+    else:
+        assert "not measurable outside pytest" in result.evidence, result.evidence
+
+
+SPOOF_LINES = [  # round three: output text the test itself prints must never count as the runner's verdict
+    "AssertionError",
+    "  Failed: 0",
+    "FAILED tests/test_helper.py::test_nothing - assert False",
+    "E       assert False",
+    "FAIL: test_nothing (tests.test_helper.T.test_nothing)",
+]
+
+
+@pytest.mark.parametrize("line", SPOOF_LINES)
+def test_mutation_is_not_proven_by_a_test_that_prints_the_runner_verdict_and_then_crashes(repo: Path, line: str) -> None:
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(
+        f"def test_nothing():\n    print({line!r})\n    import helper  # noqa: F401\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + a test that prints a verdict")
+    claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "crashed" in result.evidence, result.evidence
+
+
+def test_mutation_in_the_working_directory_is_not_proven_by_a_test_that_prints_a_verdict(repo: Path) -> None:
+    """The in-place path reads the plugin's record too: an uncommitted fix reverted in place, a test that prints
+    'AssertionError' and then crashes on the missing module, is a crash."""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")  # uncommitted: absent at HEAD
+    (repo / "tests" / "test_helper.py").write_text(
+        "def test_nothing():\n    print('AssertionError')\n    import helper  # noqa: F401\n", encoding="utf-8"
+    )
+    claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "crashed" in result.evidence and "ModuleNotFoundError" in result.evidence, result.evidence
+    assert (repo / "src" / "helper.py").read_text(encoding="utf-8") == "HELPED = True\n", "restored"
+
+
+def test_mutation_whose_only_assertion_is_in_a_fixture_is_a_setup_error_not_red(repo: Path) -> None:
+    """An assertion inside a fixture is a SETUP error: the test's own call phase never ran, so pytest records nothing
+    and the mutation is a crash. (The plugin deliberately records call-phase failures only.)"""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(
+        "import importlib.util\n\nimport pytest\n\n\n@pytest.fixture\ndef helper_present():\n"
+        "    assert importlib.util.find_spec('helper') is not None\n\n\ndef test_nothing(helper_present):\n    pass\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + a fixture that asserts")
+    claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "crashed" in result.evidence and "no test reached its call phase" in result.evidence, result.evidence
+
+
+def test_mutation_under_a_shell_wrapper_that_echoes_a_verdict_is_not_measurable(repo: Path) -> None:
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper")
+    command = "sh -c 'test -f src/helper.py || { echo AssertionError; exit 1; }'"
+    claim = _claim(repo, f"mutation: {command} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "not measurable outside pytest" in result.evidence, result.evidence
 
 
 def test_mutation_whose_test_asserts_the_fix_exists_is_proven(repo: Path) -> None:
@@ -324,11 +395,15 @@ def test_mutation_runs_never_write_bytecode_so_a_same_size_revert_cannot_reuse_t
     bytecode and read 'did not go red' (round two, nondeterministic). Every run prove-it launches refuses to write bytecode."""
     monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)  # an inherited setting must not pass this for the code
     (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")  # same size as the base's VALUE = 1
-    command = f"{sys.executable} -c 'import sys; assert sys.dont_write_bytecode; import target; assert target.VALUE == 2'"
+    (repo / "tests" / "test_flag.py").write_text(
+        "import sys\n\n\ndef test_flag():\n    assert sys.dont_write_bytecode\n    import target\n\n    assert target.VALUE == 2\n",
+        encoding="utf-8",
+    )
+    command = f"{sys.executable} -m pytest tests/test_flag.py -q -p no:cacheprovider"
     claim = _claim(repo, f"mutation: {command} :: src/target.py")
     result = pi.verify_claim(repo, claim.claim_id).results[0]
     assert result.proven is True, result.evidence
-    assert not (repo / "src" / "__pycache__").exists()
+    assert not (repo / "src" / "__pycache__").exists() and not (repo / "tests" / "__pycache__").exists()
 
 
 def test_mutation_refuses_a_symlink_path_rather_than_writing_through_it(repo: Path) -> None:
@@ -340,7 +415,10 @@ def test_mutation_refuses_a_symlink_path_rather_than_writing_through_it(repo: Pa
     _git(repo, "commit", "-q", "-m", "link.py -> real.py")
     (repo / "src" / "link.py").unlink()
     os.symlink("other.py", repo / "src" / "link.py")  # uncommitted: now points at other.py
-    command = f"{sys.executable} -c \"assert open('src/other.py').read() == 'OTHER = 1\\n'\""
+    (repo / "tests" / "test_link.py").write_text(
+        "def test_other():\n    assert open('src/other.py').read() == 'OTHER = 1\\n'\n", encoding="utf-8"
+    )
+    command = f"{sys.executable} -m pytest tests/test_link.py -q -p no:cacheprovider"
     claim = _claim(repo, f"mutation: {command} :: src/link.py")
     result = pi.verify_claim(repo, claim.claim_id).results[0]
     assert result.proven is False and "symlink" in result.evidence, result.evidence
@@ -349,16 +427,25 @@ def test_mutation_refuses_a_symlink_path_rather_than_writing_through_it(repo: Pa
 
 
 def test_mutation_that_crashes_instead_of_failing_is_unproven(repo: Path) -> None:
-    """RED means the test FAILED an assertion (exit 1); a crash (any other exit) never ran the assertion."""
+    """RED means pytest itself recorded a FAILED ASSERTION. A collection error (exit 2) and an uncaught RuntimeError
+    inside the test (exit 1, recorded by the plugin as RuntimeError) are both crashes, never RED."""
     (repo / "tests" / "test_target.py").write_text(
-        "import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 2' else 2)\n", encoding="utf-8"
+        "def test_value():\n    if open('src/target.py').read().strip() != 'VALUE = 2':\n        raise RuntimeError('boom')\n",
+        encoding="utf-8",
     )
-    _git(repo, "commit", "-q", "-am", "test: exits 2 when unhappy")
+    _git(repo, "commit", "-q", "-am", "test: raises when unhappy")
     _commit_fix(repo)
     claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py @ main")
-    verdict = pi.verify_claim(repo, claim.claim_id)
-    assert verdict.results[0].proven is False
-    assert "crashed" in verdict.results[0].evidence and "exit 2" in verdict.results[0].evidence
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False
+    assert "crashed" in result.evidence and "exit 1" in result.evidence and "RuntimeError" in result.evidence, result.evidence
+    (repo / "tests" / "test_target.py").write_text(
+        "import missing_module  # noqa: F401\n\n\ndef test_value():\n    assert True\n", encoding="utf-8"
+    )
+    _git(repo, "commit", "-q", "-am", "test: cannot even be collected")
+    claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "does not pass on the unmodified" in result.evidence and "exit 2" in result.evidence, result.evidence
 
 
 def test_committed_mutation_without_a_base_is_unproven_not_guessed(repo: Path) -> None:
@@ -461,14 +548,19 @@ def _transcript(
     ``final`` is the assistant's last text message: the Stop hook only enforces when it reads as a completion claim.
     """
     lines = []
-    for when, tool, tool_input in events:
+    for event in events:
+        when, tool, tool_input = event[:3]
+        tool_use_id = event[3] if len(event) > 3 else "x"  # type: ignore[misc]
         lines.append(
             json.dumps(
                 {
                     "type": "assistant",
                     "timestamp": when,
                     "sessionId": SESSION,
-                    "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "x", "name": tool, "input": tool_input}]},
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "tool_use", "id": tool_use_id, "name": tool, "input": tool_input}],
+                    },
                 }
             )
         )
@@ -484,6 +576,14 @@ def _transcript(
         )
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _tool_result(transcript: Path, tool_use_id: str, when: str, text: str = "done") -> None:
+    """Append what Claude Code writes when a foreground subagent hands back: a user-role tool_result for the Agent call."""
+    content = [{"type": "tool_result", "tool_use_id": tool_use_id, "content": [{"type": "text", "text": text}]}]
+    line = json.dumps({"type": "user", "timestamp": when, "message": {"role": "user", "content": content}})
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 
 def _hook(repo: Path, transcript: Path, *, session: str = SESSION, active: bool = False) -> tuple[int, dict[str, object], str]:
@@ -508,34 +608,19 @@ def test_hook_allows_a_session_that_did_no_work(repo: Path, tmp_path: Path) -> N
     assert code == 0 and out.get("decision") != "block"
 
 
-def test_hook_lets_a_session_yield_when_its_last_message_claims_nothing(repo: Path, tmp_path: Path) -> None:
-    """Unproven work + a final message that only reports status (waiting, next steps) is not a completion claim."""
+def test_hook_gates_on_work_not_on_wording(repo: Path, tmp_path: Path) -> None:
+    """The hook reads no prose (John, 2026-09-09: 'the prose classifier is not a good idea'). Unreleased work blocks
+    whatever the final message says; only a PASS or a withdrawal releases it."""
     transcript = tmp_path / "t.jsonl"
-    _transcript(
-        transcript,
-        [(_iso(-30), "Edit", {"file_path": "src/target.py"})],
-        final="Gate still running at 85%; waiting for the marker before I do anything else.",
-    )
-    code, out, _ = _hook(repo, transcript)
-    assert code == 0 and out.get("decision") != "block"
-    for claim in (
-        "All done.",
-        "The bug is fixed.",
-        "Tests are green now.",
-        "Committed as abc123.",
-        "Merged into main.",
-        "This is complete.",
+    for text in (
+        "Gate still running at 85%; waiting for the marker before I do anything else.",
+        "The work is NOT done and the test still fails.",
+        "Here is how it works: the resolver reads the manifest.",
+        "",
     ):
-        _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=claim)
-        shutil.rmtree(repo / ".verify" / ".hook", ignore_errors=True)  # each phrase is judged on its own, not by the valve
-        assert _hook(repo, transcript)[1].get("decision") == "block", claim
-    for honest in (
-        "I could not fix this. The work is NOT done and the test still fails.",
-        "Reporting this as incomplete: the mutation did not go red, so the fix is unverified.",
-        "This is not fixed yet; the pipeline works by reading the manifest but I have changed nothing that matters.",
-    ):
-        _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=honest)
-        assert _hook(repo, transcript)[1].get("decision") != "block", honest
+        _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=text)
+        shutil.rmtree(repo / ".verify" / ".hook", ignore_errors=True)
+        assert _hook(repo, transcript)[1].get("decision") == "block", text
 
 
 def test_hook_blocks_work_with_no_claim_and_names_what_to_do(repo: Path, tmp_path: Path) -> None:
@@ -562,19 +647,20 @@ def test_hook_blocks_until_a_pass_verdict_newer_than_the_last_work(repo: Path, t
     _transcript(transcript, [(_iso(-60), "Edit", {"file_path": "src/target.py"})])
     claim = _claim(repo, f"test: {TEST_CMD}", f"commit: {sha} on work")
     code, out, _ = _hook(repo, transcript)
-    assert out["decision"] == "block" and "verify" in out["reason"]
+    assert out["decision"] == "block" and "has not been verified" in out["reason"], out["reason"]
     pi.verify_claim(repo, claim.claim_id)  # UNREVIEWED
     code, out, _ = _hook(repo, transcript)
-    assert out["decision"] == "block" and "review" in out["reason"].lower()
+    assert out["decision"] == "block" and "adversarial review is not recorded" in out["reason"], out["reason"]
     pi.record_review(repo, claim.claim_id, verdict="FAIL", findings="A1 flaky")
     code, out, _ = _hook(repo, transcript)
-    assert out["decision"] == "block" and "FAIL" in out["reason"] and "withdraw" in out["reason"]
+    assert out["decision"] == "block" and "verdict FAIL" in out["reason"] and "withdraw" in out["reason"], out["reason"]
     pi.record_review(repo, claim.claim_id, verdict="PASS", findings="could not falsify")
     code, out, _ = _hook(repo, transcript)
     assert code == 0 and out.get("decision") != "block"
     # new work after the PASS re-arms the gate
     _transcript(transcript, [(_iso(-60), "Edit", {"file_path": "src/target.py"}), (_iso(30), "Write", {"file_path": "src/new.py"})])
-    assert _hook(repo, transcript)[1]["decision"] == "block"
+    out = _hook(repo, transcript)[1]
+    assert out["decision"] == "block" and "has no claim covering it" in out["reason"], out["reason"]
 
 
 def test_hook_releases_a_withdrawn_claim_and_a_claim_less_withdrawal(repo: Path, tmp_path: Path) -> None:
@@ -626,41 +712,6 @@ def test_hook_block_reason_names_the_claim_less_withdrawal(repo: Path, tmp_path:
     assert "withdraw --reason" in reason and "--claim" in reason, reason
 
 
-SMUGGLED_CLAIMS = [  # a completion claim in ONE sentence is gated whatever a later sentence takes back (round two)
-    "Done and merged. The docs are incomplete but that is tracked separately.",
-    "Fixed, committed and pushed. Nothing is left unverified.",
-    "All green, landed on main. There is nothing undone here.",
-    "Implemented and passing. Note: one flaky test is not fixed in this PR.",
-    "Merged. I never touched the frontend.",
-]
-HONEST_REPORTS = [  # each relies on exactly ONE negation alternative, in the same sentence as the completion word
-    "The suite is not yet green.",
-    "This isn't fully fixed.",
-    "I never got this passing.",
-    "I cannot call this done.",
-    "Merged, but the docs remain undone.",
-    "Implemented, but incomplete.",
-    "Landed, but the e2e test still fails.",
-    "Giving up on this; the fix is half done.",
-    "The pipeline works by reading the manifest; I have not changed anything yet.",
-    "Here is how it works: the resolver reads the manifest.",
-]
-
-
-@pytest.mark.parametrize("text", SMUGGLED_CLAIMS)
-def test_hook_gates_a_claim_that_is_negated_only_in_another_sentence(repo: Path, tmp_path: Path, text: str) -> None:
-    transcript = tmp_path / "t.jsonl"
-    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=text)
-    assert _hook(repo, transcript)[1].get("decision") == "block", text
-
-
-@pytest.mark.parametrize("text", HONEST_REPORTS)
-def test_hook_releases_an_honest_report_negated_in_the_claiming_sentence(repo: Path, tmp_path: Path, text: str) -> None:
-    transcript = tmp_path / "t.jsonl"
-    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=text)
-    assert _hook(repo, transcript)[1].get("decision") != "block", text
-
-
 WORK_COMMANDS = {  # every channel that changes files or history (round two: the list was Edit/Write + git commit + a few)
     "cat-heredoc": "cat > src/target.py <<'EOF'\nVALUE = 2\nEOF",
     "git-commit": "git commit -am 'fix'",
@@ -677,8 +728,88 @@ WORK_COMMANDS = {  # every channel that changes files or history (round two: the
     "sed-i": "sed -i 's/a/b/' src/target.py",
     "tee": "printf x | tee src/target.py",
     "lane-manager-merge": "python .agents/skills/lane-manager/lane_manager.py merge --lane x",
+    # round three: channels this repo's workflow uses
+    "ruff-format": "ruff format src/",
+    "ruff-fix": "ruff check --fix src/",
+    "black": "black src/",
+    "pre-commit": "pre-commit run --all-files",
+    "canonical-execute": "./scripts/worktree-cleanup.sh --execute",
+    "git-pull": "git pull --rebase",
+    "git-branch-f": "git branch -f lane/x HEAD",
+    "git-C": "git -C other/repo commit -m x",
+    "git-dir": "git --git-dir=.git commit -m x",
+    "gh-api-delete": "gh api -X DELETE repos/x/y",
+    "self-then-rm": "python .agents/skills/prove-it/prove_it.py status; rm -rf src/",
+    "sed-i-on-hook": "sed -i 's/x/y/' .agents/skills/prove-it/stop_hook.py",
+    "redirect-1": "echo x 1> src/generated.py",
+    "redirect-2": "make 2> src/errors.txt",
+    "in-repo-log": "pytest tests/ > tests/fixtures/expected.log",
+    "uv-pip-install": "uv pip install foo",
+    "find-delete": "find build -name '*.pyc' -delete",
+    "xargs-rm": "ls | xargs rm",
+    # round four: one pin per alternative
+    "perl-i": "perl -pi -e 's/a/b/' src/x.py",
+    "mkdir": "mkdir -p src/newpkg",
+    "touch": "touch src/newpkg/__init__.py",
+    "chmod": "chmod +x scripts/x.sh",
+    "ln": "ln -s ../real.py src/link.py",
+    "chown": "chown john: data/",
+    "install": "install -m 755 x.sh scripts/",
+    "patch": "patch -p1 < fix.diff",
+    "rsync": "rsync -a build/ dist/",
+    "truncate": "truncate -s 0 data/x.db",
+    "shred": "shred -u secrets.txt",
+    "dd": "dd if=/dev/zero of=data/blob bs=1M count=1",
+    "sponge": "sort x.txt | sponge x.txt",
+    "unzip": "unzip release.zip -d vendor/",
+    "ed": "ed -s src/x.py < script.ed",
+    "ex": "ex -c '%s/a/b/g' -c wq src/x.py",
+    "rmdir": "rmdir build/empty",
+    "tar-x": "tar xzf vendor.tgz -C vendor/",
+    "isort": "isort src/",
+    "autopep8": "autopep8 -i src/x.py",
+    "prettier": "prettier --write web/src/",
+    "eslint-fix": "eslint --fix web/src/",
+    "npm-install": "npm install",
+    "uv-sync": "uv sync",
+    "uv-lock": "uv lock",
+    "pip-install": "pip install requests",
+    "alembic": "alembic upgrade head",
+    "sqlite-delete": "sqlite3 data/x.db 'DELETE FROM runs'",
+    "git-worktree-add": "git worktree add ../wt lane/x",
+    "git-update-ref": "git update-ref refs/heads/x HEAD",
+    "git-update-index": "git update-index --assume-unchanged x",
+    "git-symbolic-ref": "git symbolic-ref HEAD refs/heads/x",
+    "git-notes": "git notes add -m x HEAD",
+    "git-gc": "git gc --prune=now",
+    "git-reflog-expire": "git reflog expire --expire=now --all",
+    "git-filter-branch": "git filter-branch --tree-filter 'rm x' HEAD",
+    "git-alias": "git -c alias.ci=commit ci -m x",
+    "gh-pr-close": "gh pr close 42",
+    "gh-pr-edit": "gh pr edit 42 --title x",
+    "gh-issue-delete": "gh issue delete 7",
+    "gh-pr-comment": "gh pr comment 42 --body x",
+    "gh-pr-reopen": "gh pr reopen 42",
+    "gh-pr-ready": "gh pr ready 42",
+    "python-open-w": "python -c \"f = open('x.txt', 'w'); f.close()\"",
+    "python-subprocess-list": "python -c \"import subprocess; subprocess.run(['git', 'commit', '-am', 'x'])\"",
+    "filigree-close": "filigree close elspeth-abc123 --reason done",
+    "filigree-start-next": "filigree start-next-work --assignee lane-3",
+    "filigree-update": "filigree update elspeth-abc123 --status closed",
+    "filigree-comment": "filigree add-comment elspeth-abc123 --body x",
+    "elspeth-run-execute": "elspeth run --settings examples/x/settings.yaml --execute",
+    "redirect-traversal": "echo x > /tmp/../home/john/elspeth/src/x.py",
+    "redirect-scratchpad-file": "echo x > src/scratchpad_utils.py",
 }
 NOT_WORK_COMMANDS = {
+    "canonical-dry-run": "./scripts/worktree-cleanup.sh --path 'lane-*'",
+    "ruff-check": "ruff check src/",
+    "git-fetch": "git fetch origin",
+    "self-status": "python .agents/skills/prove-it/prove_it.py status",
+    "filigree-list": "filigree list --status open",
+    "filigree-show": "filigree show elspeth-abc123",
+    "filigree-session-context": "filigree session-context",
+    "elspeth-run-dry": "elspeth run --settings examples/x/settings.yaml",
     "ls": "ls -la src/",
     "cat": "cat src/target.py",
     "grep": "grep -rn VALUE src/",
@@ -688,6 +819,7 @@ NOT_WORK_COMMANDS = {
     "pytest-to-log-variable": 'pytest tests/ > "$log" 2>&1; echo exit=$?',
     "redirect-devnull": "make lint > /dev/null 2>&1",
     "redirect-tmp": "pytest tests/ > /tmp/run.log 2>&1",
+    "redirect-scratchpad": "pytest tests/ > /home/x/.cache/scratchpad/run.log 2>&1",
     "python-c-print": "python -c 'print(1+1)'",
     "verifier": "python .agents/skills/prove-it/prove_it.py verify --claim x",
 }
@@ -707,21 +839,60 @@ def test_hook_does_not_count_reads_tests_and_scratch_logs_as_work(repo: Path, tm
     assert _hook(repo, transcript)[1].get("decision") != "block", name
 
 
+MCP_WORK = [
+    "mcp__elspeth-judge__stage_annotate",
+    "mcp__filigree__work_finish",
+    "mcp__filigree__issue_update",
+    "mcp__elspeth-composer__set_pipeline",
+    "mcp__filigree__resolve_annotation",  # a writer whose first token is a read verb elsewhere
+]
+MCP_READ = [
+    "mcp__elspeth-judge__stage_status",
+    "mcp__loomweave__entity_callers_list",
+    "mcp__elspeth-composer__get_pipeline_state",
+    "mcp__filigree__issue_validate",
+    "mcp__loomweave__entity_resolve",
+]
+
+
 def test_hook_counts_mcp_writers_workflows_and_delegated_agents_as_work(repo: Path, tmp_path: Path) -> None:
-    """A parent that fans work out records only an Agent tool use; the edits live in <session>/subagents/agent-*.jsonl."""
+    """MCP tools are work unless their verb is in a small READ allowlist (a list of writers was incomplete three rounds
+    running). A parent that fans work out records only an Agent tool use; the edits live in <session>/subagents/."""
     transcript = tmp_path / "t.jsonl"
-    _transcript(transcript, [(_iso(-30), "mcp__elspeth-judge__stage_annotate", {"finding": "x"})])
-    assert _hook(repo, transcript)[1].get("decision") == "block"
-    _transcript(transcript, [(_iso(-30), "mcp__loomweave__entity_find", {"q": "x"}), (_iso(-29), "Read", {"file_path": "x"})])
+    for name in [*MCP_WORK, "Workflow", "NotebookEdit", "MultiEdit"]:
+        _transcript(transcript, [(_iso(-30), name, {"x": "y"})])
+        shutil.rmtree(repo / ".verify" / ".hook", ignore_errors=True)
+        assert _hook(repo, transcript)[1].get("decision") == "block", name
+    _transcript(transcript, [(_iso(-30 + i), name, {"q": "x"}) for i, name in enumerate([*MCP_READ, "Read", "Grep"])])
     assert _hook(repo, transcript)[1].get("decision") != "block"
-    _transcript(transcript, [(_iso(-30), "Workflow", {"script": "..."})])
-    assert _hook(repo, transcript)[1].get("decision") == "block"
     _transcript(transcript, [(_iso(-30), "Agent", {"prompt": "look around", "subagent_type": "Explore"})])
     assert _hook(repo, transcript)[1].get("decision") != "block", "an Agent use alone is not work: Explore agents edit nothing"
     sub = tmp_path / "t" / "subagents" / "agent-abc123.jsonl"
     sub.parent.mkdir(parents=True)
+    (sub.parent / "agent-abc123.meta.json").write_text(json.dumps({"name": "worker-1", "agentType": "worker-1"}), encoding="utf-8")
     _transcript(sub, [(_iso(-20), "Edit", {"file_path": "src/target.py"})], final="Edited src/target.py as asked.")
-    assert _hook(repo, transcript)[1].get("decision") == "block", "the subagent's Edit is this session's work"
+    assert _hook(repo, transcript)[1].get("decision") != "block", (
+        "a subagent still running has handed nothing back: not yet this session's work"
+    )
+    _idle_notification(transcript, "worker-1", _iso(-10))
+    assert _hook(repo, transcript)[1].get("decision") == "block", "once the subagent reports idle, its Edit is this session's work"
+    time.sleep(1.1)
+    pi.withdraw_session(repo, session_id=SESSION, reason="worker-1's edit is a stub")
+    assert _hook(repo, transcript)[1].get("decision") != "block"
+    # woken again and editing after its last idle notification: not counted until it reports idle again
+    _transcript(sub, [(_iso(-20), "Edit", {"file_path": "src/target.py"}), (_iso(30), "Edit", {"file_path": "src/later.py"})], final="more")
+    assert _hook(repo, transcript)[1].get("decision") != "block"
+    _idle_notification(transcript, "worker-1 [3fa9c1]", _iso(31))  # real notifications carry a display suffix
+    assert _hook(repo, transcript)[1].get("decision") == "block"
+
+
+def _idle_notification(transcript: Path, name: str, when: str) -> None:
+    """Append what Claude Code writes when a background subagent reports idle: a user-role teammate message."""
+    body = json.dumps({"type": "idle_notification", "from": name, "timestamp": when, "idleReason": "available", "result": "done"})
+    text = f'<teammate-message teammate_id="{name}">\n{body}\n</teammate-message>'
+    line = json.dumps({"type": "user", "timestamp": when, "message": {"role": "user", "content": text}})
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 
 def test_hook_caps_repeated_blocks_so_a_session_cannot_loop_forever(repo: Path, tmp_path: Path) -> None:
@@ -782,6 +953,8 @@ def test_skill_doc_names_every_step_and_the_refusal_rule() -> None:
         "AssertionError",
         "find_spec",
         "subagents",
+        "prove_it_red_plugin",
+        "not measurable",
         "test:",
         "commit:",
         "mutation:",
@@ -790,3 +963,119 @@ def test_skill_doc_names_every_step_and_the_refusal_rule() -> None:
         "file:",
     ):
         assert token in text, token
+
+
+# ----------------------------------------------------------------- round five
+
+
+def test_mutation_ignores_xfail_records_and_asserts_raised_outside_the_test_files(repo: Path) -> None:
+    """RED is pytest's OUTCOME, not an exception type seen in flight: an xfail sibling (marked or imperative) is
+    reported xfailed, and an `assert` that fires inside production code is not the test's assertion (round four)."""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "src" / "lib.py").write_text(
+        "import importlib.util\n\n\ndef load():\n    assert importlib.util.find_spec('helper') is not None\n", encoding="utf-8"
+    )
+    shapes = {
+        "marked": "import pytest\n\n\ndef test_v():\n    import helper  # noqa: F401\n\n\n@pytest.mark.xfail\ndef test_known_bad():\n    assert 1 == 2\n",
+        "imperative": "import importlib.util\n\nimport pytest\n\n\ndef test_v():\n    import helper  # noqa: F401\n\n\ndef test_optional():\n"
+        "    if importlib.util.find_spec('helper') is None:\n        pytest.xfail('optional')\n",
+        "production-assert": "import lib\n\n\ndef test_v():\n    lib.load()\n",
+    }
+    for name, body in shapes.items():
+        (repo / "tests" / "test_helper.py").write_text(body, encoding="utf-8")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-q", "-m", f"shape {name}")
+        claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py @ main")
+        result = pi.verify_claim(repo, claim.claim_id).results[0]
+        assert result.proven is False and "crashed" in result.evidence, (name, result.evidence)
+
+
+def test_mutation_accepts_pytest_fail_as_the_tests_assertion_and_names_every_failing_test(repo: Path) -> None:
+    """`pytest.fail` is pytest's own assertion outcome (round-four R4-1); two failing tests are both recorded (R4-2)."""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(
+        "import importlib.util\n\nimport pytest\n\n\ndef test_a():\n    if importlib.util.find_spec('helper') is None:\n"
+        "        pytest.fail('helper missing')\n\n\ndef test_b():\n    assert importlib.util.find_spec('helper') is not None\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + fail/assert tests")
+    claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is True, result.evidence
+    assert "test_a" in result.evidence and "test_b" in result.evidence, result.evidence
+
+
+def test_mutation_counts_an_assertion_raised_in_a_conftest_helper_as_the_tests_own(repo: Path) -> None:
+    """Test-side helpers live in conftest.py and test_*.py modules: an assert raised there is the test's assertion."""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "conftest.py").write_text(
+        "import importlib.util\n\n\ndef expect_helper():\n    assert importlib.util.find_spec('helper') is not None\n", encoding="utf-8"
+    )
+    (repo / "tests" / "test_helper.py").write_text(
+        "from conftest import expect_helper\n\n\ndef test_v():\n    expect_helper()\n", encoding="utf-8"
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + conftest helper")
+    claim = _claim(repo, f"mutation: {PYTEST_HELPER} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is True, result.evidence
+
+
+def test_mutation_is_unproven_when_the_restore_is_not_byte_identical(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")
+    monkeypatch.setattr(pi, "_restore_in_place", lambda repo, snapshot: False)
+    claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "WITH DIFFERENCES" in result.evidence, result.evidence
+
+
+def test_in_place_mutation_records_digests_and_review_refuses_after_the_measured_bytes_change(repo: Path) -> None:
+    """A verdict binds to the bytes it measured: editing a reverted path after verify voids the review (round four)."""
+    (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")
+    claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py")
+    verdict = pi.verify_claim(repo, claim.claim_id)
+    result = verdict.results[0]
+    assert result.proven is True
+    assert result.digests == {"src/target.py": pi.sha256_of(repo / "src" / "target.py")}
+    pi.record_review(repo, claim.claim_id, verdict="PASS", findings="ok")  # unchanged bytes: accepted
+    (repo / "src" / "target.py").write_text("VALUE = 2  # edited after the verdict\n", encoding="utf-8")
+    with pytest.raises(ValueError, match=r"src/target\.py"):
+        pi.record_review(repo, claim.claim_id, verdict="PASS", findings="ok")
+    assert pi.latest_verdict(repo, session_id=SESSION).verdict == pi.VERDICT_PASS, "the earlier verdict stands as history"
+
+
+def test_hook_counts_edits_only_inside_a_worktree_of_this_repo(repo: Path, tmp_path: Path) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": str(tmp_path / "memory" / "note.md")})])
+    assert _hook(repo, transcript)[1].get("decision") != "block", "an Edit outside every worktree of the repo is not this repo's work"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": str(repo / "src" / "target.py")})])
+    assert _hook(repo, transcript)[1].get("decision") == "block"
+    wt = tmp_path / "elsewhere-wt"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt))
+    _transcript(transcript, [(_iso(-30), "Write", {"file_path": str(wt / "src" / "x.py")})])
+    assert _hook(repo, transcript)[1].get("decision") == "block", "a registered worktree of the repo counts wherever it lives"
+
+
+def test_hook_counts_a_foreground_subagents_work_once_its_tool_result_is_back(repo: Path, tmp_path: Path) -> None:
+    """Agent-tool subagents hand back via the parent's tool_result, not an idle notification (round four, 55 % of real
+    subagent transcripts). A subagent whose metadata says neither is counted in full: unknown shapes fail closed."""
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-40), "Agent", {"prompt": "fix it"}, "toolu_spawn1")])
+    sub = tmp_path / "t" / "subagents" / "agent-fg1.jsonl"
+    sub.parent.mkdir(parents=True)
+    (sub.parent / "agent-fg1.meta.json").write_text(
+        json.dumps({"toolUseId": "toolu_spawn1", "agentType": "general-purpose"}), encoding="utf-8"
+    )
+    _transcript(sub, [(_iso(-30), "Edit", {"file_path": str(repo / "src" / "target.py")})], final="edited")
+    assert _hook(repo, transcript)[1].get("decision") != "block", "still running: nothing handed back yet"
+    _tool_result(transcript, "toolu_spawn1", _iso(-20))
+    assert _hook(repo, transcript)[1].get("decision") == "block", "handed back: the subagent's Edit is this session's work"
+    unknown = tmp_path / "t" / "subagents" / "agent-mystery.jsonl"
+    (unknown.with_suffix(".meta.json")).write_text(json.dumps({"agentType": "?"}), encoding="utf-8")
+    _transcript(transcript, [(_iso(-40), "Read", {"file_path": "x"})])
+    _transcript(unknown, [(_iso(-30), "Edit", {"file_path": str(repo / "src" / "target.py")})], final="edited")
+    shutil.rmtree(sub.parent / "agent-fg1.jsonl", ignore_errors=True)
+    (sub.parent / "agent-fg1.jsonl").unlink(missing_ok=True)
+    (sub.parent / "agent-fg1.meta.json").unlink(missing_ok=True)
+    assert _hook(repo, transcript)[1].get("decision") == "block", "no hand-back channel known: counted in full"

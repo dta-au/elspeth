@@ -60,10 +60,10 @@ def _git(repo: Path, *args: str) -> str:
 
 # A tiny "project": src/target.py is the thing lanes fix; tests/run_all.py is the
 # full suite (runs every tests/test_*.py); tests/test_existing.py guards src/other.py.
-TEST_CMD = f"{sys.executable} tests/test_target.py"
+TEST_CMD = f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider"  # RED is structural: pytest records it
 SUITE_CMD = f"{sys.executable} tests/run_all.py"
-GOOD_TEST = "assert open('src/target.py').read().strip() == 'VALUE = 2'\n"  # RED is a FAILED ASSERTION, visible in the output
-FAKE_TEST = "import sys\nsys.exit(0)\n"
+GOOD_TEST = "def test_value():\n    assert open('src/target.py').read().strip() == 'VALUE = 2'\n"
+FAKE_TEST = "def test_nothing():\n    assert True\n"
 
 
 @pytest.fixture
@@ -293,7 +293,7 @@ WORKER = textwrap.dedent(
         subprocess.run([sys.executable, script, "heartbeat", "--lanes-dir", lanes_dir, "--lane", lane_id], check=True)
     beat()
     open(f"{worktree}/tests/test_target.py", "w").write(
-        "assert open('src/target.py').read().strip() == 'VALUE = 2'\\n")
+        "def test_value():\\n    assert open('src/target.py').read().strip() == 'VALUE = 2'\\n")
     open(f"{worktree}/progress", "w").write("test written\\n")
     if mode == "crash":
         beat()
@@ -393,7 +393,7 @@ def test_lane_whose_test_fails_on_the_merged_tree_is_not_verified_even_if_the_su
     """The GREEN gate stands on its own: a suite that does not select the lane's test must not cover for it (reviewer M11)."""
     run = _init(repo, suite_command=f"{sys.executable} tests/test_existing.py")
     lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
-    _worker_commits(lane.worktree_path, test_body="assert open('src/target.py').read().strip() == 'VALUE = 3'\n")
+    _worker_commits(lane.worktree_path, test_body="def test_value():\n    assert open('src/target.py').read().strip() == 'VALUE = 3'\n")
     result = lm.verify(run, "lane-01-t1")
     assert result.red_exit_code == 1
     assert result.green_exit_code == 1
@@ -458,15 +458,40 @@ def _lane_with_new_module(repo: Path, test_body: str, command: str) -> tuple[obj
 
 @pytest.mark.parametrize("shape", sorted(EXIT_1_CRASH_SHAPES))
 def test_lane_whose_test_dies_with_exit_1_but_no_failed_assertion_is_not_verified(repo: Path, shape: str) -> None:
-    """Every common runner reports an uncaught exception inside a test as exit 1 (round two): the exit code alone cannot
-    tell a failed assertion from a crash. RED is a failed assertion VISIBLE in the output."""
+    """Every common runner reports an uncaught exception inside a test as exit 1. Under pytest the plugin records the
+    failure kind (a crash here); under any other runner the kind is NOT MEASURABLE, and either way the lane is not verified."""
     body, command = EXIT_1_CRASH_SHAPES[shape]
     run, _ = _lane_with_new_module(repo, body, command)
     result = lm.verify(run, "lane-01-t1")
     assert result.red_exit_code == 1, (result.red_exit_code, result.red_output_tail)
     assert result.verified is False
-    assert any("crash" in r and "assertion" in r for r in result.reasons), result.reasons
+    assert any("assertion" in r.lower() for r in result.reasons), result.reasons
+    if shape == "pytest-in-body-import":
+        assert any("crash" in r and "ModuleNotFoundError" in r for r in result.reasons), result.reasons
+    else:
+        assert any("not measurable outside pytest" in r for r in result.reasons), result.reasons
     assert result.green_exit_code is None
+
+
+def test_lane_verification_runs_never_write_bytecode(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stale .pyc (same source size, same second) would run the wrong tree's code; every command verify launches
+    refuses to write bytecode, and not by inheritance."""
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
+    run = _init(repo)
+    lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+    body = "import sys\n\n\ndef test_value():\n    assert sys.dont_write_bytecode\n    assert open('src/target.py').read().strip() == 'VALUE = 2'\n"
+    _worker_commits(lane.worktree_path, test_body=body)
+    result = lm.verify(run, "lane-01-t1")
+    assert result.verified is True, result.reasons
+
+
+def test_lane_whose_test_prints_a_verdict_and_then_crashes_is_not_verified(repo: Path) -> None:
+    """Round three: the test's own output is not the runner's report."""
+    body = "def test_nothing():\n    print('AssertionError')\n    print('  Failed: 0')\n    import helper  # noqa: F401\n"
+    run, _ = _lane_with_new_module(repo, body, f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider")
+    result = lm.verify(run, "lane-01-t1")
+    assert result.verified is False and result.red_exit_code == 1
+    assert any("crash" in r for r in result.reasons), result.reasons
 
 
 def test_lane_whose_test_asserts_the_new_module_exists_is_verified(repo: Path) -> None:
@@ -550,13 +575,18 @@ def test_merge_is_serial_the_second_lane_needs_a_verification_against_the_new_ba
     run = _init(
         repo,
         _ticket("t1"),
-        _ticket("t2", files=["src/other.py"], test_files=["tests/test_other.py"], test_command=f"{sys.executable} tests/test_other.py"),
+        _ticket(
+            "t2",
+            files=["src/other.py"],
+            test_files=["tests/test_other.py"],
+            test_command=f"{sys.executable} -m pytest tests/test_other.py -q -p no:cacheprovider",
+        ),
     )
     a = lm.dispatch(run, "lane-01-t1", agent_name="a")
     b = lm.dispatch(run, "lane-02-t2", agent_name="b")
     _worker_commits(a.worktree_path)
     (b.worktree_path / "tests" / "test_other.py").write_text(
-        "assert open('src/other.py').read().strip() == 'OTHER = 2'\n", encoding="utf-8"
+        "def test_other():\n    assert open('src/other.py').read().strip() == 'OTHER = 2'\n", encoding="utf-8"
     )
     _git(b.worktree_path, "add", "tests")
     _git(b.worktree_path, "commit", "-q", "-m", "test: other (red)")
@@ -712,6 +742,8 @@ def test_skill_doc_is_harness_neutral_and_names_the_durable_layout() -> None:
         "redispatch",
         "block",
         "claude-code.md",
+        "prove_it_red_plugin",
+        "not measurable",
     ):
         assert token in text, token
     for primitive in ("**spawn**", "**list-live**", "**message**"):
@@ -726,3 +758,39 @@ def test_claude_code_enhancement_binds_every_primitive() -> None:
     for primitive, tool in (("spawn", "`Agent`"), ("list-live", "`ListAgents`"), ("message", "`SendMessage`")):
         assert primitive in text and tool in text, (primitive, tool)
     assert "resume" in text and "report.md" in text
+
+
+# ----------------------------------------------------------------- round five
+
+
+def test_lane_whose_only_assertion_is_an_xfail_sibling_or_a_production_assert_is_not_verified(repo: Path) -> None:
+    shapes = {
+        "marked": "import pytest\n\n\ndef test_v():\n    import helper  # noqa: F401\n\n\n@pytest.mark.xfail\ndef test_known_bad():\n    assert 1 == 2\n",
+        "production-assert": "import lib\n\n\ndef test_v():\n    lib.load()\n",
+    }
+    command = f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider"
+    for name, body in shapes.items():
+        run = _init(repo, _ticket("t1", files=["src/helper.py", "src/lib.py"], test_command=command), run_id=f"run-{name}")
+        lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+        (lane.worktree_path / "tests" / "test_target.py").write_text(body, encoding="utf-8")
+        _git(lane.worktree_path, "add", "tests/test_target.py")
+        _git(lane.worktree_path, "commit", "-q", "-m", "test")
+        (lane.worktree_path / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+        (lane.worktree_path / "src" / "lib.py").write_text(
+            "import importlib.util\n\n\ndef load():\n    assert importlib.util.find_spec('helper') is not None\n", encoding="utf-8"
+        )
+        _git(lane.worktree_path, "add", "src")
+        _git(lane.worktree_path, "commit", "-q", "-m", "fix")
+        result = lm.verify(run, "lane-01-t1")
+        assert result.verified is False and any("crash" in r for r in result.reasons), (name, result.reasons)
+        _git(repo, "worktree", "remove", "--force", str(lane.worktree_path))
+        _git(repo, "branch", "-D", lane.branch)
+
+
+def test_lane_verify_fails_closed_when_the_red_plugin_is_missing(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(lm, "PLUGIN_PATH", Path("/nonexistent/prove_it_red_plugin.py"))
+    run = _init(repo)
+    lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+    _worker_commits(lane.worktree_path)
+    result = lm.verify(run, "lane-01-t1")
+    assert result.verified is False and any("plugin missing" in r for r in result.reasons), result.reasons

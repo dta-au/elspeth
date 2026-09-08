@@ -113,15 +113,24 @@ diff), then in throwaway worktrees it proves the lane went **red → green**
 with the **full suite** passing:
 
 1. **RED** — base commit + only the lane's test files: the test command must
-   FAIL AT AN ASSERTION — exit 1 *and* a failed assertion visible in the
-   output (`AssertionError`, pytest's `assert …` line, unittest's `FAIL:`).
-   Exit 0 means the test passes without the fix and is not a failing-first
-   test. Any other exit, or exit 1 with no assertion in the output (an import
-   of something the fix adds, a usage error — every runner reports an
-   uncaught exception as exit 1 too), is a crash that never reached the
-   assertion and proves nothing, so the brief tells workers to assert that
+   FAIL AT AN ASSERTION, as recorded by the RUNNER. `verify` launches pytest
+   with prove-it's `prove_it_red_plugin` (`-p`), which records every
+   call-phase report whose outcome is `failed`; RED means that report carried
+   a `pytest.fail` or an `AssertionError` raised in a test file. An xfail is
+   reported skipped and never counts; an assert inside production code is a
+   crash, not the test's assertion. Exit codes and output text are never consulted for this —
+   every runner reports an uncaught exception as exit 1 too, and a test
+   controls its own output, so a test that prints a verdict and then crashes
+   is a crash. Exit 0 means the test passes without the fix and is not a
+   failing-first test; a crash (an import of something the fix adds, a
+   collection error) is not RED, so the brief tells workers to assert that
    what the fix adds exists (`importlib.util.find_spec`, `hasattr`) before
-   using it. Either way the lane is `failed` and nothing further is credited.
+   using it. Under any runner other than pytest the failure kind is
+   **not measurable** and the lane is not verified, for that stated reason:
+   give lanes pytest test commands. The record is proof against mistakes,
+   not against a lane that deliberately forges it from inside the test
+   process — that is what reading the lane's test source is for. Either
+   way the lane is `failed` and nothing further is credited.
 2. **GREEN** — base merged with the branch (`--no-commit`): the test command
    must exit 0. A conflict here is a failure with the conflict recorded.
 3. **SUITE** — the same merged tree: the suite command must exit 0.
