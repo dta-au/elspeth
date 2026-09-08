@@ -25,7 +25,6 @@ This guide covers common errors and their solutions when running ELSPETH pipelin
   - [Guided chat did not advance the stage](#guided-chat-did-not-advance-the-stage)
   - [Wiring confirmation failed](#wiring-confirmation-failed)
   - [Guided source schema or blob interpretation looks wrong](#guided-source-schema-or-blob-interpretation-looks-wrong)
-  - [Recipe or transform suggestion was not offered](#recipe-or-transform-suggestion-was-not-offered)
 
 ---
 
@@ -225,14 +224,14 @@ uv sync --frozen --extra tracing-langfuse
 
 2. Look for quarantined rows:
    ```sql
-   SELECT * FROM node_states WHERE status = 'quarantined';
+   SELECT * FROM token_outcomes WHERE path = 'quarantined_at_source';
    ```
 
 3. Validate your source data matches the expected schema
 
 4. Use the MCP analysis server for detailed investigation:
    ```bash
-   elspeth-mcp --database ./runs/audit.db
+   elspeth-mcp --database sqlite:///./runs/audit.db
    ```
 
 ---
@@ -313,16 +312,20 @@ uv sync --frozen --extra tracing-langfuse
 2. Ensure pipeline config uses container paths, not host paths:
    ```yaml
    # CORRECT - container path
-   source:
-     plugin: csv
-     options:
-       path: /app/input/data.csv
+   sources:
+     primary:
+       plugin: csv
+       on_success: output
+       options:
+         path: /app/input/data.csv
 
    # WRONG - host path
-   source:
-     plugin: csv
-     options:
-       path: ./input/data.csv
+   sources:
+     primary:
+       plugin: csv
+       on_success: output
+       options:
+         path: ./input/data.csv
    ```
 
 ---
@@ -412,7 +415,8 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
 
 ### Schema Validation Failures
 
-**Error:** `ValidationError: field required` or `ValidationError: value is not a valid...`
+**Error:** `ValidationError` with a per-field line such as `Field required` or
+`Input should be a valid integer, unable to parse string as an integer`
 
 **Cause:** Missing required configuration fields or wrong types.
 
@@ -426,7 +430,7 @@ The readiness probe prevents traffic before the app is ready. The liveness probe
 2. Check the configuration reference for required fields
 
 3. Common issues:
-   - Missing `source` section
+   - Missing `sources` section
    - Missing `sinks` section
    - Plugin options with wrong types
    - Undefined environment variables in `${VAR}` syntax
@@ -465,16 +469,13 @@ interpretation card must be reviewed first.
 
 **Cause:** The final guided stage (`STEP_4_WIRE`) accepts only a valid
 `CONFIRM_WIRING` payload. The wire turn is re-emitted when connection labels do
-not map to valid edges, when required/nested keys are missing, or when the
-advisor sign-off path returns `REQUEST_ADVISOR`.
+not map to valid edges or when required/nested keys are missing.
 
 **Solution:**
 
 1. Review the graph overlay and the listed source/sink/transform contracts.
 2. Correct the connection labels or ask the guided chat to revise the wiring
    using the exact node names shown in the overlay.
-3. If the response asks for advisor review, keep the pipeline in the wire stage
-   and follow the advisor guidance; do not treat the request as completion.
 
 ---
 
@@ -493,23 +494,6 @@ interpreted the source intent too broadly.
 3. If the source is actually a remote document workflow, model it as a manifest
    source followed by `blob_fetch` and a parser transform such as
    `blob_csv_expand`, not as a new source plugin.
-
----
-
-### Recipe or transform suggestion was not offered
-
-**Cause:** Guided mode may apply a registered recipe, but the recipe must match
-the actual source, sink, required fields, and safety constraints. A bare
-"CSV to JSON" shape is not enough.
-
-**Solution:**
-
-1. State the desired output fields and safety constraints explicitly in the
-   sink or transform stage.
-2. Use the plugin catalog to confirm the transform exists and that its required
-   options are available.
-3. If no recipe matches, ask guided chat for a direct transform-stage proposal
-   or switch to the YAML/freeform path for custom topology.
 
 ---
 

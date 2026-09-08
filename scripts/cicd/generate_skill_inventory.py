@@ -16,7 +16,7 @@ dispatch-outside-execute_tool carve-outs.
 The categorisation taxonomy (Discovery / State / preview / Build / edit /
 Diagnostics / Blobs / Secrets) is hand-curated and does not perfectly mirror
 ``ToolKind`` — three discovery tools live under "State / preview", one under
-"Diagnostics", and two blob-mutation tools live under "Build / edit". Those
+"Diagnostics", and one blob-mutation tool lives under "Build / edit". Those
 historical placements are encoded as named overrides in
 ``_CATEGORY_OVERRIDES``; every other tool falls into its ``ToolKind``
 default category. Adding a new tool that fits an existing category requires
@@ -175,8 +175,8 @@ _TOOL_ANNOTATIONS: Final[dict[str, str]] = {
 # Named overrides — tools whose hand-curated skill placement does not match
 # their ``ToolKind`` default. The three "stateful discovery" tools live
 # under "State / preview"; the validator-explanation discovery tool lives
-# under "Diagnostics"; two blob-mutation tools live under "Build / edit"
-# because they advance ``CompositionState`` rather than just touching blob
+# under "Diagnostics"; one blob-mutation tool lives under "Build / edit"
+# because it advances ``CompositionState`` rather than just touching blob
 # storage.
 _CATEGORY_OVERRIDES: Final[dict[str, str]] = {
     "get_pipeline_state": _STATE_PREVIEW_CATEGORY,
@@ -184,7 +184,6 @@ _CATEGORY_OVERRIDES: Final[dict[str, str]] = {
     "diff_pipeline": _STATE_PREVIEW_CATEGORY,
     "explain_validation_error": _DIAGNOSTICS_CATEGORY,
     "set_source_from_blob": _BUILD_EDIT_CATEGORY,
-    "apply_pipeline_recipe": _BUILD_EDIT_CATEGORY,
     # Carve-outs (dispatch outside execute_tool, hand-defined in _dispatch.py).
     "request_advisor_hint": _DIAGNOSTICS_CATEGORY,
     "request_interpretation_review": _DIAGNOSTICS_CATEGORY,

@@ -25,8 +25,9 @@ Preferred disclosure path:
    "Security disclosure path requested" and includes no exploit detail.
 
 As of 0.8.0, a dedicated public security mailbox has not yet been published in
-this repository. Publishing or enabling a permanent private disclosure channel
-remains a public-release readiness item.
+this repository. GitHub private vulnerability reporting is enabled for this
+repository, so a permanent private disclosure channel is available; publishing
+a dedicated security mailbox remains a public-release readiness item.
 
 ## What To Include
 

@@ -1,6 +1,6 @@
 # Landscape System Architecture
 
-Current as of 2026-08-31 for the 0.8.0 release line.
+Current as of 2026-09-08 for the 0.8.0 release line.
 
 Landscape is ELSPETH's audit database and lineage read model. It records run
 configuration, source rows, DAG nodes and edges, token lineage, node execution
@@ -14,15 +14,15 @@ Landscape subsystem.
 
 ## Current Inventory
 
-Measured from this checkout on 2026-07-23:
+Measured from this checkout on 2026-09-08:
 
 | Metric | Value |
 |--------|-------|
-| Python files in `src/elspeth/core/landscape/` | 63 |
-| Python lines in `src/elspeth/core/landscape/` | 32,137 |
-| SQLAlchemy Core tables | 41 |
-| MCP Landscape analysis tools | 29 |
-| Schema epoch | 30 |
+| Python files in `src/elspeth/core/landscape/` | 65 |
+| Python lines in `src/elspeth/core/landscape/` | 37,417 |
+| SQLAlchemy Core tables | 46 |
+| MCP Landscape analysis tools | 32 |
+| Schema epoch | 38 |
 
 The inventory above is intentionally date-stamped. Re-run these checks before
 using the numbers in release material:

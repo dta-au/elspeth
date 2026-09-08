@@ -134,7 +134,7 @@ a target.
 
 | Variable | Allowed values / purpose |
 | --- | --- |
-| `ELSPETH_WEB__DEPLOYMENT_TARGET` | `default`, `docker-compose`, `linux-systemd`, `aws-ecs`, `azure-container-apps`, or `kubernetes`. The `azure-container-apps` value is reserved; no supported Container Apps bundle ships in this release. |
+| `ELSPETH_WEB__DEPLOYMENT_TARGET` | `default`, `docker-compose`, `linux-systemd`, `aws-ecs`, `azure-container-apps`, or `kubernetes`. `azure-container-apps` ships a Bicep bundle under `deploy/azure-container-apps/`, but remains a program under acceptance rather than a supported platform. |
 | `ELSPETH_WEB__DEPLOYMENT_STATE_MODE` | `auto`, `sqlite-single`, or `external-postgresql`. Production cloud targets require `external-postgresql`; native Linux can use `sqlite-single` on one host. |
 | `ELSPETH_WEB__INSTANCE_ID` | Optional. Pins the identity this process presents on every response (`X-Elspeth-Instance`), in `/api/system/status`, and as the owner of the session-operation fences it acquires. 1-128 characters of `[A-Za-z0-9._-]` with a leading alphanumeric. Leave unset in production: each process mints a fresh `web-<uuid4>` at startup, which is what keeps two replicas distinguishable. |
 | `ELSPETH_WEB__SESSION_DB_URL` | Session database URL. External mode requires PostgreSQL. |
@@ -677,13 +677,22 @@ complete worked example, and the plugin's YAML options under
 
 ### Amazon Textract
 
-The `aws_textract_document_analysis` transform has **no environment
-variables**. It is user-configurable per node (region, the row fields carrying
-the S3 bucket and key, and the requested feature types), and it authenticates
-through the ordinary AWS credential chain — the ECS task role in a container
-deployment.
+On the CLI and YAML authoring surface the `aws_textract_document_analysis`
+transform has **no environment variables**. It is user-configurable per node
+(region, the row fields carrying the S3 bucket and key, and the requested
+feature types), and it authenticates through the ordinary AWS credential
+chain — the ECS task role in a container deployment.
 
-Two things gate it instead of an environment variable:
+The web surface is profiled instead. `ELSPETH_WEB__AWS_TEXTRACT_PROFILES` is a
+JSON array of operator-owned document profiles, each carrying exactly `alias`,
+`bucket`, and `key_prefix`. Under a profile a web author selects an opaque
+`profile` alias plus the ordinary per-node author options; `bucket`,
+`key_prefix`, and `region` are operator-owned bindings lowered only for
+execution, so rows carry relative object keys rather than bucket names. The
+region is not per-node here — it comes from the ambient `AWS_REGION`, and
+`ELSPETH_WEB__DEPLOYMENT_AWS_REGION` is rejected at startup as reserved.
+
+Two other things gate it:
 
 - **The allowlist.** It is not part of the required web core, so
   `ELSPETH_WEB__PLUGIN_ALLOWLIST` must include

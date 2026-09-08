@@ -22,6 +22,7 @@ transforms:
 - name: keyword_filter_0
   plugin: keyword_filter
   input: source_out
+  on_success: keyword_filter_0
   on_error: blocked_keywords
   options:
     fields: text
@@ -32,6 +33,7 @@ transforms:
 - name: azure_content_safety_1
   plugin: azure_content_safety
   input: keyword_filter_0
+  on_success: azure_content_safety_1
   on_error: flagged
   options:
     endpoint: ${AZURE_CONTENT_SAFETY_ENDPOINT}
@@ -44,10 +46,10 @@ transforms:
       self_harm: 0
     schema:
       mode: observed
-    pool_size: 5
 - name: azure_prompt_shield_2
   plugin: azure_prompt_shield
   input: azure_content_safety_1
+  on_success: azure_prompt_shield_2
   on_error: attacks
   options:
     endpoint: ${AZURE_CONTENT_SAFETY_ENDPOINT}
@@ -55,7 +57,6 @@ transforms:
     fields: text
     schema:
       mode: observed
-    pool_size: 5
 - name: llm_3
   plugin: llm
   input: azure_prompt_shield_2
@@ -80,6 +81,8 @@ transforms:
       '
     temperature: 0.0
     response_field: sentiment_analysis
+    required_input_fields:
+    - text
     schema:
       mode: observed
     pool_size: 10

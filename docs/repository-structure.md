@@ -23,14 +23,15 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | Developer & CI automation | `scripts/` | Runnable repo automation: CI check logic, eval drivers, git hooks, audits, deploy helpers. |
 | Deliverable-artifact build | `tools/` | Build pipelines that render *distributable artifacts* (currently `tools/pdf/`). |
 | CI/CD & governance config | `config/`, `.github/`, `.githooks/` | Declarative policy + workflow triggers + local hook bindings (see [§ CI three-way](#ci-the-three-way-split)). |
-| Deployment | `deploy/`, root `Dockerfile` / `docker-compose.yaml` | How the service is shipped and run: `deploy/compose/` adds the maintained PostgreSQL Compose bundle, `deploy/aws-ecs/terraform/` contains the supported disposable ECS cold-install source, and `deploy/linux-systemd/` contains the portable native-Linux unit and environment example. The existing `deploy/elspeth-web.service` is staging-specific. |
-| Internal evaluation | `evals/` | LLM/composer evaluation harness + dated run records. **Local-only (gitignored) as of 2026-06-28** — *except* `evals/__init__.py` and `evals/lib/`, which stay tracked because `tests/unit/evals/` import `evals.lib.*`. The dated run records and harnesses live on contributors' machines, not in the repo. |
+| Deployment | `deploy/`, root `Dockerfile` / `docker-compose.yaml` | How the service is shipped and run: `deploy/compose/` adds the maintained PostgreSQL Compose bundle, `deploy/aws-ecs/terraform/` contains the supported disposable ECS cold-install source, `deploy/azure-container-apps/` contains the Container Apps Bicep source, and `deploy/linux-systemd/` contains the portable native-Linux unit and environment example. The root `deploy/elspeth-web.service` is a gitignored source-checkout development unit, not repository content. |
+| Internal evaluation | `evals/` | LLM/composer evaluation harness + dated run records. **Local-only (gitignored) as of 2026-06-28** — *except* `evals/__init__.py` and `evals/lib/`, which stay tracked because `tests/unit/evals/` import `evals.lib.*`, and the tracked scenario corpora `evals/composer-battery/`, `evals/composer-parity/` and `evals/composer-standard-battery/`. The dated run records and the harness directories live on contributors' machines, not in the repo. |
 | Engineering notes | `notes/` | Ad-hoc engineering memos and baselines — gitignored, never tracked. Design notes that code or ADRs cite live in `docs/architecture/design-notes/`. |
 | Auxiliary package | `elspeth-lints/` | The CI tier-model linter — its own Python package (own `pyproject.toml`) consumed by CI, not by `src/`. |
 | Standalone service | `gateway/` | The `elspeth-llm-gateway` LLM compatibility gateway — its own Python package (own `pyproject.toml`, tests, and container image), deployed separately and never imported by `src/`. |
 | Marketing / landing site | `website/` | Standalone static site (HTML/CSS/JS), built and served independently of the app frontend. |
-| Runtime / working data | `data/`, `state/` | App working data and the audit database (see [§ Working-state](#working-state-where-runtime-data-lives)). Mostly gitignored. |
-| Local tool/runtime state | the gitignored dot-dirs | `.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.uv-cache`, `node_modules`, `.loomweave`, `.filigree`, `.weft`, `.clarion`, `.claude`, `.codex`, `.agents`, `.superpowers`, `.worktrees`, `scratch/`, … — never shipped, never relied on by tracked code. One bucket; do not itemise. |
+| Design system | `design/` | The ELSPETH design system pack — tokens, guidelines, components, UI kits, and assets distilled from the app frontend so design agents can build on-brand interfaces and mocks. Reference material; never built or imported by `src/`. |
+| Runtime / working data | `data/` | App working data and the system databases, the audit database among them (see [§ Working-state](#working-state-where-runtime-data-lives)). Mostly gitignored. |
+| Local tool/runtime state | the gitignored dot-dirs | `.venv`, `.ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.uv-cache`, `node_modules`, `.loomweave`, `.filigree`, `.weft`, `.clarion`, `.codex`, `.superpowers`, `.worktrees`, `scratch/`, … — never shipped, never relied on by tracked code. One bucket; do not itemise. `.agents/` and `.claude/` are **not** in this bucket (see the note below). |
 | Root metadata & manifests | root files | Governance/community docs (`LICENSE`, `GOVERNANCE.md`, `SECURITY.md`, `CODE_OF_CONDUCT.md`, `CONTRIBUTING.md`, `SUPPORT.md`), product docs (`README.md`, `ARCHITECTURE.md`, `PLUGIN.md`, `CHANGELOG.md`), and build/tooling config (`pyproject.toml`, `uv.lock`, `package*.json`, `Dockerfile`, `.pre-commit-config.yaml`, `.mcp.json`, dot-config). |
 
 > Agent-instruction files (`CLAUDE.md`, `AGENTS.md`) are **tracked** in git (as
@@ -39,21 +40,25 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 > project covenant; the maintainer's own agent toolchain (issue tracker, code
 > map, delegation conventions) is described in
 > [`docs/maintainer/toolchain.md`](maintainer/toolchain.md) and is not required
-> to contribute.
+> to contribute. The `.agents/` and `.claude/` directories are likewise partly
+> tracked, not local state: `.agents/skills/` is the canonical skills tree and
+> `.claude/skills/` holds tracked compatibility symlinks into it, so
+> `.gitignore` ignores only the machine-local subpaths named under them.
 
 ## One level down (where it aids placement)
 
 - **`config/`** → `cicd/` (one folder per CI policy: cells, allowlists, defaults), `mcp/` (MCP server configuration).
-- **`scripts/`** → `cicd/`, `eval/`, `git-hooks/`, `scan-groups/`, `skill_rgr/`, `archive/` (superseded one-offs), plus top-level utility scripts (`generate_test_data.py`, `run_mutation_testing.py`, `validate_deployment.py`, `deploy-vm.sh`, `smoke-test.sh`).
+- **`scripts/`** → `cicd/`, `codex_lenses/`, `eval/`, `git-hooks/`, `red_team/`, `scan-groups/`, `skill_rgr/`, `state_engine_assessment_lib/`, `archive/` (superseded one-offs), plus top-level utility scripts (`generate_test_data.py`, `run_mutation_testing.py`, `validate_deployment.py`, `deploy-vm.sh`, `smoke-test.sh`).
 - **`tools/`** → `pdf/` (Typst/Pandoc artifact builds).
-- **`evals/`** → dated run folders (`2026-05-03-composer/` …), `composer-harness/`, `composer-rgr/`, `lib/` (shared eval code).
+- **`evals/`** → dated run folders (`2026-05-03-composer/`, `2026-05-06-endpoint-validation/`), `composer-harness/`, `composer-rgr/`, the tracked scenario corpora `composer-battery/`, `composer-parity/` and `composer-standard-battery/`, and `lib/` (shared eval code).
 - **`data/`** → `skills/` (deployment examples of the live composer skill prompt); runtime DBs live here at deploy time (gitignored).
 - **`docs/`** → see its own [index](README.md); plans/specs that are implemented are removed from active docs and may be preserved by maintainers in the ignored local archive.
 - **`deploy/`** → `compose/` (PostgreSQL and web Compose overlays),
   `aws-ecs/terraform/` (disposable single-replica AWS cold-install source),
-  `linux-systemd/` (portable native-Linux service and environment example), and
-  the existing staging-specific service unit. Azure uses the portable Linux
-  path; Kubernetes remains BYO and has no shipped directory in this release.
+  `azure-container-apps/` (Container Apps Bicep source; the platform is not a
+  supported target in this release), and `linux-systemd/` (portable
+  native-Linux service and environment example). Kubernetes remains BYO and has
+  no shipped directory in this release.
 
 ## Decision rules — where does a new file go?
 
@@ -69,7 +74,7 @@ the root README and [ARCHITECTURE.md](../ARCHITECTURE.md) for the code tree.
 | An evaluation scenario or harness change | `evals/` |
 | A deployable artifact (service unit, env template) | `deploy/` |
 | A throwaway working file | `scratch/` (gitignored) — **never** commit it |
-| Runtime/working data the app reads or writes | `data/` (sessions/working) or `state/` (audit DB) |
+| Runtime/working data the app reads or writes | `data/` (sessions/working data and the audit DB) |
 
 The test for any folder: *would a contributor know, without asking, where to put
 a new file?* Where two folders could both plausibly hold it, the boundary is
@@ -104,16 +109,22 @@ tool; a helper that lints, tests, deploys, or generates fixtures is a script.
 
 ✓ Distinct by *target*: `deploy/compose/` = maintained database/web overlays;
 `deploy/aws-ecs/terraform/` = maintained disposable AWS ECS infrastructure;
-`deploy/linux-systemd/` = portable host service and environment example; root
-`Dockerfile`/`docker-compose.yaml` = container image and CLI-oriented base;
+`deploy/azure-container-apps/` = Container Apps Bicep source (the platform is not
+a supported target in this release); `deploy/linux-systemd/` = portable host
+service and environment example; root `Dockerfile`/`docker-compose.yaml` =
+container image and CLI-oriented base;
 `scripts/deploy-vm.sh` + `validate_deployment.py` = automation that drives a
 deploy.
 
 ### Working-state: where runtime data lives
 
-✓ Distinct by *role*: `data/` = app/session working data (sessions DB, skill
-examples); `state/` = the `audit.db` landscape database (its path is hardcoded in
-`core/config.py`). Scratch is settled by `.gitignore`: `.scratch/` is the canonical
+✓ Distinct by *role*, all under `data/`: `data/sessions.db` and `data/auth.db` =
+app/session working data (with `data/skills/` examples); the Landscape audit
+database is `data/runs/audit.db` for the web service (`web/config.py`) and, for
+ad-hoc CLI/MCP runs, the `sqlite:///./data/audit.db` default in `core/config.py`
+— a settings-overridable default created on demand, kept under `data/` so runs
+don't scatter a separate `state/` tree. There is no top-level `state/`
+directory. Scratch is settled by `.gitignore`: `.scratch/` is the canonical
 composer-MCP scratch dir (kept via `.gitkeep`), `scratch/` is the ignored
 duplicate. `.elspeth/rotations.log` is deliberately force-tracked as a tier-model
 rotation audit trail.
@@ -137,7 +148,7 @@ harness" and "engineering notes" are clear, distinct purposes.
 | 3 | `.benchmarks/` (root) empty and **not** gitignored | **Done** — deleted and added `/.benchmarks/` to `.gitignore` |
 | 4 | `.elspeth/rotations.log` under version control | **No change** — deliberately force-tracked (`!.elspeth/rotations.log`) as a tier-model rotation audit trail |
 | 5 | `tools/pdf/` briefing/walkthrough builders tied to archived 2026-05-03 evidence | **Done** — archived the two builders + their metadata; `build-arch-pack.sh` and shared infra retained |
-| 6 | `data/` vs `state/` runtime split not self-evident | **Documented** here (`state/audit.db` path is hardcoded in `core/config.py`, so it stays put) |
+| 6 | `data/` vs `state/` runtime split not self-evident | **Done** — the CLI/MCP Landscape default moved under `data/` (`core/config.py`), retiring `state/`; there is no split left to adjudicate |
 
 Not flagged (clear, distinct purpose): `src/`, `tests/`, `docs/`,
 `examples/`, `scripts/`, `tools/`, `config/`, `.github/`, `.githooks/`, `deploy/`,

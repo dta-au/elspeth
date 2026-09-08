@@ -63,11 +63,18 @@ Nested environment variables use double underscore: `ELSPETH_LANDSCAPE__URL`.
 | `sources` | object | **Yes** | - | Named source plugin configurations (one or more per run; map of source name → source config) |
 | `sinks` | object | **Yes** | - | Named sink configurations (at least one required) |
 | `queues` | object | No | `{}` | Named pass-through queue nodes for explicit fan-in (required when multiple producers feed one processing node) |
+| `llm_profiles` | object | No | `{}` | Operator-owned LLM provider profiles keyed by opaque alias; an `llm` transform can select a profile instead of carrying raw provider config |
+| `default_llm_profile` | string | No | - | Preferred profile alias; must name a configured `llm_profiles` entry |
 | `run_mode` | string | No | `"live"` | Execution mode: `live`, `replay`, `verify` |
 | `replay_from` | string | No | - | Run ID to replay/verify against (required for replay/verify modes) |
 | `transforms` | list | No | `[]` | Ordered transforms to apply |
 | `gates` | list | No | `[]` | Config-driven routing gates |
 | `coalesce` | list | No | `[]` | Fork path merge configurations |
+| `row_unions` | list | No | `[]` | `row_union` barriers — wait for every declared fork branch of a row, then release those branch tokens as one indivisible group in declared branch order. Payloads pass through untouched; unlike `coalesce` it merges no fields |
+| `collectors` | list | No | `[]` | Collectors — the closer of an expand group. Buffers every member of one group and flushes on end of group only, using the same batch-transform plugin contract as `aggregations` |
+| `scopes` | list | No | `[]` | Scope bindings pairing a multi-row transform opener with its collector closer; `policy` is required with no default |
+| `max_bound_region_depth` | int | No | `5` | Maximum supported bound-region nesting depth; the builder rejects deeper nesting. The ceiling is 64 |
+| `max_expand_group_width` | int | No | `100000` | Maximum members one expansion may mint; the engine refuses a wider expansion at the opener and routes the row through the transform error channel. The ceiling is 10000000 |
 | `aggregations` | list | No | `[]` | Batch processing configurations |
 | `depends_on` | list | No | `[]` | Pipeline dependencies — run these before the main pipeline |
 | `commencement_gates` | list | No | `[]` | Go/no-go conditions evaluated after dependencies complete |

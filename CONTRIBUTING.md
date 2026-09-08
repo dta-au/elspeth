@@ -86,7 +86,8 @@ ctx = make_context(recorder=recorder, run_id=run_id)
 
 ```bash
 # Tier model enforcement (layer dependency detection)
-env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules trust_tier.tier_model --root src/elspeth
+ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
+  env PYTHONPATH=elspeth-lints/src .venv/bin/python -m elspeth_lints.core.cli check --rules trust_tier.tier_model --root src/elspeth
 ```
 
 ## Whole-tree gates and conventions you will hit
@@ -429,6 +430,47 @@ name and label rules by calling the runtime's own validators, so test fixture
 node ids and labels must be runtime-valid — fix the fixture, never relax the
 mirror.
 
+### Gate: Landscape mutation fencing
+
+**Pins:** in `tests/unit/architecture/test_web_landscape_mutation_fencing.py`,
+four frozen inventory pins — production callers, coordination callers,
+internal facade edges, subordinate `Connection`-helper edges — plus a
+canonical DML digest (`_EXPECTED_DML_INVENTORY_SHA256`) over every current
+mutation construction. Five violation sets ride the same file: caller
+authority, coordination caller authority, API authority, transaction order,
+and escapes.
+
+Read the two halves differently. The violation sets are counters of the
+declared ADR-048 token-fencing burn-down and report outstanding sites as
+`xfail`, retiring themselves to a plain pass when a set reaches zero. **The
+inventory pins are hard failures**: a pin is a defect detector, and drift in
+one means something moved that nobody accounted for. Each test id asserts
+several checks in sequence, so a red id reports only the first failing check
+and hides the rest — score the whole gate with the maintainer tool rather
+than by re-running the id:
+
+```bash
+.venv/bin/python scripts/fencing_inventory.py .                    # every check in one pass
+.venv/bin/python scripts/fencing_inventory.py . --baseline <tree>  # unchanged / arrived / departed / moved
+```
+
+An arrived row is re-derived, a departed row is a code change to read, and a
+moved fingerprint is a call whose arguments changed.
+
+### Gate: Sessions database mutation authority
+
+**Pins:** the reviewed production writer manifest for the Sessions database
+in `tests/unit/architecture/test_session_db_mutation_authority.py`, plus the
+exact table policy. Writer identities are AST fingerprints with occurrence
+ordinals, so replacing, duplicating or removing a site cannot be hidden by an
+unchanged count, and the manifest enumerates through `iter_gate_files` from
+`tests/helpers/tree_gate.py` like every other whole-tree gate.
+
+The manifest is fail-closed: a direct production writer is not admitted until
+it is routed through a named typed authority. Adding a write to a Sessions
+table means binding it to that authority and re-deriving the manifest entry —
+never widening the policy to accept the raw site.
+
 ### Gate: CSS barrel structure
 
 **Pins:** every custom property referenced with `var()` in the frontend is
@@ -442,10 +484,12 @@ after any stylesheet change.
 
 ### Gate: Playwright auth state
 
-Playwright's global setup rewrites the shared `tests/e2e/.auth/user.json`
-for the whole worktree. Distinct backend and frontend ports do not isolate
-it, so two concurrent Playwright runs in one worktree corrupt each other's
-authenticated state. Run every Playwright suite sequentially per worktree.
+Playwright's global setup rewrites the shared
+`src/elspeth/web/frontend/tests/e2e/.auth/user.json` for the whole worktree.
+The path is resolved from the config file's own directory, not the repo root.
+Distinct backend and frontend ports do not isolate it, so two concurrent
+Playwright runs in one worktree corrupt each other's authenticated state. Run
+every Playwright suite sequentially per worktree.
 
 ### Gate walker and scratch directory
 
@@ -584,8 +628,9 @@ Working rules that follow from them:
   `node_type` dispatch site: the binder, proposal projection and
   `validate_payload`, wire cardinality, the frontend union / decoder /
   renderers, and the teaching skills. Never a lane-scoped schema narrowing.
-- The composer authors `coalesce`; `row_union` is never authorable, and a
-  `row_union`-bound fork inside any bound region is a build-time rejection.
+- The composer authors both `coalesce` and `row_union` (a plugin-free
+  `require_all` N-to-N barrier), and a `row_union`-bound fork inside any
+  bound region is a build-time rejection.
 - Scalar routing fields are the runtime authority; sink-targeting edges are
   their mirror and must agree. One predicate, `edge_lowering_error` in
   `web/composer/state.py`, decides legality for both `upsert_edge` and
@@ -669,12 +714,16 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
 - Batched rows are first-class ([ADR-020](docs/architecture/adr/020-retire-batch-llm-transforms.md)):
   every row leaves in good order or quarantines, and aggregation members'
   buffered acceptances keep the original `batch_id` across crash-retry.
-- Branch-loss reasons are categorical tokens from the shared vocabulary of
-  `record_coalesce_branch_loss`; group-settlement reasons are a closed
-  `StrEnum` ([ADR-042](docs/architecture/adr/042-group-settlement-observability.md)),
-  and merged-versus-failed is discriminated by release status, not
-  completion. A new producer reuses the vocabulary rather than inventing
-  prose.
+- Group-loss reasons are categorical tokens recorded through
+  `record_group_loss`, which is idempotent on
+  `(run_id, closer_name, group_id, member_key)`. They come from the closed
+  `GroupSettlementReason` `StrEnum`
+  ([ADR-042](docs/architecture/adr/042-group-settlement-observability.md))
+  for coalesce and scope/collector closers, and from row_union's sibling
+  vocabulary in `engine/row_union_executor.py`, which stays outside that enum
+  by ruling. Merged-versus-failed is discriminated by release status, not
+  completion. A new producer reuses one of those vocabularies rather than
+  inventing prose.
 - The loss seam is not single: coalesce branch loss, empty-group records
   (`record_empty_expansion`, gated on `creates_tokens`) and contract
   violations are separate ledgers with separate consumers.
@@ -761,9 +810,12 @@ promises are `preserves_input_values` (transform) and `observed_value_type`
 - Do not use `git stash`; use a worktree or a commit. This is a convention, not
   an enforced gate — nothing blocks it. (The old `.git/hooks/pre-stash` never
   ran: git has no `pre-stash` hook. Removed 2026-09-02.)
-- `.claude/skills/**/*.py` is production code to every whole-tree test gate
+- `.agents/skills/**/*.py` is production code to every whole-tree test gate
   but is not under the `--root src/elspeth` tier gate; ruff `T20` is ignored
-  there, as under `scripts/`.
+  there, as under `scripts/`. `.claude/skills/` holds compatibility symlinks
+  into that tree which the gate walker does not follow: it carries the same
+  `T20` ignore so a resolved path is treated alike, but is scanned by no
+  gate.
 - Keep this section current: when you land a new whole-tree gate or a new
   standing convention, add the rule here and the dated entry to
   `docs/agents/recent-code-hints.md` in the same commit.

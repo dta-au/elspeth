@@ -536,25 +536,25 @@ allow_hits:
     carried. The qname-level rationale above was re-verified against the
     current code at this site.
   expires: '2026-09-15'
-- key: plugins/infrastructure/manager.py:R4:PluginManager:register:fp=0e88b71c015f8aa0
+- key: plugins/infrastructure/manager.py:R4:PluginManager:register:fp=b8bc7d446e9da6a7
   owner: john
   reason: |-
     In PluginManager.register (manager.py:107), the broad except Exception as rollback_err sits on the *rollback* path inside the outer handler: when check_pending()/_refresh_caches() fails, the code unregisters the plugin and refreshes caches, and this inner catch guards only that rollback so a secondary rollback failure cannot bury the original diagnostic via implicit exception chaining. The original exception is unconditionally re-raised on line 109 (`raise`), so the primary failure still crashes registration as plugin-ownership policy requires; the rollback failure is recorded via _logger.error with exc_info. This is the documented rollback-protection idiom, not error swallowing — the real failure is preserved and propagated.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:08:42.383952+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-09-08T01:02:55.903430+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM. The broad except at line 107 guards only the rollback path (unregister + refresh) inside an outer handler that has already captured the primary failure; line 109 unconditionally re-raises the original exception, so the plugin-ownership crash-on-failure semantics are preserved. The inner catch exists specifically to prevent a secondary rollback exception from displacing the primary diagnostic via implicit chaining, and it records the rollback failure via _logger.error with exc_info rather than swallowing it silently. This is the documented rollback-protection idiom, not defensive suppression: the real failure still propagates.
+    PRESCRIBED FORM — the broad catch is confined to rollback attempted while an earlier registration failure is already active, and the unconditional bare `raise` at line 132 visibly re-raises that primary failure. The rollback exception is recorded with `exc_info=True`, so it is not silently discarded, while preventing it from replacing the original diagnostic. This satisfies R4’s re-raise-after-recording concern and preserves the crash semantics required for first-party plugin failures.
   judge_signature_version: 2
   scope_fingerprint: 58a08845e9c373c7e82a6d9ea1b75d345d485342edff8a5aacec0ffd057ab753
-  judge_transport: openrouter
-  ast_path: 'body[11]/body[3]/body[2]/handlers[0]/body[0]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:b75924e5a5455122243d5cc13f5ea2bf495d136abd1b6626dbd36999169f6b5f'
+  judge_transport: codex_cli
+  ast_path: 'body[16]/body[3]/body[2]/handlers[0]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:02302cd55f3e74ac5fbfc989af48ec6845a48c86bdf6e8d05d79d8f8d563ad80'
 - key: plugins/infrastructure/pooling/executor.py:R6:PooledExecutor:_execute_single:fp=71e586ef9fbea49d
   owner: john
   reason: |-
@@ -616,101 +616,44 @@ allow_hits:
   judge_transport: openrouter
   ast_path: 'body[16]/body[11]/body[4]/body[1]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:48df13bde0e03d86e8f3202957d4daafc73049fdaa4e90ae19c12c7627cea4e2'
-- key: plugins/infrastructure/batching/mixin.py:R4:BatchTransformMixin:_process_and_complete:fp=f4156f4a5d78f78b
+- key: plugins/infrastructure/batching/mixin.py:R4:BatchTransformMixin:_process_and_complete:fp=f89da8cfe4e1f752
   owner: john
   reason: |-
-    In BatchTransformMixin._process_and_complete (mixin.py:279), the broad except Exception runs on a worker thread that cannot let an exception propagate directly (the orchestrator thread would block forever on the waiter). The handler captures the original exception and traceback.format_exc() into an ExceptionResult, transports it through _complete_ticket/the waiter channel, and the orchestrator thread re-raises it — preserving crash-on-bug semantics required by plugin-ownership policy, just on the correct thread. The original exception and traceback are retained, so chaining and auditability are intact. This is the recognized thread-boundary transport idiom, not silent swallowing. Matches the existing rationale.
+    The worker catches processor exceptions only to construct an owned ExceptionResult carrying the original exception and traceback. _complete_ticket admits that result to the FIFO waiter path, or re-raises the original exception for a verified late completion. Future callbacks record that failure and accept/flush/shutdown re-raise it in the orchestrator. No exception becomes a successful row. TestBatchTransformMixinWorkerFailurePropagation.test_tier1_worker_exception_reaches_waiter_immediately and TestBatchTransformMixinEviction.test_evicted_worker_integrity_failure_reaches_shutdown exercise active and evicted outcomes.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T16:43:53.363845+00:00'
+  judge_recorded_at: '2026-09-08T00:59:53.624844+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM — the broad catch transports, rather than suppresses, an exception that cannot propagate directly from the worker thread. BatchTransformMixin._process_and_complete stores the original exception and formatted traceback in ExceptionResult and passes it through BatchTransformMixin._complete_ticket; the named downstream control is verified at engine/batch_adapter.py:230, where SharedBatchAdapter._wait_for detects ExceptionResult and re-raises its original exception at line 233. This preserves crash-on-plugin-bug semantics across the thread boundary and directly addresses R4's suppression concern.
+    PRESCRIBED FORM — the broad catch transports processor failures across the worker-thread boundary without converting them into successful rows or silently suppressing them. The control-location claim is verified: `BatchTransformMixin._complete_ticket` re-raises failed late completions, while `_record_batch_worker_failure`, `_raise_batch_worker_failure`, `accept_row`, `flush_batch_processing`, and `shutdown_batch_processing` preserve and surface failures at plugins/infrastructure/batching/mixin.py:219, 267-284, 342-354, 439-471, and 501-543. The claimed active-waiter and evicted-completion paths are pinned by `TestBatchTransformMixinWorkerFailurePropagation.test_tier1_worker_exception_reaches_waiter_immediately` and `TestBatchTransformMixinEviction.test_evicted_worker_integrity_failure_reaches_shutdown` at tests/unit/plugins/batching/test_batch_transform_mixin.py:388-414 and 984-1014. R4 is not eligible for the `@trust_boundary` decorator mechanism.
   judge_signature_version: 2
   scope_fingerprint: 93634dc847a387fb6e5ecfc8c2b261c022847882ac6e8ea40e273ef78352ae2d
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[18]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:534f3ab3d56da2e11eda153fa778566b074a7d100f8bade9027075d751c92a7d'
-- key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_complete_ticket:fp=f6b5a60d4c2ae50c
+  ast_path: 'body[15]/body[23]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:734b6ba79def69dc227f869df66af8cd3f790166ade948485511d3e7afc1879f'
+- key: plugins/infrastructure/batching/mixin.py:R9:BatchTransformMixin:evict_submission:fp=0415707765ca653e
   owner: john
   reason: |-
-    In BatchTransformMixin._complete_ticket (mixin.py:305), `except (KeyError, ShutdownError)` catches two specific, named exceptions representing legitimate expected races: a ticket already evicted by timeout (KeyError) or a buffer shutdown (ShutdownError). These are documented control-flow signals that a late worker completion arriving after eviction/shutdown is expected and discardable. The discard is recorded via debug log with token_id and state_id for traceability; re-raising would crash a worker thread over a benign race the design tolerates. This is a narrow EAFP catch, not a broad swallow — the handling IS the explicit policy for these two conditions. Existing rationale accurate.
+    Existing optional outstanding-submission index removal. Absent entry means no outstanding attempt can be evicted, and returns the declared False result; a present ticket is passed to RowReorderBuffer.evict, which validates identity and rejects completed entries. This key changes only through AST binding churn in the file; behavior of the site is unchanged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:10:49.274299+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.82
-  judge_rationale: |-
-    PRESCRIBED FORM. The except catches two specific, named exceptions (KeyError, ShutdownError) that represent legitimate expected races in a concurrent worker/buffer design: a ticket already evicted by timeout or a buffer already shut down when a late worker completion arrives. This is narrow EAFP, not a broad swallow — the two conditions ARE the documented control-flow signals, and the discard is recorded via debug log with token_id and state_id for traceability. Re-raising would crash worker threads over benign races the design explicitly tolerates; the handling IS the policy for these conditions. The rationale addresses R6's specific concern (silent swallow) by identifying the handling as explicit tolerance of named race conditions with logged traceability.
-  judge_signature_version: 2
-  scope_fingerprint: 187bc822f04749d7899c6eb435f90cfe93f039f32e28bf9790c21cefaf793dab
-  judge_transport: openrouter
-  ast_path: 'body[14]/body[19]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:6caa05eb4a7725fd97bc4209d0602c7b11513b87609f225ae15b502a98ad83e0'
-- key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_release_loop:fp=ba03beb6f92aa4ff
-  owner: john
-  reason: |-
-    In BatchTransformMixin._release_loop (mixin.py:350), except TimeoutError -> continue handles the documented poll sentinel from wait_for_next_release(timeout=1.0): 'no result ready in this window'. It is a normal condition during low load, not an error; re-raising would kill the release thread and stall the pipeline. The catch is narrowly typed, and the same try/except routes ShutdownError -> break (clean exit, line 354) and other Exception -> wrap-as-ExceptionResult/emit with TIER_1_ERRORS re-raised (lines 361-380) — discriminated control flow, not a catch-all swallow. R6's concern (errors vanishing without re-raise or error result) does not apply to a documented timeout sentinel used for poll-and-retry. Matches the existing rationale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:10:55.862589+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.9
-  judge_rationale: |-
-    RULE MISFIRES. The `except TimeoutError: continue` is not swallowing an error — it is handling the documented sentinel return of `wait_for_next_release(timeout=1.0)` meaning 'no result this poll window'. This is a polling idiom, not error suppression: the timeout IS the normal signal to re-loop. R6's concern (errors vanishing without re-raise or explicit error result) does not apply because TimeoutError here is not an error condition. The surrounding try/except demonstrates discriminated control flow: ShutdownError→break, invariant violations→raise, output failures→ExceptionResult with TIER_1_ERRORS re-raised. The narrow catch on a specific sentinel type is the correct polling pattern.
-  judge_signature_version: 2
-  scope_fingerprint: 18f39e7843017fbc821335289d9808c913bda41fbd15f1f12be06237b01e72dd
-  judge_transport: openrouter
-  ast_path: 'body[14]/body[20]/body[1]/body[2]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:e0e5878205dea9a71dba46bea8c2fb94364443e6aeed9fccb798a3ee734f0b31'
-- key: plugins/infrastructure/batching/mixin.py:R6:BatchTransformMixin:_release_loop:fp=a0a54281d2757010
-  owner: john
-  reason: |-
-    In BatchTransformMixin._release_loop (mixin.py:354), except ShutdownError -> break is the dedicated release thread's only clean-exit path. ShutdownError is an ELSPETH-internal typed control-flow signal (a RuntimeError subclass defined in row_reorder_buffer.py) raised by buffer.shutdown(); shutdown_batch_processing() drains all workers before shutting the buffer, so reaching break carries the invariant that all results have been emitted. The same try/except routes TimeoutError -> continue (line 350) and other Exception -> wrap/emit with TIER_1_ERRORS re-raised (line 361). This is a narrowly-typed wakeup signal used as control flow, not silent swallowing of a real error. Matches the existing rationale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T00:34:13.102292+00:00'
+  judge_recorded_at: '2026-09-08T01:01:41.546553+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — `ShutdownError` is a narrowly typed shutdown signal, not an operational failure being silently suppressed. `BatchTransformMixin.shutdown_batch_processing` explicitly shuts down or cancels the executor and then invokes the buffer shutdown at plugins/infrastructure/batching/mixin.py:465, while `RowReorderBuffer.wait_for_next_release` drains ready entries before raising that signal at plugins/infrastructure/batching/row_reorder_buffer.py:276; therefore `break` is the release thread's intended terminal control flow. The rationale's claim that every worker is always drained is overbroad because `wait_for_workers=False` is cancellation-oriented, but that documented branch does not turn the shutdown signal into a swallowed error.
-  judge_signature_version: 2
-  scope_fingerprint: 18f39e7843017fbc821335289d9808c913bda41fbd15f1f12be06237b01e72dd
-  judge_transport: codex_cli
-  ast_path: 'body[15]/body[20]/body[1]/body[2]/handlers[1]'
-  judge_metadata_signature: 'hmac-sha256:v2:c39fcddb1696fda866913a083d95092b550149862b60272f35aee3e67a9f88e1'
-- key: plugins/infrastructure/batching/mixin.py:R9:BatchTransformMixin:evict_submission:fp=0107c68a8eab452a
-  owner: john
-  reason: |-
-    In BatchTransformMixin.evict_submission (mixin.py:445), ticket = self._batch_submissions.pop(key, None) implements the function's documented return contract: True if evicted, False if not found or already completed. The docstring states the worker may have already completed and removed the entry, so the None sentinel directly maps to the False-return branch (line 447-448). This is process-internal coordination state under the submissions lock, and the race is real and intended — not defensive masking of a schema invariant. No audit corruption or data loss; the False return is the audited outcome. Legitimate R9 suppression. Matches the existing rationale.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T00:35:11.648995+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
-  judge_rationale: |-
-    RULE MISFIRES — the missing key is an explicitly documented coordination outcome, not a hidden schema or fixed-contract failure. The visible docstring defines `False` for an entry that is not found or already completed, and the locked `pop(key, None)` maps that expected absence to the stated return contract without fabricating pipeline or audit data. R9 is not decorator-eligible because it is neither R1 nor R5.
+    RULE MISFIRES — this mapping is explicitly an optional outstanding-submission index, and the method contract declares that absence returns False rather than representing a missing-key invariant failure. The release path independently removes the same key under the same lock at plugins/infrastructure/batching/mixin.py:397, while a present RowTicket is passed to RowReorderBuffer.evict, whose identity and completion checks are visible at plugins/infrastructure/batching/row_reorder_buffer.py:349. R9 therefore matches the syntax of a defaulted pop, but its premise that the default hides a missing-key bug is false at this site.
   judge_signature_version: 2
   scope_fingerprint: a781f2a8f5ae017989b1a82752cbb9ff18aeff9f52de1f3c0d3a5b6c5e6de0c3
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[22]/body[2]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:ffbefd94892fa2a4209fbcd4faf23ea60fe2c4fe6e4c98dd099e868dd76c4de4'
+  ast_path: 'body[15]/body[27]/body[2]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:a779d5eb215a23ffea07ab29941d7170c1be7adebaaf892817ccb86078566a1f'
 - key: plugins/transforms/batch_stats.py:R1:BatchStats:_group_rows:fp=959f0779c842f5e5
   owner: john
   reason: |-
@@ -730,26 +673,26 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[18]/body[19]/body[3]/body[2]/value'
   judge_metadata_signature: 'hmac-sha256:v2:9659a04acb041dbb35e100a01af83159055c59c21de20e3f5a4c63112fff6cae'
-- key: plugins/transforms/web_scrape.py:R1:WebScrapeTransform:process:fp=49b15f0c241922b3
+- key: plugins/transforms/web_scrape.py:R1:WebScrapeTransform:process:fp=8e450a1d1eacfe77
   owner: john
   reason: |-
-    Legitimate Tier-3 HTTP response boundary. In `src/elspeth/plugins/transforms/web_scrape.py:721-724`, `process()` fetches an external URL and receives `response` from `self._fetch_url(safe_request, ctx)`. The flagged `.get()` at `src/elspeth/plugins/transforms/web_scrape.py:744` reads an external HTTP header: `content_type_raw = response.headers.get("content-type", "")`. The surrounding guard is boundary validation, not defensive masking of Tier-1 data: lines 738-743 state that non-text responses are rejected before extraction and that an absent `Content-Type` is "treated as unknown and rejected conservatively"; lines 747-755 then return `TransformResult.error` unless the normalized header starts with `text/` or `application/xhtml+xml`. If this code drifts so the absent-header default no longer flows into the rejection path, this suppression is invalid.
+    response.headers is HTTP metadata received from the external fetch, not an ELSPETH-owned fixed schema. Its optional Content-Type is extracted with get and no fabricated string default. Absent header remains None through the rejection guard and error result content_type field; an explicitly empty header remains the distinct empty string. Only present admitted text MIME values proceed to extraction. The fetched response is locally derived rather than a function parameter, so parameter-rooted boundary metadata is not applicable. test_missing_and_empty_content_type_remain_distinct_in_error verifies the two evidence values and explicit error/no-output outcomes.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:45:33.340126+00:00'
+  judge_recorded_at: '2026-09-08T01:10:22.804074+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — `response.headers` contains externally authored HTTP metadata, so the flagged `.get()` is Tier-3 boundary extraction rather than defensive access under a first-party fixed contract. The visible flow converts an absent header to an empty string only as a rejection sentinel: it cannot match an accepted content-type prefix and therefore returns `TransformResult.error`, so no fabricated value is promoted downstream. The excerpt does not show the function declaration or its decorators, so the decorator alternative cannot be safely recommended.
+    RULE MISFIRES — `response.headers` contains HTTP-origin metadata whose shape and optional `Content-Type` value are not guaranteed by an ELSPETH-owned fixed contract, so this `.get()` is legitimate Tier-3 boundary extraction rather than defensive access to Tier-2 data. The visible code preserves an absent header as `None`, preserves an explicitly empty header as an empty string, records that evidence in the error result, and admits only validated text MIME values, so it neither fabricates nor silently recovers. The decorator alternative is inapplicable because the flagged subject is rooted in the locally obtained HTTP response rather than a function parameter, and the excerpt does not expose the function decorators in any event.
   judge_signature_version: 2
-  scope_fingerprint: 1f326863deff7a2582c1066dfe7186e888f5ccd2d0d59992ea0bc551f1140826
+  scope_fingerprint: 77b0b5fb402881bf66affdf8aa466a98d8db39fc842eb2c4feeb91b355f5ee5a
   judge_transport: codex_cli
-  ast_path: 'body[38]/body[20]/body[4]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:e86c35d575fdba7e0a895ce24302521bb74208a851cf0ec161317ca197a6d345'
-- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=eb1d22b46784fb2d
+  ast_path: 'body[39]/body[22]/body[4]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:3f004989134f71efa79dc8367e383fd83619892bcfe9a8606c904aa0a599427c'
+- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=7512b15f70fd0c7e
   owner: john
   reason: |-
     This is a legitimate Tier-3 source-header boundary suppression, not a Tier-1 audit-data read. In `plugins/sources/field_normalization.py:328-337`, `extend_field_resolution` extends sparse source field resolution from newly seen `raw_headers`; lines 344-345 immediately normalize and collision-check those external headers, and lines 351-386 turn bad external header/mapping collisions into `ExternalHeaderError` / `FieldMappingCollisionError`.
@@ -757,57 +700,57 @@ allow_hits:
     The flagged `.get()` at `plugins/sources/field_normalization.py:373` is not masking missing required internal state. It is an intentional diagnostic label inside a branch that has already proven a collision at line 372: `if final_header in existing_final_headers or final_header in new_final_to_raw:`. For collisions against a newly seen field in this same extension pass, `new_final_to_raw[final_header] = raw_header` is populated at line 387, so `.get(final_header, ...)` returns the actual prior raw header. For collisions against the already-established resolution, the local `new_final_to_raw` scratch dict intentionally cannot contain the prior raw field, so the prescribed fallback `"previously seen field"` is the stable message used in the external-header error. Future drift that removes the line-372 membership guard, changes `new_final_to_raw` from local scratch state, or uses this fallback for persisted audit/landscape data would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:43:31.299137+00:00'
+  judge_recorded_at: '2026-09-08T01:04:09.720082+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the flagged lookup does not conceal a missing key under a fixed contract; the preceding condition proves a collision either with `existing_final_headers` or with the current-pass `new_final_to_raw` scratch map. When the collision is current-pass, membership guarantees the lookup returns the prior raw header; when it is against established resolution, absence from the scratch map is expected and the fallback is only an explicit diagnostic label before a typed collision exception is raised. No pipeline datum is fabricated or promoted, and the subject of the lookup is a locally constructed scratch dictionary rather than an external function parameter, so the structural decorator contract does not apply.
+    RULE MISFIRES — `new_final_to_raw` is local scratch state for headers encountered during the current extension pass, and the visible membership guard establishes that a collision may instead come from `existing_final_headers`, where absence from the scratch map is intentional. The `.get()` therefore selects a diagnostic label rather than concealing a missing required field, coercing pipeline data, or fabricating an audit value; both collision paths immediately raise typed errors. The excerpt does not show the function definition or decorators, so the structural decorator alternative cannot be safely recommended.
   judge_signature_version: 2
   scope_fingerprint: 972e025ba9741f711ac072e685778fa6c2cc8e3f8bb4fc3de22ef79889aeda53
   judge_transport: codex_cli
-  ast_path: 'body[21]/body[14]/body[0]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:72a5a219b74f1caead0f7fafc4cf0154d9f453b29164b4ae7f418f40aaea1cd6'
-- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=cfda09bf674ad0b1
+  ast_path: 'body[22]/body[14]/body[0]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:89583210ce705070f8d0d17b692009aa3072aa36f9aaa98e0f65813eb4140652'
+- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=6138c999afe0dc80
   owner: john
   reason: |-
     This is a source-boundary header-normalization path for external sparse records, not a Tier-1 audit-data read. In `src/elspeth/plugins/sources/field_normalization.py:329-338`, `extend_field_resolution(...)` takes newly seen `raw_headers` and says it extends sparse source field resolution when a "sparse JSON-like row introduces a field." The flagged lookup at `src/elspeth/plugins/sources/field_normalization.py:370-374` reads from `existing_final_to_effective = dict(zip(resolution.final_headers, resolution.effective_headers, strict=True))` and then, only inside the collision branch, does `existing_effective_header = existing_final_to_effective.get(final_header)`. The branch at `src/elspeth/plugins/sources/field_normalization.py:371-372` covers two different collision forms: `final_header in existing_final_headers` or `final_header in new_final_to_raw`. For a same-row duplicate in `new_final_to_raw`, absence from `existing_final_to_effective` is expected and is used to classify whether `field_mapping` caused the external-header collision. The strict zip preserves the owned invariant for the existing resolution; the `.get()` is a prescribed optional lookup at the Tier-3 source header boundary. This suppression should drift-fail if the lookup is moved out of this collision classifier, if the strict zip at line 370 is removed, or if the function stops handling newly seen external sparse headers.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:44:07.685069+00:00'
+  judge_recorded_at: '2026-09-08T01:03:49.263637+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the lookup is an intentional optional-membership query, not defensive recovery from a missing key under a fixed contract. The strict zip at field_normalization.py:384 establishes the owned existing-resolution mapping, while the branch at lines 386-388 also covers same-batch collisions recorded only in `new_final_to_raw`, for which absence from `existing_final_to_effective` is expected. No malformed header is silently accepted or fabricated: every collision path raises either `FieldMappingCollisionError` or `ExternalHeaderError`. The excerpt does not show the function decorators, and the flagged subject is a derived internal classifier mapping, so no structural decorator recommendation is warranted.
+    RULE MISFIRES — the lookup does not conceal a missing-key invariant: the enclosing collision branch intentionally combines collisions against existing headers with same-row collisions, and only the former must appear in `existing_final_to_effective`. The mapping is constructed with strict pairing of the owned resolution headers, while absence during a same-row-only collision is expected and is used solely to classify the exception before the code raises. Although newly seen headers originate externally, the flagged subject is an internal derived mapping rather than data rooted at an external function parameter, so the `@trust_boundary` decorator contract does not apply to this finding.
   judge_signature_version: 2
   scope_fingerprint: 972e025ba9741f711ac072e685778fa6c2cc8e3f8bb4fc3de22ef79889aeda53
   judge_transport: codex_cli
-  ast_path: 'body[21]/body[14]/body[0]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:2c04d028e79f586abe678abe0c90ade4bb30fcf2be17518492d91d0b4b15a3b0'
-- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=045e761225867317
+  ast_path: 'body[22]/body[14]/body[0]/body[1]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:6ce1f7bf2885cd4176f60a6a10acf85a47856e3a4204bd685e404b0f2d78550f'
+- key: plugins/sources/field_normalization.py:R1:extend_field_resolution:fp=93473ccf72e3750a
   owner: john
   reason: |-
     `src/elspeth/plugins/sources/field_normalization.py:375` is a source-boundary collision classifier, not a Tier-1 audit-data read. The function is explicitly extending newly seen external headers (`raw_headers`) and validates/collides them before custody: `new_raw_headers = [header for header in raw_headers if header not in existing_mapping]` at line 340 and collision errors are raised at lines 385-386. The flagged lookup, `previous_new_effective_header = new_final_to_effective.get(final_header)`, is intentionally optional because the enclosing branch at line 372 handles two distinct collision sites: an already persisted final header (`final_header in existing_final_headers`) or a duplicate within this new external header batch (`final_header in new_final_to_raw`). For the existing-header path there is correctly no entry in `new_final_to_effective`, and line 381 explicitly treats that absence as non-mapping evidence with `previous_new_effective_header is not None`. Drift that removes the line-372 guard, changes line 381 to trust the missing value, or repurposes this for audit/Landscape data would invalidate this suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T10:43:47.057869+00:00'
+  judge_recorded_at: '2026-09-08T01:03:17.336888+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — `new_final_to_effective` is a locally built collision index whose entry is intentionally absent when the collision is with `existing_final_headers`, so this lookup is optional rather than access to a required fixed-contract field. The visible branch covers either an existing-header collision or a duplicate in the new batch, and the `is not None` check uses absence only as evidence that the latter collision source does not apply; no value is fabricated or silently substituted. Although R1 is decorator-suppressible, the excerpt does not show the function declaration or its decorators, so the structural-decorator recommendation cannot safely be made.
+    RULE MISFIRES — `new_final_to_effective` is a local index of headers already encountered in the current batch, so absence is an expected discriminator when the collision instead comes from `existing_final_headers`. The enclosing condition guarantees a collision, the optional lookup only identifies whether the current-batch mapping contributed to it, and every branch raises either `FieldMappingCollisionError` or `ExternalHeaderError`; it neither fabricates a value nor silently recovers. Although this is R1 in a boundary-related function, the excerpt does not show the function definition or decorators, so policy requires no decorator suggestion.
   judge_signature_version: 2
   scope_fingerprint: 972e025ba9741f711ac072e685778fa6c2cc8e3f8bb4fc3de22ef79889aeda53
   judge_transport: codex_cli
-  ast_path: 'body[21]/body[14]/body[0]/body[2]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:72baa3cca824a21ed5b1181f921b691f1e02af0a2e10f8e28318d1bafd2e45d5'
+  ast_path: 'body[22]/body[14]/body[0]/body[2]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:4f13df7bbec52390d1651acc905b8c55c18e22f8400d6fd98ef96f5b1c452a1c'
 - key: plugins/infrastructure/clients/http.py:R1:AuditedHTTPClient:_request_with_optional_body_cap:fp=204cec0b5169e0df
   owner: john
   reason: |-
@@ -1017,25 +960,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[13]/body[2]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:eb95a2b40ac7c2f1dfdc598ad4f8de023a14ba49a934abe12d2fd1ba37064ad5'
-- key: plugins/infrastructure/base.py:R5:BaseTransform:__init_subclass__:fp=95520686fe1f356b
+- key: plugins/infrastructure/base.py:R5:BaseTransform:__init_subclass__:fp=98e79dff2714f143
   owner: john
   reason: |-
     isinstance(resolved, property) is a nominal check against the concrete builtin property class on the result of inspect.getattr_static over ELSPETH's own class hierarchy (Tier 1). It is itself the anti-shadowing guard for elspeth-d6eeb3a71d: if a mixin ahead of BaseTransform in the MRO shadows input_schema with a non-property, the check raises TypeError at class creation instead of letting undemoted models reach every row. The check is not defensive re-typing of trusted data — it is the assertion that fails closed; removing it deletes the control (masquerade baseline: 'do not remove this check').
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T00:26:16.290400+00:00'
+  judge_recorded_at: '2026-09-08T00:57:00.285128+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM: the nominal `isinstance(resolved, property)` check is an offensive invariant assertion over ELSPETH-owned class structure, and the visible code immediately raises an informative `TypeError` when a mixin shadows the required property. It neither suppresses nor coerces a contract violation; it exposes the invalid class definition at class creation, before undemoted models can reach row processing. This is not a function-scoped Tier-3 boundary case, so the `@trust_boundary` decorator is inapplicable.
+    PRESCRIBED FORM — the visible code uses a nominal check against the concrete built-in `property` class and immediately raises an informative `TypeError` when ELSPETH-owned class composition shadows the required descriptor. This is an offensive class-creation invariant enforcing the anti-shadowing control described by the site-specific rationale, not silent recovery, coercion, or defensive re-typing of pipeline data. The subject is not rooted in an external function parameter, so the `@trust_boundary` structural alternative does not apply.
   judge_signature_version: 2
   scope_fingerprint: 05820b47d3c5cd07aa34b12a96598e8af5fb6812f4f42ea0b1ce161342d8af42
   judge_transport: codex_cli
-  ast_path: 'body[19]/body[47]/body[3]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:3d33dbae8e9d9a0a8d9877504365f24300444a6a2c312aeff22db28ad127d5c9'
+  ast_path: 'body[19]/body[51]/body[3]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:18de8c7c579f4ee010d35294cc2056a02e4dbf7fa0ba8d67ce6c5ba75fbd43fa'
 - key: plugins/infrastructure/clients/http.py:R5:AuditedHTTPClient:_record_call:fp=d5da9ecadd68d01b
   owner: john
   reason: |-
@@ -2013,105 +1956,86 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[50]/body[2]/body[11]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:e55bb5c2ddb192739ce75a3793dc439a2bc240788e1e685396e2bc3ff19bfff1'
-- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_bind_profiled_audit_identity:fp=e8b5e72fabbf6009
+- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_bind_profiled_audit_identity:fp=714ba3c4fc195022
   owner: john
   reason: |-
     `isinstance(identity, TextractProfiledAuditIdentity)` is the nominal admission check on the Web-only audit authority that `web/execution/preflight.py` binds after runtime construction. The parameter is deliberately typed `object` because a typed signature is not a runtime control: this method is the only place the transform accepts an identity that later drives `_audit_location_identity` and the HMAC binding-fingerprint comparison below it, so an impostor must be refused here, and a raise on anything but the concrete owned frozen class is ADR-032 rule 1 (nominally type what ELSPETH owns; never a runtime_checkable Protocol). Nothing is defaulted or coerced — the check exists so that no forgeable config field can stand in for the identity.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:08:16.290256+00:00'
+  judge_recorded_at: '2026-09-08T01:07:06.535547+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the visible code uses a nominal `isinstance` check against the concrete ELSPETH-owned `TextractProfiledAuditIdentity` and immediately raises `TypeError` on an impostor. The identity is accepted as `object`, then its profile and binding fingerprint are verified before it is stored and used, so this is an offensive runtime admission check rather than defensive recovery, coercion, or defaulting. The parameter is an ELSPETH-owned audit-authority object, not Tier-3 external data, so the trust-boundary decorator contract does not apply.
+    PRESCRIBED FORM — The flagged `isinstance` is an offensive nominal admission check against the ELSPETH-owned frozen `TextractProfiledAuditIdentity` and immediately raises `TypeError`; it neither defaults, coerces, nor performs a structural Protocol probe. The authority is constructed in `web/plugin_policy/profiles.py:1043` and passed by `bind_profiled_textract_audit_identities` at `web/execution/preflight.py:432`, while the visible method then checks the profile and HMAC binding fingerprint before storing it. This is not Tier-3 data rooted in an external parameter, so the trust-boundary decorator contract does not apply.
   judge_signature_version: 2
   scope_fingerprint: f07e5f3ceaabd7895996a465c2d66930d2c93d066abd8934e7ec1484cd74b60a
   judge_transport: codex_cli
-  ast_path: 'body[44]/body[17]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:6b62a20abd5b509735a54f9ca59a00f09de5a7d267ebd5e7848cd07fd37ddf36'
-- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_process_single_with_state:fp=59e13b8df2751e99
+  ast_path: 'body[44]/body[18]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:ad567e52f744c82729c2d4a28d08fe48f2f480557c9da90fb5153609eff19d81'
+- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_process_single_with_state:fp=a9cbf3e399962c97
   owner: john
   reason: |-
     `isinstance(location, TransformResult)` is nominal discrimination against `TransformResult`, a concrete class ELSPETH owns, over the Tier-2 union `_read_document_location` returns (`tuple[str, str, str | None] | TransformResult`): the early-return arm carries an already-built row error result (missing/invalid bucket, key or version), the other arm carries the validated S3 location that is then unpacked. This is ADR-032 rule 1 (internal boundary: isinstance against an owned concrete class), not a Tier-3 shape guard, and neither arm defaults or coerces — the same shape B20 rationalised in textract_inline_analysis._process_single_with_state.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:08:43.402060+00:00'
+  judge_recorded_at: '2026-09-08T01:07:42.412478+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.95
   judge_rationale: |-
-    RULE MISFIRES — this is nominal discrimination between the two explicitly declared arms of a first-party return contract, not a defensive re-check masking a contract violation. The helper at plugins/transforms/aws/textract_document_analysis.py:586 declares `tuple[str, str, str | None] | TransformResult`, returns validation errors as `TransformResult` at lines 593-625, and returns the validated tuple at line 628; the branch at line 708 therefore preserves both arms without coercion, defaults, or silent recovery. The input `row` is Tier-2 pipeline data, so this is not a function-scoped Tier-3 boundary eligible for the decorator.
+    RULE MISFIRES — the check discriminates between two explicitly permitted arms of the first-party return union from `_read_document_location`: an owned `TransformResult` error result or a validated location tuple. The visible control flow returns the error arm unchanged and unpacks the tuple arm, so it neither conceals a contract violation nor defaults, coerces, or fabricates data. This is nominal discrimination against an ELSPETH-owned concrete class, consistent with ADR-032's internal-boundary rule, not a Tier-3 shape guard; `_process_single_with_state` receives Tier-2 `PipelineRow` data, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: d4f4407b38866f026eaf745591d44147945ffeb88d5de3265a7a2358da60103c
   judge_transport: codex_cli
-  ast_path: 'body[44]/body[29]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:355c436e2e2807f9999054fd69e1e0b93faf423df21dc8b9f9b34379b6aa895b'
-- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_process_verified_document:fp=c505b6ba2633ab5c
+  ast_path: 'body[44]/body[30]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:f3c7bf70ea91d1486a4fdde732bda86c49d16b067e0f119eb52994d0d649def6'
+- key: plugins/transforms/aws/textract_document_analysis.py:R5:AWSTextractDocumentAnalysis:_process_verified_document:fp=15bb43800cfbb3c3
   owner: john
   reason: |-
     `isinstance(collected, TransformResult)` discriminates the Tier-2 union `_poll_and_collect` returns (`tuple[Mapping[str, Any], ...] | TransformResult`): a routed row error (poll_timeout, shutdown_requested, malformed_response, too_many_blocks, pagination_cycle …) versus the collected SUCCEEDED pages that `normalize_textract_result` then validates. `TransformResult` is a concrete owned class, so this is ADR-032 rule 1 nominal typing of an internal seam; the error arm is returned unchanged and the page arm is fully re-validated downstream, so nothing is defaulted.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:08:57.036552+00:00'
+  judge_recorded_at: '2026-09-08T01:08:46.720403+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is nominal discrimination between the two arms of an explicit first-party return union, not defensive revalidation or concealment of a contract violation. The verified `_poll_and_collect` definition at plugins/transforms/aws/textract_document_analysis.py:854 declares `tuple[Mapping[str, Any], ...] | TransformResult`; its error paths return `TransformResult` while the successful completion at line 938 returns `tuple(pages)`. The external page contents remain subject to downstream normalization, and this branch neither coerces nor fabricates them.
+    RULE MISFIRES — `src/elspeth/plugins/transforms/aws/textract_document_analysis.py:855` declares `_poll_and_collect` as returning `tuple[Mapping[str, Any], ...] | TransformResult`, and its visible branches return both alternatives, so the check discriminates a declared union rather than defensively revalidating a single-type contract. `TransformResult` is a concrete ELSPETH-owned class, and the branch returns that error result unchanged while the tuple arm proceeds to response normalization. The subject is a local call result rather than data rooted at an external parameter of `_process_verified_document`, so the `@trust_boundary` alternative does not apply.
   judge_signature_version: 2
   scope_fingerprint: 8a7baecf6fc0166bf7e13c5945e3d7aabfdbeeef53b7d045c9763e9fb3326d51
   judge_transport: codex_cli
-  ast_path: 'body[44]/body[30]/body[6]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:44b5bc2dc3231c3c44e268d56b548125e21b40bbb32296470936010582f67334'
+  ast_path: 'body[44]/body[31]/body[6]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:79bc0a076428af8c4764bcff19d6256e6ab5d8071696afd97ebd01246ccf6c79'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 20
-      redacted_hash: 2bfc0af37d30aa45
-- key: plugins/transforms/aws/textract_inline_analysis.py:R5:AWSTextractInlineAnalysis:_process_single_with_state:fp=6944f1e7021a0625
+      redacted_hash: ffa9001c94143ecd
+- key: plugins/transforms/aws/textract_inline_analysis.py:R5:AWSTextractInlineAnalysis:_process_single_with_state:fp=e114d0bc418b9af5
   owner: john
   reason: |-
     `isinstance(document, TransformResult)` is nominal discrimination against `TransformResult`, a concrete class ELSPETH owns, over the Tier-2 union `_read_document_bytes` returns (`tuple[str, bytes] | TransformResult`): the early-return arm carries an already-built row error result, the other arm carries validated payload bytes. This is ADR-032 rule 1 (internal boundary: isinstance against an owned concrete class), not a Tier-3 shape guard, and neither arm defaults or coerces — a foreign object would fail the tuple unpack on the next line.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:08:35.905935+00:00'
+  judge_recorded_at: '2026-09-08T01:09:06.546142+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — the check discriminates the declared first-party union returned by `_read_document_bytes`, rather than defensively revalidating a value under a single fixed contract. The visible helper paths return either an owned `TransformResult.error(...)` or the `(payload_ref, content)` tuple consumed immediately afterward, and the nominal check targets the concrete ELSPETH-owned `TransformResult` class as ADR-032 permits. No malformed value is suppressed, coerced, or defaulted, and the subject is not rooted in a Tier-3 parameter requiring `@trust_boundary`.
+    RULE MISFIRES — the visible code and site-specific rationale establish that `_read_document_bytes` deliberately returns a union of an ELSPETH-owned concrete `TransformResult` and a `(str, bytes)` payload tuple. The nominal `isinstance(document, TransformResult)` discriminates the already-built error-result arm for immediate return; it neither masks a contract violation nor defaults, coerces, or silently recovers malformed data. This is an internal concrete-type discriminator permitted by ADR-032, not a Tier-3 parameter boundary requiring `@trust_boundary`.
   judge_signature_version: 2
   scope_fingerprint: 3a83a67eb1bfba61b515dfb7f89e3cf17859d1de28ca126d715fae124a9902bf
   judge_transport: codex_cli
-  ast_path: 'body[41]/body[24]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:b31aa4286ac48636aae77cf57b9e4aee22c83a62bb443289c5752763cb1c2c2a'
-- key: plugins/transforms/field_mapper.py:R6:_names_a_row_key:fp=caa3a06a0cceb6b5
-  owner: john
-  reason: |-
-    `except ExternalHeaderError: return False` is the predicate's documented negative answer, not a swallow: `_names_a_row_key` asks whether a config literal is a fixed point of `normalize_field_name`, and a literal that normalizes to NOTHING (the only case that raises `ExternalHeaderError`) names no row field at all because the source boundary rejects such a header, so `False` is the correct and only truthful value. The handler is narrowed to the one owned exception class that means exactly that; a bare `ValueError` from an algorithm bug still propagates, so the error class a bad mapping key raises at construction is unchanged. This mirrors `value_transform._row_key_aliases` deliberately, and returning `False` here is what lets `declared_input_fields` ABSTAIN rather than assert a row key that cannot exist (elspeth-f262a8c678).
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:08:45.483336+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.96
-  judge_rationale: |-
-    RULE MISFIRES — `_names_a_row_key` is a Boolean classification predicate, and the visible docstring establishes that `ExternalHeaderError` means the literal cannot normalize to any row-field name, making `False` the predicate’s truthful negative result rather than silent recovery. The handler is narrowly typed, while unrelated algorithm failures continue to propagate, and the result causes declaration logic to abstain instead of fabricating a positive field claim. The decorator alternative is inapplicable because the finding is R6, not R1 or R5.
-  judge_signature_version: 2
-  scope_fingerprint: 66abe3201f61c6c4d6a39b7dd79f8374e0b81d44ee55ab03f2b12e450fea81d4
-  judge_transport: codex_cli
-  ast_path: 'body[18]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:30d76ab686a43ba9e1fd1440af4eeb6c26dd5c8c0ff6ee182a1d3e87b137e099'
+  ast_path: 'body[42]/body[25]/body[3]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:a214997429a304c19266fbaf943937803d05a7374e953e78dc86e44323f5b7a8'
 - key: plugins/transforms/llm/providers/azure.py:R6:_module_:fp=d94f619bf86df74c
   owner: john
   reason: |-
@@ -2264,25 +2188,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[53]/body[21]/body[1]/test'
   judge_metadata_signature: 'hmac-sha256:v2:c9c06b365cdb023c13ee16b6bb36c32d2f6ea4d72f7275b0ccf9558aaddc67c7'
-- key: plugins/transforms/reference_join.py:R5:build_reference_index:fp=98f952ae97025a85
+- key: plugins/transforms/reference_join.py:R5:build_reference_index:fp=bf7a6e65cac20d83
   owner: john
   reason: |-
     `isinstance(exc.__cause__, KeyError | IndexError)` discriminates the CAUSE of an `ExpressionEvaluationError` raised by ELSPETH's own expression parser (Tier 1), not external data: the parser chains a `KeyError`/`IndexError` when an output path does not fit a sparse reference entry (legitimately `_UNRESOLVED`, governed by `on_miss`) and anything else when the authored expression is broken (refused at load). Exception-class hierarchy matching is the only correct Python discriminator here — `except KeyError` matches by hierarchy for exactly the same reason — and the else-branch is a loud `ReferenceTableError`, not a default. No coercion or shape guess is involved.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T14:14:44.465495+00:00'
+  judge_recorded_at: '2026-09-08T01:10:01.660972+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — the flagged `isinstance` is exception-class dispatch on `ExpressionEvaluationError.__cause__`, not defensive revalidation of data under a fixed contract. The visible comments and branches establish that `KeyError`/`IndexError` specifically represent a path absent from a legitimate sparse entry and are preserved as `_UNRESOLVED`, while every other evaluation failure raises `ReferenceTableError` loudly. No malformed shape is coerced or hidden, and `_UNRESOLVED` records absence rather than fabricating a value; the rationale's Tier-1 label is unnecessary to, and does not undermine, this site-specific justification.
+    RULE MISFIRES — the `isinstance` examines an exception’s chained cause to classify evaluation outcomes, rather than defensively rechecking the shape of Tier-1/Tier-2 data or masking a contract violation. The visible code treats only `KeyError`/`IndexError` causes as sparse-path misses governed by `on_miss`, while every other `ExpressionEvaluationError` becomes a chained, informative `ReferenceTableError`; the subsequent `never_resolved` check also refuses expressions that fit no entries. No decorator applies because the checked subject is the locally caught exception cause, not data rooted at an external function parameter.
   judge_signature_version: 2
   scope_fingerprint: 99989abd21f7fe4b922266817cb5b9a9892a890e91c12bcb5ae870244929049f
   judge_transport: codex_cli
-  ast_path: 'body[30]/body[7]/body[5]/body[0]/handlers[0]/body[0]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:651a1c2de5a9e0e9510f68d332ef2c2ce0b032790a8537fa11828c8af42c0601'
+  ast_path: 'body[31]/body[7]/body[5]/body[0]/handlers[0]/body[0]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:5ce9f2cfec73954f512036ace6073f4026d89f6b8c91a8d37ca88504cc9c2986'
 - key: plugins/sinks/_audit_export_bundle_effects.py:R6:preflight_audit_export_bundle:fp=cdf1bcdadf070049
   owner: john
   reason: |-
@@ -2416,44 +2340,44 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[13]/body[5]/body[1]/handlers[1]'
   judge_metadata_signature: 'hmac-sha256:v2:4ca1560581ec007df2cd13f239c935196ac85dda2cca24dca44a82ca679328c9'
-- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=4beba94c036a0967
+- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=4103942b8e2bd3a8
   owner: john
   reason: |-
     After exact dispatch to `azure_search`, the nominal `AzureSearchProviderConfig` check fails closed with `FrameworkBugError` on any wrong variant, then reads only the owned `index` field. Unknown provider names also raise; no structural object is admitted.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:40:53.727393+00:00'
+  judge_recorded_at: '2026-09-08T01:09:26.164286+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — after exact dispatch on `provider_name == "azure_search"`, the nominal `AzureSearchProviderConfig` check rejects a wrong first-party variant with a meaningful `FrameworkBugError` and does not coerce, default, or admit a structural impostor. The visible code then accesses the owned `index` field directly, while unknown provider names also fail closed, so this is the policy-prescribed offensive `isinstance`→raise form for a plugin contract violation. This is not a Tier-3 parameter-rooted boundary case, so the `@trust_boundary` decorator contract does not apply.
+    PRESCRIBED FORM — after exact nominal dispatch on `provider_name`, the `isinstance` check rejects a mismatched first-party configuration variant with the correctly framed `FrameworkBugError`; it neither coerces, defaults, nor admits a structural impostor. The visible code then accesses only the variant-specific owned `index` field, while unknown provider names also fail closed, so this is the policy-prescribed offensive check that makes a contract violation maximally informative. This is an internal nominal-contract enforcement point rather than a Tier-3 boundary function, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
   scope_fingerprint: b83a72ed14393010da398c819cee06bacaeba342a6a4f2859b888f7ab3c64a91
   judge_transport: codex_cli
-  ast_path: 'body[22]/body[18]/body[2]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:bde6a0ed0ccd471e5e88674807a72531e56c44bd4f4c6b6d36950c375024e467'
-- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=b30d31076cbb7dd0
+  ast_path: 'body[23]/body[19]/body[2]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:db7a68fbd59817dbee0d3436c1fce4a4f839ad125cd4b876df35af8761807c67'
+- key: plugins/transforms/rag/transform.py:R5:RAGRetrievalTransform:_configured_collection_name:fp=e95a5bfb3b7067b7
   owner: john
   reason: |-
     After the exact provider-name dispatch selects `chroma`, this nominal check validates the ELSPETH-owned `ChromaSearchProviderConfig` variant. A mismatch raises `FrameworkBugError` before any readiness identity is read; it cannot authorize or coerce an impostor.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:40:54.818624+00:00'
+  judge_recorded_at: '2026-09-08T01:09:43.041354+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    PRESCRIBED FORM — after exact dispatch on `provider_name == "chroma"`, the nominal `isinstance` check enforces that the ELSPETH-owned configuration is the corresponding concrete `ChromaSearchProviderConfig`. The visible code raises `FrameworkBugError` immediately on mismatch and neither coerces the value nor admits an impostor, making this an offensive, informative crash for an internal contract violation. This is not a Tier-3 parameter-rooted boundary case, so the `@trust_boundary` decorator contract does not apply.
+    PRESCRIBED FORM — after exact provider-name discrimination, the nominal `isinstance` check enforces the corresponding ELSPETH-owned concrete configuration variant and raises a typed, informative `FrameworkBugError` on mismatch. The visible code neither coerces nor admits the wrong object and reads `collection` only after successful discrimination, matching the policy’s offensive wrong-type-to-crash form for an unknown-type internal boundary. This is not Tier-3 external input and therefore is not a structural `@trust_boundary` decorator case.
   judge_signature_version: 2
   scope_fingerprint: b83a72ed14393010da398c819cee06bacaeba342a6a4f2859b888f7ab3c64a91
   judge_transport: codex_cli
-  ast_path: 'body[22]/body[18]/body[1]/body[1]/test/operand'
-  judge_metadata_signature: 'hmac-sha256:v2:8be96f6be8924a876738d3b2356e966162b1758407cdeb5bbe8ce635598db2f2'
+  ast_path: 'body[23]/body[19]/body[1]/body[1]/test/operand'
+  judge_metadata_signature: 'hmac-sha256:v2:131f9f00d429c64c715edcd81bfe18464978ac295e430ccc3022aed594370d86'
 - key: plugins/infrastructure/telemetry.py:R6:emit_resource_cleanup_failed:fp=814c11050e1d9462
   owner: john
   reason: |-
@@ -2492,3 +2416,117 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[48]/body[3]/body[1]/handlers[2]'
   judge_metadata_signature: 'hmac-sha256:v2:a212ed8c6c533a19d9294964a16de579dea001c063482661025c9de03ac77020'
+- key: plugins/infrastructure/batching/mixin.py:R5:BatchTransformMixin:_complete_ticket:fp=1f889d35f8fdf6ca
+  owner: john
+  reason: |-
+    Nominal discrimination of the explicitly declared owned TransformResult | ExceptionResult union. On the verified late-completion outcome, ExceptionResult must raise its original exception instead of being discarded as a benign late row result. No value is coerced, defaulted, or accepted through structural typing. The Future callback and lifecycle failure channel retain this raised error; TestBatchTransformMixinEviction.test_evicted_worker_integrity_failure_reaches_shutdown verifies the identical AuditIntegrityError reaches shutdown and flush.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:39:51.810540+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance` at `mixin.py:353` nominally discriminates the explicitly declared `TransformResult | ExceptionResult` union from `mixin.py:346`; it is not defensive revalidation, coercion, defaulting, or structural admission. For an evicted late completion, the `ExceptionResult` branch raises the original exception, while `_record_batch_worker_failure` and `_raise_batch_worker_failure` preserve and surface that failure through shutdown and flush (`mixin.py:267-284,501-543`). This control path is verified by `tests/unit/plugins/batching/test_batch_transform_mixin.py::TestBatchTransformMixinEviction::test_evicted_worker_integrity_failure_reaches_shutdown` at lines 388-414, which proves the identical `AuditIntegrityError` instance reaches both lifecycle calls.
+  judge_signature_version: 2
+  scope_fingerprint: 20579bb0cb2e4aa0f014d460ffa1546c6749fc681f34ae3c2c68b778eb28f5c1
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[24]/body[1]/body[1]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:35f35edc34e85d56105c52ebaa5b3c2dac0fefb83254e5c384356f0b006230af'
+- key: plugins/infrastructure/batching/mixin.py:R5:BatchTransformMixin:_release_loop:fp=59c9f8b21a161323
+  owner: john
+  reason: |-
+    Nominal classification of a caught exception against ELSPETH owned TIER_1_ERRORS. If delivering the original output failure itself raises an ordinary error, the check preserves and re-raises the original Tier1 exception rather than replacing its integrity signal with generic FrameworkBugError. _run_release_loop retains the raised failure for orchestrator lifecycle calls and re-raises on the release thread. This is exception-hierarchy dispatch, not revalidation or a fallback value.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:40:00.916768+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the `isinstance` at line 427 performs nominal exception-hierarchy dispatch on a broadly caught exception; it is not revalidating a fixed data contract or masking malformed data. The visible branches preserve the original Tier-1 integrity exception when delivery of its `ExceptionResult` also fails, while ordinary output-port failures become an explicit `FrameworkBugError`, with no suppression, coercion, or fallback value. This is offensive crash-preserving handling, and the decorator is inapplicable because the subject is not Tier-3 data rooted in a function parameter.
+  judge_signature_version: 2
+  scope_fingerprint: df80169c368c520e42167ba9baded0690060133c0b717ea7e346a5e302c4c881
+  judge_transport: codex_cli
+  ast_path: 'body[15]/body[25]/body[1]/body[3]/handlers[0]/body[4]/handlers[1]/body[0]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:397f682685c251a9f898713b9ec802d38e8b988a84f6c4622740ff5b8812f249'
+- key: plugins/sources/field_normalization.py:R6:is_normalized_field_name:fp=d6e13a8f6eb38ebb
+  owner: john
+  reason: |-
+    RULE MISFIRES: is_normalized_field_name is a boolean fixed-point predicate, and ExternalHeaderError is the explicit negative result for a header that cannot normalize to a usable name. normalize_field_name in the same source module raises that specific class when normalization produces the empty string. The handler returns False rather than constructing a substitute name. Other failures propagate. Consumers such as FieldMapper._is_static_normalized_source and the module's _names_a_row_key use the predicate to avoid asserting construction-time field guarantees for unresolved original-header spellings. This is explicit classification of a valid negative outcome, not silent recovery that promotes invalid data. R6 is outside boundary-decorator suppression.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:42:40.871889+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: `is_normalized_field_name` is explicitly a boolean predicate whose documented negative result is `False`, including when a header normalizes to no usable row-key name. The visible code catches only `ExternalHeaderError`, returns that explicit negative classification without fabricating or promoting a substitute value, and allows all other failures to propagate. R6 is not decorator-suppressible, so `should_use_decorator` is null.
+  judge_signature_version: 2
+  scope_fingerprint: 1363961d37cf7aff47db348b905ad35cd5cd145dc046ccdffd80894dbd96bc78
+  judge_transport: codex_cli
+  ast_path: 'body[16]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:0921edb619ef50aa71eb18a045411569ea4797fac9ed46c3bf03584df610d191'
+- key: plugins/transforms/field_mapper.py:R6:FieldMapper:process:fp=155a31c390770e52
+  owner: john
+  reason: |-
+    RULE MISFIRES: the narrow KeyError handler answers the documented optional contract-name resolution case after source in row has already succeeded. SchemaContract.resolve_name in contracts/schema_contract.py raises KeyError for names absent from its declared schema. PipelineRow.__contains__ admits such a name only for FLEXIBLE/OBSERVED mode when that exact literal key exists in the payload; __getitem__ implements the same extra-field rule. Thus assigning resolved_source = source preserves the actual accessible extra key rather than fabricating a normalized name. The subsequent resolved_source != target comparison still adds a collision and raises PluginContractViolation before output mutation whenever this would overwrite another field. Declared aliases use resolve_name's real result. An absent or FIXED-inaccessible source fails the earlier membership guard and never reaches this handler.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:44:01.058112+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
+  judge_rationale: |-
+    RULE MISFIRES: this handler distinguishes an expected optional name-resolution miss rather than suppressing a malformed-row failure. SchemaContract.resolve_name raises KeyError only when a name is absent from the declared schema (src/elspeth/contracts/schema_contract.py:116), while the preceding membership gate and PipelineRow.__contains__ permit an undeclared literal only when that exact payload key exists under FLEXIBLE/OBSERVED semantics (src/elspeth/plugins/transforms/field_mapper.py:647; src/elspeth/contracts/schema_contract.py:590). The fallback therefore preserves an accessible extra key, and the subsequent comparison raises PluginContractViolation before output mutation for any destructive collision (src/elspeth/plugins/transforms/field_mapper.py:659).
+  judge_signature_version: 2
+  scope_fingerprint: 85fba80baac01489293e465ed5e3a01e5079d64007e61c4de6c130e999773179
+  judge_transport: codex_cli
+  ast_path: 'body[25]/body[20]/body[2]/body[1]/body[2]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:1e5906b808399472480f2b93c10bbdf9fc23fda5e40d031a157b905d1a711139'
+- key: plugins/transforms/llm/langfuse.py:R4:ActiveLangfuseTracer:record_error:fp=2264ff85a2e2aca1
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: ActiveLangfuseTracer.record_error scopes its broad handler to optional Langfuse SDK observation context entry/exit and generation.update. First-party metadata construction, parent.tracing_metadata, ChatMessage construction and audit_messages projection all run before the try and therefore cannot be hidden by this handler. A preceding except contract_errors.TIER_1_ERRORS: raise preserves ELSPETH audit/framework corruption. Other SDK failures call _handle_trace_failure with the distinct langfuse_error_trace_failed event; that helper logs plugin, exception type and traceback through the independent last-resort logger. The function returns no substitute LLM result and does not change the already-failed provider call's outcome. This is an acknowledged optional telemetry failure boundary, not lost pipeline evidence or a Tier-3 R1/R5 decorator case.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:43:10.847196+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM: The broad handler is narrowly scoped to optional Langfuse SDK observation entry/exit and `generation.update`, while first-party message construction and `audit_messages` projection visibly occur before the `try`. `contract_errors.TIER_1_ERRORS` are explicitly re-raised, and remaining telemetry failures are reported through `_handle_trace_failure` without fabricating a result or altering the failed provider call's outcome. This conforms to the telemetry primacy rule's best-effort telemetry and last-resort logging behavior, and R4 is not eligible for the Tier-3 R1/R5 decorator mechanism.
+  judge_signature_version: 2
+  scope_fingerprint: 6919431391b627228d58d16ead744d6375978283b958c5db7ebb0eb0a78aa35c
+  judge_transport: codex_cli
+  ast_path: 'body[13]/body[4]/body[10]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:f4a0cd445237cf7135dc393a9b94c1a3a7d25f21bc8ace3cae4daa010222a178'
+- key: plugins/transforms/llm/langfuse.py:R4:ActiveLangfuseTracer:record_success:fp=7ac07034f3e03611
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: ActiveLangfuseTracer.record_success places only optional Langfuse SDK observation entry/exit and generation.update inside the broad try. Owned usage projection, metadata, parent.tracing_metadata and audit_messages run before it, so their bugs propagate. Registered Tier-1 errors are re-raised by the first handler. The residual handler calls _handle_trace_failure with langfuse_trace_failed, which emits plugin identity, exception class and traceback rather than silently discarding telemetry failure. No LLM response, token count or audit record is defaulted or manufactured; loss of this optional trace does not replace the primary provider result. The source explicitly distinguishes optional tracing from first-party projection, and R4 is not decorator-suppressible.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T05:44:09.288433+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    PRESCRIBED FORM: The broad handler encloses only optional Langfuse SDK observation and update operations, while first-party metadata and audit projection execute before it and Tier-1 exceptions are explicitly re-raised (src/elspeth/plugins/transforms/llm/langfuse.py:127-175). I verified the named _handle_trace_failure control at src/elspeth/plugins/transforms/llm/langfuse.py:245-266 records the event, plugin identity, exception class, and traceback through the last-resort logger without fabricating or replacing the primary provider result. The containment behavior and Tier-1 propagation are pinned by tests/unit/plugins/llm/test_langfuse_tracer.py:421-492, so this is recorded best-effort telemetry failure rather than silent suppression of first-party bugs. R4 is not eligible for the trust-boundary decorator.
+  judge_signature_version: 2
+  scope_fingerprint: 62abf4b5e2d54799d7dd00985f59270257c2cacfa22a0ef6aed67a6b36433d8d
+  judge_transport: codex_cli
+  ast_path: 'body[13]/body[3]/body[11]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:064b07aead5e639a135f0f0c22e428843afd35c984cedfb5ead162259ad36b2a'

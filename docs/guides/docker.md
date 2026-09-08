@@ -416,13 +416,15 @@ Pipeline configurations in containers should use **absolute container paths**:
 
 ```yaml
 # config/pipeline.yaml
-source:
-  plugin: csv
-  on_success: output              # Route rows directly to sink
-  options:
-    path: /app/input/data.csv     # Container path, not host path
-    schema:
-      mode: observed
+sources:
+  primary:
+    plugin: csv
+    on_success: output            # Route rows directly to sink
+    options:
+      path: /app/input/data.csv   # Container path, not host path
+      schema:
+        mode: observed
+      on_validation_failure: discard
 
 sinks:
   output:
@@ -430,6 +432,8 @@ sinks:
     on_write_failure: discard
     options:
       path: /app/output/results.csv  # Container path
+      schema:
+        mode: observed
 
 landscape:
   url: ${DATABASE_URL:-sqlite:////app/data/audit.db}

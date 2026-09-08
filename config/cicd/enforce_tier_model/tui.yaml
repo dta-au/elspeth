@@ -360,25 +360,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[10]/body[1]/test/operand'
   judge_metadata_signature: 'hmac-sha256:v2:2577f838d2aab1432de2070aac69eca4077a72c2fe3f2f07b00c6270d0e13877'
-- key: tui/screens/explain_screen.py:R1:ExplainScreen:_artifact_for_lineage:fp=555bc982e45b1a5d
+- key: tui/screens/explain_screen.py:R1:ExplainScreen:_artifact_for_lineage:fp=72b6bdc6e81be3ac
   owner: john
   reason: |-
     This owned state-id index legitimately omits node states that produced no artifact. The explicit empty tuple means continue searching earlier states; only a non-empty sequence returns evidence, and exhausting the search returns the declared `None` verdict. No required artifact field is defaulted.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-29'
+  expires: '2026-12-07'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-31T02:43:38.075409+00:00'
+  judge_recorded_at: '2026-09-08T01:10:42.661751+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.95
   judge_rationale: |-
-    RULE MISFIRES — `artifacts_by_state_id` is explicitly a sparse owned index, so absence of a state ID means that state produced no artifact rather than that a required field is missing. The empty tuple is used only as the declared no-results sequence while searching earlier states; it neither fabricates artifact evidence nor suppresses malformed Tier-1 data. This is not an external-parameter trust-boundary case, so the decorator contract does not apply.
+    RULE MISFIRES — `artifacts_by_state_id` is a deliberately sparse owned index, not a record schema in which every state ID is a required key. The empty tuple is used only as a non-evidence control-flow sentinel so the search continues to earlier states; it neither fabricates an artifact nor conceals a required artifact field, and exhaustion is explicitly represented by the declared `None` result.
   judge_signature_version: 2
-  scope_fingerprint: 2028563f6b3a32aa609e6018149ee5f44eec6befdef1f4ef767c77688682a98f
+  scope_fingerprint: 02d34be1d9a12f8a9fe827eff85c6d28a133bd30b064906ee899f2c8bc38d306
   judge_transport: codex_cli
-  ast_path: 'body[23]/body[9]/body[3]/body[0]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:5adbc94a39f3449f35e3ea8c9eeea0a5bf21282400824e5adf686d313cf99ebe'
+  ast_path: 'body[23]/body[9]/body[2]/body[0]/value'
+  judge_metadata_signature: 'hmac-sha256:v2:c1502cae252870bb8bbfb93571e3b558cd64463c852e4c2d95583ce06a399da7'
 - key: tui/widgets/node_detail.py:R5:NodeDetailPanel:render_content:fp=c39d6a802a47f16f
   owner: john
   reason: |-

@@ -10,6 +10,8 @@
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
 > use-case-specific applications, but it is not yet ready for general production use.
 > Before relying on it, validate ELSPETH against your requirements and risk controls.
+> **AI Generated Code:** ELSPETH is an AI generated and reviewed rapid prototype that is
+> in active development. Limited user testing has been conducted with a small set of use cases only.
 
 Elspeth is a pipeline engine for building, validating, running, and auditing
 workflows where outputs need to be reviewed, explained, and reproduced. It
@@ -88,8 +90,8 @@ validation, preflight checks, and execution evidence.
 
 The substrate is therefore the product. A pipeline is made from declared
 primitives: sources, transforms, pure-config gates, aggregations, coalesce
-points, row-union barriers, and sinks. Those primitives carry schema and
-semantic contracts.
+points, row-union barriers, scope-bound collectors, and sinks. Those primitives
+carry schema and semantic contracts.
 Runtime assembly turns them into an execution graph; validation checks wiring,
 route targets, schema compatibility, and contracts before the executor runs the
 graph and writes the Landscape audit record.
@@ -739,19 +741,22 @@ See `docs/guides/landscape-mcp-analysis.md` for the full tool reference.
 
 ```yaml
 # pipeline.yaml
-source:
-  plugin: csv
-  on_success: validated       # Named output connection
-  options:
-    path: data/input.csv
-    schema:
-      mode: observed
+sources:
+  input_csv:
+    plugin: csv
+    on_success: validated       # Named output connection
+    options:
+      path: data/input.csv
+      on_validation_failure: discard   # Required: sink name or 'discard'
+      schema:
+        mode: observed
 
 transforms:
 - name: enrich
   plugin: field_mapper
   input: validated            # Connects to source output
   on_success: enriched        # Named output connection
+  on_error: discard           # Required: sink name or 'discard'
   options:
     schema:
       mode: observed
@@ -769,12 +774,18 @@ gates:
 sinks:
   results:
     plugin: csv
+    on_write_failure: discard   # Required: sink name or 'discard'
     options:
       path: output/results.csv
+      schema:
+        mode: observed
   flagged:
     plugin: csv
+    on_write_failure: discard   # Required: sink name or 'discard'
     options:
       path: output/flagged.csv
+      schema:
+        mode: observed
 
 landscape:
   url: sqlite:///./audit.db
@@ -789,17 +800,21 @@ Elspeth handles messy external headers through source-side normalization and sin
 Normalize messy headers (e.g., `"User ID"`, `"CaSE Study1 !!!! xx!"`) to valid Python identifiers at the source boundary:
 
 ```yaml
-source:
-  plugin: csv
-  options:
-    path: data/input.csv
+sources:
+  input_csv:
+    plugin: csv
+    options:
+      path: data/input.csv
+      on_validation_failure: discard   # Required: sink name or 'discard'
+      schema:
+        mode: observed
 
-    # Headers are always normalized to valid Python identifiers automatically
-    # e.g., "User ID" → "user_id"
+      # Headers are always normalized to valid Python identifiers automatically
+      # e.g., "User ID" → "user_id"
 
-    # Optional: Override specific normalized names
-    field_mapping:
-      case_study1_xx: cs1  # After normalization, rename to cs1
+      # Optional: Override specific normalized names
+      field_mapping:
+        case_study1_xx: cs1  # After normalization, rename to cs1
 ```
 
 #### Sink Display Headers
@@ -836,12 +851,12 @@ Transform-added fields (not in source) use their normalized names when restoring
 # the deployment secret manager; do not commit it.
 export ELSPETH_FINGERPRINT_KEY="$(openssl rand -hex 32)"
 
-# Azure Key Vault (alternative to direct key)
-export ELSPETH_KEYVAULT_URL="https://example-vault.vault.azure.net/"
-export ELSPETH_KEYVAULT_SECRET_NAME="elspeth-fingerprint-key"
+# Azure Key Vault is an alternative to the direct key, but it is configured in
+# the settings YAML `secrets:` block rather than by environment variables. See
+# Secret Fingerprinting below.
 # Optional: pin the exact allowed Key Vault URL(s), comma-separated, as an SSRF
 # hardening control; when unset, any https *.vault.azure.net host is accepted
-export ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS="$ELSPETH_KEYVAULT_URL"
+export ELSPETH_KEYVAULT_ALLOWED_VAULT_URLS="https://example-vault.vault.azure.net"
 
 # Provider configuration. Inject real credentials from a secret manager.
 export AZURE_OPENAI_API_KEY="fake_azure_openai_key_for_docs_only"
@@ -859,25 +874,20 @@ Elspeth automatically loads `.env` files. Use `--no-dotenv` to skip in CI/CD.
 
 ## Advanced Configuration
 
-### Hierarchical Settings
+### Per-Deployment Overrides
 
-```yaml
-# Base defaults
-default:
-  concurrency:
-    max_workers: 4
-
-# Profile overrides
-profiles:
-  production:
-    concurrency:
-      max_workers: 16
-    landscape:
-      url: postgresql://...
-```
+Per-deployment settings are layered with environment variables rather than
+profile sections: the settings loader runs with `environments=False`, so a YAML
+carrying `default:` or `profiles:` keys is refused at load. A variable named
+`ELSPETH_<SETTINGS_KEY>` overrides that key, nested values are supplied with
+Dynaconf's `@json` marker, and an object override deep-merges into the
+configured value rather than replacing it.
 
 ```bash
-elspeth run --settings config.yaml --profile production
+export ELSPETH_CONCURRENCY='@json {"max_workers": 16}'
+export ELSPETH_LANDSCAPE='@json {"url": "postgresql://user@host/elspeth", "backend": "postgresql"}'
+
+elspeth run --settings config.yaml --execute
 ```
 
 ### Secret Fingerprinting
@@ -888,6 +898,18 @@ Elspeth fingerprints secrets before storing in the audit trail:
 - **Development**: Set `ELSPETH_ALLOW_RAW_SECRETS=true` (redacts instead of fingerprints)
 
 Missing fingerprint key with secrets in config causes startup failure (fail-closed design).
+
+To load the key from Azure Key Vault instead, declare it in the settings YAML
+`secrets:` block. `vault_url` must be a literal HTTPS URL, because secrets are
+loaded before environment variable references are resolved:
+
+```yaml
+secrets:
+  source: keyvault
+  vault_url: https://my-vault.vault.azure.net
+  mapping:
+    ELSPETH_FINGERPRINT_KEY: elspeth-fingerprint-key
+```
 
 ### Payload Store
 
@@ -972,8 +994,6 @@ rate_limit:
 
 Rate limits are **per-service** - all plugins using the same service share the bucket. See [Configuration Reference](docs/reference/configuration.md#rate-limit-settings) for details.
 
-</details>
-
 ---
 
 ## Docker
@@ -1042,12 +1062,12 @@ elspeth/
 │   │   └── executors/      # Transform, gate, sink, aggregation executors
 │   ├── plugins/            # Sources, transforms, sinks, LLM integrations
 │   ├── mcp/                # Landscape MCP analysis server
- │   ├── testing/            # ChaosLLM, ChaosWeb, ChaosEngine test servers
+ │   ├── testing/            # Test factories for constructing production types
  │   ├── web/                # FastAPI app, Composer routes, auth/session storage, frontend
  │   ├── tui/                # Terminal UI (Textual)
  │   └── cli.py              # Typer CLI
  ├── gateway/                # Standalone LLM compatibility gateway service
- ├── deploy/                 # Compose, AWS ECS Terraform, and Linux systemd bundles
+ ├── deploy/                 # Compose, AWS ECS Terraform, Azure Container Apps, and Linux systemd bundles
  ├── elspeth-lints/          # Project-specific static analysis (ADR-023)
  ├── examples/               # Runnable example pipelines
  ├── docs/                   # Active public documentation
@@ -1062,7 +1082,7 @@ elspeth/
 
 | Component | Technology | Purpose |
 | --------- | ---------- | ------- |
-| CLI | Typer | Commands: run, join, explain, validate, resume, purge |
+| CLI | Typer | Commands: run, explain, validate, purge, resume, export-resume, join, health, web, composer, doctor, plugins |
 | TUI | Textual | Interactive graph-backed lineage explorer |
 | Config | Dynaconf + Pydantic | Multi-source with env var expansion |
 | Plugins | pluggy | Dynamic discovery, extensible components |

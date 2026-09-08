@@ -1,6 +1,6 @@
 # Data Trust Model & Error Handling Guide
 
-**MANDATORY READING** when working on: Sources, Transforms, Sinks, Aggregations, external API integrations, Landscape recording, or any code that handles data crossing system boundaries. (Gates are config-driven operations, not plugins — see AGENTS.md.)
+**MANDATORY READING** when working on: Sources, Transforms, Sinks, Aggregations, external API integrations, Landscape recording, or any code that handles data crossing system boundaries. (Gates are config-driven operations, not plugins — see [Gate Settings](../reference/configuration.md#gate-settings).)
 
 ## Overview
 
@@ -30,7 +30,7 @@ ELSPETH has three fundamentally different trust tiers with distinct handling rul
 The audit trail is the legal record. Silently coercing bad data is evidence tampering. If an auditor asks "why did row 42 get routed here?" and we give a confident wrong answer because we coerced garbage into a valid-looking value, we've committed fraud.
 
 **Examples of Tier 1 data:**
-- `landscape.get_row_state(token_id)` results
+- `landscape.query.get_node_states_for_token(token_id)` results
 - `node_states` table records
 - `calls` table records
 - Run configuration stored in `runs` table
@@ -39,12 +39,12 @@ The audit trail is the legal record. Silently coercing bad data is evidence tamp
 **Correct handling:**
 ```python
 # CORRECT - Let it crash if our data is corrupt
-row_state = landscape.get_row_state(token_id)
-node_id = row_state.node_id  # Direct access - crash if missing
+node_states = landscape.query.get_node_states_for_token(token_id)
+node_id = node_states[0].node_id  # Direct access - crash if missing
 
 # WRONG - Defensive handling on our own data
-row_state = landscape.get_row_state(token_id)
-node_id = getattr(row_state, 'node_id', None)  # NO! Hides corruption
+node_states = landscape.query.get_node_states_for_token(token_id)
+node_id = getattr(node_states[0], 'node_id', None)  # NO! Hides corruption
 if node_id is None:
     node_id = "unknown"  # NO! Evidence tampering
 ```
@@ -216,34 +216,57 @@ def process(self, row: PipelineRow, ctx: PluginContext) -> TransformResult:
 
 ### Real Example from LLMTransform (Multi-Query Strategy)
 
-This is the correct pattern as implemented in production:
+This is the correct pattern as implemented in production, in
+`MultiQueryStrategy._execute_one_query`
+(`src/elspeth/plugins/transforms/llm/transform.py`):
 
 ```python
-# Line 227-236: External call (Tier 3 boundary created)
+# External call (Tier 3 boundary created)
 try:
-    response = await self._llm_executor.execute_llm_call(...)
-except Exception as e:
-    return TransformResult.error(...)  # Wrapped immediately
+    result = provider.execute_query(messages, model=self.model, ...)
+except ContextLengthError as e:
+    return TransformResult.error({"reason": "context_length_exceeded", ...}, retryable=False)
+except LLMClientError as e:
+    if e.retryable:
+        raise  # Pool catches with AIMD; sequential catches and returns error
+    return TransformResult.error({"reason": "multi_query_failed", ...}, retryable=False)
 
-# Line 241-251: IMMEDIATE validation at boundary
-try:
-    parsed = json.loads(response.content)
-except json.JSONDecodeError:
-    return TransformResult.error(...)  # Can't parse - reject immediately
+# Normalize the envelope the model actually returned
+content = strip_markdown_fences(result.content)
 
-# Line 253-263: Structure type validation (defense against non-dict JSON)
-if not isinstance(parsed, dict):
-    return TransformResult.error({
-        "reason": "invalid_json_type",
-        "expected": "object",
-        "actual": type(parsed).__name__
-    })
+# IMMEDIATE validation at boundary - parse and type-check in one step
+extracted, extraction_error = extract_structured_fields(content, spec.output_fields)
+if extraction_error is not None:
+    extraction_error["query_name"] = spec.name
+    extraction_error["query_index"] = query_idx
+    return TransformResult.error(extraction_error, retryable=False)
 
-# Line 266-274: NOW safe to use - it's validated Tier 2 data
-output[output_key] = parsed[json_field]  # No defensive .get() needed
+# NOW safe to use - it's validated Tier 2 data
+for suffix, value in extracted.items():
+    partial[f"{spec.name}_{suffix}"] = value  # No defensive .get() needed
 ```
 
-From this point forward, `parsed` is treated as Tier 2 pipeline data. No more validation. No `.get()` calls. We trust it because we validated it at the boundary.
+The parse and the structure check live in the shared boundary helper
+`extract_structured_fields` (`src/elspeth/plugins/transforms/llm/validation.py`),
+so single-prompt mode, multi-query mode, and the LLM source all reject the same
+malformed payloads the same way:
+
+```python
+try:
+    parsed = json.loads(content, parse_constant=reject_nonfinite_constant)
+except (json.JSONDecodeError, ValueError) as e:
+    return {}, {"reason": "json_parse_failed", "error": str(e), ...}  # Can't parse - reject immediately
+
+# Structure type validation (defense against non-dict JSON)
+if not isinstance(parsed, dict):
+    return {}, {
+        "reason": "invalid_json_type",
+        "expected": "object",
+        "actual": type(parsed).__name__,
+    }
+```
+
+From this point forward, `extracted` is treated as Tier 2 pipeline data. No more validation. No `.get()` calls. We trust it because we validated it at the boundary.
 
 ## Coercion Rules by Plugin Type
 
@@ -262,7 +285,7 @@ From this point forward, `parsed` is treated as Tier 2 pipeline data. No more va
 |----------------------|---------------------|-----|
 | `self._config.field` | ❌ No | Our code, our config - crash on bug |
 | `self._internal_state` | ❌ No | Our code - crash on bug |
-| `landscape.get_row_state(token_id)` | ❌ No | Our data - crash on corruption |
+| `landscape.query.get_node_states_for_token(token_id)` | ❌ No | Our data - crash on corruption |
 | `row["field"]` arithmetic/parsing | ✅ Yes | Their data values can fail operations |
 | `external_api.call(row["id"])` | ✅ Yes | External system, anything can happen |
 | `json.loads(external_response)` | ✅ Yes | External data - validate immediately |
@@ -484,7 +507,7 @@ Ask yourself these questions:
 | `user_input.strip().lower()` | ✅ Yes | User input can be weird |
 | `self._state.current_phase.name` | ❌ No | Our state machine |
 | `external_db.query(sql)` | ✅ Yes | External system |
-| `landscape.get_row(id)` | ❌ No | Our audit data |
+| `landscape.query.get_row(row_id)` | ❌ No | Our audit data |
 | `row.get("optional_field")` | ⚠️ Depends | Only if schema says optional |
 | `getattr(plugin, "process")` | ❌ No | Plugin interface contract |
 

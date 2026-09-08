@@ -67,6 +67,7 @@ authors, and integrators must uphold.
 - [System Operations](contracts/system-operations.md)
 - [Execution Graph](contracts/execution-graph.md)
 - [Token Outcome Assurance](contracts/token-outcomes/README.md)
+- [Plugin Catalogue Reference Content](contracts/plugin-catalogue-reference-content.md)
 
 ## Guides
 
@@ -120,7 +121,7 @@ Audience-facing release and evaluation documents. See the
 
 - [Composer Guide](release/composer-guide.md) — current user-facing guide to the web authoring surface
 - [Platform Architecture](release/platform-architecture.md) — current platform architecture, trust-boundary, and operational-responsibility overview
-- [Audit and Lineage Guarantees](release/guarantees.md) — long-lived assurance narrative; refreshed per release (current contract surface; §1–§10 RC-3 base, §11–§14 RC-5.2 additions)
+- [Audit and Lineage Guarantees](release/guarantees.md) — long-lived assurance narrative; refreshed per release (current contract surface; §1–§10 RC-3 base, §11–§14 RC-5.2 additions, §15 RC-6 additions, §16 AWS ECS operator telemetry)
 - Per-period progress and velocity reports (RC-1 to RC-5) are internal work
   product and no longer ship as active public docs.
 - Superseded RC snapshots such as `feature-inventory.md`,
