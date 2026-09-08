@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
-from sqlalchemy import func, insert, update
+from sqlalchemy import insert, select, update
+from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError
-from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node, stamp_inside_next_transaction
+from tests.fixtures.landscape import leader_coordination_token, make_factory, register_test_node
 from tests.helpers.postgres_target import postgres_test_target
 
 from elspeth.contracts import NodeType, TerminalOutcome, TerminalPath
@@ -24,7 +26,7 @@ from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -299,6 +301,7 @@ def test_postgresql_rm01_through_rm06_and_rm09_through_rm13(postgres_db: Landsca
 
 
 def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: LandscapeDB) -> None:
+    """Pin exact SQL boundary operands; this is not a timing or lock-wait proof."""
     factory = make_factory(postgres_db)
     run_id = "rm-postgresql-coordination"
     leader = f"worker:{run_id}:leader"
@@ -309,21 +312,28 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
     assert occupied is not None
     assert occupied.leader_worker_id == leader
     assert occupied.seat_live is True
-    # Liveness is judged against the reading transaction's own database time
-    # (ADR-047): a deadline stamped EQUAL to it inside that transaction is live.
-    seat_at_equality = (
-        update(run_coordination_table)
-        .where(run_coordination_table.c.run_id == run_id)
-        .values(leader_heartbeat_expires_at=func.current_timestamp())
-    )
-    with stamp_inside_next_transaction(postgres_db.engine, seat_at_equality):
+    # This advisory read takes no authority locks. Stamp exactly its fresh
+    # database sample through the owned internal reader; the public API still
+    # accepts no clock, and the SELECT must treat exact equality as live.
+    seat_samples: list[datetime] = []
+
+    def seat_equality_clock(conn: Connection) -> datetime:
+        sampled = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_coordination_table).where(run_coordination_table.c.run_id == run_id).values(leader_heartbeat_expires_at=sampled)
+        )
+        seat_samples.append(sampled)
+        return sampled
+
+    with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=seat_equality_clock):
         equality = coordination.live_leader(run_id=run_id)
     assert equality is not None
+    assert seat_samples == [equality.leader_heartbeat_expires_at]
     assert equality.seat_live is True
     assert coordination.live_leader(run_id="rm-postgresql-missing") is None
 
     # NOW is in the database clock's past: these deadlines are all beyond the
-    # grace threshold; "equality" is re-stamped inside the sweep's transaction.
+    # grace threshold; "equality" is re-stamped at the sweep's fresh sample.
     registered_at = NOW - timedelta(minutes=2)
     workers = (
         ("dead-z", "follower", "active", NOW - timedelta(seconds=11), registered_at),
@@ -344,17 +354,28 @@ def test_postgresql_rm07_and_rm08_coordination_boundaries(postgres_db: Landscape
                     departed_at=NOW if status == "departed" else None,
                 )
             )
-    member_at_threshold = (
-        update(run_workers_table)
-        .where(run_workers_table.c.worker_id == "equality")
-        .values(heartbeat_expires_at=func.current_timestamp() - timedelta(seconds=10))
-    )
-    with stamp_inside_next_transaction(postgres_db.engine, member_at_threshold):
+    member_samples: list[datetime] = []
+
+    def member_equality_clock(conn: Connection) -> datetime:
+        sampled = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == "equality", run_workers_table.c.run_id == run_id)
+            .values(heartbeat_expires_at=sampled - timedelta(seconds=10))
+        )
+        assert conn.execute(
+            select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == "equality")
+        ).scalar_one() == sampled - timedelta(seconds=10)
+        member_samples.append(sampled)
+        return sampled
+
+    with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=member_equality_clock):
         dead = coordination.dead_non_leader_workers(
             run_id=run_id,
             leader_worker_id=leader,
             grace_seconds=10,
         )
+    assert len(member_samples) == 1
     assert dead == ("dead-a", "dead-z")
 
     with postgres_db.engine.begin() as conn:

@@ -54,7 +54,7 @@ from elspeth.contracts.errors import RunMembershipLostError, SchedulerLeaseLostE
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkItem, TokenWorkStatus
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -883,10 +883,10 @@ def test_postgresql_sink_redrive_recovery_excludes_expiry_equality_and_preserves
 def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(postgres_url: str) -> None:
     """RC-07 backend semantics only; this does not enable PostgreSQL followers.
 
-    The grace predicate compares the member's deadline against the evicting
-    transaction's own database time (ADR-047), so each boundary arm stamps the
-    deadline INSIDE that transaction from ``CURRENT_TIMESTAMP``: exactly at
-    ``database_now - grace`` (inert) and one microsecond before it (evicted).
+    After the target worker lock, stamp its deadline from the decision's fresh
+    database sample (ADR-047): exactly at ``database_now - grace`` (inert) and
+    one microsecond before it (evicted). Only the owned internal reader is
+    patched; leader admission and completion still obtain fresh samples.
     """
     now = datetime(2026, 8, 12, 5, 0, tzinfo=UTC)
     run_id = "run-eviction-boundary"
@@ -901,11 +901,32 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
         now=now,
     )
     coord = RunCoordinationRepository(db.engine)
-    member_deadline = update(run_workers_table).where(run_workers_table.c.worker_id == worker_id)
+    member_deadline = update(run_workers_table).where(run_workers_table.c.worker_id == worker_id, run_workers_table.c.run_id == run_id)
     grace = timedelta(seconds=GRACE)
+    target_locked = False
+    boundary_offset = timedelta(0)
+    decision_samples: list[datetime] = []
+
+    def observe_target_lock(conn: Connection, cursor: Any, statement: str, parameters: Any, context: Any, executemany: bool) -> None:
+        nonlocal target_locked
+        if statement.startswith("SELECT run_workers.worker_id") and "FOR UPDATE" in statement:
+            assert parameters["worker_id_1"] == worker_id
+            assert parameters["run_id_1"] == run_id
+            target_locked = True
+
+    def boundary_clock(conn: Connection) -> datetime:
+        nonlocal target_locked
+        sampled = read_landscape_decision_time(conn)
+        if target_locked:
+            target_locked = False
+            conn.execute(member_deadline.values(heartbeat_expires_at=sampled - grace - boundary_offset))
+            decision_samples.append(sampled)
+        return sampled
+
+    event.listen(db.engine, "after_cursor_execute", observe_target_lock)
     try:
         before_equality = capture_state_engine_image(db, run_id=run_id)
-        with stamp_inside_next_transaction(db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace)):
+        with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=boundary_clock):
             assert (
                 coord.evict_worker(
                     token=token,
@@ -914,6 +935,14 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
                     window_seconds=WINDOW,
                 )
                 is False
+            )
+        assert len(decision_samples) == 1
+        with db.read_only_connection() as conn:
+            assert (
+                conn.execute(
+                    select(run_workers_table.c.heartbeat_expires_at).where(run_workers_table.c.worker_id == worker_id)
+                ).scalar_one()
+                == decision_samples[0] - grace
             )
         # The inert verb committed only its leader-fence refresh (and the
         # test's own boundary stamp): no status, eviction stamp, or event.
@@ -928,9 +957,8 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
             [],
         )
 
-        with stamp_inside_next_transaction(
-            db.engine, member_deadline.values(heartbeat_expires_at=func.current_timestamp() - grace - timedelta(microseconds=1))
-        ):
+        boundary_offset = timedelta(microseconds=1)
+        with patch("elspeth.core.landscape.run_coordination_repository.read_landscape_decision_time", side_effect=boundary_clock):
             assert (
                 coord.evict_worker(
                     token=token,
@@ -940,11 +968,21 @@ def test_postgresql_eviction_exact_boundary_is_inert_until_strictly_expired(post
                 )
                 is True
             )
+        assert len(decision_samples) == 2
+        with db.read_only_connection() as conn:
+            evicted = conn.execute(
+                select(run_workers_table.c.heartbeat_expires_at, run_workers_table.c.evicted_at).where(
+                    run_workers_table.c.worker_id == worker_id
+                )
+            ).one()
+        assert evicted.heartbeat_expires_at == decision_samples[1] - grace - timedelta(microseconds=1)
+        assert evicted.evicted_at == decision_samples[1]
         assert _worker_status_and_live_leases(db, run_id=run_id, worker_id=worker_id) == (
             "evicted",
             [],
         )
     finally:
+        event.remove(db.engine, "after_cursor_execute", observe_target_lock)
         db.close()
 
 
