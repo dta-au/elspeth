@@ -33,9 +33,13 @@ from elspeth.contracts import (
 )
 from elspeth.contracts.audit import TokenRef
 from elspeth.contracts.call_data import RawCallPayload
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.core.landscape.database import LandscapeDB
+from elspeth.core.landscape.execution.batches import add_batch_member_guarded
 from elspeth.core.landscape.factory import RecorderFactory
+from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
+from tests.fixtures.landscape import claim_test_work_item, leader_coordination_token, leader_member_token
 
 _OBSERVED_SCHEMA = SchemaConfig.from_dict({"mode": "observed"})
 
@@ -128,10 +132,18 @@ def _build_multi_run_landscape() -> MultiRunFixture:
         sink_nid = f"sink-{suffix}"
 
         # -- run + nodes --
-        factory.run_lifecycle.begin_run(config={}, canonical_version="v1", run_id=run_id)
+        factory.run_lifecycle.begin_run(
+            config={},
+            canonical_version="v1",
+            run_id=run_id,
+            openrouter_catalog_sha256="0" * 64,
+            openrouter_catalog_source="bundled",
+        )
+        leader = leader_coordination_token(factory, run_id)
+        member = leader_member_token(factory, run_id)
 
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader,
             plugin_name="csv",
             node_type=NodeType.SOURCE,
             plugin_version="1.0",
@@ -140,7 +152,7 @@ def _build_multi_run_landscape() -> MultiRunFixture:
             schema_config=_OBSERVED_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader,
             plugin_name="passthrough",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",
@@ -149,7 +161,7 @@ def _build_multi_run_landscape() -> MultiRunFixture:
             schema_config=_OBSERVED_SCHEMA,
         )
         factory.data_flow.register_node(
-            run_id=run_id,
+            coordination_token=leader,
             plugin_name="csv_sink",
             node_type=NodeType.SINK,
             plugin_version="1.0",
@@ -161,8 +173,8 @@ def _build_multi_run_landscape() -> MultiRunFixture:
         # -- edges --
         edge_s2t = f"edge-{suffix}-s2t"
         edge_t2k = f"edge-{suffix}-t2k"
-        factory.data_flow.register_edge(run_id, src_nid, xform_nid, "continue", RoutingMode.MOVE, edge_id=edge_s2t)
-        factory.data_flow.register_edge(run_id, xform_nid, sink_nid, "continue", RoutingMode.MOVE, edge_id=edge_t2k)
+        factory.data_flow.register_edge(src_nid, xform_nid, "continue", RoutingMode.MOVE, coordination_token=leader, edge_id=edge_s2t)
+        factory.data_flow.register_edge(xform_nid, sink_nid, "continue", RoutingMode.MOVE, coordination_token=leader, edge_id=edge_t2k)
 
         # -- rows, tokens, states, calls, routing, outcomes --
         row_ids: list[str] = []
@@ -173,18 +185,28 @@ def _build_multi_run_landscape() -> MultiRunFixture:
             tok_id = f"tok-{suffix}-{i}"
             state_id = f"st-{suffix}-{i}"
 
-            factory.data_flow.create_row(run_id, src_nid, i, {"val": f"{suffix}-{i}"}, row_id=row_id, source_row_index=i, ingest_sequence=i)
-            factory.data_flow.create_token(row_id, token_id=tok_id)
+            factory.data_flow.create_row_with_token(
+                src_nid,
+                i,
+                {"val": f"{suffix}-{i}"},
+                row_id=row_id,
+                token_id=tok_id,
+                source_row_index=i,
+                ingest_sequence=i,
+                coordination_token=leader,
+            )
+            work_item = claim_test_work_item(factory, member_token=member, token_id=tok_id, node_id=xform_nid, step_index=1)
 
             # begin + complete a node state on the transform node
             factory.execution.begin_node_state(
-                tok_id, xform_nid, run_id, step_index=1, input_data={"val": f"{suffix}-{i}"}, state_id=state_id
+                tok_id, xform_nid, step_index=1, input_data={"val": f"{suffix}-{i}"}, state_id=state_id, member_token=member
             )
             factory.execution.complete_node_state(
                 state_id,
                 NodeStateStatus.COMPLETED,
                 output_data={"val": f"{suffix}-{i}", "processed": True},
                 duration_ms=10.0,
+                member_token=member,
             )
 
             call_id: str | None = None
@@ -200,6 +222,8 @@ def _build_multi_run_landscape() -> MultiRunFixture:
                     request_data=RawCallPayload({"url": f"https://api.example.com/{suffix}"}),
                     response_data=RawCallPayload({"status": 200}),
                     latency_ms=42.0,
+                    member_token=member,
+                    work_item=work_item,
                 )
                 call_id = call_obj.call_id
 
@@ -209,6 +233,7 @@ def _build_multi_run_landscape() -> MultiRunFixture:
                     edge_t2k,
                     RoutingMode.MOVE,
                     event_id=f"re-{suffix}-0",
+                    member_token=member,
                 )
                 re_id = re_obj.event_id
 
@@ -218,6 +243,8 @@ def _build_multi_run_landscape() -> MultiRunFixture:
                 outcome=TerminalOutcome.SUCCESS,
                 path=TerminalPath.DEFAULT_FLOW,
                 sink_name="output",
+                member_token=member,
+                work_item=work_item,
             )
 
             row_ids.append(row_id)
@@ -225,10 +252,17 @@ def _build_multi_run_landscape() -> MultiRunFixture:
 
         # -- batch (on transform node, using aggregation node type conceptually) --
         batch_id = f"batch-{suffix}"
-        factory.execution.create_batch(run_id, xform_nid, batch_id=batch_id)
-        factory.execution.add_batch_member(batch_id, token_infos[0].token_id, ordinal=0)
-        factory.execution.add_batch_member(batch_id, token_infos[1].token_id, ordinal=1)
-        factory.execution.update_batch_status(batch_id, BatchStatus.EXECUTING, trigger_type=TriggerType.COUNT, trigger_reason="count=2")
+        factory.execution.create_batch(xform_nid, coordination_token=leader, batch_id=batch_id)
+        # Seed the query fixture's historical membership under its real leader.
+        # Runtime barrier fixtures use scheduler adoption and real row payloads.
+        with fenced_leader_transaction(
+            db.engine, token=leader, window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, verb="multi_run_fixture_batch_members"
+        ) as conn:
+            for ordinal, info in enumerate(token_infos):
+                add_batch_member_guarded(conn, batch_id=batch_id, token_id=info.token_id, ordinal=ordinal, expected_run_id=run_id)
+        factory.execution.update_batch_status(
+            batch_id, BatchStatus.EXECUTING, coordination_token=leader, trigger_type=TriggerType.COUNT, trigger_reason="count=2"
+        )
 
         run_infos.append(
             RunInfo(

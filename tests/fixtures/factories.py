@@ -26,8 +26,9 @@ from elspeth.contracts.node_state_context import (
     PoolStatsSnapshot,
     QueryOrderEntry,
 )
-from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.core.dag.wiring import WiredTransform
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 if TYPE_CHECKING:
     from elspeth.contracts import TransformProtocol
@@ -159,24 +160,13 @@ def make_context(
         if member_token is None and coordination_token is not None:
             member_token = coordination_token.membership
         if work_item is None and member_token is not None:
-            timestamp = datetime.now(UTC)
-            work_item = TokenWorkItem(
-                work_item_id="mock-work-item",
-                run_id=run_id,
+            work_item = mock_item_audit_authority(
+                run_id,
                 token_id=token.token_id,
                 row_id=token.row_id,
                 node_id=node_id,
-                step_index=0,
-                ingest_sequence=0,
-                row_payload_json="{}",
-                status=TokenWorkStatus.LEASED,
-                attempt=1,
-                available_at=timestamp,
-                created_at=timestamp,
-                updated_at=timestamp,
-                lease_owner=member_token.worker_id,
-                lease_expires_at=timestamp,
-            )
+                member_token=member_token,
+            )["work_item"]
 
     return PluginContext(
         run_id=run_id,

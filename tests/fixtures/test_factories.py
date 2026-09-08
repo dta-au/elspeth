@@ -13,6 +13,33 @@ import pytest
 
 from elspeth.contracts import NodeType
 
+
+@pytest.mark.parametrize("with_leader", [False, True])
+def test_mock_audit_authority_supplies_a_nominal_matching_claim(with_leader: bool) -> None:
+    from elspeth.contracts.coordination import WorkerMembershipToken
+    from elspeth.contracts.scheduler import TokenWorkItem, TokenWorkStatus
+    from tests.fixtures.factories import make_context, make_token_info
+    from tests.fixtures.mock_audit import mock_audit_authority, mock_item_audit_authority
+
+    builder = mock_audit_authority if with_leader else mock_item_audit_authority
+    authority = builder("custom-run", token_id="custom-token", row_id="custom-row", node_id="custom-node")
+    ctx = make_context(
+        run_id="custom-run",
+        token=make_token_info(token_id="custom-token", row_id="custom-row"),
+        node_id="custom-node",
+        **authority,
+    )
+    member = ctx.require_member_token()
+    claim = ctx.require_work_item()
+    # Mock(spec=TokenWorkItem) passes isinstance; exact type proves real DTO custody.
+    assert type(member) is WorkerMembershipToken
+    assert type(claim) is TokenWorkItem
+    assert (claim.run_id, claim.token_id, claim.row_id, claim.node_id) == ("custom-run", "custom-token", "custom-row", "custom-node")
+    assert claim.lease_owner == member.worker_id
+    assert claim.status is TokenWorkStatus.LEASED
+    assert claim.lease_expires_at is not None and claim.lease_expires_at > claim.created_at
+
+
 # =============================================================================
 # make_context() — PluginContext factory
 # =============================================================================
@@ -119,8 +146,8 @@ class TestMakeSourceContext:
             source_node_id="source",
             source_plugin_name="csv",
         )
-        row = setup.data_flow.create_row(
-            run_id=setup.run_id,
+        row, token = setup.data_flow.create_row_with_token(
+            coordination_token=setup.coordination_token,
             source_node_id=setup.source_node_id,
             row_index=0,
             data={"field": "value"},
@@ -128,6 +155,7 @@ class TestMakeSourceContext:
             ingest_sequence=0,
         )
         assert row.row_id is not None
+        assert token.row_id == row.row_id
 
 
 # =============================================================================
@@ -280,7 +308,7 @@ class TestMakeRecorderWithRun:
         setup = make_recorder_with_run(run_id="multi-node-run")
         # register_node must succeed on the data_flow repository
         node = setup.data_flow.register_node(
-            run_id=setup.run_id,
+            coordination_token=setup.coordination_token,
             plugin_name="enricher",
             node_type=NodeType.TRANSFORM,
             plugin_version="1.0",

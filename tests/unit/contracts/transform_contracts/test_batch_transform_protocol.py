@@ -59,8 +59,10 @@ import pytest
 
 from elspeth.contracts import Determinism, PluginSchema, TransformProtocol, TransformResult
 from elspeth.contracts.contexts import TransformContext
+from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.identity import TokenInfo
 from elspeth.contracts.plugin_context import PluginContext
+from elspeth.contracts.scheduler import TokenWorkItem
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow
 from elspeth.engine.batch_adapter import ExceptionResult
@@ -68,6 +70,7 @@ from elspeth.plugins.infrastructure.base import BaseTransform
 from elspeth.plugins.infrastructure.batching import OutputPort
 from elspeth.plugins.infrastructure.batching.mixin import BatchTransformMixin
 from elspeth.testing import make_contract, make_pipeline_row, make_row
+from tests.fixtures.mock_audit import mock_item_audit_authority
 
 
 class _BatchContractInputSchema(PluginSchema):
@@ -187,7 +190,7 @@ class _BatchContractExemplarTransform(BaseTransform, BatchTransformMixin):
         output["processed"] = True
         return TransformResult.success(
             PipelineRow(output, row.contract),
-            success_reason={"action": "batch_contract_exemplar"},
+            success_reason={"action": "processed"},
         )
 
     def close(self) -> None:
@@ -277,7 +280,9 @@ class _BatchContractLandscape:
         self.allocated_state_ids: list[str] = []
         self.recorded_calls: list[dict[str, Any]] = []
 
-    def allocate_call_index(self, state_id: str) -> int:
+    def allocate_call_index(self, state_id: str, *, member_token: WorkerMembershipToken, work_item: TokenWorkItem) -> int:
+        assert work_item.run_id == member_token.run_id
+        assert work_item.lease_owner == member_token.worker_id
         self.allocated_state_ids.append(state_id)
         return len(self.allocated_state_ids) - 1
 
@@ -331,6 +336,12 @@ class BatchTransformContractTestBase(ABC):
                 landscape=_BatchContractLandscape(),
                 state_id=f"state-{counter:03d}",
                 node_id="test-batch-transform",
+                **mock_item_audit_authority(
+                    "test-run-001",
+                    token_id=f"token-{counter:03d}",
+                    row_id=f"row-{counter:03d}",
+                    node_id="test-batch-transform",
+                ),
                 token=TokenInfo(
                     token_id=f"token-{counter:03d}",
                     row_id=f"row-{counter:03d}",
