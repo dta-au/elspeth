@@ -19,10 +19,10 @@ import pytest
 from sqlalchemy import select, update
 from typer.testing import CliRunner
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import FrameworkBugError, RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.plugin_context import PluginContext
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository

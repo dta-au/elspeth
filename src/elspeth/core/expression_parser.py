@@ -368,7 +368,7 @@ class _ExpressionValidator(ast.NodeVisitor):
             if type(op) not in _COMPARISON_OPS:
                 self.errors.append(f"Forbidden comparison operator: {type(op).__name__}")
             # Restrict is/is not to None checks only
-            elif isinstance(op, ast.Is | ast.IsNot):
+            elif type(op) in (ast.Is, ast.IsNot):
                 left_operand = all_operands[i]
                 right_operand = all_operands[i + 1]
                 if not (self._is_none_constant(left_operand) or self._is_none_constant(right_operand)):

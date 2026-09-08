@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 import elspeth.contracts.errors as contract_errors
 from elspeth import __version__
+from elspeth.config_loading import load_settings
 from elspeth.contracts import ExecutionResult, SecretResolutionInput
 from elspeth.contracts.auth import AuthProviderType
 from elspeth.contracts.errors import (
@@ -33,7 +34,7 @@ from elspeth.contracts.errors import (
 from elspeth.contracts.preflight import PreflightResult
 from elspeth.contracts.types import AggregationName
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, SourceSettings, load_settings, resolve_config
+from elspeth.core.config import ElspethSettings, SourceSettings, resolve_config
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.security.config_secrets import SecretLoadError, load_secrets_from_config
 from elspeth.engine.orchestrator.preflight import SinkEffectCapabilityError

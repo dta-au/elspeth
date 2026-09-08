@@ -165,7 +165,7 @@ class TestLoadSettings:
     """Test Dynaconf-based settings loading."""
 
     def test_load_from_yaml_file(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -191,7 +191,7 @@ retry:
         assert settings.retry.max_attempts == 5
 
     def test_load_with_env_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -225,7 +225,7 @@ sinks:
         If _lowercase_schema_keys doesn't lowercase PLUGIN, Pydantic sees an unknown
         field and reports 'plugin' as missing.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -252,7 +252,7 @@ sinks:
         env vars (not merged with YAML), Dynaconf produces uppercase keys
         that must be lowercased for Pydantic validation.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -273,7 +273,7 @@ sources:
     def test_load_settings_rejects_report_assemble_title_placeholder_before_env_expansion(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("REPORT_SECRET", "expanded-host-secret")
         config_file = tmp_path / "settings.yaml"
@@ -309,7 +309,7 @@ sinks:
     def test_load_settings_from_yaml_string_rejects_report_assemble_join_with_placeholder_before_env_expansion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("REPORT_JOINER", "expanded-host-secret")
 
@@ -348,7 +348,7 @@ sinks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Environment overrides under options.schema must reach runtime schema config."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -375,7 +375,7 @@ sinks:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Environment overrides for options.schema fields must override YAML schema fields."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -406,7 +406,7 @@ sinks:
         assert "SCHEMA" not in settings.sources["primary"].options
 
     def test_load_validates_schema(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -426,7 +426,7 @@ concurrency:
             load_settings(config_file)
 
     def test_load_missing_required_field(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -438,7 +438,7 @@ retry:
             load_settings(config_file)
 
     def test_load_missing_file_raises_file_not_found(self, tmp_path: Path) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         missing_file = tmp_path / "nonexistent.yaml"
         with pytest.raises(FileNotFoundError, match="Config file not found"):
@@ -706,7 +706,7 @@ class TestLoadSettingsArchitecture:
 
     def test_load_readme_example(self, tmp_path: Path) -> None:
         """Load config with config-driven gates."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -756,7 +756,7 @@ landscape:
 
     def test_load_minimal_config(self, tmp_path: Path) -> None:
         """Minimal valid configuration."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -781,7 +781,7 @@ sinks:
 
     def test_load_default_sink_in_yaml_rejected(self, tmp_path: Path) -> None:
         """default_sink in YAML is rejected as unknown key."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1737,7 +1737,7 @@ class TestLoadSettingsWithGates:
 
     def test_load_settings_with_gates(self, tmp_path: Path) -> None:
         """Load YAML with gates section."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1773,7 +1773,7 @@ gates:
 
     def test_load_settings_with_fork_gate(self, tmp_path: Path) -> None:
         """Load YAML with fork gate."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1814,7 +1814,7 @@ gates:
         gate route labels, causing routing failures when gate conditions returned
         mixed-case strings like "High" but routes had been lowercased to "high".
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -1857,7 +1857,7 @@ gates:
 
     def test_load_settings_preserves_schema_route_label(self, tmp_path: Path) -> None:
         """Route labels named SCHEMA are user data, not plugin schema options."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -2494,7 +2494,7 @@ class TestSecretFieldFingerprinting:
 
     def test_api_key_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """API keys in config should be preserved for runtime use."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2524,7 +2524,8 @@ sinks:
 
     def test_api_key_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """API keys should be fingerprinted when creating audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2559,7 +2560,8 @@ sinks:
 
     def test_named_source_api_keys_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Every named source should fingerprint secret options in the audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2599,7 +2601,7 @@ sinks:
 
     def test_token_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Token fields should be preserved for runtime use."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2625,7 +2627,8 @@ sinks:
 
     def test_token_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Token fields should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2652,7 +2655,7 @@ sinks:
 
     def test_secret_suffix_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fields ending in _secret should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2678,7 +2681,8 @@ sinks:
 
     def test_secret_suffix_is_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Fields ending in _secret should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2705,7 +2709,7 @@ sinks:
 
     def test_sink_options_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in sink options should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2731,7 +2735,8 @@ sinks:
 
     def test_sink_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in sink options should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2758,7 +2763,7 @@ sinks:
 
     def test_non_secret_fields_preserved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Non-secret fields should remain unchanged."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2792,7 +2797,7 @@ sinks:
         Regression test: _lowercase_schema_keys must not apply sink name
         handling to user data that happens to contain a 'sinks' key.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -2821,7 +2826,7 @@ sinks:
 
     def test_row_plugin_options_preserved_at_load_time(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in row_plugins options should be preserved for runtime."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2857,7 +2862,8 @@ transforms:
 
     def test_row_plugin_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Secret fields in row_plugins options should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -2893,7 +2899,8 @@ transforms:
 
     def test_telemetry_exporter_options_are_fingerprinted_in_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Telemetry exporter secrets should be fingerprinted in audit copy."""
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import resolve_config
 
         monkeypatch.setenv("ELSPETH_FINGERPRINT_KEY", "test-key")
 
@@ -3064,7 +3071,7 @@ telemetry:
         fingerprint key is only required when calling resolve_config()
         to create the audit copy.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
@@ -3090,11 +3097,8 @@ sinks:
 
     def test_missing_key_raises_error_on_resolve_config(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """resolve_config should raise SecretFingerprintError when key missing."""
-        from elspeth.core.config import (
-            SecretFingerprintError,
-            load_settings,
-            resolve_config,
-        )
+        from elspeth.config_loading import load_settings
+        from elspeth.core.config import SecretFingerprintError, resolve_config
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.delenv("ELSPETH_ALLOW_RAW_SECRETS", raising=False)
@@ -3138,7 +3142,7 @@ sinks:
 
     def test_dev_mode_allows_load_settings(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """ELSPETH_ALLOW_RAW_SECRETS=true should allow load and keep secrets as-is."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         monkeypatch.delenv("ELSPETH_FINGERPRINT_KEY", raising=False)
         monkeypatch.setenv("ELSPETH_ALLOW_RAW_SECRETS", "true")
@@ -3902,7 +3906,7 @@ class TestEnvPlaceholderGuardIsDerived:
         ``csv.headers`` writes its mapping values as the artifact's header row —
         and with the map gone there is no registry to be disjoint from.
         """
-        from elspeth.core.config import _plugin_bearing_sections
+        from elspeth.config_loading import _plugin_bearing_sections
 
         sections = _plugin_bearing_sections()
 
@@ -3928,8 +3932,8 @@ class TestEnvPlaceholderGuardIsDerived:
         declaration the guard cannot see fails loudly instead of silently
         protecting nothing.
         """
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
         from elspeth.contracts.emitted_option import emitted_option_fields
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         declarations = [
             (kind, name, option)
@@ -4015,7 +4019,7 @@ class TestEnvPlaceholderGuardIsDerived:
         because declarations are unioned by plugin name. Only sink ``lookups``
         and the broader policy for outbound OData identity remain deferred.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         option_value: object
         if option_name == "columns":
@@ -4055,7 +4059,7 @@ class TestEnvPlaceholderGuardIsDerived:
         remain valid, while sink ``lookups`` and broader outbound-identity policy
         are explicitly outside this bounded repair.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         raw_config = {
             "sinks": {
@@ -4078,7 +4082,7 @@ class TestEnvPlaceholderGuardIsDerived:
         the env guard must derive from them rather than restating the same field
         list as ``EmittedToOutput`` annotations on every config model.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
         from elspeth.plugins.infrastructure.base import BaseTransform
         from elspeth.plugins.infrastructure.manager import get_shared_plugin_manager
 
@@ -4121,7 +4125,7 @@ class TestEnvPlaceholderGuardIsDerived:
         the plugin it was first tested against — would still pass a test that
         checks ``report_assemble`` and nothing else.
         """
-        from elspeth.core.config import _declared_emitted_options
+        from elspeth.config_loading import _declared_emitted_options
 
         enforced = {
             name
@@ -4145,7 +4149,7 @@ class TestEnvPlaceholderGuardIsDerived:
         arbitrary. It must not also be unexplained: the message carries the
         declaring kind and the declared reason, so an operator can see why.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         raw_config = {
             "sinks": {"out": {"plugin": "csv", "options": {"headers": {"body": self.PLACEHOLDER}}}},
@@ -4169,7 +4173,7 @@ class TestEnvPlaceholderGuardIsDerived:
         exactly what "declaration tests pin existence, not truth" warns about.
         So the two-kind declaration is injected rather than left unproven.
         """
-        from elspeth.core import config as config_module
+        from elspeth import config_loading as config_module
 
         def _two_kinds(plugin_name: str) -> dict[str, list[tuple[str, str]]]:
             return {
@@ -4202,7 +4206,7 @@ class TestEnvPlaceholderGuardIsDerived:
         — walks straight past ``{field: display_name}``, which is exactly the
         shape whose values are written as the artifact's header row.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         for label, headers in (
             ("mapping value", {"body": self.PLACEHOLDER}),
@@ -4223,7 +4227,7 @@ class TestEnvPlaceholderGuardIsDerived:
 
     def test_clean_values_are_still_accepted(self) -> None:
         """Negative control: the guard must reject placeholders, not the option."""
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         _reject_sensitive_plugin_env_placeholders_before_expansion(
             {
@@ -4245,7 +4249,7 @@ class TestEnvPlaceholderGuardIsDerived:
         The guard must not turn "no such plugin" into its own message, and must
         not crash on the lookup either.
         """
-        from elspeth.core.config import _reject_sensitive_plugin_env_placeholders_before_expansion
+        from elspeth.config_loading import _reject_sensitive_plugin_env_placeholders_before_expansion
 
         _reject_sensitive_plugin_env_placeholders_before_expansion(
             {"transforms": [{"name": "t", "plugin": "no_such_plugin", "options": {"title": self.PLACEHOLDER}}]}
@@ -4737,8 +4741,8 @@ class TestLoadSettingsWithRunMode:
 
     def test_load_settings_with_live_mode(self, tmp_path: Path) -> None:
         """Load YAML with live mode (default)."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4762,8 +4766,8 @@ run_mode: live
 
     def test_load_settings_with_replay_mode(self, tmp_path: Path) -> None:
         """Load YAML with replay mode."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4788,8 +4792,8 @@ replay_from: run-abc123
 
     def test_load_settings_with_verify_mode(self, tmp_path: Path) -> None:
         """Load YAML with verify mode."""
+        from elspeth.config_loading import load_settings
         from elspeth.contracts.enums import RunMode
-        from elspeth.core.config import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4814,7 +4818,7 @@ replay_from: run-xyz789
 
     def test_load_settings_replay_without_source_run_id_fails(self, tmp_path: Path) -> None:
         """Loading replay mode without source_run_id should fail."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -4842,7 +4846,7 @@ class TestLoadSettingsTemplateFileExpansion:
 
     def test_load_settings_expands_template_files(self, tmp_path: Path) -> None:
         """load_settings expands template_file in row_plugins."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Create directory structure
         prompts_dir = tmp_path / "prompts"
@@ -4993,7 +4997,7 @@ class TestEnvVarExpansion:
 
     def test_load_settings_from_yaml_string_preserves_env_placeholders_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The in-memory loader treats ${VAR} as literal user data by default."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -5017,7 +5021,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_can_opt_into_env_expansion(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Trusted in-process callers can explicitly request host environment expansion."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -5047,7 +5051,7 @@ sinks:
         secrets: the operator tree was already expanded, and attacker-supplied
         blob text like ${INLINE_PROMPT_SECRET} must stay data, not a host lookup.
         """
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         monkeypatch.setenv("INLINE_PROMPT_SECRET", "server-secret-value")
 
@@ -5071,7 +5075,7 @@ sinks:
         assert settings.sources["primary"].options["prompt_template"] == "prefix-${INLINE_PROMPT_SECRET}-suffix"
 
     def test_load_settings_from_yaml_string_rejects_aggregation_file_backed_options(self) -> None:
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         with pytest.raises(ValueError) as exc_info:
             load_settings_from_yaml_string(
@@ -5110,8 +5114,8 @@ class TestBoundedYamlStringLoader:
 
     def test_load_settings_from_yaml_string_accepts_inline_blob_aggregate_sized_content(self) -> None:
         """Resolved inline content up to the blob aggregate cap fits under the YAML cap."""
+        from elspeth.config_loading import load_settings_from_yaml_string
         from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP
-        from elspeth.core.config import load_settings_from_yaml_string
 
         inline_content = "x" * BLOB_INLINE_AGGREGATE_BYTE_CAP
         settings = load_settings_from_yaml_string(
@@ -5136,8 +5140,9 @@ sinks:
         """Resolved inline content is not serialized back through the YAML byte cap."""
         import yaml
 
+        from elspeth.config_loading import load_settings_from_config_dict
         from elspeth.core.blobs_inline import BLOB_INLINE_AGGREGATE_BYTE_CAP
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_config_dict
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         inline_content = "\x00" * BLOB_INLINE_AGGREGATE_BYTE_CAP
         config_dict = {
@@ -5164,7 +5169,8 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_oversized_yaml_before_parse(self) -> None:
         """Web-facing YAML must be byte-capped before PyYAML parses it."""
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         oversized = (
             """
@@ -5188,7 +5194,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_aliases_before_construction(self) -> None:
         """Aliases are rejected so small YAML cannot amplify during object construction."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         aliased = """
 sources:
@@ -5211,7 +5217,7 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_excessive_depth(self) -> None:
         """Deep but textually small YAML is rejected before recursive construction."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         lines = [
             "sources:",
@@ -5239,7 +5245,8 @@ sinks:
 
     def test_load_settings_from_yaml_string_rejects_excessive_node_count(self) -> None:
         """Many small YAML nodes are rejected even when the byte cap is not reached."""
-        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES, load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
+        from elspeth.core.config import MAX_IN_MEMORY_PIPELINE_YAML_BYTES
 
         option_lines = [f"      key_{index}: value" for index in range(5_100)]
         yaml_content = "\n".join(
@@ -5332,7 +5339,7 @@ class TestSinkNameCasing:
 
     def test_load_settings_rejects_mixed_case_sink_names(self, tmp_path: Path) -> None:
         """Mixed-case sink names from YAML are rejected with helpful error."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5413,7 +5420,7 @@ class TestUnknownKeyRejection:
 
     def test_typo_key_raises_value_error(self, tmp_path: Path) -> None:
         """A typo like 'trnasforms' instead of 'transforms' must be rejected."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5439,7 +5446,7 @@ trnasforms:
 
     def test_multiple_typo_keys_all_reported(self, tmp_path: Path) -> None:
         """Multiple unknown keys should all appear in the error message."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5462,7 +5469,7 @@ retrry:
 
     def test_valid_config_still_loads(self, tmp_path: Path) -> None:
         """A config with only valid keys must load without error (no regression)."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5498,7 +5505,7 @@ retry:
         Dynaconf injects keys like LOAD_DOTENV into the settings dict.
         These are filtered by the allowlist but must not be treated as user errors.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # A minimal valid config — Dynaconf will inject LOAD_DOTENV automatically
         config_file = tmp_path / "settings.yaml"
@@ -5523,7 +5530,7 @@ sinks:
         ELSPETH_LOG_LEVEL set in docker-compose) and injects them into raw_config.
         The unknown-key check must only flag keys from the YAML file, not env vars.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Set an ELSPETH_* env var that is NOT an ElspethSettings field
         monkeypatch.setenv("ELSPETH_LOG_LEVEL", "DEBUG")
@@ -5550,7 +5557,7 @@ sinks:
         Regression test: env var filtering must not accidentally disable
         the typo check for actual YAML key typos.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         # Set a legitimate env var
         monkeypatch.setenv("ELSPETH_LOG_LEVEL", "DEBUG")
@@ -5577,7 +5584,7 @@ trnasforms:
         It must not be rejected as an unknown key even though it's not in
         ElspethSettings.model_fields.
         """
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5709,7 +5716,7 @@ class TestLowercaseSchemaKeysBranchPreservation:
 
     def test_load_settings_preserves_coalesce_branch_names(self, tmp_path: Path) -> None:
         """Full config loading preserves mixed-case coalesce branch names."""
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text("""
@@ -5843,7 +5850,7 @@ class TestLoadSettingsFromYamlStringBoundary:
 
     def test_non_mapping_yaml_document_raises(self) -> None:
         """A YAML document that is not a mapping is refused, never coerced."""
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         with pytest.raises(ValueError, match="must be a YAML mapping"):
             load_settings_from_yaml_string("- just\n- a\n- list\n")
@@ -5862,7 +5869,7 @@ class TestLoadSettingsYamlDocumentShape:
 
     @pytest.mark.parametrize("doc", ["false\n", "0\n", "[]\n"])
     def test_falsy_non_mapping_yaml_file_rejected(self, tmp_path: Path, doc: str) -> None:
-        from elspeth.core.config import load_settings
+        from elspeth.config_loading import load_settings
 
         config_file = tmp_path / "settings.yaml"
         config_file.write_text(doc)

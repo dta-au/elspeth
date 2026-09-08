@@ -17,7 +17,7 @@ import sqlite3
 from pathlib import Path
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
-from elspeth.core.config import load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.payload_store import FilesystemPayloadStore

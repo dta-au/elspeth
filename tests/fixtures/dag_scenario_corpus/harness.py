@@ -18,6 +18,7 @@ from unittest.mock import patch
 import yaml
 from sqlalchemy import select
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import RunStatus
 from elspeth.contracts.audit_export import (
     AUDIT_EXPORT_MAX_CHUNK_BYTES,
@@ -35,7 +36,7 @@ from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffec
 from elspeth.core.checkpoint import CheckpointManager, RecoveryManager
 from elspeth.core.checkpoint.compatibility import CheckpointCompatibilityValidator
 from elspeth.core.checkpoint.recovery import NonResumableRunError
-from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB, LandscapeExporter, RecorderFactory
 from elspeth.core.landscape.execution.sink_effect_reservation import SinkEffectReservation

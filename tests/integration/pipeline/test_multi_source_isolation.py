@@ -14,10 +14,10 @@ from pathlib import Path
 from sqlalchemy import and_, select
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import NodeType
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import (

@@ -13,10 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.sql import Update
 from sqlalchemy.sql.compiler import SQLCompiler
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import NodeType, RoutingMode
 from elspeth.contracts.coordination import CoordinationToken
 from elspeth.contracts.errors import AuditIntegrityError
-from elspeth.core.config import SourceSettings, load_settings_from_yaml_string
+from elspeth.core.config import SourceSettings
 from elspeth.core.dag import ExecutionGraph, GraphValidationError
 from elspeth.core.landscape.database import LandscapeDB, Tier1Engine
 from elspeth.core.landscape.database_clock import read_landscape_transaction_time

@@ -758,8 +758,9 @@ class TestJoinCommand:
     def test_join_refused_no_live_leader(self, tmp_path: Path) -> None:
         """join exits 1 and names elspeth resume when the leader seat is dead."""
         from elspeth.cli import app
+        from elspeth.config_loading import load_settings
         from elspeth.core.canonical import stable_hash
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.core.config import resolve_config
 
         run_id = "run-dead-leader-003"
         settings_path = _make_minimal_settings(tmp_path)
@@ -790,8 +791,9 @@ class TestJoinCommand:
         from unittest.mock import patch
 
         from elspeth.cli import app
+        from elspeth.config_loading import load_settings
         from elspeth.core.canonical import stable_hash
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.core.config import resolve_config
 
         run_id = "run-clean-depart-004"
         settings_path = _make_minimal_settings(tmp_path)
@@ -881,8 +883,9 @@ class TestJoinCommand:
         from sqlalchemy import select
 
         from elspeth.cli import app
+        from elspeth.config_loading import load_settings
         from elspeth.core.canonical import stable_hash
-        from elspeth.core.config import load_settings, resolve_config
+        from elspeth.core.config import resolve_config
         from elspeth.core.landscape import LandscapeDB
         from elspeth.core.landscape.schema import run_coordination_table, run_workers_table, runs_table
 

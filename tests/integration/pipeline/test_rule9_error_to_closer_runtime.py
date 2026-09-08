@@ -74,8 +74,8 @@ from typing import Any
 import pytest
 from sqlalchemy import create_engine, select
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.dag.models import GraphValidationError
 from elspeth.core.landscape import LandscapeDB

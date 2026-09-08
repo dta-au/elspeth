@@ -15,12 +15,13 @@ from typing import Any
 
 import pytest
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.coordination import WorkerMembershipToken
 from elspeth.contracts.enums import NodeType
 from elspeth.contracts.errors import OrchestrationInvariantError
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose, SinkEffectInputKind
 from elspeth.contracts.types import CollectorName, NodeID
-from elspeth.core.config import ElspethSettings, load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.engine.orchestrator import PipelineConfig
 from elspeth.engine.orchestrator.graph_wiring import assign_plugin_node_ids, build_dag_traversal_context

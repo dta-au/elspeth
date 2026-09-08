@@ -35,6 +35,7 @@ from pydantic import ValidationError as PydanticValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
+from elspeth.config_loading import load_settings_from_config_dict, load_settings_from_yaml_string
 from elspeth.contracts.audit import SecretResolutionInput
 from elspeth.contracts.aws_s3 import S3ProfiledAuditIdentities
 from elspeth.contracts.aws_textract import TextractProfiledAuditIdentities
@@ -57,7 +58,7 @@ from elspeth.core.blobs_inline import (
     _resolve_blob_content_results,
     _substitute_blob_content_refs,
 )
-from elspeth.core.config import load_bounded_pipeline_yaml, load_settings_from_config_dict, load_settings_from_yaml_string
+from elspeth.core.config import load_bounded_pipeline_yaml
 from elspeth.core.events import EventBus
 from elspeth.core.landscape.run_lifecycle_repository import is_valid_sha256_hex
 from elspeth.core.landscape.schema import node_states_table

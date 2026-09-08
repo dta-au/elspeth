@@ -14,7 +14,8 @@ from unittest.mock import patch
 import pytest
 from pydantic import SecretBytes
 
-from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, load_settings_from_yaml_string, resolve_config
+from elspeth.config_loading import load_settings_from_yaml_string
+from elspeth.core.config import ElspethSettings, load_bounded_pipeline_yaml, resolve_config
 from elspeth.plugins.infrastructure.preflight import plugin_preflight_mode, plugin_preflight_mode_enabled
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 from elspeth.plugins.sinks.csv_sink import CSVSink

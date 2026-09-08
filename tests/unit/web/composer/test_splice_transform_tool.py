@@ -9,8 +9,9 @@ from dataclasses import replace
 import pytest
 from pydantic import TypeAdapter
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts import NodeType
-from elspeth.core.config import RuntimeNodeName, load_settings_from_yaml_string
+from elspeth.core.config import RuntimeNodeName
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.composer.protocol import ToolArgumentError
 from elspeth.web.composer.redaction import MANIFEST, SpliceTransformArgumentsModel, redact_tool_call_arguments

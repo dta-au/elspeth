@@ -650,7 +650,7 @@ sinks:
 
     def _graph(self) -> ExecutionGraph:
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(self._PIPELINE)
         plugins = instantiate_plugins_from_config(settings)
@@ -797,7 +797,7 @@ def _build_repro_graph(
     source_schema_override: str | None = None,
 ) -> ExecutionGraph:
     from elspeth.cli_helpers import instantiate_plugins_from_config
-    from elspeth.core.config import load_settings_from_yaml_string
+    from elspeth.config_loading import load_settings_from_yaml_string
 
     yaml_text = _REPRO_PIPELINE.format(
         consumer_id_type=consumer_id_type,
@@ -905,7 +905,7 @@ sinks:
         mode: observed
 """
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(pipeline)
         plugins = instantiate_plugins_from_config(settings)
@@ -976,7 +976,7 @@ sinks:
 
     def _build_aggregation_pipeline(self, *, consumer_id_type: str) -> ExecutionGraph:
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(self._AGGREGATION_PIPELINE.format(consumer_id_type=consumer_id_type))
         plugins = instantiate_plugins_from_config(settings)
@@ -1024,7 +1024,7 @@ sinks:
             '    fields:\n      description: 10\n    suffix: "..."\n    required_input_fields:\n    - not_a_column\n',
         )
         from elspeth.cli_helpers import instantiate_plugins_from_config
-        from elspeth.core.config import load_settings_from_yaml_string
+        from elspeth.config_loading import load_settings_from_yaml_string
 
         settings = load_settings_from_yaml_string(yaml_extra_required)
         plugins = instantiate_plugins_from_config(settings)

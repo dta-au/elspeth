@@ -34,6 +34,7 @@ from elspeth.core.checkpoint import CheckpointCorruptionError, CheckpointManager
 from elspeth.core.checkpoint import recovery as recovery_module
 from elspeth.core.checkpoint.manager import IncompatibleCheckpointError
 from elspeth.core.checkpoint.recovery import _DELEGATION_PATHS, IncompleteTokenSpec
+from elspeth.core.checkpoint.serialization import checkpoint_dumps
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.schema import (
@@ -46,6 +47,7 @@ from elspeth.core.landscape.schema import (
     token_work_items_table,
     tokens_table,
 )
+from tests.fixtures.factories import make_pipeline_row
 from tests.fixtures.landscape import insert_crashed_leader_seat, make_landscape_db
 from tests.helpers.checkpoint import create_checkpoint
 from tests.helpers.run_coordination import register_run_leader
@@ -1692,6 +1694,35 @@ def _valid_incomplete_token_spec_kwargs() -> dict[str, Any]:
         "step_in_pipeline": 1,
         "max_attempt": -1,
     }
+
+
+@pytest.mark.parametrize("payload", [b"\xff", b"{", b"[]", b"null", b'{"data": {}}', b'{"contract": {}}'])
+def test_reconstruct_token_row_rejects_corrupt_envelope(
+    recovery_manager: RecoveryManager, payload_store: PayloadStore, payload: bytes
+) -> None:
+    source_row = make_pipeline_row({"id": 1})
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["token_data_ref"] = payload_store.store(payload)
+    spec = IncompleteTokenSpec(**kwargs)
+
+    with pytest.raises(AuditIntegrityError) as caught:
+        recovery_manager.reconstruct_token_row(spec, "run-corrupt", source_row, payload_store)
+
+    assert spec.token_id in str(caught.value)
+    assert "run-corrupt" in str(caught.value)
+
+
+def test_reconstruct_token_row_restores_persisted_token_envelope(recovery_manager: RecoveryManager, payload_store: PayloadStore) -> None:
+    source_row = make_pipeline_row({"id": 1})
+    token_row = make_pipeline_row({"id": 2})
+    payload = checkpoint_dumps({"data": token_row.to_dict(), "contract": token_row.contract.to_checkpoint_format()}).encode()
+    kwargs = _valid_incomplete_token_spec_kwargs()
+    kwargs["token_data_ref"] = payload_store.store(payload)
+
+    restored = recovery_manager.reconstruct_token_row(IncompleteTokenSpec(**kwargs), "run-valid", source_row, payload_store)
+
+    assert restored.to_dict() == {"id": 2}
+    assert restored.contract.version_hash() == token_row.contract.version_hash()
 
 
 def test_incomplete_token_spec_accepts_valid_identity() -> None:

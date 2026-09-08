@@ -296,6 +296,23 @@ class TestBeginRunDirect:
             rows = conn.execute(select(run_web_plugin_policy_table)).all()
         assert rows == []
 
+    def test_begin_run_rejects_unowned_policy_evidence_before_any_insert(self) -> None:
+        from elspeth.core.landscape.schema import run_coordination_table
+
+        db = make_landscape_db()
+        repo = RunLifecycleRepository(db, DatabaseOps(db), RunLoader())
+        with pytest.raises(AuditIntegrityError, match="must be a WebPluginPolicyEvidence"):
+            repo.begin_run(
+                config={},
+                canonical_version="v1",
+                run_id="invalid-policy-run",
+                web_plugin_policy_evidence=object(),
+            )
+
+        with db.read_only_connection() as conn:
+            for table in (runs_table, run_coordination_table, run_web_plugin_policy_table):
+                assert conn.execute(select(table).where(table.c.run_id == "invalid-policy-run")).first() is None
+
     def test_web_policy_insert_rolls_back_run_attribution_and_leader_rows(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from sqlalchemy.exc import IntegrityError
 

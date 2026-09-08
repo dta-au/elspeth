@@ -10,8 +10,8 @@ indirection.
 
 import pytest
 
+from elspeth.config_loading import load_settings_from_config_dict
 from elspeth.contracts.sink_effects import SinkEffectExecutionPurpose
-from elspeth.core.config import load_settings_from_config_dict
 from elspeth.plugins.infrastructure.runtime_factory import (
     _expand_env_placeholder_value,
     instantiate_plugins_from_config,

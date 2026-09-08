@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import pytest
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.enums import NodeType as RuntimeNodeType
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.web.composer.state import (
     CompositionState,
     NodeSpec,

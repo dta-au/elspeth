@@ -24,10 +24,11 @@ import yaml
 from sqlalchemy import select
 
 from elspeth.cli_helpers import instantiate_plugins_from_config
+from elspeth.config_loading import load_settings
 from elspeth.contracts import RunStatus, TerminalOutcome, TerminalPath
 from elspeth.contracts.identity import path_expand_group_id
 from elspeth.contracts.run_result import RunResult
-from elspeth.core.config import load_settings, resolve_config
+from elspeth.core.config import resolve_config
 from elspeth.core.dag import ExecutionGraph
 from elspeth.core.landscape import LandscapeDB
 from elspeth.core.landscape.schema import token_outcomes_table, transform_errors_table

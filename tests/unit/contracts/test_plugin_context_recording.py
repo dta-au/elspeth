@@ -486,6 +486,43 @@ class TestRecordCallGuards:
 class TestRecordCallHappyPath:
     """record_call() writes to Landscape before emitting telemetry."""
 
+    @pytest.mark.parametrize(
+        ("response", "expected_prompt", "expected_completion"),
+        [
+            ({}, None, None),
+            ({"usage": None}, None, None),
+            ({"usage": "unavailable"}, None, None),
+            ({"usage": {"prompt_tokens": -1, "completion_tokens": True}}, None, None),
+            ({"usage": {"prompt_tokens": 7}}, 7, None),
+            ({"usage": {"prompt_tokens": 7, "completion_tokens": 3}}, 7, 3),
+        ],
+    )
+    def test_llm_usage_observation_preserves_raw_response_and_unknown_counts(
+        self, response: dict[str, Any], expected_prompt: int | None, expected_completion: int | None
+    ) -> None:
+        writer = _FakePluginAuditWriter()
+        events: list[ExternalCallCompleted] = []
+        ctx = PluginContext(
+            run_id="run-1",
+            config={},
+            landscape=cast(Any, writer),
+            operation_id="operation-001",
+            telemetry_emit=events.append,
+        )
+        ctx.record_call(CallType.LLM, CallStatus.SUCCESS, {}, response_data=response)
+
+        assert writer.operation_calls[0]["response_data"].to_dict() == response
+        assert len(events) == 1
+        assert events[0].response_payload is not None
+        assert events[0].response_payload.to_dict() == response
+        usage = events[0].token_usage
+        if expected_prompt is None and expected_completion is None:
+            assert usage is None
+        else:
+            assert usage is not None
+            assert usage.prompt_tokens == expected_prompt
+            assert usage.completion_tokens == expected_completion
+
     def test_state_context_records_call_and_emits_token_correlated_telemetry(self) -> None:
         writer = _FakePluginAuditWriter(node_state=_completed_node_state(token_id="token-001"))
         emitted_events: list[ExternalCallCompleted] = []

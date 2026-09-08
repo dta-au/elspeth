@@ -35,8 +35,8 @@ from pathlib import Path
 
 import pytest
 
+from elspeth.config_loading import load_settings
 from elspeth.core.canonical import compute_full_topology_hash
-from elspeth.core.config import load_settings
 from elspeth.core.dag import ExecutionGraph
 from elspeth.plugins.infrastructure.runtime_factory import instantiate_plugins_from_config
 
