@@ -16,6 +16,7 @@ from typing import Any, Literal
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.composer.source_demand import (
     SOURCE_DATA_CONTRACT_USER_TERM,
@@ -107,7 +108,7 @@ def _resolved_contract_options(acknowledged: list[str], *, extra: dict[str, Any]
 
 
 def _legacy_v1_contract_options(acknowledged: list[str]) -> dict[str, Any]:
-    """Persisted v1 evidence: valid historically, but not v2 authority."""
+    """Unsupported persisted format, retained only as a rejection fixture."""
     payload = {
         "contract_version": 1,
         "kind": SOURCE_DATA_CONTRACT_USER_TERM,
@@ -168,12 +169,26 @@ class TestSiteStaging:
         state = _state(_resolved_contract_options(["colour"]), required=["colour"])
         assert _contract_sites(state) == []
 
-    def test_legacy_v1_acknowledgement_reopens_with_current_demand_and_blocks_execution(self) -> None:
+    def test_unsupported_acknowledgement_raises_instead_of_migrating(self) -> None:
         state = _state(_legacy_v1_contract_options(["colour"]), required=["colour"])
 
-        assert current_source_data_contract_demand(state, "source") == ("colour",)
-        assert [site.component_id for site in _contract_sites(state)] == ["source"]
-        assert isinstance(materialize_state_for_execution(state), InterpretationReviewPending)
+        with pytest.raises(AuditIntegrityError, match="unsupported version"):
+            current_source_data_contract_demand(state, "source")
+        with pytest.raises(AuditIntegrityError, match="unsupported version"):
+            _contract_sites(state)
+        with pytest.raises(AuditIntegrityError, match="unsupported version"):
+            materialize_state_for_execution(state)
+
+    @pytest.mark.parametrize("required", (["colour"], None), ids=("live-demand", "no-demand"))
+    def test_corrupt_acknowledgement_raises_even_without_live_demand(self, required: list[str] | None) -> None:
+        options = _resolved_contract_options(["colour"])
+        options[INTERPRETATION_REQUIREMENTS_KEY][0]["accepted_value"] = "{broken"
+        state = _state(options, required=required)
+
+        with pytest.raises(AuditIntegrityError, match="not valid JSON"):
+            current_source_data_contract_demand(state, "source")
+        with pytest.raises(AuditIntegrityError, match="not valid JSON"):
+            materialize_state_for_execution(state)
 
     def test_incoherent_accepted_value_and_hash_blocks_execution(self) -> None:
         options = _resolved_contract_options(["colour"])

@@ -41,6 +41,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Final
 
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec
@@ -63,7 +64,6 @@ SOURCE_DATA_CONTRACT_ENFORCEMENT_SEMANTICS: Final[str] = "payload_and_emitted_co
 _SOURCE_DATA_CONTRACT_DRAFT_KEYS: Final[frozenset[str]] = frozenset(
     {"contract_version", "kind", "demanded_fields", "sample_header", "missing_from_sample"}
 )
-_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION: Final[int] = 1
 
 # Bounded read for the ILLUSTRATIVE sample header: the sample is evidence
 # shown on the card, never the thing being ratified, so the read is
@@ -92,11 +92,6 @@ def source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
             "demanded_fields": sorted(set(fields)),
         }
     )
-
-
-def _legacy_source_data_contract_artifact_hash(fields: Iterable[str]) -> str:
-    """Reproduce the v1 field-only hash for migration checks only."""
-    return stable_hash({"review_kind": SOURCE_DATA_CONTRACT_USER_TERM, "demanded_fields": sorted(fields)})
 
 
 @observation_boundary(
@@ -388,96 +383,54 @@ def build_source_data_contract_draft(
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
-def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...] | None:
-    """Recognize a complete current draft, returning None for other shapes.
+def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...]:
+    """Read the current server-authored card, raising on corrupt persisted evidence.
 
-    These drafts are server-authored by build_source_data_contract_draft;
-    persistence does not turn them into Tier-3 input. This recognizer confers
-    no acknowledgement authority: resolved_source_data_contract_fields also
-    requires coherent review evidence and an exact artifact hash.
+    Absence of a review is represented by the caller's optional requirement,
+    never by malformed card bytes. A card that exists must satisfy the exact
+    current format produced by ``build_source_data_contract_draft``.
     """
     try:
         payload = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    return _validated_source_data_contract_fields(payload, version=SOURCE_DATA_CONTRACT_DRAFT_VERSION)
+    except (TypeError, ValueError) as exc:
+        raise AuditIntegrityError("source data contract draft is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise AuditIntegrityError("source data contract draft must be a JSON object")
+    return _validated_source_data_contract_fields(payload)
 
 
-def _validated_source_data_contract_fields(
-    payload: Mapping[str, Any],
-    *,
-    version: int,
-) -> tuple[str, ...] | None:
-    """Validate the complete canonical draft shape for one known version."""
+def _validated_source_data_contract_fields(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Enforce the canonical owned card contract without repairing evidence."""
     if frozenset(payload) != _SOURCE_DATA_CONTRACT_DRAFT_KEYS:
-        return None
+        raise AuditIntegrityError("source data contract draft has invalid keys")
     raw_version = payload["contract_version"]
-    if type(raw_version) is not int or raw_version != version:
-        return None
+    if type(raw_version) is not int or raw_version != SOURCE_DATA_CONTRACT_DRAFT_VERSION:
+        raise AuditIntegrityError("source data contract draft has unsupported version")
     if payload["kind"] != SOURCE_DATA_CONTRACT_USER_TERM:
-        return None
+        raise AuditIntegrityError("source data contract draft has invalid kind")
     demanded = payload["demanded_fields"]
     if not isinstance(demanded, list) or not all(isinstance(field, str) for field in demanded):
-        return None
+        raise AuditIntegrityError("source data contract demanded_fields must be a string list")
     if not demanded or demanded != sorted(set(demanded)):
-        return None
+        raise AuditIntegrityError("source data contract demanded_fields must be nonempty, sorted and unique")
     sample_header = payload["sample_header"]
     if sample_header is not None and (not isinstance(sample_header, list) or not all(isinstance(field, str) for field in sample_header)):
-        return None
+        raise AuditIntegrityError("source data contract sample_header must be a string list or null")
     missing_from_sample = payload["missing_from_sample"]
     if not isinstance(missing_from_sample, list) or not all(isinstance(field, str) for field in missing_from_sample):
-        return None
+        raise AuditIntegrityError("source data contract missing_from_sample must be a string list")
     expected_missing = [] if sample_header is None else sorted(set(demanded) - set(sample_header))
     if missing_from_sample != expected_missing:
-        return None
+        raise AuditIntegrityError("source data contract sample evidence is inconsistent")
     return tuple(demanded)
-
-
-def parse_legacy_source_data_contract_fields(value: str) -> tuple[str, ...] | None:
-    """Parse exact v1 fields solely to migrate pending pre-v2 cards."""
-    try:
-        payload = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    return _validated_source_data_contract_fields(
-        payload,
-        version=_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION,
-    )
 
 
 def source_data_contract_fields_for_demand_recompute(
     value: str,
     artifact_hash: str | None,
-) -> tuple[str, ...] | None:
-    """Recover current or coherent-v1 fields solely for demand recomputation.
-
-    V1 evidence remains historically valid evidence of what the user saw; it
-    is not corrupt and is not silently rewritten. Its field-only artifact did
-    not bind today's fail-closed consequence, however, so the execution
-    authority parser above rejects it. This migration-only parser lets the
-    demand walk remove the v1 guarantee stamp and re-derive a new v2 card the
-    user can actually resolve.
-    """
-    try:
-        payload = json.loads(value)
-    except (TypeError, ValueError):
-        return None
-    if not isinstance(payload, Mapping):
-        return None
-    current_fields = _validated_source_data_contract_fields(
-        payload,
-        version=SOURCE_DATA_CONTRACT_DRAFT_VERSION,
-    )
-    if current_fields is not None:
-        return current_fields if artifact_hash == source_data_contract_artifact_hash(current_fields) else None
-    legacy_fields = _validated_source_data_contract_fields(
-        payload,
-        version=_LEGACY_SOURCE_DATA_CONTRACT_DRAFT_VERSION,
-    )
-    if legacy_fields is None:
-        return None
-    return legacy_fields if artifact_hash == _legacy_source_data_contract_artifact_hash(legacy_fields) else None
+) -> tuple[str, ...]:
+    """Read acknowledged fields only from an intact current artifact/hash pair."""
+    fields = parse_source_data_contract_accepted_fields(value)
+    if artifact_hash != source_data_contract_artifact_hash(fields):
+        raise AuditIntegrityError("source data contract acknowledged artifact hash is inconsistent")
+    return fields

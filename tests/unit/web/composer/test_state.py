@@ -11069,6 +11069,26 @@ class TestCompositionStateRowUnion:
         )
         assert "count/timeout/condition trigger" in group_error.message
 
+    @pytest.mark.parametrize("aggregation_first", (False, True))
+    def test_row_union_invalid_downstream_trigger_keeps_intrinsic_rejection(self, aggregation_first: bool) -> None:
+        """Skipping derived group analysis must retain the actual parse error."""
+        aggregation = replace(
+            self._aggregation("after_union", "union_out", "output", output_mode="transform"),
+            trigger={"count": "not-a-count"},
+        )
+        state = self._state()
+        nodes = tuple(aggregation if node.id == "after_union" else node for node in state.nodes)
+        if aggregation_first:
+            nodes = (aggregation, *(node for node in nodes if node.id != aggregation.id))
+
+        result = replace(state, nodes=nodes).validate()
+
+        assert not result.is_valid
+        errors = [error for error in result.errors if error.error_code == "aggregation_trigger_invalid"]
+        assert len(errors) == 1
+        assert errors[0].component == "node:after_union"
+        assert errors[0].severity == "high"
+
     @pytest.mark.parametrize("barrier_type", ["coalesce", "row_union"])
     def test_row_union_rejects_downstream_correlated_barrier(self, barrier_type: str) -> None:
         post_union_gate = self._gate(
@@ -13357,6 +13377,7 @@ def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules(
 
     from elspeth.contracts.schema import SchemaConfig
     from elspeth.plugins.transforms.llm.base import LLMConfig
+    from elspeth.plugins.transforms.llm.multi_query import QueryDefinition
     from elspeth.web.composer.state import (
         _parse_template_names,
         _validate_prompt_template_variable_bindings,
@@ -13367,10 +13388,15 @@ def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules(
     node = _tier_rem_node(id="llm1", plugin="llm", options={"prompt_template": bad_template})
     assert _validate_prompt_template_variable_bindings(node) == ()
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as node_error:
         LLMConfig(
             provider="openrouter",
             model="anthropic/claude-sonnet-4.6",
             prompt_template=bad_template,
             schema_config=SchemaConfig(mode="observed", fields=None),
         )
+    assert any(error["loc"] == ("prompt_template",) for error in node_error.value.errors())
+
+    with pytest.raises(ValidationError) as query_error:
+        QueryDefinition(input_fields={"text": "text"}, template=bad_template)
+    assert any(error["loc"] == ("template",) for error in query_error.value.errors())

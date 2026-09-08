@@ -397,6 +397,8 @@ class TestDraftAndArtifact:
         "payload",
         (
             "not json",
+            [],
+            None,
             {"demanded_fields": "colour"},
             {"demanded_fields": [1]},
             {
@@ -480,6 +482,8 @@ class TestDraftAndArtifact:
         ),
         ids=(
             "not-json",
+            "array",
+            "null",
             "missing-shape",
             "non-string-demand",
             "legacy-version",
@@ -495,12 +499,42 @@ class TestDraftAndArtifact:
             "extra-key",
         ),
     )
-    def test_parse_abstains_on_malformed_or_non_current_payloads(self, payload: object) -> None:
+    def test_parse_raises_on_corrupt_or_unsupported_owned_payloads(self, payload: object) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
         value = payload if isinstance(payload, str) else json.dumps(payload)
-        assert parse_source_data_contract_accepted_fields(value) is None
+        with pytest.raises(AuditIntegrityError):
+            parse_source_data_contract_accepted_fields(value)
 
     def test_user_term_constant(self) -> None:
         assert SOURCE_DATA_CONTRACT_USER_TERM == "source_data_contract"
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        (
+            ("demanded_fields", "colour"),
+            ("demanded_fields", [1]),
+            ("sample_header", [1]),
+            ("missing_from_sample", "colour"),
+            ("missing_from_sample", [1]),
+        ),
+    )
+    def test_owned_field_shape_corruption_raises(self, field: str, value: object) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+
+        payload = json.loads(build_source_data_contract_draft(["colour"], None))
+        payload[field] = value
+        with pytest.raises(AuditIntegrityError, match="must be a string list"):
+            parse_source_data_contract_accepted_fields(json.dumps(payload))
+
+    @pytest.mark.parametrize("artifact_hash", (None, "incorrect"))
+    def test_demand_recompute_raises_on_broken_artifact_binding(self, artifact_hash: str | None) -> None:
+        from elspeth.contracts.errors import AuditIntegrityError
+        from elspeth.web.composer.source_demand import source_data_contract_fields_for_demand_recompute
+
+        draft = build_source_data_contract_draft(["colour"], None)
+        with pytest.raises(AuditIntegrityError, match="artifact hash is inconsistent"):
+            source_data_contract_fields_for_demand_recompute(draft, artifact_hash)
 
 
 class TestSampleHeader:

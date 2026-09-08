@@ -1289,8 +1289,6 @@ def resolved_source_data_contract_fields(requirement: InterpretationRequirement)
     if accepted_value is None:
         return None
     fields = parse_source_data_contract_accepted_fields(accepted_value)
-    if not fields:
-        return None
     if requirement["accepted_artifact_hash"] != source_data_contract_artifact_hash(fields):
         return None
     return fields
@@ -1360,12 +1358,7 @@ def current_source_data_contract_demand(state: CompositionState, source_name: st
             requirement["accepted_value"],
             requirement["accepted_artifact_hash"],
         )
-        # Invalid evidence strips nothing. Coherent v1 evidence may strip its
-        # old guarantee ONLY here so the current demand resurfaces as a
-        # resolvable v2 card; resolved_source_data_contract_fields remains
-        # current-v2-only and therefore keeps execution fail-closed.
-        if acknowledged is not None:
-            disregard = frozenset(acknowledged)
+        disregard = frozenset(acknowledged)
     return backtraced_source_demand(state, source_name, disregard_fields=disregard)
 
 
@@ -2579,24 +2572,6 @@ def _reconcile_source_options(
             _require_resolved_review_coherence(previous_requirement)
             acknowledged_fields = resolved_source_data_contract_fields(previous_requirement)
             if acknowledged_fields is None:
-                accepted_value = previous_requirement["accepted_value"]
-                legacy_fields = (
-                    source_data_contract_fields_for_demand_recompute(
-                        accepted_value,
-                        previous_requirement["accepted_artifact_hash"],
-                    )
-                    if accepted_value is not None
-                    else None
-                )
-                if legacy_fields is not None:
-                    # Coherent v1 evidence is valid history but cannot carry
-                    # authority for v2's corrected consequence. Preserve the
-                    # historic row so its fields remain available to the
-                    # migration-only demand recompute; the site enumerator
-                    # still reopens it and the surfacer computes a current v2
-                    # draft from the live graph.
-                    reconciled.append(dict(previous_requirement))
-                    continue
                 raise ValueError(f"resolved interpretation requirement {requirement_id!r} evidence drifted")
             proposed_guaranteed_fields = _observed_source_guaranteed_fields(proposed.options)
             if proposed_guaranteed_fields is None or not frozenset(acknowledged_fields) <= proposed_guaranteed_fields:

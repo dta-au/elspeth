@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from elspeth.contracts.composer_interpretation import InterpretationKind
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.policy_view import PolicyCatalogView
@@ -634,7 +635,7 @@ def test_exact_round_trip_rejects_incoherent_stored_source_contract_evidence() -
     assert result.data["error_code"] == "review_reconciliation_failed"
 
 
-def test_exact_round_trip_reopens_coherent_legacy_v1_source_contract() -> None:
+def test_exact_round_trip_refuses_unsupported_source_contract() -> None:
     current = _resolved_source_contract_state(required_fields=["colour"])
     source = current.sources["source"]
     options = deep_thaw(source.options)
@@ -653,16 +654,8 @@ def test_exact_round_trip_reopens_coherent_legacy_v1_source_contract() -> None:
     legacy = current.with_named_source("source", replace(source, options=options))
     exact = _exact_arguments(legacy)
 
-    result = _execute_set_pipeline(deep_thaw(exact.data), legacy, _trained_context())
-
-    assert result.success, result.data
-    reopened = result.updated_state.sources["source"].options[INTERPRETATION_REQUIREMENTS_KEY][0]
-    # The v1 row remains honest historical evidence, but it no longer admits
-    # execution and the derived current-v2 site is pending.
-    assert reopened["status"] == "resolved"
-    assert reopened["accepted_artifact_hash"] == requirement["accepted_artifact_hash"]
-    assert current_source_data_contract_demand(result.updated_state, "source") == ("colour",)
-    assert isinstance(materialize_state_for_execution(result.updated_state), InterpretationReviewPending)
+    with pytest.raises(AuditIntegrityError, match="unsupported version"):
+        _execute_set_pipeline(deep_thaw(exact.data), legacy, _trained_context())
 
 
 def test_public_set_pipeline_cannot_forge_resolved_source_contract_artifact() -> None:
