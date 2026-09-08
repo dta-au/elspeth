@@ -21,7 +21,8 @@ from elspeth.contracts.scheduler import TokenWorkStatus
 from elspeth.contracts.schema import SchemaConfig
 from elspeth.contracts.schema_contract import PipelineRow, SchemaContract
 from elspeth.core.checkpoint.recovery import RecoveryManager
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape import run_coordination_repository as coordination_module
+from elspeth.core.landscape.database_clock import read_landscape_decision_time, read_landscape_transaction_time
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
 from elspeth.core.landscape.schema import (
@@ -36,8 +37,8 @@ from tests.fixtures.landscape import (
     make_factory,
     make_landscape_db,
     register_test_node,
-    within_one_database_second,
 )
+from tests.helpers.state_engine import capture_state_engine_image
 
 NOW = datetime(2026, 8, 11, 20, 0, 0, tzinfo=UTC)
 RUN_ID = "rm-truth-run"
@@ -370,7 +371,7 @@ def test_rm05_peer_authority_is_scoped_to_the_pending_continuations() -> None:
     )
 
 
-def test_rm07_occupied_leader_seat_truth_table() -> None:
+def test_rm07_occupied_leader_seat_truth_table(monkeypatch: pytest.MonkeyPatch) -> None:
     factory, _repository, _ids = _seed_scheduler_image()
     coordination = RunCoordinationRepository(factory._db.engine)
 
@@ -380,20 +381,18 @@ def test_rm07_occupied_leader_seat_truth_table() -> None:
     assert occupied.leader_epoch == 1
     assert occupied.seat_live is True
 
-    # A seat deadline EQUAL to database time is still live (``>=``); pinned
-    # by stamping the seat and reading it inside one database second.
-    def equality_arm(database_now: datetime) -> bool:
-        with factory._db.engine.begin() as conn:
-            conn.execute(
-                update(run_coordination_table)
-                .where(run_coordination_table.c.run_id == RUN_ID)
-                .values(leader_heartbeat_expires_at=database_now)
-            )
-        equality = coordination.live_leader(run_id=RUN_ID)
-        assert equality is not None
-        return equality.seat_live
-
-    assert within_one_database_second(factory._db.engine, equality_arm) is True
+    # Pin equality to an actual fresh DB sample, independent of elapsed time.
+    with factory._db.engine.begin() as conn:
+        database_now = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_coordination_table).where(run_coordination_table.c.run_id == RUN_ID).values(leader_heartbeat_expires_at=database_now)
+        )
+    monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+    before_read = capture_state_engine_image(factory, run_id=RUN_ID)
+    equality = coordination.live_leader(run_id=RUN_ID)
+    assert equality is not None
+    assert equality.seat_live is True
+    assert capture_state_engine_image(factory, run_id=RUN_ID) == before_read
     assert coordination.live_leader(run_id="missing-run") is None
 
     with factory._db.engine.begin() as conn:
@@ -405,7 +404,7 @@ def test_rm07_occupied_leader_seat_truth_table() -> None:
     assert coordination.live_leader(run_id=RUN_ID) is None
 
 
-def test_rm08_dead_non_leader_worker_truth_table_and_ordering() -> None:
+def test_rm08_dead_non_leader_worker_truth_table_and_ordering(monkeypatch: pytest.MonkeyPatch) -> None:
     factory, _repository, _ids = _seed_scheduler_image()
     coordination = RunCoordinationRepository(factory._db.engine)
     # Deadlines are judged against the Landscape database clock (ADR-047):
@@ -430,18 +429,18 @@ def test_rm08_dead_non_leader_worker_truth_table_and_ordering() -> None:
                 )
             )
 
-    # The equality boundary (deadline == database_now - grace is NOT dead) is
-    # pinned by stamping the row and sweeping inside one database second.
-    def sweep_with_equality_at_threshold(database_now: datetime) -> tuple[str, ...]:
-        with factory._db.engine.begin() as conn:
-            conn.execute(
-                update(run_workers_table)
-                .where(run_workers_table.c.worker_id == "equality")
-                .values(heartbeat_expires_at=database_now - timedelta(seconds=10))
-            )
-        return coordination.dead_non_leader_workers(run_id=RUN_ID, leader_worker_id=LEADER, grace_seconds=10)
-
-    assert within_one_database_second(factory._db.engine, sweep_with_equality_at_threshold) == ("dead-first", "dead-second")
+    # At exact equality the worker is NOT dead: only strict ``<`` qualifies.
+    with factory._db.engine.begin() as conn:
+        database_now = read_landscape_decision_time(conn)
+        conn.execute(
+            update(run_workers_table)
+            .where(run_workers_table.c.worker_id == "equality")
+            .values(heartbeat_expires_at=database_now - timedelta(seconds=10))
+        )
+    monkeypatch.setattr(coordination_module, "read_landscape_decision_time", lambda _conn: database_now)
+    before_read = capture_state_engine_image(factory, run_id=RUN_ID)
+    assert coordination.dead_non_leader_workers(run_id=RUN_ID, leader_worker_id=LEADER, grace_seconds=10) == ("dead-first", "dead-second")
+    assert capture_state_engine_image(factory, run_id=RUN_ID) == before_read
 
 
 def test_rm08_equal_registration_times_order_by_worker_identity() -> None:

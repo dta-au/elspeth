@@ -17,6 +17,7 @@ from typing import Any, TypedDict
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.engine import Connection
 
 from elspeth.contracts import (
     CallStatus,
@@ -184,21 +185,31 @@ class TestBeginRunDirect:
         ops = DatabaseOps(db)
         repo = RunLifecycleRepository(db, ops, RunLoader())
         observed_run_ids: list[str] = []
+        original_register = RunCoordinationRepository.register_run_leader_on
 
-        def spy_register_run_leader_on(self: RunCoordinationRepository, *args: object, **kwargs: object) -> CoordinationToken:
-            del self, args
-            observed_run_ids.append(str(kwargs["run_id"]))
-            return CoordinationToken(
-                run_id=str(kwargs["run_id"]),
-                worker_id=str(kwargs["worker_id"]),
-                leader_epoch=1,
+        def spy_register_run_leader_on(
+            self: RunCoordinationRepository,
+            conn: Connection,
+            *,
+            run_id: str,
+            worker_id: str,
+            window_seconds: float,
+            entry_point: str,
+        ) -> CoordinationToken:
+            observed_run_ids.append(run_id)
+            return original_register(
+                self,
+                conn,
+                run_id=run_id,
+                worker_id=worker_id,
+                window_seconds=window_seconds,
+                entry_point=entry_point,
             )
 
         monkeypatch.setattr(
             RunCoordinationRepository,
             "register_run_leader_on",
             spy_register_run_leader_on,
-            raising=False,
         )
 
         repo.begin_run(
@@ -209,6 +220,11 @@ class TestBeginRunDirect:
         )
 
         assert observed_run_ids == ["public-composition-run"]
+        assert leader_token_for(db, "public-composition-run") == CoordinationToken(
+            run_id="public-composition-run",
+            worker_id="worker:public-composition-run:abc123",
+            leader_epoch=1,
+        )
 
     def test_begin_run_self_mints_worker_identity_when_omitted(self) -> None:
         """Uniformity-for-free: callers that pass no identity still get a seat."""
