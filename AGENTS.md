@@ -42,6 +42,47 @@ ELSPETH_JUDGE_METADATA_SIGNATURE_VERIFY_MODE=shape-only-when-key-missing \
 elspeth run --settings examples/<name>/settings.yaml --execute
 ```
 
+### Canonical scripts: worktree cleanup, branch safety, full-suite gate
+
+Three scripts under `scripts/` are the canonical way to do the tasks agents
+otherwise improvise by hand (the header of each one cites the transcript
+measurement and the incident behind every rule it enforces). All three are
+**dry-run by default** and print the exact commands they would run; nothing
+changes without `--execute`. Prefer them over retyping the underlying git and
+pytest incantations, and fix the script when a rule is wrong rather than
+working around it.
+
+- `scripts/worktree-cleanup.sh [--execute] [--base REF] [--path GLOB] [--delete-branches] [--discard-ignored] [--link-venv]`
+  classifies every registered worktree as MAIN, MISSING, LOCKED, IN-USE,
+  DIRTY, UNKNOWN, UNMERGED, IGNORED or REMOVABLE; drops MISSING
+  registrations and removes only clean worktrees whose HEAD is an ancestor
+  of `--base` (default: the main checkout's branch). Never forces a present
+  tree, never a branch with unlanded commits, never a tree whose `git status`
+  failed (UNKNOWN); gitignored content beyond caches (lane notes, a local
+  `.elspeth/`, `data/`) holds a tree as IGNORED until `--discard-ignored`.
+  IN-USE comes from `/proc/<pid>/cwd`, not a pgrep pattern; the dry run
+  writes nothing (measured: a worktree's index inode is unchanged across it).
+  Note `--no-optional-locks` only silences `git status`; `git diff` still
+  rewrites the stat cache, so none of these scripts diff a working tree they
+  do not own. `--link-venv` repairs
+  the missing `.venv` symlink that makes subprocess tests fail as ordinary
+  assertion errors.
+- `scripts/branch-safety-check.sh [--intent commit|rebase|merge|push] [--base REF] [--fetch]`
+  is a read-only pre-flight that prints one `[PASS|WARN|FAIL]` line per check
+  with the instrument that produced it: unfinished merge/rebase, protected
+  branch, staged artefact paths and user-home paths, the secret scanner,
+  whether HEAD is already published, ahead/behind against a **named two-dot**
+  base range, rerere, the HMAC key in the environment, and that
+  `elspeth.__file__` resolves inside this tree. Exit 1 on any FAIL. `--fetch`
+  is its only write.
+- `scripts/full-suite-gate.sh [--execute [--detach]] [--stages ruff,mypy,contracts,lints,pytest,testcontainer] [--root DIR] [--log-dir DIR]`
+  runs the pre-merge gate as CI runs it: one log per stage, every exit code
+  written to `summary.txt`, the tree state hashed before and after
+  (`frozen=NO` means the run is not evidence), provenance proved with both
+  `-o pythonpath` and an exported `PYTHONPATH`, workers capped when sibling
+  suites are on the box. From an agent shell use `--execute --detach` and poll
+  the printed `.done` path. The suite is never piped through `tail`.
+
 ## Gotchas
 
 - **STOP — read [CONTRIBUTING.md § Whole-tree gates](CONTRIBUTING.md#whole-tree-gates-and-conventions-you-will-hit)
@@ -154,6 +195,9 @@ elspeth run --settings examples/<name>/settings.yaml --execute
   unique, lane-private log path, not a shared generic filename.
 - Do not claim "zero failures", "suite green", or "passes in isolation" until
   the process has exited and you have read its exit code.
+- `scripts/full-suite-gate.sh --execute --detach` does all of the above for
+  you (per-stage logs, recorded exit codes, a frozen-tree check); read its
+  `summary.txt`, not its terminal output.
 
 ## Editing Rules
 
@@ -167,7 +211,9 @@ elspeth run --settings examples/<name>/settings.yaml --execute
 
 - Before every commit, run `git status --short` and confirm the staged set.
   Never stage `.claude/lanes/`, dry-run artifacts, scratch logs, or build
-  output.
+  output. `scripts/branch-safety-check.sh` checks the staged set for exactly
+  those paths, for user-home paths, and for credential-shaped strings; run it
+  before every commit, rebase or push.
 - Run the lint gate (ruff) locally before pushing; do not rely on CI to
   surface unused imports or formatting.
 

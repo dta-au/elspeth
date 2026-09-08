@@ -11,4 +11,13 @@ The maintainer's own agent toolchain (issue tracker, code map, delegation
 conventions) is described in docs/maintainer/toolchain.md; none of it is
 required to contribute.
 
+Three tasks have a canonical script and must not be improvised from raw git
+or pytest commands (see AGENTS.md § Canonical scripts). Each is dry-run by
+default and acts only with `--execute`:
+
+- worktree cleanup — `scripts/worktree-cleanup.sh`
+- branch safety verification before a commit, rebase, merge or push —
+  `scripts/branch-safety-check.sh`
+- the full-suite pre-merge gate — `scripts/full-suite-gate.sh --execute --detach`
+
 @AGENTS.md
