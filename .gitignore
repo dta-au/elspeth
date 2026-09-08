@@ -65,6 +65,9 @@ docs-archive/
 .claude/worktrees/
 .claude/plans/
 .claude/lanes/
+# lane-manager per-lane state and prove-it claims/verdicts — working state, never public.
+.lanes/
+.verify/
 .claude/handovers/
 .claude/red-team/
 .mcp.json
