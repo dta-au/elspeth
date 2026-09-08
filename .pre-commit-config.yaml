@@ -257,13 +257,15 @@ repos:
         entry: .venv/bin/python scripts/cicd/generate_skill_inventory.py --check
         language: system
         pass_filenames: false
-        files: ^(src/elspeth/web/composer/(skills/pipeline_composer\.md|tools/(declarations|_registry|_dispatch|blobs|generation|outputs|recipes|secrets|sessions|sources|transforms)\.py)|scripts/cicd/generate_skill_inventory\.py)$
+        files: ^(src/elspeth/web/composer/(skills/pipeline_composer\.md|tools/(declarations|_registry|_dispatch|blobs|generation|outputs|secrets|sessions|sources|transforms)\.py)|scripts/cicd/generate_skill_inventory\.py)$
 
       # Telemetry-backfill cohort-attribution trailer enforcement.
       # Runs at commit-msg stage; rejects commits that touch a cohort directory
-      # without the matching `telemetry-backfill: <cohort-token>` trailer.  See
-      # docs/composer/ux-redesign-2026-05/20-phase-8-polish-and-telemetry.md
-      # §"Cohort attribution via commit trailers (A4 — load-bearing)".
+      # without the matching `telemetry-backfill: <cohort-token>` trailer.  The
+      # rationale left the tree in the 0.7.0 docs cleanout (70cdbeb2f).  The
+      # docs-archive/ copy is gitignored, so it reaches no fresh clone; recover
+      # §"Cohort attribution via commit trailers (A4 — load-bearing)" with:
+      #   git show 70cdbeb2f^:docs/composer/ux-redesign-2026-05/20-phase-8-polish-and-telemetry.md
       - id: telemetry-backfill-trailer
         name: telemetry-backfill cohort-attribution trailer check
         entry: .githooks/commit-msg-telemetry-backfill

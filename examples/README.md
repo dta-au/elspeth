@@ -26,6 +26,7 @@ Some examples need setup or use multiple configurations:
 | `chroma_rag_qa` (OpenRouter) | `./examples/chroma_rag_qa/run.sh` |
 | `chroma_rag_indexed` | `elspeth run --settings examples/chroma_rag_indexed/query_pipeline.yaml --execute` |
 | `textract_inline` | `python examples/textract_inline/scripts/prepare_document_blobs.py`, then `elspeth run --settings examples/textract_inline/settings.generated.yaml --execute` |
+| `join_refused` | `./examples/join_refused/run.sh` |
 | `multi_worker` | `./examples/multi_worker/run.sh` |
 | `multi_worker_showcase` | `./examples/multi_worker_showcase/run.sh` |
 | `statistical_batch_plugins` | Run one `settings_*.yaml` file at a time |
@@ -95,6 +96,7 @@ New in 0.6.0: examples that demonstrate concurrent in-process token scheduling
 |---------|---------------------|
 | [`concurrent_scheduler`](concurrent_scheduler/) | Count-6 two-source rendezvous — proves the scheduler holds multiple token lifecycles open at once (pure-data, self-verifying) |
 | [`multi_worker`](multi_worker/) | `elspeth join` — leader + follower(s) share one RUNNING run; asserts ≥2 workers shared the rows (ChaosLLM, self-verifying) |
+| [`join_refused`](join_refused/) | The same admission path **refusing** — a follower whose settings differ from the leader's by one scalar is rejected with `JoinRefusedError` and registers nothing, while a matching follower keeps working (ChaosLLM, self-verifying) |
 | [`multi_worker_showcase`](multi_worker_showcase/) | 4-worker swarm with live stats and a shared-work assertion (ChaosLLM, self-verifying) |
 
 ### OpenRouter LLM (real API — requires `OPENROUTER_API_KEY`)

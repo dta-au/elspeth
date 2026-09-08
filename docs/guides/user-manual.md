@@ -78,8 +78,12 @@ Options:
 | `plugins list` | List available plugins |
 | `purge` | Delete old payloads to free storage |
 | `resume` | Resume a failed run from checkpoint |
+| `export-resume` | Resume a finalized run's unfinished audit export |
+| `join` | Attach to a running pipeline as a follower worker |
 | `health` | Check system health for deployment verification |
 | `web` | Start the web application server |
+| `composer users` | Add, remove, and bootstrap local Composer web users |
+| `doctor` | Deployment readiness checks (`deployment`, `aws-ecs`) |
 
 ---
 
@@ -117,13 +121,32 @@ elspeth run --settings settings.yaml --execute --format json
 
 ### Run Output
 
+Console mode prints one bracketed line per phase, streaming progress lines, and
+a single summary line. From
+`elspeth run --settings examples/boolean_routing/settings.yaml --execute`:
+
 ```
-Run completed: RunStatus.COMPLETED
-  Rows processed: 100
-  Run ID: e58480edd52a4292809928bd6425f4ed
+[DATABASE] Connecting...
+[DATABASE] ✓ Completed in 0.17s
+[GRAPH] Building...
+[GRAPH] ✓ Completed in 0.00s
+[SOURCE] Initializing → csv...
+[SOURCE] ✓ Completed in 0.00s
+[PROCESS] Processing...
+  Processing: 1 rows | 53 rows/sec | ✓1 ✗0 ⚠0 ↪1 ↯0
+  Processing: 10 rows | 27 rows/sec | ✓10 ✗0 ⚠0 ↪10 ↯0
+[PROCESS] ✓ Completed in 0.37s
+
+✓ Run COMPLETED: 10 rows processed | ✓10 succeeded | ✗0 failed | ⚠0 quarantined | →10 routed (rejected:5, approved:5) | 0.39s total
 ```
 
-The **Run ID** is your key for querying the audit trail later.
+The `→N routed` clause appears only when the run routed rows; the destination
+order and the elapsed times vary per run.
+
+Console mode does not print the run ID. To capture it for querying the audit
+trail later, use `--format json` — the `run_completed` and `execution_result`
+events both carry `run_id` — or query the most recent run with
+`elspeth explain --run latest`.
 
 ### Exit Codes
 
@@ -160,11 +183,13 @@ Output:
 SOURCES:
   aws_s3               - Load bounded CSV, JSON-array, or JSONL rows from one immutable S3 object.
   azure_blob           - Load rows from Azure Blob Storage.
+  blob_rows            - Emit one five-field custody row per configured managed blob.
   csv                  - Load rows from a CSV file.
   dataverse            - Load rows from Microsoft Dataverse via OData v4 REST API.
   json                 - Load rows from a JSON file.
   null                 - A source that yields no rows.
   text                 - Load one output row per text line into a configured column.
+  llm                  - Issue one authored prompt and emit at most one validated source row.
 
 TRANSFORMS:
   batch_classifier_metrics - Compute classifier confusion matrix and F-score metrics over a batch.
@@ -181,6 +206,8 @@ TRANSFORMS:
   batch_top_k          - Report most frequent scalar values over a batch.
   blob_csv_expand      - Parse a CSV blob and emit one output row per CSV data row.
   blob_fetch           - Fetch an HTTP(S) URL into the run payload store and emit a blob reference.
+  blob_json_expand     - Parse a JSON document and emit one output row per record.
+  blob_text_expand     - Decode a text blob from the payload store and emit one row per line or chunk.
   field_mapper         - Map, rename, and select row fields.
   json_explode         - Explode a JSON array field into multiple rows.
   keyword_filter       - Filter rows containing blocked content patterns.
@@ -196,6 +223,7 @@ TRANSFORMS:
   aws_bedrock_content_safety - Block configured harmful-content categories through Bedrock Guardrails.
   aws_bedrock_prompt_shield - Block prompt attacks identified by an operator-owned Guardrail.
   aws_textract_document_analysis - Enrich S3 document references through asynchronous Amazon Textract analysis.
+  aws_textract_inline_analysis - Enrich managed-blob document rows through synchronous Amazon Textract analysis.
   azure_content_safety - Analyze content using Azure Content Safety API.
   azure_document_intelligence - Enrich rows with Azure Document Intelligence extraction (async analyze LRO).
   azure_prompt_shield  - Detect jailbreak attempts and prompt injection using Azure Prompt Shield.
@@ -209,6 +237,7 @@ SINKS:
   csv                  - Write rows to a CSV file.
   database             - Write rows to a database table.
   dataverse            - Write rows to Microsoft Dataverse via OData v4 REST API.
+  document             - Write one configured field's whole value to a file, byte-for-byte.
   json                 - Write rows to a JSON file.
   text                 - Write one configured string field per canonical LF-delimited record.
 ```
@@ -317,11 +346,15 @@ elspeth resume run-abc123 --settings settings.yaml --database ./runs/audit.db
 
 Output:
   Run run-abc123 can be resumed.
+
   Resume point:
-    Token ID: token-xyz
-    Node ID: transform_2
     Sequence number: 45
+    Has barrier scalars: No
+    Blocked barrier rows (journal): 0
     Unprocessed rows: 55
+
+  Dry run - use --execute to actually resume processing.
+  Topology validation passed - checkpoint is compatible with current config.
 ```
 
 ### Execute Resume
@@ -362,6 +395,9 @@ elspeth health --json
 |--------|-------------|
 | `--verbose, -v` | Include detailed check information |
 | `--json, -j` | Output as JSON |
+| `--host TEXT` | Web server host to check. Defaults to `ELSPETH_WEB__HOST` or `127.0.0.1` |
+| `--port, -p INTEGER` | Web server port to check. Defaults to `ELSPETH_WEB__PORT` or `8451` |
+| `--skip-web / --check-web` | Skip the web interface check. Default: skip (batch containers). Use `--check-web` to probe |
 
 ### What Gets Checked
 
@@ -369,7 +405,10 @@ elspeth health --json
 - **commit**: Git commit SHA (if available)
 - **python**: Python version
 - **database**: Database connectivity (if `DATABASE_URL` is set)
+- **config_dir**: Configuration directory
+- **output_dir**: Output directory
 - **plugins**: Plugin availability
+- **web**: Web interface reachability (skipped unless `--check-web` is passed)
 
 ### Example JSON Output
 
@@ -380,9 +419,13 @@ elspeth health --json
   "commit": "abc123f",
   "checks": {
     "version": {"status": "ok", "value": "0.8.0"},
+    "commit": {"status": "ok", "value": "abc123f"},
     "python": {"status": "ok", "value": "3.13.1"},
     "database": {"status": "ok", "value": "connected"},
-    "plugins": {"status": "ok", "value": "6 sources, 19 transforms, 6 sinks"}
+    "config_dir": {"status": "ok", "value": "./config"},
+    "output_dir": {"status": "ok", "value": "./output"},
+    "plugins": {"status": "ok", "value": "9 sources, 37 transforms, 9 sinks"},
+    "web": {"status": "skip", "value": "skipped via --skip-web"}
   }
 }
 ```
@@ -534,7 +577,7 @@ pipelines without hand-editing YAML. Start it with:
 elspeth web
 ```
 
-Then open the URL printed on the console (typically <http://localhost:8765>).
+Then open the URL printed on the console (typically <http://localhost:8451>).
 
 ### Using the desktop workspace
 
@@ -549,22 +592,24 @@ without leaving the conversation.
 - Select **Collapse authoring pane** when you want more room for the pipeline.
   **Restore authoring pane** reopens it; the collapsed control continues to
   report busy, error, or unread authoring status.
-- Use **Graph**, **Spec**, **YAML**, and **Run** to switch the persistent
-  pipeline view. Graph shows the pipeline structure; Spec and YAML become
-  available once the pipeline has content. Spec summarizes its components and
-  configuration, YAML provides the current export controls, and Run shows
-  current or recent execution results.
-- Select the **Validation** or **Audit** status in the workspace action bar to
-  open the Inspector. Guided sessions also show a **History** tab when completed
-  decisions are available. Close the Inspector to return focus to the status
-  control that opened it.
+- Use **Graph**, **Spec**, **YAML**, **Checks**, and **Run** to switch the
+  persistent pipeline view. Graph and Run are always available; Spec, YAML, and
+  Checks become available once the pipeline has content, and YAML also appears
+  while a YAML proposal is pending review. Spec summarizes its
+  components and configuration, YAML provides the current export controls,
+  Checks carries a status badge and renders validation and audit content
+  inline, and Run shows current or recent execution results.
+- Guided sessions show a **History** tab in the Inspector when completed
+  decisions are available.
 - Use **Focus Graph** for an optional full-screen graph. The persistent Graph
   tab remains the normal working view.
 
 The workspace action bar keeps state-dependent actions such as **Save for
-review**, **Run pipeline**, and **Export YAML** reachable without scrolling the
-conversation. Lower-frequency actions appear under **More actions** when they
-are available.
+review** and **Run pipeline** reachable without scrolling the conversation.
+**Import YAML** sits between them when the **Detail level** preference is set
+to **Show technical detail**, which is not the default. Export is not on the
+bar: the YAML tab's **Copy** and **Download** controls carry it. The plugin
+catalog opens from the artifact workspace toolbar.
 
 When the workspace is too narrow for both main panes, use the **Compose** and
 **Pipeline** switcher to choose which pane is visible. Pane resizing is disabled
@@ -640,15 +685,16 @@ it.
 Guided mode builds the pipeline through ordered stages:
 
 1. **Source** — describe where the data comes from. The source driver can revise
-   a committed source in place and can route a URL-row source to the web-scrape
-   recipe when that shape is appropriate.
+   a committed source in place. A URL-row source that needs page content is
+   bridged by the ordinary `web_scrape` transform, which the planner proposes
+   like any other node.
 2. **Sink** — describe where results should land and which output fields matter.
    The sink driver supports free-text intent and commits the resulting sink
    configuration only after validation.
 3. **Transforms** — describe how to bridge the source to the sink. The transform
-   stage may apply a recipe-backed path or a model-proposed transform chain, but
-   the committed pipeline still passes the same runtime-oriented validators as
-   YAML.
+   stage produces a model-proposed transform chain — there is no server-derived
+   alternative path — but the committed pipeline still passes the same
+   runtime-oriented validators as YAML.
 4. **Wiring** — review the final graph shape. `STEP_4_WIRE` rebuilds edges from
    model connection labels, renders the contract overlay, and accepts only a
    valid `CONFIRM_WIRING` payload.
@@ -734,9 +780,11 @@ validation summary, and graph impact for review.
 
 If a stage depends on a subjective interpretation, guided mode surfaces a
 pending interpretation card and blocks advancement until the card is reviewed.
-At the final wiring stage, the advisor sign-off path can return
-`REQUEST_ADVISOR`; that re-emits the wire turn for review rather than
-auto-completing the pipeline.
+Advisor sign-off is a completion gate rather than a wiring-stage outcome: an
+`advisor_signoff` fact bound to the reviewed graph's fingerprint withholds
+completion until a compose turn obtains a current review, and the advisor
+checkpoint that feeds it records a `clean`, `flagged`, `unavailable`, or
+`malformed` verdict.
 
 ### Completion and execution
 

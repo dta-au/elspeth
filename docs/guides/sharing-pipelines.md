@@ -10,9 +10,11 @@ A composer user with a valid composition state can mint a **shareable
 link** that grants a different authenticated user read-only access to a
 frozen snapshot of the pipeline. The reviewer sees:
 
-* The composition graph (sources, transforms, sinks).
-* The rendered YAML.
-* The full six-row Audit Readiness panel as it stood at mark-time.
+* The composition graph (sources, transforms, sinks), as a redacted
+  public projection.
+* The rendered YAML, from the same public projection.
+* All six rows of the Audit Readiness panel as they stood at mark-time
+  (the `secrets` row's detail is withheld).
 * Who shared the pipeline and when, plus the link's expiry.
 
 The reviewer cannot edit, execute, or fork the shared session. The
@@ -36,8 +38,8 @@ the result in your staging / production configuration under
 
 The key must:
 
-* Be at least 32 bytes (utf-8 encoded). Shorter keys are rejected at
-  service startup.
+* Be at least 32 bytes (base64-decoded). Shorter keys are rejected at
+  service startup, as are string values that are not valid base64.
 * Not appear in version control, logs, chat transcripts, or screenshots.
 * Be different from any audit-signing key the deployment uses — the
   shareable-link key has a different rotation cadence and a different
@@ -168,7 +170,12 @@ hash route `#/shared/{token}` and makes a backend call to
    the blob has been reaped by the retention policy, returns 404 with a
    "ask the sender for a fresh link" message.
 4. **Returns the frozen snapshot** including the mark-time readiness
-   panel. The reviewer sees exactly what the owner saw at mark-time.
+   panel, as a redacted public projection of what the owner saw. All
+   six readiness rows are present, but the `secrets` row's `detail` is
+   nulled; the graph and YAML are `generate_public_composition_dict` /
+   `generate_public_yaml` output, which excludes source and sink path
+   carriers, nested transform persistence paths, blob identifiers, and
+   bind-source markers.
 
 The resolve path does NOT call `ReadinessService.compute_snapshot` —
 the audit_readiness field is read directly from the frozen blob. This
@@ -247,8 +254,15 @@ with `openssl rand -base64 32` and add it to the configuration.
 
 ### Service refuses to start with "shareable_link_signing_key must be at least 32 bytes"
 
-The configured key is shorter than 32 bytes (utf-8 encoded). Regenerate
+The configured key is shorter than 32 bytes (base64-decoded). Regenerate
 with `openssl rand -base64 32` and replace.
+
+### Service refuses to start with "shareable_link_signing_key string inputs must be base64-encoded"
+
+The configured value is a string that is not valid base64. String inputs
+are base64-decoded at the boundary — never utf-8-encoded — so a
+passphrase or a hex string is refused outright. Regenerate with
+`openssl rand -base64 32` and replace.
 
 ### Service refuses to start with a `SESSION_SCHEMA_EPOCH` mismatch
 
@@ -260,17 +274,60 @@ path. Do not roll older code over a database initialized by newer code; restore
 is not a supported repair path. Keep the service drained, repair the current
 release forward, recreate fresh state, and retry.
 
+### `POST /mark-ready-for-review` returns 409 with "No composition state exists for this session"
+
+The session has never committed a composition state. `GET
+/sessions/{session_id}/shareable-link` returns the same detail.
+
 ### `POST /mark-ready-for-review` returns 409 with "composition validation failed"
 
 The composition has validation errors. Fix them in the composer and try
 again.
 
+### `POST /mark-ready-for-review` returns 409 with "interpretation review cards are waiting"
+
+Validation halted only because LLM interpretation review cards are
+unresolved; there are no errors to fix. Resolve the cards in the
+composer and try again. The refusal is deliberate — a reviewer of an
+un-reviewed composition would be attesting over unresolved cards.
+
+### `POST /mark-ready-for-review` returns 409 with "composition completion gates have not passed"
+
+Validation succeeded, but a completion gate — advisor sign-off, for
+example — withheld `completion_ready`. Resolve the reported blockers and
+try again. This is the axis the Save-for-review button is disabled on,
+so the button normally forecloses this refusal.
+
 ### `POST /mark-ready-for-review` returns 409 with "readiness panel reports an error"
 
 The audit-readiness panel has at least one row with `status == "error"`
 — typically an unresolved validation issue, a missing secret reference,
-or a plugin-trust gap. Resolve the error and try again. (Warnings, e.g.
-pending LLM interpretations, do NOT block sharing.)
+or a plugin-trust gap. Resolve the error and try again. A row with
+`status == "warning"` does not trip this gate. Pending LLM
+interpretations are not an example of a non-blocking warning: they do
+surface as a warning row, but the request is refused earlier, at the
+validation gate, with "interpretation review cards are waiting".
+
+### `POST /mark-ready-for-review` returns 409 with "composition changed while preparing the review snapshot"
+
+Validation and readiness were computed against different composition
+versions — the state moved while the snapshot was being prepared. Retry
+against the current state.
+
+### `POST /mark-ready-for-review` returns 409 with "Session operation is already active"
+
+Marking ready is a writer: it takes COMPOSE authority on the session and
+refuses while another compose operation holds the lease. Wait for the
+in-flight operation to finish, then retry.
+
+### `GET /sessions/{session_id}/shareable-link` returns 409
+
+The re-mint route refuses when the current state has never been marked
+ready ("mark this composition ready for review before requesting a
+shareable link"), or when the mark-time audit row exists but its snapshot
+blob is gone from the payload store ("current composition state has not
+been marked ready for review"). Both are resolved by clicking **Save for
+review** again.
 
 ### `GET /sessions/shared/{token}` returns 401 unexpectedly
 
@@ -290,11 +347,20 @@ The payload store has reaped the blob. Ask the sender to re-mint.
 The user-facing entry points landed by Phase 6B:
 
 * **Completion bar** — `components/composer/CompletionBar.tsx`. Mounted
-  in the pipeline artifact action bar. Three co-equal verbs: Save
-  for review, Run pipeline, Export YAML. The Save-for-review button is
-  client-side-disabled when the composition's validation is invalid or
-  has not run; the backend would also 409 on submission, but the
-  client preview is friendlier.
+  in the pipeline artifact action bar. Renders, in DOM order: Save for
+  review, Import YAML (only when the per-user `show_advanced`
+  preference is on), and Run pipeline. There is no Export YAML button —
+  export lives on the YAML artifact tab's Copy/Download controls and on
+  the command palette (Ctrl+Shift+Y). Run pipeline is not co-equal: it
+  carries the danger-family red fill and is isolated at the bar's right
+  edge, while Save and Import stay in the left cluster. The
+  Save-for-review button is client-side-disabled when the backend-owned
+  completion-readiness flag is not true — which includes the case where
+  validation has not yet run — or while a mark request is in flight; its
+  tooltip is the first completion blocker's detail. This mirrors the
+  backend's `completion_not_ready` gate and is deliberately stricter
+  than Run pipeline: a composition can be validation-valid and still
+  have the button disabled.
 * **Save-for-review dialog** —
   `components/composer/SaveForReviewDialog.tsx`. Mounted at app-root so
   the verb can open it from any focused view. Three observable states:

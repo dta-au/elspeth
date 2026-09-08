@@ -97,11 +97,13 @@ Azure production requires external Azure Database for PostgreSQL. Azure VM
 SQLite is supported only for explicitly non-production use on one persistent
 host. Back up its database with the payload store.
 
-The `azure-container-apps` runtime target value is reserved for a future
-deployment contract. Azure Container Apps is unsupported and its bundle is
-deferred until cross-instance admission and fencing lands under
-`elspeth-b5d7aa5655`; a one-replica setting does not prove that platform
-replacements never overlap.
+The `azure-container-apps` runtime target ships a Bicep bundle in
+`deploy/azure-container-apps/` (provider-scoped receipts, replica > 1 probes
+and runbooks). Azure Container Apps is **not yet a supported target**: the
+support claim waits on the operator-run live acceptance on dev hardware
+(`elspeth-5ec3befc1a`). Until that acceptance is recorded, treat the bundle as
+available for evaluation rather than as a supported deployment contract — a
+one-replica setting does not prove that platform replacements never overlap.
 
 ## Kubernetes
 

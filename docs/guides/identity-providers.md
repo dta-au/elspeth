@@ -631,18 +631,18 @@ These are settings-load refusals. The message names the setting.
 | `public_base_url must be an origin without path, query, or fragment` | The value carries a path. | Use the bare origin. |
 | `sso endpoint overrides are all-or-none; missing: <settings>` | A partial break-glass override. | Set all three, or none. |
 | `authorization_endpoint failed expected-origin check` | A break-glass override points off the profile's permitted origins. | **First check the URL you supplied** — a typo is the common cause. Widening `sso_endpoint_origins` (generic `oidc` only) is correct only when the provider genuinely serves that endpoint from the other origin: every origin you add is one the backend may send the client secret to at the token endpoint, and may fetch signing keys from. |
-| `Assertion failed`, with no message naming a setting | Break-glass endpoint overrides on `entra` or `google`, which cannot bypass discovery. | Remove the four `sso_*` endpoint settings. |
 
 ### Sign-in fails in the browser
 
 | Symptom | Cause |
 | ------- | ----- |
 | `/api/auth/sso/start` returns 404, and no sign-in button appears | `auth_provider=local`. The single sign-on routes do not exist on a local deployment. |
-| 503, `Single sign-on is not configured on this deployment` | A provider is selected but the runtime was not built. The deployment fails closed rather than half-way. |
+| The sign-in page shows `Single sign-on is not configured on this deployment` instead of a sign-in button | No start URL was published for the selected provider. A provider whose single sign-on runtime cannot be built refuses to start — the log names `<provider> is not wired for single sign-on: missing <settings>` — so this banner should not appear on a deployment that is serving at all. |
 | The provider refuses before ELSPETH is reached, citing the redirect URI | The registered URI is not exactly `https://<public_base_url>/api/auth/sso/callback`. |
 | `discovery document failed the exact issuer check` | `sso_issuer` does not exactly match the `issuer` in the provider's discovery document. Trailing slashes matter. |
 | `This account is awaiting approval` | Expected on a first login. The identity is pending until an administrator **activates** it, through the admin API. That is the design, not a fault. If this is the first person on a new deployment and there is no administrator yet to activate them, see [Admitting the first person](#admitting-the-first-person) — that is the step, and it is the one most often missed. |
-| `This account has been disabled` | The person authenticated; an administrator disabled the identity here. |
+| `This account has been disabled` | The person authenticated; the identity is disabled here. Either an administrator disabled it, or ELSPETH did over a rebound — see the `This account needs an administrator's attention` row, whose later sign-in attempts arrive as this message. |
+| `This account needs an administrator's attention before you can sign in` | The email address behind this provider subject is not the one first seen for it. ELSPETH refuses the login and disables the identity itself, recording the reason as `rebound` and no disabling administrator; the refusal deliberately names neither address. An administrator re-enabling a rebound-disabled identity rebases the baseline to the new address. The last active human administrator is the one exception: that identity is refused the login but is *not* disabled, so the deployment is not locked out. |
 | `This sign-in link has already been used or has expired` | The handoff code is single-use and short-lived. Start the login again. |
 | `Entra ID token was issued by a different tenant`, or `is missing the required claim 'tid'` | The sign-in came from a directory other than `entra_tenant_id`. |
 | `Google ID token is missing the required claim 'hd'` | A personal Google account, which carries no hosted domain. Only Workspace accounts in the configured domain can sign in. |

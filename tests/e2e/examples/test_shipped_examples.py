@@ -87,6 +87,7 @@ _AUXILIARY_EXAMPLE_YAMLS: frozenset[tuple[str, str]] = frozenset(
         ("chaosllm_endurance", "chaos_config.yaml"),
         ("chaosllm_sentiment", "chaos_config.yaml"),
         ("document_review_panel", "chaos_config.yaml"),
+        ("join_refused", "chaos_config.yaml"),
         ("multi_query_assessment", "criteria_lookup.yaml"),
         ("multi_worker", "chaos_config.yaml"),
         ("multi_worker", "chaos_config_faults.yaml"),

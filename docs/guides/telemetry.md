@@ -56,8 +56,8 @@ Granularity controls which events are emitted:
 
 | Level | Events Emitted | Typical Volume | Use Case |
 |-------|----------------|----------------|----------|
-| `lifecycle` | `RunStarted`, `RunFinished`, `PhaseChanged` | ~10-20 per run | Production (minimal overhead) |
-| `rows` | Above + `RowCreated`, `TransformCompleted`, `GateEvaluated`, `TokenCompleted`, `FieldResolutionApplied` | N x M (rows x transforms) | Production (standard) |
+| `lifecycle` | `RunStarted`, `RunFinished`, `PhaseChanged`, `ResourceCleanupFailed`, `EngineSpanCompleted` (`run` and `source` spans) | ~10-20 per run | Production (minimal overhead) |
+| `rows` | Above + `RowCreated`, `TransformCompleted`, `GateEvaluated`, `TokenCompleted`, `FieldResolutionApplied`, `EngineSpanCompleted` (`row`, `transform`, `gate`, `aggregation`, `sink` spans) | N x M (rows x transforms) | Production (standard) |
 | `full` | Above + `ExternalCallCompleted` with all details | High | Debugging, development |
 
 **Performance guidance:**
@@ -147,12 +147,19 @@ The OTLP exporter is a locked base dependency; no ad-hoc package install is
 required.
 
 **Span mapping:**
-- `span.name` = Event class name (e.g., "TransformCompleted")
+- `span.name` = Event class name (e.g., "TransformCompleted"). For
+  `EngineSpanCompleted` it is the engine span name instead (`run`, `source`,
+  `row`, `transform`, `gate`, `aggregation`, `sink`), and the class name is
+  carried as the `event_type` attribute.
 - `span.trace_id` = Derived from `run_id` (consistent within run)
 - `span.attributes` = A bounded allowlist of non-content event fields. Request/
   response payloads, provider endpoints, exception text, credentials, URLs,
   local paths, and raw AWS identifiers are never exported.
-- `span.start_time` = Event timestamp (instant spans - events are points in time)
+- `span.start_time` = Event timestamp (instant spans - events are points in
+  time). `EngineSpanCompleted` is the exception: the span runs from
+  `started_at` to the completion timestamp, so it retains its real duration,
+  and it sets a parent span context from `parent_span_id`. This exporter is
+  therefore one of the backend-native parent link paths.
 
 The delivery health snapshot distinguishes attempted, delivered, failed,
 dropped, and still-pending events. Buffering is not delivery. OTLP transport,
@@ -213,7 +220,7 @@ telemetry:
       options:
         connection_string: ${APPLICATIONINSIGHTS_CONNECTION_STRING}
         batch_size: 100  # Events per batch (default: 100)
-        service_name: "my-pipeline"  # Service name in App Insights (default: "elspeth")
+        service_name: "my-pipeline"  # Service name in App Insights (required)
         service_version: "1.0.0"  # Service version (optional)
         deployment_environment: "production"  # Environment tag (optional)
 ```
@@ -244,10 +251,10 @@ telemetry:
   exporters:
     - name: datadog
       options:
-        service_name: elspeth-pipeline  # Default: "elspeth"
-        env: production             # Default: "production"
-        agent_host: localhost       # Default: "localhost"
-        agent_port: 8126            # Default: 8126
+        service_name: elspeth-pipeline  # Required
+        env: production             # Required
+        agent_host: localhost       # Required
+        agent_port: 8126            # Required
         version: "1.0.0"            # Optional service version tag
 ```
 
@@ -362,7 +369,7 @@ When an alert fires in your observability platform, follow this workflow to inve
 2. **Query Landscape for details:**
    ```sql
    -- Via MCP query() tool
-   SELECT state_id, status, error, input_hash, output_hash
+   SELECT state_id, status, error_json, input_hash, output_hash
    FROM node_states
    WHERE run_id = 'run-xyz789' AND node_id = 'llm_classifier' AND status = 'failed'
    LIMIT 10
@@ -414,14 +421,16 @@ telemetry:
 ### Events Being Dropped
 
 **Symptoms:**
-- Log message: "Telemetry buffer overflow - events dropped"
+- Log message: "Telemetry events dropped due to backpressure"
 - Missing events in observability platform
 
 **Solutions:**
 1. Reduce granularity: `full` -> `rows` -> `lifecycle`
-2. Increase buffer size (if using custom BoundedBuffer)
-3. Check exporter endpoint latency
-4. Switch to `block` backpressure mode (if data completeness is critical)
+2. Check exporter endpoint latency
+3. Switch to `block` backpressure mode (if data completeness is critical)
+
+The async export queue is a fixed internal buffer and has no settings surface;
+granularity and `backpressure_mode` are the only tunable levers.
 
 ### All Exporters Failing
 
@@ -471,7 +480,7 @@ These metrics are logged at pipeline shutdown and can be monitored via structure
 |----------|---------------------|
 | Development/debugging | `granularity: full`, console exporter |
 | Production (low volume) | `granularity: rows`, OTLP with batching |
-| Production (high volume) | `granularity: lifecycle`, increase buffer |
+| Production (high volume) | `granularity: lifecycle`, tune `backpressure_mode` |
 | CI/CD pipelines | `enabled: false` or `granularity: lifecycle` |
 | Debugging production issue | Temporarily enable `granularity: full` |
 
@@ -484,6 +493,8 @@ These metrics are logged at pipeline shutdown and can be monitored via structure
 | `RunStarted` | Pipeline begins | `config_hash`, `source_plugin` |
 | `RunFinished` | Pipeline finishes | `status`, `row_count`, `duration_ms` |
 | `PhaseChanged` | Phase transition | `phase`, `action` |
+| `ResourceCleanupFailed` | Plugin resource cleanup fails | `component`, `resource`, `error_type`, `suppressed` |
+| `EngineSpanCompleted` | Engine span closes - `run` and `source` spans at `lifecycle`, the remaining span names at `rows` | `name`, `started_at`, `span_id`, `parent_span_id`, `status` |
 
 ### Row-Level Events
 
@@ -493,6 +504,7 @@ These metrics are logged at pipeline shutdown and can be monitored via structure
 | `TransformCompleted` | Transform finishes | `node_id`, `plugin_name`, `status`, `duration_ms` |
 | `GateEvaluated` | Gate routes row | `routing_mode`, `destinations` |
 | `TokenCompleted` | Token reaches terminal | `outcome`, `sink_name` |
+| `FieldResolutionApplied` | Source field resolution recorded | `source_plugin`, `field_count`, `normalization_version` |
 
 ### External Call Events
 
