@@ -3,7 +3,7 @@
 # READ THIS BEFORE TRUSTING A GREEN GATE.
 #
 # One entry per constructed-exception raise site under the runtime
-# preflight roots (src/elspeth/core/dag/, src/elspeth/core/config.py).
+# preflight roots (DAG validation, config models and config_loading).
 # Each entry adjudicates whether the composer's Stage-1 authoring
 # validator mirrors that runtime rejection. Identity is
 # (path, qualname, exception, message, ordinal) - no line numbers.

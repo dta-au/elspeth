@@ -4,6 +4,7 @@
     "examples/ab_llm_experiment/settings_arm_loss.yaml": "6691591372ae87dc8700a27ee9a32f6992e4546a46e163a9ece3247144a9f67e",
     "examples/ab_llm_experiment/settings_models.yaml": "fddb39fc3a291555c8c0a33b055b6416057188f90ba5fe906032a2d43150f664",
     "examples/audit_export/settings.yaml": "6f35c041560ff9a58b858c70156270ea038bdb8d69afc05c5833ce0c91bd01ee",
+    "examples/azure_blob_sentiment/settings.yaml": "97a651efadc6e9ec3e13011dffd3fb2caaab797a486d238429ef0b53126fe264",
     "examples/batch_aggregation/settings.yaml": "cf8a247802ccfa8f7877ace17bc62e2e765bd02fbea48b3930602ce429b3c2af",
     "examples/blob_transforms/settings_expand_csv_blobs.yaml": "c17f1ddc4282853c9b82466b1564c23903d2b2181e7606873a1714af5cbaf3b6",
     "examples/blob_transforms/settings_expand_inline_csv.yaml": "1fd413c85493b307fbdc9116e3d4196cebf021e61642b1cc56488f987137ba46",
@@ -32,6 +33,8 @@
     "examples/fork_coalesce/settings_union_fail.yaml": "be0ab09fdb63795cc872b509ad03052022af6949e7ba74cd53d81b13497e5fda",
     "examples/fork_coalesce/settings_union_first_wins.yaml": "b05693d1b199fd2d12118e9ac27c632cb6746ce51ea0381d2cfc59087f97d7c7",
     "examples/fork_coalesce/settings_union_last_wins.yaml": "445379c27caa1fd5dfbfa02e0145035d98284410f8c9c767dabd74e80dd9a845",
+    "examples/join_refused/settings.yaml": "0ee1ab521f1a5a253988d12621bb0a62850e62f3e5e55be976b7b6c636a89529",
+    "examples/join_refused/settings_mismatched.yaml": "b33ea9f6debd692b6e2511315bfc899133ee0d77e8e7a75d8a7f726c0f85210f",
     "examples/json_explode/settings.yaml": "7544f80a351874aeb2e58b9d36dbccd6f087856e61f00f8423e69761a2ce2029",
     "examples/landscape_journal/settings.yaml": "ca82470a88f8a926fc59ffb896acd5bc7bbad5403fe538b6a0a0caedad8d63ca",
     "examples/large_scale_test/settings.yaml": "611539ab5be06231beb0339170186260478e44fc68b2914923d142a8507fcd59",
@@ -80,7 +83,6 @@
     "examples/transform_pipeline/settings.yaml": "3ed007db05239536ff49bdc2cfc22b4c4824a0a3e41772a102cf39856c2e7742"
   },
   "unbuildable": {
-    "examples/azure_blob_sentiment/settings.yaml": "ValidationError",
     "examples/azure_blob_sentiment/settings_pooled.yaml": "ValidationError",
     "examples/azure_keyvault_secrets/settings.yaml": "PluginConfigError",
     "examples/azure_openai_sentiment/settings.yaml": "PluginConfigError",
