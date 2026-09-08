@@ -1174,6 +1174,16 @@ def _stated_subject_is_grounded(
     )
 
 
+@observation_boundary(
+    tier=3,
+    source="AST expression parsed from a user- or planner-authored gate condition",
+    source_param="node",
+    suppresses=("R5",),
+    invariant=(
+        "returns a nonempty literal row column only for row['column'] or row.get('column'); "
+        "all other expression shapes return None and cannot establish stated-predicate coverage"
+    ),
+)
 def _row_column(node: ast.expr) -> str | None:
     if (
         isinstance(node, ast.Subscript)
@@ -2234,10 +2244,9 @@ class _DeferredCoverageContext:
             successors = self.route_targets(current, "on_success")
             if len(successors) != 1:
                 return None
-            successor = self.exact_components.get(next(iter(successors)))
-            if successor is None:
-                return None
-            current = successor
+            # Both indexes are constructed from the same candidate components.
+            # A consumer without its component is an internal integrity fault.
+            current = self.exact_components[next(iter(successors))]
 
     def route_output_name(self, gate: _CandidateComponent, route_label: Literal["true", "false"]) -> str | None:
         """Resolve one branch only when it has one linear path to one output."""
@@ -2255,9 +2264,7 @@ class _DeferredCoverageContext:
             if identity in visited:
                 return None
             visited.add(identity)
-            component = self.exact_components.get(identity)
-            if component is None:
-                return None
+            component = self.exact_components[identity]
             if component.kind == "output":
                 return component.name
             if component.kind != "node":
