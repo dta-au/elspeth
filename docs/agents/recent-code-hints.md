@@ -2079,6 +2079,22 @@ the same commit; the rules live there, the history lives here.
   `execution/validation.py::_skipped_checks` emits every check DOWNSTREAM of a halted stage as `passed=False` with `outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` — `advisor_signoff` included — so every pending-handoff strict preflight carries a "failing" advisor check that means NEVER EVALUATED. Reading it as a failure published the "advisory review did not clear" notice over a CLEAN advisor verdict (elspeth-fa18d54eef; live in three sessions before the telemetry caught it). Dispatch through `execution/completion_gates.advisor_signoff_check_failed` (skipped-aware), or for a new check name discriminate on `outcome_code` directly. The companion trap is FIXTURE DIVERGENCE: `_handoff_result()`-style hand-built ValidationResults with `checks=[]` pin a shape `validate_pipeline` never emits (the real producer appends the skipped tail), which is why seven scripted reproductions missed a bug three live sessions hit. When a consumer dispatches on checks, give the fixture the producer's skipped rows — `_producer_honest_handoff_result` in `tests/unit/web/composer/test_advisor_terminal_publication.py` is the worked example.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
+- **2026-09-09 — A parser over persisted JSON is a raising `@trust_boundary`, not an allowlist argument: "the bytes are ELSPETH-authored" does not make a stored row typed**
+  The judge blocked four R5 (`isinstance`) entries on `web/composer/source_demand.py::_validated_source_data_contract_fields`
+  that had been justified as "owned evidence, deliberately not a boundary". The judge policy's structural test decides
+  this, not the prose: the function took a parsed-JSON `Mapping[str, Any]` parameter and every guarded name derived
+  from it, which is the decorator case (raising form: `tier=3`, `source_param`, `suppresses=("R5",)`, an `invariant`
+  naming the exception, `test_ref` + `test_fingerprint`). The house precedent is
+  `web/interpretation_state.py::_coerce_requirement`, whose `source` prose already calls a sessions.db round-trip
+  Tier-3 input. The decorator weakens nothing — its contract IS "raise `AuditIntegrityError`, never repair" — and the
+  `trust_boundary.tests` gate binds that claim to a real test by AST fingerprint. The fix merged the two-function split
+  into one decorated `parse_source_data_contract_accepted_fields(value)` so the whole parse is one boundary with ZERO
+  allowlist entries (the two already-signed R5 entries became `stale_delete`). Mechanics worth knowing: compute the
+  fingerprint with the gate's own `_fingerprint_test_function` over `_lookup_named_function(tree, [name])`; the test
+  must call the decorated symbol by name with `source_param` supplied (keyword is unambiguous) inside
+  `pytest.raises(<the invariant's exception>)`; removing a `Mapping[str, Any]` annotation site moves the soft-mapping
+  census DOWN, which is also a drift — re-pin with `--write-census` in the same commit.
+
 - **2026-09-09 — Advisor checkpoint verdicts and terminal-publication branches are AUDIT ROWS first; the structlog events are their mirror, and a `suppress(Exception)` around the event was a policy violation, not a signing problem**
   The trust-tier judge blocked `web/composer/advisor_checkpoint_telemetry.py:R7:record_advisor_terminal_publication`
   on the 0.8.0 tail: the suppressed `slog.info` was the PRIMARY record of which branch published a turn's fixed copy

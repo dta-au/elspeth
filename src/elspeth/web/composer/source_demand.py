@@ -43,7 +43,7 @@ from typing import Any, Final
 
 from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.hashing import stable_hash
-from elspeth.contracts.trust_boundary import observation_boundary
+from elspeth.contracts.trust_boundary import observation_boundary, trust_boundary
 from elspeth.web.composer.state import SOURCE_AUTHORING_KEY, CompositionState, SourceSpec
 
 # Stable user-facing label for the data-contract review row. The card's
@@ -383,12 +383,30 @@ def build_source_data_contract_draft(
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
 
 
+@trust_boundary(
+    tier=3,
+    source="the persisted source_data_contract card text (a pending interpretation event's llm_draft / "
+    "accepted_value) read back from sessions.db storage as untyped JSON; server-authored by "
+    "build_source_data_contract_draft at write time, but a stored row carries no type guarantee",
+    source_param="value",
+    suppresses=("R5",),
+    invariant="raises AuditIntegrityError on every malformed card: not valid JSON, not an object with exactly "
+    "the canonical keys, an unsupported contract_version or kind, a demanded_fields / sample_header / "
+    "missing_from_sample that is not a string list, or sample evidence inconsistent with the demand set; "
+    "never filters, coerces, defaults or otherwise repairs a field — corrupt owned evidence crashes",
+    test_ref="tests/unit/web/composer/test_source_demand.py::test_parse_source_data_contract_rejects_corrupt_persisted_card",
+    test_fingerprint="adf970a8ba05b157ddf617431eba68724ecb08807b02c7b5490ae346b6ecb330",
+)
 def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...]:
     """Read the current server-authored card, raising on corrupt persisted evidence.
 
     Absence of a review is represented by the caller's optional requirement,
     never by malformed card bytes. A card that exists must satisfy the exact
-    current format produced by ``build_source_data_contract_draft``.
+    current format produced by ``build_source_data_contract_draft``; nothing
+    here repairs evidence, because the validated tuple is rehashed by
+    ``source_data_contract_fields_for_demand_recompute`` and stamped into the
+    source's guaranteed fields, so a silently narrowed set would weaken a
+    guarantee the user acknowledged.
     """
     try:
         payload = json.loads(value)
@@ -396,11 +414,6 @@ def parse_source_data_contract_accepted_fields(value: str) -> tuple[str, ...]:
         raise AuditIntegrityError("source data contract draft is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise AuditIntegrityError("source data contract draft must be a JSON object")
-    return _validated_source_data_contract_fields(payload)
-
-
-def _validated_source_data_contract_fields(payload: Mapping[str, Any]) -> tuple[str, ...]:
-    """Enforce the canonical owned card contract without repairing evidence."""
     if frozenset(payload) != _SOURCE_DATA_CONTRACT_DRAFT_KEYS:
         raise AuditIntegrityError("source data contract draft has invalid keys")
     raw_version = payload["contract_version"]

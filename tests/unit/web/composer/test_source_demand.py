@@ -537,6 +537,20 @@ class TestDraftAndArtifact:
             source_data_contract_fields_for_demand_recompute(draft, artifact_hash)
 
 
+def test_parse_source_data_contract_rejects_corrupt_persisted_card() -> None:
+    """Honesty test bound to the parser's ``@trust_boundary``: a stored card whose
+    demanded_fields is not a string list raises rather than being filtered,
+    because the validated tuple is what gets rehashed and stamped as a
+    guarantee. The boundary is exercised through ``value``, the declared
+    ``source_param``."""
+    from elspeth.contracts.errors import AuditIntegrityError
+
+    payload = json.loads(build_source_data_contract_draft(["colour"], None))
+    payload["demanded_fields"] = ["colour", 1]
+    with pytest.raises(AuditIntegrityError, match="demanded_fields must be a string list"):
+        parse_source_data_contract_accepted_fields(value=json.dumps(payload))
+
+
 class TestSampleHeader:
     def test_reads_header_from_bound_csv(self, tmp_path: Path) -> None:
         csv_path = tmp_path / "upload.csv"

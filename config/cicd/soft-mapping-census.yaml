@@ -816,7 +816,7 @@ files:
     boundary: 1
     dict[str, Any]: 39
   src/elspeth/web/composer/source_demand.py:
-    Mapping[str, Any]: 8
+    Mapping[str, Any]: 7
     dict[str, Any]: 1
   src/elspeth/web/composer/source_inspection.py:
     Mapping[str, Any]: 1
@@ -1008,10 +1008,10 @@ files:
     dict[str, Any]: 3
     dict[str, object]: 2
 totals:
-  Mapping[str, Any]: 865
+  Mapping[str, Any]: 864
   Mapping[str, object]: 284
   MutableMapping[str, Any]: 13
   boundary: 64
   dict[str, Any]: 1141
   dict[str, object]: 389
-  soft: 2692
+  soft: 2691
