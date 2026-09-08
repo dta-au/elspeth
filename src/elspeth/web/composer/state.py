@@ -439,13 +439,15 @@ def _routing_label_errors(
         elif node.node_type in ("coalesce", "row_union"):
             kind = "Coalesce" if node.node_type == "coalesce" else "row_union"
             raw_branches = node.branches
-            # Typed ``object`` on purpose: a persisted payload can carry a
-            # non-string branch value that ``NodeSpec.from_dict`` admits and
-            # the intrinsic node-shape checks own; the isinstance guard below
-            # keeps this rule to well-typed labels.
-            items: list[tuple[object, object]]
+            # A persisted payload can carry a non-string branch name or
+            # connection that ``NodeSpec.from_dict`` admits; the intrinsic
+            # node-shape checks own that rejection, so this rule keeps only
+            # the well-typed pairs and walks nothing else.
+            items: list[tuple[str, str]]
             if isinstance(raw_branches, Mapping):
-                items = list(raw_branches.items())
+                items = [
+                    (name, connection) for name, connection in raw_branches.items() if isinstance(name, str) and isinstance(connection, str)
+                ]
             elif raw_branches is not None:
                 listed = [name for name in raw_branches if isinstance(name, str)]
                 duplicates = sorted({name for name in listed if listed.count(name) > 1})
@@ -460,8 +462,6 @@ def _routing_label_errors(
                 items = []
             seen_keys: set[str] = set()
             for branch_name, connection in items:
-                if not isinstance(branch_name, str) or not isinstance(connection, str):
-                    continue
                 if not branch_name or not branch_name.strip():
                     add(component, f"{kind} branch names must not be empty")
                     continue
@@ -3564,27 +3564,29 @@ def _validate_web_scrape_http_identity_not_placeholder(node: NodeSpec) -> tuple[
     return tuple(errors)
 
 
-def _validate_aggregation_trigger(node_id: str, trigger: Mapping[str, Any]) -> ValidationEntry | None:
-    """Validate a composer-authored aggregation trigger at the Tier-3 boundary.
+def _parse_aggregation_trigger(node_id: str, trigger: Mapping[str, Any]) -> tuple[TriggerConfig | None, ValidationEntry | None]:
+    """Parse a composer-authored aggregation trigger at the Tier-3 boundary.
 
     ``node.trigger`` is composer/LLM/user-authored config read back from session
     state, so a malformed ``trigger`` is recoverable external input, not an
     invariant break. We run it through the same ``TriggerConfig`` parser the
     runtime settings load uses and convert a parse failure into an explicit
-    blocking ``ValidationEntry`` — rejecting the bad trigger before runtime
-    settings load rather than crashing the composer.
+    ``(None, ValidationEntry)`` result — rejecting the bad trigger before
+    runtime settings load rather than crashing the composer. The parsed
+    ``TriggerConfig`` is returned so later derived analyses (the row_union
+    downstream-group rule) consult this one parse instead of re-parsing and
+    re-deciding what to do with a malformed trigger.
     """
     try:
-        TriggerConfig.model_validate(deep_thaw(trigger))
+        return TriggerConfig.model_validate(deep_thaw(trigger)), None
     except PydanticValidationError as exc:
         detail = "; ".join(str(error["msg"]) for error in exc.errors())
-        return ValidationEntry(
+        return None, ValidationEntry(
             component=f"node:{node_id}",
             message=f"Aggregation '{node_id}' trigger is invalid: {detail}",
             severity="high",
             error_code="aggregation_trigger_invalid",
         )
-    return None
 
 
 @observation_boundary(
@@ -3721,15 +3723,14 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
     template = node.options.get("prompt_template")
     if not isinstance(template, str):
         return ()
-    masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
-    try:
-        ast = create_sandboxed_environment().parse(masked)
-        usage = extract_jinja2_field_usage(masked)
-    except TemplateSyntaxError:
+    parsed, _syntax_error = _parse_template_names(template)
+    if parsed is None:
+        # Plugin-config admission owns the syntax rejection (pinned by
+        # test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules).
         return ()
 
     errors: list[ValidationEntry] = []
-    unbound = sorted(find_runtime_unbound_variables(ast) - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+    unbound = sorted(parsed.context_names - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
     if unbound:
         names = ", ".join(f"'{name}'" for name in unbound)
         errors.append(
@@ -3751,7 +3752,7 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
     if isinstance(declared, Sequence) and not isinstance(declared, (str, bytes)):
         declared_names = tuple(name for name in declared if isinstance(name, str))
         if declared_names:
-            undeclared = undeclared_row_fields(usage.fields, declared_names)
+            undeclared = undeclared_row_fields(parsed.row_fields, declared_names)
             if undeclared:
                 fields = describe_undeclared_row_fields(undeclared)
                 declared_display = ", ".join(f"'{name}'" for name in sorted(declared_names))
@@ -3780,23 +3781,39 @@ def _validate_prompt_template_variable_bindings(node: NodeSpec) -> tuple[Validat
 _MULTI_QUERY_IMPLICIT_ROW_NAMES: frozenset[str] = frozenset({"source_row"})
 
 
-def _parse_template_names(template: str) -> tuple[frozenset[str], frozenset[str]] | None:
-    """Parse a prompt into (possible context names, first-level row fields).
+@dataclass(frozen=True, slots=True)
+class PromptTemplateNames:
+    """The names one prompt template reads.
+
+    ``context_names`` are the top-level names the template may resolve from
+    its render context (``find_runtime_unbound_variables``); ``row_fields``
+    are the first-level ``row.<field>`` accesses. Dynamic row accesses
+    (``row[expr]``) are unprovable at parse time and are deliberately not
+    reported — only the concrete field set is carried.
+    """
+
+    context_names: frozenset[str]
+    row_fields: frozenset[str]
+
+
+def _parse_template_names(template: str) -> tuple[PromptTemplateNames | None, str | None]:
+    """Parse a prompt into its names, or return the syntax failure explicitly.
 
     ``{{interpretation:...}}`` placeholders are masked first — they resolve to
     operator-accepted text upstream of rendering and are not Jinja2 names.
-    Returns None when the template does not parse; sibling rules own syntax
-    errors, so callers stay silent on that shape. Dynamic row accesses
-    (``row[expr]``) are unprovable at parse time and are deliberately not
-    reported — only the concrete field set is returned.
+    Returns ``(None, detail)`` when the template does not parse: the raising
+    rejection of malformed Jinja is owned by the plugin config models that
+    admit the text (``LLMConfig.validate_prompt_template``,
+    ``QueryDefinition.validate_template``), so the advisory callers abstain
+    on that shape rather than reporting it a second time.
     """
     masked = INTERPRETATION_PLACEHOLDER_RE.sub(" ", template)
     try:
         ast = create_sandboxed_environment().parse(masked)
         usage = extract_jinja2_field_usage(masked)
-    except TemplateSyntaxError:
-        return None
-    return find_runtime_unbound_variables(ast), usage.fields
+    except TemplateSyntaxError as exc:
+        return None, str(exc)
+    return PromptTemplateNames(context_names=find_runtime_unbound_variables(ast), row_fields=usage.fields), None
 
 
 @observation_boundary(
@@ -3876,7 +3893,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
         return ()
 
     node_template = node.options.get("prompt_template")
-    node_parse = _parse_template_names(node_template) if isinstance(node_template, str) else None
+    node_parse, _node_syntax_error = _parse_template_names(node_template) if isinstance(node_template, str) else (None, None)
 
     errors: list[ValidationEntry] = []
     node_template_in_use = False
@@ -3891,7 +3908,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
 
         override = entry.get("template")
         if isinstance(override, str):
-            parsed = _parse_template_names(override)
+            parsed, _override_syntax_error = _parse_template_names(override)
             source_desc = "its template override"
         elif override is None:
             if node_parse is None:
@@ -3903,7 +3920,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
             continue
         if parsed is None:
             continue
-        top_level_names, row_fields = parsed
+        top_level_names, row_fields = parsed.context_names, parsed.row_fields
 
         if source_desc == "its template override":
             unbound_names = sorted(top_level_names - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
@@ -3947,7 +3964,7 @@ def _validate_multi_query_template_variable_bindings(node: NodeSpec) -> tuple[Va
             )
 
     if node_template_in_use and node_parse is not None:
-        unbound_names = sorted(node_parse[0] - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
+        unbound_names = sorted(node_parse.context_names - _PROMPT_TEMPLATE_CONTEXT_NAMES - _PROMPT_TEMPLATE_GLOBAL_NAMES)
         if unbound_names:
             names = ", ".join(f"'{name}'" for name in unbound_names)
             errors.append(
@@ -4769,33 +4786,44 @@ def _check_schema_contracts(
         _participates, guarantees = _effective_producer_vote(producer)
         return guarantees
 
+    def _parse_producer_raw_schema(
+        producer: ProducerEntry,
+    ) -> tuple[SchemaConfig | None, ValidationEntry | None]:
+        """Lazy ``contract_config_invalid`` parser for a producer's declared schema.
+
+        Honours the nested contract-options alias for the kinds in
+        ``NESTED_CONTRACT_OPTIONS_NODE_TYPES`` and, like the ``_parse_*``
+        family below, converts the parser's ValueError into an explicit
+        ``(None, ValidationEntry)`` result. ``(None, None)`` means the
+        producer declares no schema block at all.
+        """
+        contract_options = producer.options
+        contract_owner = _producer_owner(producer)
+        try:
+            if not is_source_producer_id(producer.producer_id):
+                producer_node = node_by_id[producer.producer_id]
+                if node_type_nests_contract_options(producer_node.node_type):
+                    contract_options, contract_owner = get_aggregation_contract_options(
+                        producer.options,
+                        owner=f"node:{producer.producer_id}",
+                    )
+            return get_raw_schema_config(contract_options, owner=contract_owner), None
+        except ValueError as exc:
+            return None, _err(_producer_owner(producer), f"Invalid contract config: {exc}", "high", "contract_config_invalid")
+
     def _known_producer_schema_config(producer: ProducerEntry) -> SchemaConfig | None:
         """Return the runtime producer schema when Composer can prove it.
 
         The DAG builder assigns each transform/aggregation its computed output
         ``SchemaConfig`` and falls back to the raw declaration only when the
         plugin has no computed output contract. Draft config/probe failures
-        abstain: their existing validation paths own the rejection.
+        abstain: a declaration that does not parse is reported as
+        ``contract_config_invalid`` against the same owner by the eager
+        syntax sweep at the end of this function, and a plugin that does not
+        construct is rejected by its own probe path.
         """
-        contract_options = producer.options
-        contract_owner = _producer_owner(producer)
-        if not is_source_producer_id(producer.producer_id):
-            producer_node = node_by_id[producer.producer_id]
-            if node_type_nests_contract_options(producer_node.node_type):
-                try:
-                    contract_options, contract_owner = get_aggregation_contract_options(
-                        producer.options,
-                        owner=f"node:{producer.producer_id}",
-                    )
-                except ValueError:
-                    return None
-
-        try:
-            raw_schema = get_raw_schema_config(
-                contract_options,
-                owner=contract_owner,
-            )
-        except ValueError:
+        raw_schema, parse_error = _parse_producer_raw_schema(producer)
+        if parse_error is not None:
             return None
 
         if is_source_producer_id(producer.producer_id):
@@ -7184,6 +7212,11 @@ class CompositionState:
             seen_edge_ids.add(edge.id)
 
         # 7. Node type field consistency
+        # Every aggregation trigger that parses, keyed by node id: the derived
+        # row_union downstream-group rule below consults this instead of
+        # re-parsing, so a malformed trigger is decided exactly once (by the
+        # intrinsic check that reports it).
+        parsed_aggregation_triggers: dict[str, TriggerConfig] = {}
         for node in self.nodes:
             if node.node_type not in COMPOSER_NODE_TYPES:
                 expected = ", ".join(sorted(COMPOSER_NODE_TYPES))
@@ -7696,9 +7729,11 @@ class CompositionState:
                 # If early triggers are present, validate them through the same
                 # TriggerConfig parser used by settings load.
                 if node.trigger is not None:
-                    trigger_error = _validate_aggregation_trigger(node.id, node.trigger)
+                    parsed_trigger, trigger_error = _parse_aggregation_trigger(node.id, node.trigger)
                     if trigger_error is not None:
                         errors.append(trigger_error)
+                    if parsed_trigger is not None:
+                        parsed_aggregation_triggers[node.id] = parsed_trigger
                 # output_mode must be a valid OutputMode value when present.
                 # Both the test AND the message derive from the enum, never
                 # restate it: a hand-listed tuple here made OutputMode a third
@@ -8207,14 +8242,12 @@ class CompositionState:
                                 )
                             )
                             break
-                        if downstream.node_type != "aggregation" or downstream.trigger is None:
+                        if downstream.node_type != "aggregation" or downstream.id not in parsed_aggregation_triggers:
+                            # No early trigger (implicit end_of_source), or a
+                            # malformed one the intrinsic trigger check above
+                            # already rejected: nothing to analyse here.
                             continue
-                        try:
-                            trigger = TriggerConfig.model_validate(deep_thaw(downstream.trigger))
-                        except PydanticValidationError:
-                            # The aggregation's intrinsic trigger validator
-                            # owns malformed external input.
-                            continue
+                        trigger = parsed_aggregation_triggers[downstream.id]
                         if trigger.has_count or trigger.has_timeout or trigger.has_condition:
                             errors.append(
                                 _err(

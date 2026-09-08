@@ -804,11 +804,10 @@ def _find_static_llm_prompt_advisories(state: CompositionState) -> list[_StaticL
         template = node.options.get("prompt_template")
         if not isinstance(template, str):
             continue
-        parsed = _parse_template_names(template)
+        parsed, _syntax_error = _parse_template_names(template)
         if parsed is None:
             continue
-        top_level_names, _row_fields = parsed
-        if "row" in top_level_names:
+        if "row" in parsed.context_names:
             continue
         findings.append(_StaticLLMPromptFinding(node_id=node.id))
     return findings

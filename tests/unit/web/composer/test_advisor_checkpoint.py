@@ -4496,7 +4496,7 @@ def test_advisor_injection_preflight_scans_aggregation_trigger() -> None:
 
     The payload here is a REACHABLE one: it passes ``TriggerConfig``
     expression validation (allowed key, string-literal comparand) and the
-    composer's own ``_validate_aggregation_trigger``, so a live author can
+    composer's own ``_parse_aggregation_trigger``, so a live author can
     reach the advisor with it. The structural scan already returns True for
     this string — only the scan ARM was missing.
     """
@@ -4521,12 +4521,14 @@ def test_advisor_injection_preflight_scans_reachable_trigger_through_live_valida
     validation that stands between an author and the advisor. Pin that, so a
     future reader cannot dismiss the arm as unreachable defence-in-depth."""
     from elspeth.core.config import TriggerConfig
-    from elspeth.web.composer.state import _validate_aggregation_trigger
+    from elspeth.web.composer.state import _parse_aggregation_trigger
 
     trigger = {"condition": f'row.get("batch_count") == "{_CONTROL_FLOW_INJECTION_PAYLOAD}"'}
 
     assert TriggerConfig.model_validate(trigger).condition == trigger["condition"]
-    assert _validate_aggregation_trigger("agg1", trigger) is None
+    parsed_trigger, trigger_error = _parse_aggregation_trigger("agg1", trigger)
+    assert trigger_error is None
+    assert parsed_trigger is not None and parsed_trigger.condition == trigger["condition"]
 
 
 @pytest.mark.parametrize(

@@ -13438,7 +13438,9 @@ def test_template_syntax_rejection_is_owned_by_plugin_config_not_advisory_rules(
     )
 
     bad_template = "{% if %}"
-    assert _parse_template_names(bad_template) is None
+    parsed, syntax_error = _parse_template_names(bad_template)
+    assert parsed is None
+    assert syntax_error is not None and "Expected an expression" in syntax_error
     node = _tier_rem_node(id="llm1", plugin="llm", options={"prompt_template": bad_template})
     assert _validate_prompt_template_variable_bindings(node) == ()
 

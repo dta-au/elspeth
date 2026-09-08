@@ -2079,6 +2079,25 @@ the same commit; the rules live there, the history lives here.
   `execution/validation.py::_skipped_checks` emits every check DOWNSTREAM of a halted stage as `passed=False` with `outcome_code=CHECK_OUTCOME_SKIPPED_AFTER_FAILURE` — `advisor_signoff` included — so every pending-handoff strict preflight carries a "failing" advisor check that means NEVER EVALUATED. Reading it as a failure published the "advisory review did not clear" notice over a CLEAN advisor verdict (elspeth-fa18d54eef; live in three sessions before the telemetry caught it). Dispatch through `execution/completion_gates.advisor_signoff_check_failed` (skipped-aware), or for a new check name discriminate on `outcome_code` directly. The companion trap is FIXTURE DIVERGENCE: `_handoff_result()`-style hand-built ValidationResults with `checks=[]` pin a shape `validate_pipeline` never emits (the real producer appends the skipped tail), which is why seven scripted reproductions missed a bug three live sessions hit. When a consumer dispatches on checks, give the fixture the producer's skipped rows — `_producer_honest_handoff_result` in `tests/unit/web/composer/test_advisor_terminal_publication.py` is the worked example.
   See [CONTRIBUTING: Convention: web composer and frontend](../../CONTRIBUTING.md#convention-web-composer-and-frontend).
 
+- **2026-09-09 — "A sibling rule owns the rejection, this handler abstains" is a design smell the judge now blocks: parse ONCE and let the abstaining site consult the explicit result**
+  Six more blocks on `web/composer/state.py` in the same round, every one an R6 `except X: return None/()/continue`
+  (or an R5 guard) justified by "the intrinsic check / plugin config / syntax sweep owns this". The judge cannot
+  verify a control-location claim from an excerpt, and the shape itself is the defect: two sites parsing the same
+  bytes and separately deciding what to do when they don't parse. Each fix removed the second parse. Template
+  syntax: `_parse_template_names` now returns `(PromptTemplateNames | None, syntax_error)` and
+  `_validate_prompt_template_variable_bindings` calls it instead of re-parsing. Producer schema:
+  `_parse_producer_raw_schema` joins the lazy `(value, ValidationEntry)` `_parse_*` family and
+  `_known_producer_schema_config` abstains on the explicit error. Aggregation triggers: `_parse_aggregation_trigger`
+  returns the parsed `TriggerConfig` alongside the entry; the intrinsic loop records it in
+  `parsed_aggregation_triggers` and the row_union downstream-group rule looks the trigger up rather than
+  re-validating. Coalesce/row_union labels: the type filter moved into the comprehension that READS
+  `node.branches`, where the function's existing `@trust_boundary(source_param="nodes")` derivation reaches it (the
+  loop guard was flagged because `items` is un-derived on the `else: items = []` path, so the merged state lost it).
+  Mechanics: the lint's "explicit outcome" for a handler is a raise, a non-default return (a 2-tuple like
+  `None, _err(...)` counts; bare `None`/`()`/`[]` do not) or an `errors.append(<record>)`; inserting a nested `def`
+  or a statement shifts every later sibling's `ast_path`, so signed entries after it in the same scope go
+  `drift_repair` (`_edge_field_type_conflict` x3 here) — that churn is the operator's cost, never a design input.
+
 - **2026-09-09 — A parser over persisted JSON is a raising `@trust_boundary`, not an allowlist argument: "the bytes are ELSPETH-authored" does not make a stored row typed**
   The judge blocked four R5 (`isinstance`) entries on `web/composer/source_demand.py::_validated_source_data_contract_fields`
   that had been justified as "owned evidence, deliberately not a boundary". The judge policy's structural test decides
