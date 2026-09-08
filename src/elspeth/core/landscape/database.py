@@ -27,6 +27,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.contracts.url import SENSITIVE_PARAMS, _scrub_odbc_connect_value
 from elspeth.core.landscape.journal import LandscapeJournal
+from elspeth.core.landscape.lease_deadlines import install_deadline_guard
 from elspeth.core.landscape.schema import SQLITE_SCHEMA_EPOCH, metadata, schema_identity_table
 from elspeth.core.schema_identity import (
     SCHEMA_IDENTITY_TABLE_NAME,
@@ -118,6 +119,7 @@ def verify_sqlite_tier1_pragmas(engine: Engine, *, owner: str) -> None:
     if engine.dialect.name != "sqlite":
         return
 
+    install_deadline_guard(engine)
     with _maybe_serialize_shared_connection(engine), engine.connect() as conn:
         fk_result = conn.exec_driver_sql("PRAGMA foreign_keys").scalar_one_or_none()
         jm_result = conn.exec_driver_sql("PRAGMA journal_mode").scalar_one_or_none()
@@ -1028,6 +1030,7 @@ class LandscapeDB:
                 LandscapeDB._configure_sqlite(self._engine)
         if self._journal is not None:
             self._journal.attach(self._engine)
+        install_deadline_guard(self._engine)
         # Tier-1: probe the SQLite PRAGMAs we just configured — if any
         # didn't take effect, the audit DB does not meet the durability /
         # concurrency contract and we MUST refuse to open it.  Skipped for
@@ -1920,6 +1923,8 @@ class LandscapeDB:
                 payload_base_path=dump_to_jsonl_payload_base_path,
             )
             journal.attach(engine)
+
+        install_deadline_guard(engine)
 
         instance = cls._from_parts(
             url,

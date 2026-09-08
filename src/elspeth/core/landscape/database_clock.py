@@ -1,53 +1,46 @@
-"""The Landscape database clock: the one place Landscape reads database time.
+"""Landscape-owned database clocks, normalized to aware UTC.
 
-ADR-047 (Landscape database-clock authority): every custody, liveness,
-expiry, takeover and stale-owner decision under ``core/landscape``,
-``core/checkpoint`` and ``engine/orchestrator`` compares against the
-Landscape database's own transaction time, never a process clock and never a
-``now`` a caller supplied. This module is that clock's single read site.
+ADR-047's approved 2026-09-08 amendment distinguishes fresh locked lease
+decisions from transaction timestamp classification. ``read_landscape_decision_time``
+samples PostgreSQL wall time or SQLite millisecond time in a separate query
+after required locks; one sample supplies the decision's predicates and writes.
+``read_landscape_transaction_time`` retains PostgreSQL transaction-start time
+and SQLite whole-second statement time for explicitly classified uses.
 
-``read_landscape_transaction_time`` is the symbol the clock-authority gate
-(tests/unit/core/landscape/test_database_clock_authority.py) trusts when it
-is imported from this package; a same-named helper defined anywhere else is
-not trusted, and a process clock in this body is classified as process time
-at every authority sink that consumes it.
-
-Contract (rulings 9425/9444 on elspeth-0ff11aa42e):
-
-* one ``CURRENT_TIMESTAMP`` read per call —
-  PostgreSQL returns the transaction-start instant (``transaction_timestamp``
-  semantics: every read inside one transaction is the same instant and the
-  in-SQL fence deadline is written from that same instant), SQLite returns
-  the statement's wall-clock second in UTC;
-* the result is an aware UTC ``datetime`` on both dialects — a
-  ``timestamptz`` under a non-UTC session time zone is converted with
-  ``astimezone``, SQLite's naive UTC text gets ``tzinfo=UTC`` attached;
-* a result of the wrong shape for the dialect is Landscape corruption
-  (``AuditIntegrityError``), an unknown dialect is ``NotImplementedError``;
-* nothing here imports ``elspeth.web``: the Sessions clock
-  (``clock_timestamp()``) is a distinct authority with the same contract, and
-  the two domains never cross.
-
-PostgreSQL call placement does not refresh transaction time: even a read
-after acquiring a lock returns the instant at which the transaction started.
-A deadline derived from that instant loses residual life to lock waits and
-the remaining transaction body. ADR-047's 2026-09-08 erratum records this
-limitation (elspeth-8f97b3403e); the selected clock semantics are unchanged.
-
-SQLite's ``CURRENT_TIMESTAMP`` has whole-second resolution and no fraction.
-The in-SQL fence deadline (``run_coordination_repository``) is therefore
-written in the DateTime storage format with the ``.000000`` fraction appended,
-so it compares byte-for-byte against a bound value of the same instant; no
-liveness window, production or test, has to absorb a sub-second artefact.
+Neither helper accepts a caller timestamp or reads the process/Sessions clock.
+The authority gate binds their exact owned implementations and import paths.
+Malformed database results are audit corruption; unknown dialects fail closed.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Connection, func
+from sqlalchemy import Connection, DateTime, func
 
 from elspeth.contracts.errors import AuditIntegrityError
+
+
+def read_landscape_decision_time(conn: Connection) -> datetime:
+    """Sample fresh Landscape time after acquiring a decision's required locks.
+
+    Reuse this one value in the locked decision's predicates and writes.
+    PostgreSQL's separate query avoids evaluating a deadline expression before
+    a contended UPDATE acquires its row lock. SQLite supplies milliseconds.
+    This helper does not acquire locks or establish transaction ownership.
+    """
+    dialect = conn.dialect.name
+    if dialect == "postgresql":
+        stamped = conn.scalar(func.clock_timestamp())
+        if type(stamped) is not datetime or stamped.tzinfo is None or stamped.utcoffset() is None:
+            raise AuditIntegrityError(f"Tier 1: PostgreSQL clock_timestamp returned {type(stamped).__name__}, expected an aware datetime")
+        return stamped.astimezone(UTC)
+    if dialect == "sqlite":
+        stamped = conn.scalar(func.strftime("%Y-%m-%d %H:%M:%f", "now", type_=DateTime()))
+        if type(stamped) is not datetime or stamped.tzinfo is not None:
+            raise AuditIntegrityError(f"Tier 1: SQLite strftime returned {type(stamped).__name__}, expected a naive UTC datetime")
+        return stamped.replace(tzinfo=UTC)
+    raise NotImplementedError(f"read_landscape_decision_time is not implemented for dialect {dialect!r}")
 
 
 def read_landscape_transaction_time(conn: Connection) -> datetime:
@@ -55,8 +48,8 @@ def read_landscape_transaction_time(conn: Connection) -> datetime:
 
     Bind the returned value into the predicates and columns of the decision.
     On PostgreSQL it is transaction-start time, irrespective of lock order;
-    it does not guarantee fresh remaining lease life at commit. The in-SQL
-    fence expression is the other place database time appears.
+    it is unsuitable for fresh lease decisions. Use the decision helper for
+    those after obtaining their required locks.
     """
     dialect = conn.dialect.name
     if dialect == "postgresql":
@@ -73,17 +66,13 @@ def read_landscape_transaction_time(conn: Connection) -> datetime:
 
 
 def landscape_clock_resolution(conn: Connection) -> timedelta:
-    """Return the smallest interval this dialect's Landscape clock can distinguish.
+    """Return the conservative precision shared by Landscape clock readers.
 
-    A deadline is only as precise as the clock that stamps it AND the clock
-    that later compares against it, and under ADR-047 both are this one.
-    SQLite's ``CURRENT_TIMESTAMP`` is whole-second, so a deadline stamped
-    ``database_now + ttl`` from an instant part-way through second S is
-    compared as though it had been stamped at S: it lapses at the next second
-    boundary and delivers ``floor(ttl) + 1 - fraction`` seconds of life, which
-    for any sub-second ``ttl`` does not depend on ``ttl`` at all and has a
-    floor of zero. PostgreSQL's transaction timestamp carries microseconds, so
-    the quantisation is immaterial there.
+    SQLite's retained transaction/classification reader uses whole seconds;
+    its fresh decision reader uses milliseconds. Preserve the coarser value
+    for existing duration alignment and comparison compatibility. PostgreSQL
+    readers both represent microseconds. This is not the fresh helper's
+    standalone sampling precision.
     """
     dialect = conn.dialect.name
     if dialect == "postgresql":

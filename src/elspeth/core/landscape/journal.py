@@ -52,6 +52,7 @@ from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.payload_store import IntegrityError, PayloadNotFoundError
 from elspeth.contracts.trust_boundary import trust_boundary
 from elspeth.core.landscape._helpers import now
+from elspeth.core.landscape.lease_deadlines import install_deadline_guard, rollback_failed_commit
 from elspeth.core.landscape.schema import sidecar_journal_outbox_table
 from elspeth.core.landscape.serialization import serialize_datetime
 from elspeth.core.payload_store import FilesystemPayloadStore
@@ -65,6 +66,20 @@ _JOURNAL_DIRECTORY_MODE = 0o700
 _JOURNAL_FILE_MODE = 0o600
 _NON_OWNER_PERMISSION_BITS = stat.S_IRWXG | stat.S_IRWXO
 _JOURNAL_OPEN_SECURITY_FLAGS = 0 if os.name == "nt" else os.O_CLOEXEC | os.O_NOFOLLOW
+
+
+def discard_journal_transaction(conn: Connection) -> None:
+    """Discard only owned journal bookkeeping after a known rollback.
+
+    The deadline commit guard also uses this on its explicit DBAPI rollback
+    path, where initiating a second SQLAlchemy transaction lifecycle would
+    interfere with the commit event currently being dispatched.
+    """
+    if _BUFFER_STACK_KEY in conn.info:
+        stack: list[list[JournalRecord]] = conn.info[_BUFFER_STACK_KEY]
+        stack.clear()
+        stack.append([])
+    conn.info.pop(_PENDING_BATCH_IDS_KEY, None)
 
 
 class _NamedSqlTable(Protocol):
@@ -206,6 +221,7 @@ class LandscapeJournal:
         event.listen(engine, "savepoint", self._after_savepoint)
         event.listen(engine, "rollback_savepoint", self._after_rollback_savepoint)
         event.listen(engine, "release_savepoint", self._after_release_savepoint)
+        install_deadline_guard(engine, after_journal=True)
 
     def _ensure_buffer_stack(self, conn: Connection) -> list[list[JournalRecord]]:
         """Return the buffer stack for a connection, creating if needed.
@@ -278,6 +294,14 @@ class LandscapeJournal:
 
     def _before_commit(self, conn: Connection) -> None:
         """Persist one journal batch inside the transaction being committed."""
+        try:
+            self._prepare_commit(conn)
+        except BaseException:
+            rollback_failed_commit(conn)
+            raise
+
+    def _prepare_commit(self, conn: Connection) -> None:
+        """Serialize the journal batch before the deadline guard observes time."""
         all_records = self._take_buffered_records(conn)
         if not all_records:
             return
@@ -317,12 +341,7 @@ class LandscapeJournal:
                 record.pop("_payload_ref_columns")
 
     def _after_rollback(self, conn: Connection) -> None:
-        if _BUFFER_STACK_KEY in conn.info:
-            stack: list[list[JournalRecord]] = conn.info[_BUFFER_STACK_KEY]
-            stack.clear()
-            stack.append([])  # Reset to single root buffer
-        if _PENDING_BATCH_IDS_KEY in conn.info:
-            conn.info.pop(_PENDING_BATCH_IDS_KEY)
+        discard_journal_transaction(conn)
 
     # After this many consecutive failures, disable until next success
     _MAX_CONSECUTIVE_FAILURES = 5
