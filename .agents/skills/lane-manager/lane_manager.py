@@ -27,6 +27,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -55,6 +56,9 @@ LIVE_WORKTREE = "alive-worktree-activity"
 DEAD = "dead"
 
 DEFAULT_WINDOW_SECONDS = 900
+# RED is a FAILED ASSERTION, visible in the output. Exit 1 alone proves nothing: pytest, unittest and a plain script all
+# report an uncaught exception inside a test as exit 1 too. Same rule and regex as prove-it's prove_it.py.
+RED_RE = re.compile(r"AssertionError|^E\s+assert\b|- assert\b|\bFailed: |^FAIL: ", re.MULTILINE)
 SCRIPT_PATH = Path(__file__).resolve()
 
 
@@ -303,8 +307,11 @@ def render_brief(run: Run, lane: LaneStatus) -> str:
         f"Lane: {lane.lane_id} — {lane.title} (ticket {lane.ticket}). Plan: {lane.plan_path}\n\n"
         f"Goal: {lane.description or lane.title}\n\n"
         "Rules:\n"
-        f"1. Write the FAILING TEST FIRST in {tests}. Run `{lane.expected.test_command}` and confirm it FAILS (exit 1, not a crash) "
-        "BEFORE touching the fix; if the fix adds a module, import it inside the test body. Commit the test on its own.\n"
+        f"1. Write the FAILING TEST FIRST in {tests}. Run `{lane.expected.test_command}` BEFORE touching the fix and confirm it "
+        "FAILS AT AN ASSERTION (AssertionError / FAIL in the output, exit 1) — not a crash: an uncaught exception also exits 1 "
+        "and proves nothing. If the fix adds a module or attribute, assert it exists first "
+        "(`assert importlib.util.find_spec('x') is not None`, `assert hasattr(obj, 'name')`) so the base run fails at the "
+        "assertion rather than at an import. Commit the test on its own.\n"
         f"2. Then fix the code in {files}; run the same test command until it exits 0; commit the fix.\n"
         f"3. Commit only to `{lane.branch}` inside {lane.worktree_path}. Never edit or commit in the main checkout.\n"
         f"4. Before each step, run the heartbeat so a crash can be told from slow work:\n   {heartbeat_cmd}\n"
@@ -596,13 +603,14 @@ def _temp_worktree(repo: Path, sha: str, prefix: str) -> Iterator[Path]:
 def _run_command(command: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{cwd / 'src'}:{cwd / 'elspeth-lints' / 'src'}"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"  # a stale .pyc (same source size, same second) would run the wrong tree's code
     try:
         proc = subprocess.run(shlex.split(command), cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return None, f"command not found: {exc}"
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
-    return proc.returncode, (proc.stdout + proc.stderr)[-2000:]
+    return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
 
 
 def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: int = 7200) -> Verification:
@@ -654,9 +662,12 @@ def verify(run: Run, lane_id: str, *, test_timeout: int = 1800, suite_timeout: i
                 elif red_rc is None:
                     reasons.append(f"red run could not complete: {red_tail}")
                 elif red_rc != 1:
+                    reasons.append(f"test crashed on the base rather than failing (exit {red_rc}): RED means a failed assertion (exit 1)")
+                elif not RED_RE.search(red_tail):
                     reasons.append(
-                        f"test crashed on the base rather than failing (exit {red_rc}): RED means a failed assertion (exit 1); "
-                        "import the fix's modules inside the test body so the assertion runs"
+                        "test crashed on the base rather than failing: exit 1 but no failed assertion in the output (an uncaught "
+                        "exception, e.g. importing a module the fix adds); assert what the fix adds exists "
+                        "(importlib.util.find_spec / hasattr) so the assertion is what fails"
                     )
     if not reasons and branch_sha is not None:
         with _temp_worktree(repo, base_sha, "lane-green-") as tree:

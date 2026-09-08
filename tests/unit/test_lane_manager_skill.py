@@ -62,7 +62,7 @@ def _git(repo: Path, *args: str) -> str:
 # full suite (runs every tests/test_*.py); tests/test_existing.py guards src/other.py.
 TEST_CMD = f"{sys.executable} tests/test_target.py"
 SUITE_CMD = f"{sys.executable} tests/run_all.py"
-GOOD_TEST = "import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 2' else 1)\n"
+GOOD_TEST = "assert open('src/target.py').read().strip() == 'VALUE = 2'\n"  # RED is a FAILED ASSERTION, visible in the output
 FAKE_TEST = "import sys\nsys.exit(0)\n"
 
 
@@ -183,6 +183,7 @@ def test_brief_tells_the_worker_where_to_write_and_to_return_one_line(repo: Path
     assert "heartbeat" in brief and "lane-01-t1" in brief
     assert "one line" in brief.lower()
     assert "failing test" in brief.lower() and "before" in brief.lower()
+    assert "assertion" in brief.lower() and "find_spec" in brief, "RED is a failed assertion; a module the fix adds is asserted present"
     assert TEST_CMD in brief
 
 
@@ -292,7 +293,7 @@ WORKER = textwrap.dedent(
         subprocess.run([sys.executable, script, "heartbeat", "--lanes-dir", lanes_dir, "--lane", lane_id], check=True)
     beat()
     open(f"{worktree}/tests/test_target.py", "w").write(
-        "import sys\\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 2' else 1)\\n")
+        "assert open('src/target.py').read().strip() == 'VALUE = 2'\\n")
     open(f"{worktree}/progress", "w").write("test written\\n")
     if mode == "crash":
         beat()
@@ -392,7 +393,7 @@ def test_lane_whose_test_fails_on_the_merged_tree_is_not_verified_even_if_the_su
     """The GREEN gate stands on its own: a suite that does not select the lane's test must not cover for it (reviewer M11)."""
     run = _init(repo, suite_command=f"{sys.executable} tests/test_existing.py")
     lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
-    _worker_commits(lane.worktree_path, test_body="import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 3' else 1)\n")
+    _worker_commits(lane.worktree_path, test_body="assert open('src/target.py').read().strip() == 'VALUE = 3'\n")
     result = lm.verify(run, "lane-01-t1")
     assert result.red_exit_code == 1
     assert result.green_exit_code == 1
@@ -427,6 +428,57 @@ def test_lane_whose_test_crashes_on_the_base_is_not_verified(repo: Path) -> None
     assert result.verified is False
     assert any("crash" in r for r in result.reasons), result.reasons
     assert result.green_exit_code is None
+
+
+EXIT_1_CRASH_SHAPES = {
+    "plain-script": ("import helper  # noqa: F401\n", f"{sys.executable} tests/test_target.py"),
+    "pytest-in-body-import": (
+        "def test_nothing():\n    import helper  # noqa: F401\n",
+        f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider",
+    ),
+    "unittest": (
+        "import unittest\n\nimport helper  # noqa: F401\n\n\nclass T(unittest.TestCase):\n    def test_nothing(self):\n        pass\n",
+        f"{sys.executable} -m unittest tests/test_target.py",
+    ),
+}
+
+
+def _lane_with_new_module(repo: Path, test_body: str, command: str) -> tuple[object, object]:
+    run = _init(repo, _ticket("t1", files=["src/target.py", "src/helper.py"], test_command=command))
+    lane = lm.dispatch(run, "lane-01-t1", agent_name="a")
+    (lane.worktree_path / "tests" / "test_target.py").write_text(test_body, encoding="utf-8")
+    _git(lane.worktree_path, "add", "tests/test_target.py")
+    _git(lane.worktree_path, "commit", "-q", "-m", "test: imports the new helper")
+    (lane.worktree_path / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (lane.worktree_path / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _git(lane.worktree_path, "add", "src")
+    _git(lane.worktree_path, "commit", "-q", "-m", "fix: adds helper")
+    return run, lane
+
+
+@pytest.mark.parametrize("shape", sorted(EXIT_1_CRASH_SHAPES))
+def test_lane_whose_test_dies_with_exit_1_but_no_failed_assertion_is_not_verified(repo: Path, shape: str) -> None:
+    """Every common runner reports an uncaught exception inside a test as exit 1 (round two): the exit code alone cannot
+    tell a failed assertion from a crash. RED is a failed assertion VISIBLE in the output."""
+    body, command = EXIT_1_CRASH_SHAPES[shape]
+    run, _ = _lane_with_new_module(repo, body, command)
+    result = lm.verify(run, "lane-01-t1")
+    assert result.red_exit_code == 1, (result.red_exit_code, result.red_output_tail)
+    assert result.verified is False
+    assert any("crash" in r and "assertion" in r for r in result.reasons), result.reasons
+    assert result.green_exit_code is None
+
+
+def test_lane_whose_test_asserts_the_new_module_exists_is_verified(repo: Path) -> None:
+    """The honest shape for a fix that adds a module: assert its presence, so the base run fails at an assertion."""
+    body = (
+        "import importlib.util\n\n\ndef test_helper_exists():\n    assert importlib.util.find_spec('helper') is not None\n"
+        "    import helper\n\n    assert helper.HELPED\n"
+    )
+    run, _ = _lane_with_new_module(repo, body, f"{sys.executable} -m pytest tests/test_target.py -q -p no:cacheprovider")
+    result = lm.verify(run, "lane-01-t1")
+    assert result.verified is True, result.reasons
+    assert result.red_exit_code == 1 and result.green_exit_code == 0 and result.suite_exit_code == 0
 
 
 def test_lane_that_never_wrote_a_test_is_not_verified(repo: Path) -> None:
@@ -504,7 +556,7 @@ def test_merge_is_serial_the_second_lane_needs_a_verification_against_the_new_ba
     b = lm.dispatch(run, "lane-02-t2", agent_name="b")
     _worker_commits(a.worktree_path)
     (b.worktree_path / "tests" / "test_other.py").write_text(
-        "import sys\nsys.exit(0 if open('src/other.py').read().strip() == 'OTHER = 2' else 1)\n", encoding="utf-8"
+        "assert open('src/other.py').read().strip() == 'OTHER = 2'\n", encoding="utf-8"
     )
     _git(b.worktree_path, "add", "tests")
     _git(b.worktree_path, "commit", "-q", "-m", "test: other (red)")

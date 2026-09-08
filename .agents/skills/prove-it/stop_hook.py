@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """Claude Code Stop hook: refuse to let a session that did work stop without a prove-it PASS.
 
-Reads the hook payload on stdin (session_id, transcript_path, cwd), scans the session's
-transcript for WORK SIGNALS (Edit/Write/NotebookEdit tool uses; Bash commands that write files
-or commit/merge), and compares the newest one against the session's newest prove-it release:
-a ``PASS`` verdict or an explicit, reasoned withdrawal. Work newer than the last release blocks
-the stop with a reason that names the exact next command. Other sessions' claims are invisible.
+Reads the hook payload on stdin (session_id, transcript_path, cwd), scans the session's transcript — and the
+transcripts of every subagent it spawned, under ``<transcript stem>/subagents/agent-*.jsonl`` — for WORK SIGNALS,
+and compares the newest one against the session's newest prove-it release: a ``PASS`` verdict or an explicit,
+reasoned withdrawal. Work newer than the last release blocks the stop with a reason that names the exact next
+command. Other sessions' claims are invisible.
 
-After MAX_BLOCKS consecutive blocks for the same work the hook releases the session with a loud
-systemMessage — a gate that can loop forever is a denial of service, not a control — and says
-plainly that the work is NOT verified.
+A work signal is anything that changes files or history: the editing tools; ``Workflow``; an MCP tool whose name
+carries a writing verb; a Bash command that commits, merges, pushes, resets or otherwise rewrites git state, copies,
+moves, removes or rewrites files, redirects output to a path, or runs inline Python that writes. Redirects to
+``/dev/null``, ``/tmp``, a scratchpad, a ``.log`` file, or a shell variable are treated as logs, not work — that
+narrow set is the hook's deliberate fail-open, listed here so it can be judged.
+
+The gate is on what the user is about to be told: the final assistant text is split into sentences and enforcement
+happens only when some sentence claims completion ("done", "fixed", "green", "merged", ...) WITHOUT a negation in
+that same sentence. A later sentence cannot take back an earlier claim; an honest "not yet green" is not a claim.
+
+After MAX_BLOCKS consecutive blocks for the same work the hook releases the session with a loud systemMessage — a
+gate that can loop forever is a denial of service, not a control — and says plainly that the work is NOT verified.
 
 Emits JSON on stdout: ``{"decision": "block", "reason": ...}`` or ``{}``/``{"systemMessage": ...}``.
 Never exits non-zero on its own errors: a broken hook must not trap every session.
@@ -27,21 +36,47 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-EDIT_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
-WORK_RE = re.compile(
-    r"\bgit\s+(commit|merge|cherry-pick|rebase|am|apply|revert)\b|lane_manager\.py\s+merge\b|\bcat\s*>|\btee\b|\bsed\s+-i\b"
-    r"|>\s*[\w./-]+\.(py|md|json|toml|yaml|yml|ts|tsx|js|sh)\b"
+WORK_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit", "Workflow"}  # Workflow: orchestration whose agents edit
+MCP_WRITE_VERBS = {
+    "create", "update", "add", "remove", "delete", "set", "write", "stage", "annotate", "promote", "dismiss", "close",
+    "reopen", "start", "claim", "release", "register", "import", "ingest", "trigger", "patch", "upsert", "splice",
+    "save", "link", "unlink", "resolve", "supersede", "carry", "rekey", "restart", "reload", "undo", "archive",
+    "compact", "checkpoint", "move", "retarget", "enable", "disable", "cancel", "clear", "batch",
+}  # fmt: skip
+GIT_WRITE_RE = re.compile(
+    r"\bgit\s+(?:-C\s+\S+\s+|-c\s+\S+\s+)*"
+    r"(commit|merge|cherry-pick|rebase|am|apply|revert|push|reset|clean|restore|checkout|switch|rm|mv|add|tag"
+    r"|branch\s+-[dDmM]|worktree\s+(?:add|remove|prune|move)|update-ref|filter-branch|notes)\b"
 )
+GH_WRITE_RE = re.compile(
+    r"\bgh\s+(?:pr|issue|release|repo|api)\b.*?\b(merge|create|close|edit|ready|delete|comment|reopen"
+    r"|-X\s+(?:POST|PUT|PATCH|DELETE)|--method[= ](?:POST|PUT|PATCH|DELETE))\b"
+)
+FILE_WRITE_RE = re.compile(
+    r"(?:^|[;&|(\s])(?:sudo\s+)?(cp|mv|rm|rmdir|mkdir|touch|ln|chmod|chown|install|patch|rsync|truncate|tee|shred|dd)\s"
+)
+INPLACE_EDIT_RE = re.compile(r"\b(?:sed|perl)\s+(?:\S+\s+)*?-[a-zA-Z]*i\b")
+PY_INLINE_RE = re.compile(r"\bpython[0-9.]*\s+(?:-c\b|-\s*<<)")
+PY_WRITE_RE = re.compile(
+    r"write_text|write_bytes|\.write\(|open\([^)]*['\"][wax]|os\.(?:remove|rename|replace|unlink|makedirs|mkdir|rmdir)\b"
+    r"|shutil\.|Path\([^)]*\)\.(?:unlink|mkdir|rename|touch|replace)"
+)
+REDIRECT_RE = re.compile(r"(?:(?<![0-9<>])>{1,2}|&>{1,2})\s*(?!&)(\S+)")
+LOG_TARGET_RE = re.compile(r"""^["']?(?:\$|/dev/null|/tmp/|.*scratchpad|.*\.log["']?$)""")
+LANE_MERGE_RE = re.compile(r"lane_manager\.py\s+merge\b")
 SELF_RE = re.compile(r"prove_it\.py|stop_hook\.py")
+
+SENTENCE_RE = re.compile(r"[.!?\n]+")
 NEGATED_RE = re.compile(
-    r"\b(not|isn't|is not|are not|aren't|never|cannot|can't|could not|couldn't|un)\s*-?\s*"
-    r"(done|complete[d]?|fixed|finished|verified|resolved|working|passing|green|merged|committed|implemented|landed|substantiated)\b"
-    r"|\bincomplete\b|\bunverified\b|\bunproven\b|\bstill fails?\b|\bgiving up\b",
+    r"\b(?:not|never|cannot)\b|n't\b"
+    r"|\bun(?:done|fixed|finished|verified|proven|tested|merged|resolved|committed|changed|touched|able)\b"
+    r"|\bincomplete\b|\bstill\s+(?:fails?|failing|broken|red)\b|\bgiving up\b",
     re.IGNORECASE,
 )
 COMPLETION_RE = re.compile(
-    r"\b(complete[ds]?|done|fixed|finished|pass(es|ed|ing)?|green|landed|merged|committed|resolved|implemented|verified|works|shipped"
-    r"|ready (for|to) (review|merge|ship)|no longer reproduces|all set)\b",
+    r"\b(complete[ds]?|done|fixed|finished|pass(es|ed|ing)?|green|landed|merged|committed|resolved|implemented|verified|shipped"
+    r"|ready (for|to) (review|merge|ship)|no longer reproduces|all set)\b"
+    r"|(?<!how )\b(?:it|that|this|everything|all|now)\s+works\b|\bworks\s+(?:now|again|as expected)\b",
     re.IGNORECASE,
 )
 
@@ -62,14 +97,35 @@ def _parse_ts(text: str) -> datetime | None:
         return None
 
 
-def scan_transcript(transcript: Path) -> tuple[datetime | None, str]:
-    """(newest work-signal timestamp, the assistant's final text) — (None, "") if the transcript is unreadable or quiet.
+def bash_is_work(command: str) -> bool:
+    """Does this shell command change files or git history? Fails toward YES; the log-target set is the only fail-open."""
+    if GIT_WRITE_RE.search(command) or GH_WRITE_RE.search(command) or LANE_MERGE_RE.search(command):
+        return True
+    if SELF_RE.search(command):
+        return False  # the verifier's own commands (claim / verify / review / withdraw) are not work
+    if FILE_WRITE_RE.search(command) or INPLACE_EDIT_RE.search(command):
+        return True
+    if PY_INLINE_RE.search(command) and PY_WRITE_RE.search(command):
+        return True
+    return any(not LOG_TARGET_RE.match(target) for target in REDIRECT_RE.findall(command))
 
-    A work signal is a tool use that changed files or history. The final text is what the user is about to read;
-    the hook only enforces when it reads as a completion claim, so a session can yield to wait without claiming.
-    """
-    if not transcript.is_file():
-        return None, ""
+
+def tool_is_work(name: str, tool_input: dict[str, object]) -> bool:
+    if name in WORK_TOOLS:
+        return True
+    if name == "Bash":
+        return bash_is_work(str(tool_input.get("command", "")))
+    if name.startswith("mcp__"):
+        return bool(set(name.split("__")[-1].split("_")) & MCP_WRITE_VERBS)
+    return False
+
+
+def is_completion_claim(text: str) -> bool:
+    """True when some sentence claims completion and is not negated within that same sentence."""
+    return any(COMPLETION_RE.search(s) and not NEGATED_RE.search(s) for s in SENTENCE_RE.split(text))
+
+
+def _scan_lines(transcript: Path) -> tuple[datetime | None, str]:
     latest: datetime | None = None
     last_text = ""
     with transcript.open(encoding="utf-8", errors="replace") as handle:
@@ -97,14 +153,25 @@ def scan_transcript(transcript: Path) -> tuple[datetime | None, str]:
             for block in content:
                 if type(block) is not dict or block.get("type") != "tool_use":
                     continue
-                name = str(block.get("name", ""))
                 tool_input = block.get("input") if type(block.get("input")) is dict else {}
-                is_work = name in EDIT_TOOLS
-                if name == "Bash":
-                    command = str(tool_input.get("command", ""))
-                    is_work = bool(WORK_RE.search(command)) and not SELF_RE.search(command)
-                if is_work and (latest is None or when > latest):
+                if tool_is_work(str(block.get("name", "")), tool_input) and (latest is None or when > latest):
                     latest = when
+    return latest, last_text
+
+
+def scan_transcript(transcript: Path) -> tuple[datetime | None, str]:
+    """(newest work-signal timestamp across the session and its subagents, the session's final assistant text).
+
+    (None, "") if the transcript is unreadable or quiet. Only the parent's final text is judged: a subagent's report
+    is addressed to the session, not to the user.
+    """
+    if not transcript.is_file():
+        return None, ""
+    latest, last_text = _scan_lines(transcript)
+    for sub in sorted((transcript.parent / transcript.stem / "subagents").glob("agent-*.jsonl")):
+        sub_latest, _ = _scan_lines(sub)
+        if sub_latest is not None and (latest is None or sub_latest > latest):
+            latest = sub_latest
     return latest, last_text
 
 
@@ -140,7 +207,7 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
     work, last_text = scan_transcript(Path(str(payload.get("transcript_path") or "")))
     if work is None or not session_id:
         return {}
-    if not COMPLETION_RE.search(last_text) or NEGATED_RE.search(last_text):
+    if not is_completion_claim(last_text):
         return {}  # the user is not being told anything is complete (status, or an honest 'not done'); nothing to gate
     script = f"python {HERE / 'prove_it.py'}"
     claims = pi.claims_for_session(repo, session_id)
@@ -167,7 +234,8 @@ def decide(payload: dict[str, object]) -> dict[str, object]:
             "--assert 'mutation: <test cmd> :: <fix paths> [@ <base>]' ...`, "
             f"then `{script} verify --claim <id>`, then spawn the adversarial reviewer and record "
             f"`{script} review --claim <id> --verdict PASS|FAIL --findings <file>`. "
-            f"To stop without claiming success: `{script} withdraw --claim <id> --reason '<what could not be substantiated>'`."
+            f"To stop without claiming success: `{script} withdraw --claim <id> --reason '<what could not be substantiated>'`, "
+            f"or with no claim at all `{script} withdraw --reason '<why this work is not being claimed>'`."
         )
     else:
         claim = open_claims[-1]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,7 +56,7 @@ def _git(repo: Path, *args: str) -> str:
 
 
 TEST_CMD = f"{sys.executable} tests/test_target.py"
-GOOD_TEST = "import sys\nsys.exit(0 if open('src/target.py').read().strip() == 'VALUE = 2' else 1)\n"
+GOOD_TEST = "assert open('src/target.py').read().strip() == 'VALUE = 2'\n"  # RED is a FAILED ASSERTION, visible in the output
 
 
 @pytest.fixture
@@ -231,9 +232,7 @@ def test_mutation_of_a_committed_fix_reverts_in_a_fresh_worktree_not_the_checkou
 def test_mutation_of_a_committed_new_file_treats_absence_at_base_as_the_pre_fix_state(repo: Path) -> None:
     """A fix that ADDS a module cannot be checked out from the base; reverting it means deleting it."""
     (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
-    (repo / "tests" / "test_helper.py").write_text(
-        "import sys, os\nsys.exit(0 if os.path.exists('src/helper.py') else 1)\n", encoding="utf-8"
-    )
+    (repo / "tests" / "test_helper.py").write_text("import os\n\nassert os.path.exists('src/helper.py')\n", encoding="utf-8")
     _git(repo, "add", ".")
     _git(repo, "commit", "-q", "-m", "feat: helper (new file)")
     claim = _claim(repo, f"mutation: {sys.executable} tests/test_helper.py :: src/helper.py @ main")
@@ -244,18 +243,108 @@ def test_mutation_of_a_committed_new_file_treats_absence_at_base_as_the_pre_fix_
 
 
 def test_mutation_command_that_cannot_run_is_unproven_not_red(repo: Path) -> None:
-    """A non-zero exit is not evidence of RED unless the same command exits 0 on the unmodified tree (reviewer finding)."""
+    """A failing exit is not RED unless the same command exits 0 on the unmodified tree — even when it fails at an
+    assertion: an always-red `assert False` must be caught by the PRECONDITION, not by the exit-code reading (round two)."""
     _commit_fix(repo)
+    always_red = f"{sys.executable} -c 'assert False, \"always red\"'"
+    claim = _claim(repo, f"mutation: {always_red} :: src/target.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False
+    assert "does not pass on the unmodified" in result.evidence and "exit 1" in result.evidence, result.evidence
     claim = _claim(repo, f"mutation: {sys.executable} -c 'import sys; sys.exit(9)' :: src/target.py @ main")
-    verdict = pi.verify_claim(repo, claim.claim_id)
-    assert verdict.results[0].proven is False
-    assert "unmodified" in verdict.results[0].evidence and "exit 9" in verdict.results[0].evidence
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "does not pass on the unmodified" in result.evidence and "exit 9" in result.evidence
     # working-directory mode has the same precondition
     (repo / "src" / "target.py").write_text("VALUE = 2  # wip\n", encoding="utf-8")
-    claim = _claim(repo, f"mutation: {sys.executable} -c 'import sys; sys.exit(5)' :: src/target.py")
-    verdict = pi.verify_claim(repo, claim.claim_id)
-    assert verdict.results[0].proven is False and "unmodified" in verdict.results[0].evidence
+    claim = _claim(repo, f"mutation: {always_red} :: src/target.py")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "does not pass on the unmodified" in result.evidence, result.evidence
     assert (repo / "src" / "target.py").read_text(encoding="utf-8") == "VALUE = 2  # wip\n"
+
+
+def test_mutation_precondition_is_measured_in_the_fresh_tree_not_the_checkout(repo: Path) -> None:
+    """The checkout passes only because of an uncommitted edit OUTSIDE the fix paths; the tip does not. Unproven."""
+    _commit_fix(repo)
+    (repo / "tests" / "test_target.py").write_text("assert open('src/target.py').read().strip() == 'VALUE = 3'\n", encoding="utf-8")
+    _git(repo, "commit", "-q", "-am", "test: wants 3 (red at the tip)")
+    (repo / "tests" / "test_target.py").write_text(GOOD_TEST, encoding="utf-8")  # uncommitted: the checkout is green
+    assert subprocess.run(shlex.split(TEST_CMD), cwd=repo, check=False).returncode == 0
+    claim = _claim(repo, f"mutation: {TEST_CMD} :: src/target.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False
+    assert "does not pass on the unmodified tree" in result.evidence, result.evidence
+
+
+EXIT_1_CRASH_SHAPES = {
+    "plain-script": ("import helper  # noqa: F401\n", f"{sys.executable} tests/test_helper.py"),
+    "pytest-in-body-import": (
+        "def test_nothing():\n    import helper  # noqa: F401\n",
+        f"{sys.executable} -m pytest tests/test_helper.py -q -p no:cacheprovider",
+    ),
+    "unittest": (
+        "import unittest\n\nimport helper  # noqa: F401\n\n\nclass T(unittest.TestCase):\n    def test_nothing(self):\n        pass\n",
+        f"{sys.executable} -m unittest tests/test_helper.py",
+    ),
+}
+
+
+@pytest.mark.parametrize("shape", sorted(EXIT_1_CRASH_SHAPES))
+def test_mutation_whose_reverted_run_dies_with_exit_1_but_no_failed_assertion_is_unproven(repo: Path, shape: str) -> None:
+    """Every common runner reports an uncaught exception as exit 1 (round two). RED is a FAILED ASSERTION visible in the
+    output; a test that merely imports what the fix adds proves nothing about the fix."""
+    body, command = EXIT_1_CRASH_SHAPES[shape]
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(body, encoding="utf-8")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + a test that asserts nothing")
+    claim = _claim(repo, f"mutation: {command} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False, result.evidence
+    assert "exit 1" in result.evidence and "assertion" in result.evidence.lower(), result.evidence
+
+
+def test_mutation_whose_test_asserts_the_fix_exists_is_proven(repo: Path) -> None:
+    """The honest shape for a fix that adds a module: assert its presence, so the base run fails at an assertion."""
+    (repo / "src" / "helper.py").write_text("HELPED = True\n", encoding="utf-8")
+    (repo / "tests" / "test_helper.py").write_text(
+        "import importlib.util\n\n\ndef test_helper_exists():\n    assert importlib.util.find_spec('helper') is not None\n"
+        "    import helper\n\n    assert helper.HELPED\n",
+        encoding="utf-8",
+    )
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "feat: helper + a test that asserts it exists")
+    command = f"{sys.executable} -m pytest tests/test_helper.py -q -p no:cacheprovider"
+    claim = _claim(repo, f"mutation: {command} :: src/helper.py @ main")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is True, result.evidence
+
+
+def test_mutation_runs_never_write_bytecode_so_a_same_size_revert_cannot_reuse_the_fix(repo: Path) -> None:
+    """Python trusts a .pyc by source mtime (1 s) + size; a same-size revert in the same second would run the FIX's
+    bytecode and read 'did not go red' (round two, nondeterministic). Every run prove-it launches refuses to write bytecode."""
+    (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")  # same size as the base's VALUE = 1
+    command = f"{sys.executable} -c 'import sys; assert sys.dont_write_bytecode; import target; assert target.VALUE == 2'"
+    claim = _claim(repo, f"mutation: {command} :: src/target.py")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is True, result.evidence
+    assert not (repo / "src" / "__pycache__").exists()
+
+
+def test_mutation_refuses_a_symlink_path_rather_than_writing_through_it(repo: Path) -> None:
+    """HEAD's blob for a symlink is the link TARGET string; writing it through the link corrupts the file it points at,
+    and that corruption is what would make the test 'go red' (round two)."""
+    (repo / "src" / "real.py").write_text("REAL = 1\n", encoding="utf-8")
+    os.symlink("real.py", repo / "src" / "link.py")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "link.py -> real.py")
+    (repo / "src" / "link.py").unlink()
+    os.symlink("other.py", repo / "src" / "link.py")  # uncommitted: now points at other.py
+    command = f"{sys.executable} -c \"assert open('src/other.py').read() == 'OTHER = 1\\n'\""
+    claim = _claim(repo, f"mutation: {command} :: src/link.py")
+    result = pi.verify_claim(repo, claim.claim_id).results[0]
+    assert result.proven is False and "symlink" in result.evidence, result.evidence
+    assert (repo / "src" / "other.py").read_text(encoding="utf-8") == "OTHER = 1\n"
+    assert os.readlink(repo / "src" / "link.py") == "other.py"
 
 
 def test_mutation_that_crashes_instead_of_failing_is_unproven(repo: Path) -> None:
@@ -351,6 +440,9 @@ def test_cli_round_trip(repo: Path, tmp_path: Path) -> None:
     assert status.returncode == 0 and json.loads(status.stdout)["verdict"] == pi.VERDICT_PASS
     withdrawn = run("withdraw", "--claim", claim_id, "--reason", "changed my mind")
     assert withdrawn.returncode == 0
+    claimless = run("withdraw", "--reason", "not claiming the rest")  # the form the hook names for a session with no claim
+    assert claimless.returncode == 0, claimless.stderr
+    assert json.loads(claimless.stdout)["withdrawn"]["reason"] == "not claiming the rest"
 
 
 # ----------------------------------------------------------------- the Stop hook
@@ -484,7 +576,7 @@ def test_hook_blocks_until_a_pass_verdict_newer_than_the_last_work(repo: Path, t
     assert _hook(repo, transcript)[1]["decision"] == "block"
 
 
-def test_hook_releases_a_withdrawn_claim_and_ignores_other_sessions(repo: Path, tmp_path: Path) -> None:
+def test_hook_releases_a_withdrawn_claim_and_a_claim_less_withdrawal(repo: Path, tmp_path: Path) -> None:
     transcript = tmp_path / "t.jsonl"
     _transcript(transcript, [(_iso(-60), "Edit", {"file_path": "src/target.py"})])
     claim = _claim(repo, "file: missing.txt")
@@ -494,16 +586,6 @@ def test_hook_releases_a_withdrawn_claim_and_ignores_other_sessions(repo: Path, 
     code, out, _ = _hook(repo, transcript)
     assert code == 0 and out.get("decision") != "block"
     assert "withdrawn" in out.get("systemMessage", "").lower()
-    # a different session's open, failing claim never blocks this one: own PASS, foreign FAIL, work + completion text
-    sha = _commit_fix(repo)
-    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})])
-    mine = _claim(repo, f"commit: {sha} on work")
-    pi.verify_claim(repo, mine.claim_id)
-    pi.record_review(repo, mine.claim_id, verdict="PASS", findings="ok")
-    other = _claim(repo, "file: missing.txt", session=OTHER_SESSION)
-    pi.verify_claim(repo, other.claim_id)
-    assert pi.latest_verdict(repo, session_id=OTHER_SESSION).verdict == pi.VERDICT_FAIL
-    assert _hook(repo, transcript)[1].get("decision") != "block"
     # a claim-less withdrawal releases too
     time.sleep(1.1)
     _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"}), (_iso(0), "Write", {"file_path": "src/new.py"})])
@@ -512,6 +594,133 @@ def test_hook_releases_a_withdrawn_claim_and_ignores_other_sessions(repo: Path, 
     pi.withdraw_session(repo, session_id=SESSION, reason="new.py is a stub; not claiming it")
     code, out, _ = _hook(repo, transcript)
     assert code == 0 and out.get("decision") != "block" and "withdrawn" in out.get("systemMessage", "").lower()
+
+
+def test_hook_ignores_other_sessions_claims_in_both_directions(repo: Path, tmp_path: Path) -> None:
+    """A foreign PASS must not release this session; a foreign FAIL newer than this session's PASS must not block it.
+    Both halves fail if the session filter is dropped (round two: the earlier version of this test was vacuous)."""
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})])
+    sha = _commit_fix(repo)
+    foreign_pass = _claim(repo, f"commit: {sha} on work", session=OTHER_SESSION)
+    pi.verify_claim(repo, foreign_pass.claim_id)
+    pi.record_review(repo, foreign_pass.claim_id, verdict="PASS", findings="ok")
+    assert pi.latest_verdict(repo, session_id=OTHER_SESSION).verdict == pi.VERDICT_PASS
+    assert _hook(repo, transcript)[1].get("decision") == "block", "another session's PASS is not this session's"
+    mine = _claim(repo, f"commit: {sha} on work")
+    pi.verify_claim(repo, mine.claim_id)
+    pi.record_review(repo, mine.claim_id, verdict="PASS", findings="ok")
+    time.sleep(1.1)
+    foreign_fail = _claim(repo, "file: missing.txt", session=OTHER_SESSION)
+    pi.verify_claim(repo, foreign_fail.claim_id)
+    assert pi.latest_verdict(repo, session_id=OTHER_SESSION).verdict == pi.VERDICT_FAIL
+    code, out, _ = _hook(repo, transcript)
+    assert code == 0 and out.get("decision") != "block", "a newer FAIL from another session does not block this one"
+
+
+def test_hook_block_reason_names_the_claim_less_withdrawal(repo: Path, tmp_path: Path) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})])
+    reason = str(_hook(repo, transcript)[1]["reason"])
+    assert "withdraw --reason" in reason and "--claim" in reason, reason
+
+
+SMUGGLED_CLAIMS = [  # a completion claim in ONE sentence is gated whatever a later sentence takes back (round two)
+    "Done and merged. The docs are incomplete but that is tracked separately.",
+    "Fixed, committed and pushed. Nothing is left unverified.",
+    "All green, landed on main. There is nothing undone here.",
+    "Implemented and passing. Note: one flaky test is not fixed in this PR.",
+    "Merged. I never touched the frontend.",
+]
+HONEST_REPORTS = [  # each relies on exactly ONE negation alternative, in the same sentence as the completion word
+    "The suite is not yet green.",
+    "This isn't fully fixed.",
+    "I never got this passing.",
+    "I cannot call this done.",
+    "Merged, but the docs remain undone.",
+    "Implemented, but incomplete.",
+    "Landed, but the e2e test still fails.",
+    "Giving up on this; the fix is half done.",
+    "The pipeline works by reading the manifest; I have not changed anything yet.",
+    "Here is how it works: the resolver reads the manifest.",
+]
+
+
+@pytest.mark.parametrize("text", SMUGGLED_CLAIMS)
+def test_hook_gates_a_claim_that_is_negated_only_in_another_sentence(repo: Path, tmp_path: Path, text: str) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=text)
+    assert _hook(repo, transcript)[1].get("decision") == "block", text
+
+
+@pytest.mark.parametrize("text", HONEST_REPORTS)
+def test_hook_releases_an_honest_report_negated_in_the_claiming_sentence(repo: Path, tmp_path: Path, text: str) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Edit", {"file_path": "src/target.py"})], final=text)
+    assert _hook(repo, transcript)[1].get("decision") != "block", text
+
+
+WORK_COMMANDS = {  # every channel that changes files or history (round two: the list was Edit/Write + git commit + a few)
+    "cat-heredoc": "cat > src/target.py <<'EOF'\nVALUE = 2\nEOF",
+    "git-commit": "git commit -am 'fix'",
+    "cp": "cp scratch/fixed.py src/target.py",
+    "mv": "mv src/old.py src/new.py",
+    "rm": "rm -rf build/",
+    "redirect-txt": "echo notes > notes.txt",
+    "heredoc-dockerfile": "cat <<'EOF' > Dockerfile\nFROM python\nEOF",
+    "python-c-write": "python -c \"open('src/target.py','w').write('VALUE = 2')\"",
+    "python-write-text": "python - <<'EOF'\nfrom pathlib import Path\nPath('x.py').write_text('1')\nEOF",
+    "git-push": "git push origin HEAD",
+    "gh-pr-merge": "gh pr merge 42 --squash",
+    "git-reset-hard": "git reset --hard && git clean -fd",
+    "sed-i": "sed -i 's/a/b/' src/target.py",
+    "tee": "printf x | tee src/target.py",
+    "lane-manager-merge": "python .agents/skills/lane-manager/lane_manager.py merge --lane x",
+}
+NOT_WORK_COMMANDS = {
+    "ls": "ls -la src/",
+    "cat": "cat src/target.py",
+    "grep": "grep -rn VALUE src/",
+    "git-status": "git status --short && git diff --stat",
+    "git-log": "git log --oneline -5",
+    "pytest-plain": "pytest tests/unit/test_x.py -n 0 -q",
+    "pytest-to-log-variable": 'pytest tests/ > "$log" 2>&1; echo exit=$?',
+    "redirect-devnull": "make lint > /dev/null 2>&1",
+    "redirect-tmp": "pytest tests/ > /tmp/run.log 2>&1",
+    "python-c-print": "python -c 'print(1+1)'",
+    "verifier": "python .agents/skills/prove-it/prove_it.py verify --claim x",
+}
+
+
+@pytest.mark.parametrize("name", sorted(WORK_COMMANDS))
+def test_hook_counts_every_write_channel_as_work(repo: Path, tmp_path: Path, name: str) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Bash", {"command": WORK_COMMANDS[name]})])
+    assert _hook(repo, transcript)[1].get("decision") == "block", name
+
+
+@pytest.mark.parametrize("name", sorted(NOT_WORK_COMMANDS))
+def test_hook_does_not_count_reads_tests_and_scratch_logs_as_work(repo: Path, tmp_path: Path, name: str) -> None:
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "Bash", {"command": NOT_WORK_COMMANDS[name]})])
+    assert _hook(repo, transcript)[1].get("decision") != "block", name
+
+
+def test_hook_counts_mcp_writers_workflows_and_delegated_agents_as_work(repo: Path, tmp_path: Path) -> None:
+    """A parent that fans work out records only an Agent tool use; the edits live in <session>/subagents/agent-*.jsonl."""
+    transcript = tmp_path / "t.jsonl"
+    _transcript(transcript, [(_iso(-30), "mcp__elspeth-judge__stage_annotate", {"finding": "x"})])
+    assert _hook(repo, transcript)[1].get("decision") == "block"
+    _transcript(transcript, [(_iso(-30), "mcp__loomweave__entity_find", {"q": "x"}), (_iso(-29), "Read", {"file_path": "x"})])
+    assert _hook(repo, transcript)[1].get("decision") != "block"
+    _transcript(transcript, [(_iso(-30), "Workflow", {"script": "..."})])
+    assert _hook(repo, transcript)[1].get("decision") == "block"
+    _transcript(transcript, [(_iso(-30), "Agent", {"prompt": "look around", "subagent_type": "Explore"})])
+    assert _hook(repo, transcript)[1].get("decision") != "block", "an Agent use alone is not work: Explore agents edit nothing"
+    sub = tmp_path / "t" / "subagents" / "agent-abc123.jsonl"
+    sub.parent.mkdir(parents=True)
+    _transcript(sub, [(_iso(-20), "Edit", {"file_path": "src/target.py"})], final="Edited src/target.py as asked.")
+    assert _hook(repo, transcript)[1].get("decision") == "block", "the subagent's Edit is this session's work"
 
 
 def test_hook_caps_repeated_blocks_so_a_session_cannot_loop_forever(repo: Path, tmp_path: Path) -> None:
@@ -569,6 +778,9 @@ def test_skill_doc_names_every_step_and_the_refusal_rule() -> None:
         "review",
         "Stop hook",
         "could not be substantiated",
+        "AssertionError",
+        "find_spec",
+        "subagents",
         "test:",
         "commit:",
         "mutation:",

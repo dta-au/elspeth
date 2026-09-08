@@ -31,6 +31,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -49,6 +50,10 @@ REVIEW_NONE = "none"
 KINDS = ("test", "commit", "mutation", "file", "exit0", "nonzero")
 MAX_BLOCKS = 5  # the Stop hook releases a session after this many blocks so it cannot loop forever
 SESSION_ENV = ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+# RED is a FAILED ASSERTION, visible in the output. Exit 1 alone proves nothing: pytest, unittest and a plain script all
+# report an uncaught exception inside a test as exit 1 too. Keyed on the property "an assertion failed" (pytest's
+# `assert` / `Failed:` lines, unittest's `FAIL:`, the AssertionError itself), never on a list of crash exception names.
+RED_RE = re.compile(r"AssertionError|^E\s+assert\b|- assert\b|\bFailed: |^FAIL: ", re.MULTILINE)
 
 
 def now() -> datetime:
@@ -291,13 +296,16 @@ def _fresh_worktree(repo: Path, ref: str) -> Iterator[Path]:
 def _run(command: str, cwd: Path, timeout: int) -> tuple[int | None, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = f"{cwd / 'src'}:{cwd / 'elspeth-lints' / 'src'}"
+    # Python trusts a .pyc by source mtime (1 s granularity) + size: the pre-revert run would compile the FIX, and a
+    # same-size revert in the same second would then execute the fix's bytecode and read as "did not go red".
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
     try:
         proc = subprocess.run(shlex.split(command), cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         return None, f"command not found: {exc}"
     except subprocess.TimeoutExpired:
         return None, f"timed out after {timeout}s"
-    return proc.returncode, (proc.stdout + proc.stderr)[-1500:]
+    return proc.returncode, (proc.stdout + proc.stderr)[-3000:]
 
 
 def _uncommitted(repo: Path, paths: list[str] | None = None) -> list[str]:
@@ -396,17 +404,25 @@ def _restore_in_place(repo: Path, snapshot: dict[str, bytes | None]) -> bool:
 
 
 def _interpret_red(rc: int | None, tail: str, note: str) -> tuple[bool, str]:
-    """RED means the test FAILED an assertion (exit 1). 0 = not red; other codes = crashed, never ran the assertion."""
+    """RED means the test FAILED AN ASSERTION: exit 1 AND a failed assertion visible in the output.
+
+    0 = not red; any other exit = crashed; exit 1 without an assertion in the output = an uncaught exception that the
+    runner reported as a failure (pytest, unittest and plain scripts all do), which never ran the assertion either.
+    """
     if rc is None:
         return False, f"{note}; test could not run ({tail})"
     if rc == 0:
         return False, f"{note}; test did not go red (exit 0): the test does not depend on the fix"
     if rc != 1:
+        return False, f"{note}; test crashed rather than failed (exit {rc}): RED means a failed assertion (exit 1)"
+    if not RED_RE.search(tail):
         return (
             False,
-            f"{note}; test crashed rather than failed (exit {rc}): RED means a failed assertion (exit 1) — import the fix's modules inside the test body",
+            f"{note}; test failed with exit 1 but no failed assertion in its output (an uncaught exception is a crash, not RED): "
+            "assert what the fix adds exists (importlib.util.find_spec / hasattr) so the assertion is what fails; "
+            f"tail: {tail.strip()[-300:]}",
         )
-    return True, f"{note}; test went red (exit 1)"
+    return True, f"{note}; test went red (exit 1, failed assertion)"
 
 
 def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) -> AssertionResult:
@@ -418,6 +434,13 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
     if _uncommitted(repo, paths):
         # Working-directory mode: the fix is uncommitted, so the working directory IS the subject.
         # Only the named paths are touched, from a byte snapshot; nothing else is read or written.
+        links = [rel for rel in paths if (repo / rel).is_symlink() or _git(repo, "ls-files", "-s", "--", rel).stdout.startswith("120000")]
+        if links:
+            evidence = (
+                f"{links} is a symlink (in the working directory or at HEAD): HEAD's blob is the link-target string and a revert "
+                "would write it THROUGH the link into another file; name the real file instead"
+            )
+            return AssertionResult(aid, "mutation", text, False, evidence, str(repo))
         pre_rc, pre_tail = _run(command, repo, timeout)
         if pre_rc != 0:
             evidence = f"command does not pass on the unmodified working directory (exit {pre_rc}): a later non-zero exit would prove nothing; {pre_tail.strip()[-200:]}"
@@ -427,7 +450,7 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
             rc, tail = _run(command, repo, timeout)
         finally:
             restored = _restore_in_place(repo, snapshot)
-        note = f"passes unmodified (exit 0); reverted {paths} to HEAD in place from a byte snapshot; restored " + (
+        note = f"passes before the revert (exit 0); reverted {paths} to HEAD in place from a byte snapshot; restored " + (
             "byte-identical" if restored else "WITH DIFFERENCES — inspect"
         )
         proven, evidence = _interpret_red(rc, tail, note)
@@ -460,7 +483,7 @@ def _check_mutation(repo: Path, tip: str, a: dict[str, object], timeout: int) ->
             elif target.exists():
                 target.unlink()
         rc, tail = _run(command, tree, timeout)
-        note = f"passes unmodified at {tip[:12]} (exit 0); in a fresh worktree with {present} restored from {base}" + (
+        note = f"passes at {tip[:12]} before the revert (exit 0); in a fresh worktree with {present} restored from {base}" + (
             f" and {absent} removed (absent at {base})" if absent else ""
         )
         proven, evidence = _interpret_red(rc, tail, note)
