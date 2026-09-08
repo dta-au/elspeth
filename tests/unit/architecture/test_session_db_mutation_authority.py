@@ -3963,7 +3963,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "bc4b6272008ed6ec",
         1,
         None,
-        line=1285,
+        line=1288,
         connection_escape=True,
     ),
     # Re-pinned by P4-D6 step 5 (cross-module rule): same shape as
@@ -3976,7 +3976,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "b92e2e573b8362dd",
         1,
         None,
-        line=1306,
+        line=1309,
     ),
     # ``with begin_write(self._engine) as conn`` inside LandscapeDB: the
     # in-file wrapper hop is transparent and ``self`` carries the declared
@@ -3989,7 +3989,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "91a7ddcfb7d2279c",
         1,
         None,
-        line=1319,
+        line=1322,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4000,7 +4000,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "4644a6cc893b4d09",
         1,
         None,
-        line=1346,
+        line=1349,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4010,7 +4010,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "026fc33c365235c4",
         1,
         None,
-        line=1605,
+        line=1608,
     ),
     WriterIdentity(
         "src/elspeth/core/landscape/database.py",
@@ -4020,7 +4020,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "44c4543542ceeb85",
         1,
         None,
-        line=2065,
+        line=2068,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -4031,7 +4031,7 @@ _REVIEWED_NON_SESSION_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "222b5f4b0d258dbe",
         1,
         None,
-        line=2047,
+        line=2050,
         connection_escape=True,
     ),
     WriterIdentity(
@@ -16633,7 +16633,7 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "145b5590f940eae3",
             1,
             None,
-            line=1358,
+            line=1361,
         ),
         WriterIdentity(
             "src/elspeth/core/schema_shape.py",
@@ -16711,10 +16711,10 @@ def test_live_connection_domain_classification_is_exact() -> None:
             "_run_locked",
             "<sessions-write-connection>",
             "write_connection",
-            "4312f607f547b35b",
+            "6577c8508024422b",
             1,
             None,
-            line=249,
+            line=241,
             connection_escape=True,
         ),
         # The session-lock wrapper: an honest escape until every caller proves
