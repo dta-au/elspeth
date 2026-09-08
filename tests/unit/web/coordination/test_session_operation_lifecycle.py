@@ -1362,3 +1362,287 @@ def test_invalid_renew_interval_fails_before_authority_acquisition() -> None:
         with pytest.raises(ValueError, match="renew_interval_seconds"):
             asyncio.run(acquire_with_interval(interval))
     assert authority.acquire_calls == []
+
+
+# ---------------------------------------------------------------------------
+# Simultaneous-failure preservation (elspeth-ba3af151a7, elspeth-4844c270fa,
+# elspeth-fa0e13545b): Tier-1 integrity failures survive as instances while
+# ordinary secondary failures remain class-name notes.
+# ---------------------------------------------------------------------------
+
+
+def _members(error: BaseException) -> tuple[BaseException, ...]:
+    assert isinstance(error, BaseExceptionGroup)
+    return error.exceptions
+
+
+@pytest.mark.asyncio
+async def test_close_preserves_integrity_failure_from_second_child_behind_ordinary_release_failure() -> None:
+    authority = _FakeAuthority()
+    ordinary_child = ValueError("first child failed")
+    integrity_child = AuditIntegrityError("second child integrity failed")
+    release_error = OSError("release transport failed")
+    authority.release_error = release_error
+    lease = await _acquire(authority, renew_interval_seconds=10)
+
+    async def fail_with(error: BaseException) -> None:
+        raise error
+
+    lease.create_task(fail_with(ordinary_child), name="ordinary-child")
+    lease.create_task(fail_with(integrity_child), name="integrity-child")
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.close()
+
+    assert _members(raised.value) == (release_error, integrity_child)
+    assert "ValueError" in "\n".join(release_error.__notes__)
+    assert authority.release_attempts == [lease.context]
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_close_preserves_integrity_child_failure_behind_renewal_loss() -> None:
+    authority = _FakeAuthority()
+    loss = SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+    authority.renew_error = loss
+    integrity_child = AuditIntegrityError("child integrity failed during loss")
+    child_started = asyncio.Event()
+
+    async def child() -> None:
+        child_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise integrity_child
+
+    lease = await _acquire(authority)
+    lease.create_task(child(), name="integrity-child")
+    await child_started.wait()
+    await lease.wait_until_lost()
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.close()
+
+    assert _members(raised.value) == (loss, integrity_child)
+    assert authority.release_calls == []
+    assert lease.disposition is SessionOperationLeaseDisposition.LOST
+
+
+@pytest.mark.asyncio
+async def test_close_ordinary_secondary_failures_remain_notes_on_primary() -> None:
+    authority = _FakeAuthority()
+    child_error = ValueError("child failed")
+    release_secret = "release-secret-database-detail"  # secret-scan: allow-this-line
+    release_error = OSError(release_secret)
+    authority.release_error = release_error
+    lease = await _acquire(authority, renew_interval_seconds=10)
+
+    async def failing_child() -> None:
+        raise child_error
+
+    lease.create_task(failing_child(), name="failing-child")
+    with pytest.raises(OSError) as raised:
+        await lease.close()
+
+    assert raised.value is release_error
+    assert "ValueError" in "\n".join(release_error.__notes__)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ["acquire", "release"])
+async def test_cancelled_acquire_integrity_failure_survives_cancellation(seam: str) -> None:
+    authority = _FakeAuthority()
+    authority.acquire_allowed.clear()
+    integrity_error = AuditIntegrityError(f"{seam} integrity failed")
+    if seam == "acquire":
+        authority.acquire_error = integrity_error
+    else:
+        authority.release_error = integrity_error
+    acquire_task = asyncio.create_task(_acquire(authority))
+    await _wait_for_thread_event(authority.acquire_started)
+
+    acquire_task.cancel("acquire-cancellation")
+    authority.acquire_allowed.set()
+    with pytest.raises(AuditIntegrityError) as raised:
+        await acquire_task
+
+    assert raised.value is integrity_error
+    assert isinstance(raised.value.__context__, asyncio.CancelledError)
+    assert raised.value.__context__.args == ("acquire-cancellation",)
+    if seam == "release":
+        assert authority.release_attempts == [authority.context]
+    else:
+        assert authority.release_attempts == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_acquire_ordinary_cleanup_failure_still_yields_cancellation() -> None:
+    authority = _FakeAuthority()
+    authority.acquire_allowed.clear()
+    authority.release_error = OSError("release-secret-detail")  # secret-scan: allow-this-line
+    acquire_task = asyncio.create_task(_acquire(authority))
+    await _wait_for_thread_event(authority.acquire_started)
+
+    acquire_task.cancel("acquire-cancellation")
+    authority.acquire_allowed.set()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await acquire_task
+
+    assert "OSError" in "\n".join(raised.value.__notes__)
+    assert "release-secret-detail" not in "".join(traceback.format_exception(raised.value))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("cas_error", "release_error", "expected_members"),
+    [
+        pytest.param(
+            AuditIntegrityError("cas integrity"), OSError("release-secret"), ("cas",), id="cas-integrity"
+        ),  # secret-scan: allow-this-line
+        pytest.param(
+            RuntimeError("cas-secret"), AuditIntegrityError("release integrity"), ("release",), id="release-integrity"
+        ),  # secret-scan: allow-this-line
+        pytest.param(AuditIntegrityError("cas integrity"), AuditIntegrityError("release integrity"), ("cas", "release"), id="both"),
+    ],
+)
+async def test_cancelled_adopt_integrity_failures_survive_cancellation(
+    cas_error: BaseException, release_error: BaseException, expected_members: tuple[str, ...]
+) -> None:
+    authority = _FakeAuthority()
+    authority.compare_and_swap_allowed.clear()
+    authority.lease_active = True
+    context = authority.context
+    authority.compare_and_swap_error = cas_error
+    authority.release_error = release_error
+    adopt_task = asyncio.create_task(
+        SessionOperationLease.adopt(
+            cast("SessionOperationAuthority", authority),
+            context,
+            lease_seconds=30,
+            renew_interval_seconds=10,
+        )
+    )
+    await _wait_for_thread_event(authority.compare_and_swap_started)
+
+    adopt_task.cancel("first-adoption-cancellation")
+    authority.compare_and_swap_allowed.set()
+    with pytest.raises(BaseException) as raised:
+        await adopt_task
+
+    by_name = {"cas": cas_error, "release": release_error}
+    expected = tuple(by_name[name] for name in expected_members)
+    if len(expected) == 1:
+        assert raised.value is expected[0]
+        assert isinstance(raised.value.__context__, asyncio.CancelledError)
+        ordinary = release_error if expected_members == ("cas",) else cas_error
+        assert type(ordinary).__name__ in "\n".join(raised.value.__notes__)
+        assert str(ordinary) not in "".join(traceback.format_exception(raised.value))
+    else:
+        assert _members(raised.value) == expected
+        assert isinstance(raised.value.__context__, asyncio.CancelledError)
+    assert authority.release_attempts == [context]
+
+
+@pytest.mark.asyncio
+async def test_adopt_cas_failure_release_integrity_failure_is_preserved_with_primary() -> None:
+    authority = _FakeAuthority()
+    authority.lease_active = True
+    context = authority.context
+    cas_error = RuntimeError("compare-and-swap acknowledgement failed")
+    release_error = AuditIntegrityError("release integrity failed")
+    authority.compare_and_swap_error = cas_error
+    authority.release_error = release_error
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await SessionOperationLease.adopt(
+            cast("SessionOperationAuthority", authority),
+            context,
+            lease_seconds=30,
+            renew_interval_seconds=10,
+        )
+
+    assert _members(raised.value) == (cas_error, release_error)
+    assert authority.release_attempts == [context]
+
+
+@pytest.mark.asyncio
+async def test_archive_restore_integrity_failure_is_preserved_with_primary() -> None:
+    authority = _FakeAuthority()
+    primary = RuntimeError("primary-operation-secret")
+    restore_error = AuditIntegrityError("restore integrity failed")
+    authority.archive_delete_error = primary
+    authority.reconcile_archive_delete_result = ArchiveDeleteReconciliation.CURRENT
+    lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
+
+    async def restore_current() -> None:
+        raise restore_error
+
+    async def finalize_consumed() -> None:
+        raise AssertionError("finalize must not run for CURRENT")
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.consume_archive(restore_current=restore_current, finalize_consumed=finalize_consumed)
+
+    assert _members(raised.value) == (primary, restore_error)
+    assert authority.release_calls == []
+    assert lease.disposition is SessionOperationLeaseDisposition.UNKNOWN
+    assert lease.closed
+
+
+@pytest.mark.asyncio
+async def test_archive_reconciliation_integrity_failure_survives_unknown_terminal_classification() -> None:
+    authority = _FakeAuthority()
+    primary = RuntimeError("connection dropped operation_id=operation-secret-1")
+    reconciliation_error = AuditIntegrityError("reconciliation integrity failed")
+    authority.archive_delete_error = primary
+    authority.reconcile_archive_delete_error = reconciliation_error
+    lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.consume_archive()
+
+    terminal, preserved = _members(raised.value)
+    assert isinstance(terminal, SessionOperationTerminalOutcomeUnknown)
+    assert preserved is reconciliation_error
+    assert "operation-secret-1" not in "".join(traceback.format_exception(terminal))
+    assert authority.release_calls == []
+    assert lease.disposition is SessionOperationLeaseDisposition.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_archive_integrity_primary_survives_reconciliation_fence_loss() -> None:
+    authority = _FakeAuthority()
+    primary = AuditIntegrityError("archive invariant failed")
+    authority.archive_delete_error = primary
+    authority.reconcile_archive_delete_error = SessionOperationFenceLost(FenceLossReason.STALE_EPOCH)
+    lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.consume_archive()
+
+    fence_loss, preserved = _members(raised.value)
+    assert isinstance(fence_loss, SessionOperationFenceLost)
+    assert fence_loss.reason is FenceLossReason.STALE_EPOCH
+    assert preserved is primary
+    assert lease.disposition is SessionOperationLeaseDisposition.LOST
+    assert authority.release_calls == []
+
+
+@pytest.mark.asyncio
+async def test_archive_child_integrity_failure_survives_release_failure() -> None:
+    authority = _FakeAuthority()
+    child_error = AuditIntegrityError("archive child integrity failed")
+    release_error = OSError("release failed")
+    authority.release_error = release_error
+    lease = await _acquire(authority, operation_kind=SessionOperationKind.ARCHIVE, renew_interval_seconds=10)
+
+    async def failing_child() -> None:
+        raise child_error
+
+    lease.create_task(failing_child())
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await lease.consume_archive()
+
+    assert _members(raised.value) == (release_error, child_error)
+    assert authority.archive_delete_calls == []
+    assert lease.closed

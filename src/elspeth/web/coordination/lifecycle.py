@@ -10,7 +10,7 @@ after every lifecycle-owned child task has settled.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Iterable
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, Literal, Never, cast, final
 from uuid import UUID
@@ -39,6 +39,68 @@ type ArchiveLifecycleCallback = Callable[[], Awaitable[None]]
 
 async def _noop_archive_lifecycle_callback() -> None:
     return
+
+
+def _preserve_failures(
+    primary: BaseException,
+    secondaries: Iterable[BaseException | None],
+    *,
+    note_prefix: str | None,
+    group_message: str,
+) -> BaseException:
+    """Return what must escape when more than one lifecycle step failed.
+
+    Every Tier-1 integrity failure survives as its own instance, grouped with
+    ``primary``.  Ordinary secondary failures are reduced to a class-name note
+    on ``primary`` (when ``note_prefix`` is given) so provider or database
+    detail never rides an outward exception; a caller whose terminal
+    classification already records those names passes ``None``.
+    """
+    preserved: list[BaseException] = [primary]
+    for secondary in secondaries:
+        if secondary is None or any(secondary is kept for kept in preserved):
+            continue
+        if isinstance(secondary, contract_errors.TIER_1_ERRORS):
+            preserved.append(secondary)
+        elif note_prefix is not None:
+            primary.add_note(f"{note_prefix} also failed with {type(secondary).__name__}.")
+    if len(preserved) == 1:
+        return primary
+    return BaseExceptionGroup(group_message, preserved)
+
+
+def _failure_after_cancellation(
+    cancellation: asyncio.CancelledError,
+    failures: Iterable[tuple[str, BaseException | None]],
+    *,
+    group_message: str,
+) -> BaseException:
+    """Return what escapes once cancellation-time cleanup has been joined.
+
+    Cancellation stays primary while every joined failure is ordinary; those
+    are recorded on it as class-name notes.  A Tier-1 integrity failure is
+    never reduced to a note: it (or a group of them) escapes instead, carrying
+    the ordinary notes, with the cancellation left as its ``__context__``.
+    """
+    integrity: list[BaseException] = []
+    notes: list[str] = []
+    for note_prefix, failure in failures:
+        if failure is None or any(failure is kept for kept in integrity):
+            continue
+        if isinstance(failure, contract_errors.TIER_1_ERRORS):
+            integrity.append(failure)
+        else:
+            notes.append(f"{note_prefix} also failed with {type(failure).__name__}.")
+    escaping: BaseException
+    if not integrity:
+        escaping = cancellation
+    elif len(integrity) == 1:
+        escaping = integrity[0]
+    else:
+        escaping = BaseExceptionGroup(group_message, integrity)
+    for note in notes:
+        escaping.add_note(note)
+    return escaping
 
 
 def _validate_lifecycle_timing(*, lease_seconds: int, renew_interval_seconds: float | None) -> float:
@@ -115,27 +177,31 @@ async def _finish_cancelled_adopt(
     authority: SessionOperationAuthority,
     compare_and_swap_task: asyncio.Task[Any],
     context: SessionOperationContext,
-) -> tuple[str | None, str | None]:
-    """Join a cancellation-surviving adoption and release its exact context."""
-    compare_and_swap_error_type: str | None = None
+) -> tuple[BaseException | None, BaseException | None]:
+    """Join a cancellation-surviving adoption and release its exact context.
+
+    Both failures are returned as instances; the caller decides which may
+    escape and which are reduced to class-name notes.
+    """
+    compare_and_swap_error: BaseException | None = None
     try:
         await compare_and_swap_task
     except BaseException as error:
-        compare_and_swap_error_type = type(error).__name__
+        compare_and_swap_error = error
 
-    release_error_type = await _capture_adopt_release_error_type(authority, context)
-    return compare_and_swap_error_type, release_error_type
+    release_error = await _capture_adopt_release_error(authority, context)
+    return compare_and_swap_error, release_error
 
 
-async def _capture_adopt_release_error_type(
+async def _capture_adopt_release_error(
     authority: SessionOperationAuthority,
     context: SessionOperationContext,
-) -> str | None:
-    """Release an exact adopted context and retain only a safe error type name."""
+) -> BaseException | None:
+    """Release an exact adopted context and return its failure, if any."""
     try:
         await run_sync_in_worker(authority.release, context)
     except BaseException as error:
-        return type(error).__name__
+        return error
     return None
 
 
@@ -152,30 +218,44 @@ async def _raise_adopt_failure_after_release(
     del failure
     release_tasks = [
         asyncio.create_task(
-            _capture_adopt_release_error_type(authority, context),
+            _capture_adopt_release_error(authority, context),
             name="session-operation-failed-adopt-release",
         )
     ]
     try:
-        release_error_type = await asyncio.shield(release_tasks[0])
+        shielded_release_error = await asyncio.shield(release_tasks[0])
     except asyncio.CancelledError as cancellation:
-        release_error_type = await _join_shielded_task_after_cancellation(release_tasks[0])
+        joined_release_error = await _join_shielded_task_after_cancellation(release_tasks[0])
         cancellation.add_note(f"Session-operation adoption {phase} failed with {failure_type} before cancellation.")
-        if release_error_type is not None:
-            cancellation.add_note(f"Session-operation failed-adoption release also failed with {release_error_type}.")
+        escaping = _failure_after_cancellation(
+            cancellation,
+            (
+                (f"Session-operation adoption {phase}", failure_refs[0]),
+                ("Session-operation failed-adoption release", joined_release_error),
+            ),
+            group_message="Session operation adoption integrity failures",
+        )
         failure_refs.clear()
         release_tasks.clear()
-        cancellation.__cause__ = None
-        cancellation.__context__ = None
-        raise cancellation from None
+        del joined_release_error
+        if escaping is cancellation:
+            cancellation.__cause__ = None
+            cancellation.__context__ = None
+            raise cancellation from None
+        raise escaping from cancellation
     else:
         primary = failure_refs.pop()
         release_tasks.clear()
-        if release_error_type is not None:
-            primary.add_note(f"Session-operation failed-adoption release also failed with {release_error_type}.")
+        escaping = _preserve_failures(
+            primary,
+            (shielded_release_error,),
+            note_prefix="Session-operation failed-adoption release",
+            group_message="Session operation adoption and release failed",
+        )
+        del shielded_release_error
         primary.__cause__ = None
         primary.__context__ = None
-        raise primary from None
+        raise escaping from None
 
 
 async def _join_shielded_task_after_cancellation[T](task: asyncio.Task[T]) -> T:
@@ -283,27 +363,50 @@ class SessionOperationLease:
                 name="session-operation-cancelled-acquire-cleanup",
             )
             cleanup_error = await _join_shielded_task_after_cancellation(cleanup_task)
-            if cleanup_error is not None:
-                cancellation.add_note(f"Session-operation acquire cancellation cleanup also failed with {type(cleanup_error).__name__}.")
-            raise
+            cancelled_escaping = _failure_after_cancellation(
+                cancellation,
+                (("Session-operation acquire cancellation cleanup", cleanup_error),),
+                group_message="Session operation acquire cancellation integrity failures",
+            )
+            del cleanup_error
+            if cancelled_escaping is cancellation:
+                raise
+            raise cancelled_escaping from cancellation
         context_error = _acquired_context_error(context, requested_kind=operation_kind)
         if context_error is not None:
             release_task = asyncio.create_task(
                 _release_acquired_context(authority, context),
                 name="session-operation-invalid-context-release",
             )
+            escaping: BaseException = context_error
             try:
                 await asyncio.shield(release_task)
             except asyncio.CancelledError as cancellation:
+                release_error: BaseException | None = None
                 try:
                     await _join_shielded_task_after_cancellation(release_task)
-                except BaseException as release_error:
-                    cancellation.add_note(f"Session-operation invalid-context release also failed with {type(release_error).__name__}.")
-                cancellation.add_note(f"Session-operation context validation also failed with {type(context_error).__name__}.")
-                raise
+                except BaseException as error:
+                    release_error = error
+                escaping = _failure_after_cancellation(
+                    cancellation,
+                    (
+                        ("Session-operation invalid-context release", release_error),
+                        ("Session-operation context validation", context_error),
+                    ),
+                    group_message="Session operation invalid-context integrity failures",
+                )
+                del release_error
+                if escaping is cancellation:
+                    raise
+                raise escaping from cancellation
             except BaseException as release_error:
-                context_error.add_note(f"Session-operation invalid-context release also failed with {type(release_error).__name__}.")
-            raise context_error
+                escaping = _preserve_failures(
+                    context_error,
+                    (release_error,),
+                    note_prefix="Session-operation invalid-context release",
+                    group_message="Session operation context validation and release failed",
+                )
+            raise escaping
         return cls(
             authority,
             context,
@@ -357,18 +460,23 @@ class SessionOperationLease:
                     name="session-operation-cancelled-adopt-cleanup",
                 )
             ]
-            compare_and_swap_error_type, release_error_type = await _join_shielded_task_after_cancellation(cleanup_tasks[0])
-            if compare_and_swap_error_type is not None:
-                cancellation.add_note(
-                    f"Session-operation adoption cancellation compare-and-swap also failed with {compare_and_swap_error_type}."
-                )
-            if release_error_type is not None:
-                cancellation.add_note(f"Session-operation adoption cancellation release also failed with {release_error_type}.")
+            cancelled_compare_and_swap_error, cancelled_release_error = await _join_shielded_task_after_cancellation(cleanup_tasks[0])
+            escaping = _failure_after_cancellation(
+                cancellation,
+                (
+                    ("Session-operation adoption cancellation compare-and-swap", cancelled_compare_and_swap_error),
+                    ("Session-operation adoption cancellation release", cancelled_release_error),
+                ),
+                group_message="Session operation adoption cancellation integrity failures",
+            )
+            del cancelled_compare_and_swap_error, cancelled_release_error
             cleanup_tasks.clear()
             compare_and_swap_tasks.clear()
-            cancellation.__cause__ = None
-            cancellation.__context__ = None
-            raise cancellation from None
+            if escaping is cancellation:
+                cancellation.__cause__ = None
+                cancellation.__context__ = None
+                raise cancellation from None
+            raise escaping from cancellation
         except BaseException as compare_and_swap_error:
             compare_and_swap_tasks.clear()
             compare_and_swap_cleanup = _raise_adopt_failure_after_release(
@@ -438,16 +546,23 @@ class SessionOperationLease:
                     name="session-fork-child-cancelled-adopt-cleanup",
                 )
             ]
-            validation_error_type, release_error_type = await _join_shielded_task_after_cancellation(cleanup_tasks[0])
-            if validation_error_type is not None:
-                cancellation.add_note(f"Fork-child adoption cancellation validation also failed with {validation_error_type}.")
-            if release_error_type is not None:
-                cancellation.add_note(f"Fork-child adoption cancellation release also failed with {release_error_type}.")
+            cancelled_validation_error, cancelled_release_error = await _join_shielded_task_after_cancellation(cleanup_tasks[0])
+            escaping = _failure_after_cancellation(
+                cancellation,
+                (
+                    ("Fork-child adoption cancellation validation", cancelled_validation_error),
+                    ("Fork-child adoption cancellation release", cancelled_release_error),
+                ),
+                group_message="Fork-child adoption cancellation integrity failures",
+            )
+            del cancelled_validation_error, cancelled_release_error
             cleanup_tasks.clear()
             validation_tasks.clear()
-            cancellation.__cause__ = None
-            cancellation.__context__ = None
-            raise cancellation from None
+            if escaping is cancellation:
+                cancellation.__cause__ = None
+                cancellation.__context__ = None
+                raise cancellation from None
+            raise escaping from cancellation
         except BaseException as validation_error:
             validation_tasks.clear()
             validation_cleanup = _raise_adopt_failure_after_release(
@@ -577,17 +692,21 @@ class SessionOperationLease:
             if not task.done():
                 task.cancel()
 
-    async def _join_owned_tasks(self) -> BaseException | None:
+    async def _join_owned_tasks(self) -> tuple[BaseException, ...]:
+        """Join every owned child and return each distinct non-cancellation failure."""
         if not self._owned_tasks:
-            return None
+            return ()
         tasks = tuple(self._owned_tasks)
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        first_error: BaseException | None = None
+        errors: list[BaseException] = []
         for result in results:
-            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError) and first_error is None:
-                first_error = result
+            if not isinstance(result, BaseException) or isinstance(result, asyncio.CancelledError):
+                continue
+            if any(result is kept for kept in errors):
+                continue
+            errors.append(result)
         self._owned_tasks.clear()
-        return first_error
+        return tuple(errors)
 
     async def _stop_and_join_renewal(self) -> None:
         self._stop_renewal.set()
@@ -605,10 +724,10 @@ class SessionOperationLease:
         self._disposition = SessionOperationLeaseDisposition.RELEASED
 
     async def _close(self) -> None:
-        owned_error: BaseException | None = None
+        owned_errors: tuple[BaseException, ...] = ()
         release_error: BaseException | None = None
         try:
-            owned_error = await self._join_owned_tasks()
+            owned_errors = await self._join_owned_tasks()
             await self._stop_and_join_renewal()
             if self._renewal_error is None:
                 try:
@@ -620,12 +739,18 @@ class SessionOperationLease:
         finally:
             self._closed = True
 
-        if self._renewal_error is not None:
-            raise self._renewal_error
-        if release_error is not None:
-            raise release_error
-        if owned_error is not None:
-            raise owned_error
+        # Priority order is unchanged: renewal loss, then release, then owned
+        # children.  What changed is that no failure behind the primary is
+        # discarded: integrity failures escape as instances, the rest as notes.
+        failures = [failure for failure in (self._renewal_error, release_error, *owned_errors) if failure is not None]
+        if not failures:
+            return
+        raise _preserve_failures(
+            failures[0],
+            failures[1:],
+            note_prefix="Session-operation close",
+            group_message="Session operation close failed",
+        )
 
     async def _run_archive_action(self) -> None:
         action_task = asyncio.create_task(
@@ -692,7 +817,6 @@ class SessionOperationLease:
         *,
         primary_error: BaseException,
     ) -> None:
-        restore_error_type: str | None = None
         try:
             await self._run_archive_lifecycle_callback(
                 restore_current,
@@ -703,13 +827,16 @@ class SessionOperationLease:
                 self._disposition = SessionOperationLeaseDisposition.LOST
             else:
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
-            if restore_error is not primary_error:
-                restore_error_type = type(restore_error).__name__
+            escaping = _preserve_failures(
+                primary_error,
+                (restore_error,),
+                note_prefix="Archive restore-current compensation",
+                group_message="Archive action and restore-current compensation failed",
+            )
+            del restore_error
         else:
             return
-        if restore_error_type is not None:
-            primary_error.add_note(f"Archive restore-current compensation also failed with {restore_error_type}.")
-        raise primary_error from None
+        raise escaping from None
 
     @staticmethod
     def _unknown_terminal_error(*, primary_type: str, terminal_type: str, phase: str) -> SessionOperationTerminalOutcomeUnknown:
@@ -717,6 +844,24 @@ class SessionOperationLease:
         error.add_note(f"Archive action failed with {primary_type}.")
         error.add_note(f"Archive {phase} failed with {terminal_type}.")
         return error
+
+    @staticmethod
+    def _terminal_with_integrity(
+        terminal: BaseException,
+        originals: Iterable[BaseException | None],
+    ) -> BaseException:
+        """Attach any Tier-1 original to a sanitized terminal classification.
+
+        The terminal error already names every original by class; ordinary
+        originals therefore add nothing, but an integrity failure must not be
+        reduced to that name.
+        """
+        return _preserve_failures(
+            terminal,
+            originals,
+            note_prefix=None,
+            group_message="Archive terminal outcome with integrity failures",
+        )
 
     @staticmethod
     def _sanitized_fence_loss(
@@ -737,14 +882,26 @@ class SessionOperationLease:
         finalize_consumed: ArchiveLifecycleCallback,
     ) -> None:
         try:
-            owned_error = await self._join_owned_tasks()
+            owned_errors = await self._join_owned_tasks()
             await self._stop_and_join_renewal()
             if self._renewal_error is not None:
                 self._disposition = SessionOperationLeaseDisposition.LOST
-                raise self._renewal_error
-            if owned_error is not None:
-                await self._release_current()
-                raise owned_error
+                raise _preserve_failures(
+                    self._renewal_error,
+                    owned_errors,
+                    note_prefix="Session-operation archive child",
+                    group_message="Session operation archive refused after renewal loss",
+                )
+            if owned_errors:
+                release_error = await self._capture_release_error()
+                failures = [failure for failure in (release_error, *owned_errors) if failure is not None]
+                del release_error
+                raise _preserve_failures(
+                    failures[0],
+                    failures[1:],
+                    note_prefix="Session-operation archive close",
+                    group_message="Session operation archive children failed",
+                )
 
             primary_error = await self._capture_archive_action_error()
             if primary_error is None:
@@ -760,30 +917,42 @@ class SessionOperationLease:
             if isinstance(reconciliation_error, SessionOperationFenceLost):
                 reason = reconciliation_error.reason
                 self._disposition = SessionOperationLeaseDisposition.LOST
+                escaping = self._terminal_with_integrity(
+                    self._sanitized_fence_loss(
+                        reason=reason,
+                        primary_type=primary_type,
+                        phase="reconciliation",
+                    ),
+                    (primary_error,),
+                )
                 del primary_error, reconciliation_error
-                raise self._sanitized_fence_loss(
-                    reason=reason,
-                    primary_type=primary_type,
-                    phase="reconciliation",
-                ) from None
+                raise escaping from None
             if reconciliation_error is not None:
                 reconciliation_type = type(reconciliation_error).__name__
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                escaping = self._terminal_with_integrity(
+                    self._unknown_terminal_error(
+                        primary_type=primary_type,
+                        terminal_type=reconciliation_type,
+                        phase="reconciliation",
+                    ),
+                    (primary_error, reconciliation_error),
+                )
                 del primary_error, reconciliation_error
-                raise self._unknown_terminal_error(
-                    primary_type=primary_type,
-                    terminal_type=reconciliation_type,
-                    phase="reconciliation",
-                ) from None
+                raise escaping from None
             if type(reconciliation) is not ArchiveDeleteReconciliation:
                 reconciliation_type = type(reconciliation).__name__
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                escaping = self._terminal_with_integrity(
+                    self._unknown_terminal_error(
+                        primary_type=primary_type,
+                        terminal_type=reconciliation_type,
+                        phase="reconciliation",
+                    ),
+                    (primary_error,),
+                )
                 del primary_error, reconciliation
-                raise self._unknown_terminal_error(
-                    primary_type=primary_type,
-                    terminal_type=reconciliation_type,
-                    phase="reconciliation",
-                ) from None
+                raise escaping from None
             if reconciliation is ArchiveDeleteReconciliation.CONSUMED:
                 self._disposition = SessionOperationLeaseDisposition.CONSUMED
                 # Confirmed deletion resolves commit uncertainty, not an
@@ -797,9 +966,16 @@ class SessionOperationLease:
                     )
                 except BaseException as finalization_error:
                     if not retain_primary_error:
+                        finalization_error.add_note(f"Archive action failed with {primary_type}.")
                         raise
-                    primary_error.add_note(f"Consumed archive finalization also failed with {type(finalization_error).__name__}.")
-                    raise primary_error from None
+                    escaping = _preserve_failures(
+                        primary_error,
+                        (finalization_error,),
+                        note_prefix="Consumed archive finalization",
+                        group_message="Archive action and consumed finalization failed",
+                    )
+                    del finalization_error
+                    raise escaping from None
                 if retain_primary_error:
                     raise primary_error
                 return
@@ -812,21 +988,29 @@ class SessionOperationLease:
             if isinstance(release_error, SessionOperationFenceLost):
                 reason = release_error.reason
                 self._disposition = SessionOperationLeaseDisposition.LOST
+                escaping = self._terminal_with_integrity(
+                    self._sanitized_fence_loss(
+                        reason=reason,
+                        primary_type=primary_type,
+                        phase="rollback release",
+                    ),
+                    (primary_error,),
+                )
                 del primary_error, release_error
-                raise self._sanitized_fence_loss(
-                    reason=reason,
-                    primary_type=primary_type,
-                    phase="rollback release",
-                ) from None
+                raise escaping from None
             if release_error is not None:
                 release_type = type(release_error).__name__
                 self._disposition = SessionOperationLeaseDisposition.UNKNOWN
+                escaping = self._terminal_with_integrity(
+                    self._unknown_terminal_error(
+                        primary_type=primary_type,
+                        terminal_type=release_type,
+                        phase="rollback release",
+                    ),
+                    (primary_error, release_error),
+                )
                 del primary_error, release_error
-                raise self._unknown_terminal_error(
-                    primary_type=primary_type,
-                    terminal_type=release_type,
-                    phase="rollback release",
-                ) from None
+                raise escaping from None
             raise primary_error
         finally:
             self._closed = True
