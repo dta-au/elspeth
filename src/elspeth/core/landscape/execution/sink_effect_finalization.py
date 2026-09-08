@@ -37,7 +37,7 @@ from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.data_flow.outcomes import TokenOutcomeRepository, TokenOutcomeWrite
 from elspeth.core.landscape.data_flow.ownership import RowTokenOwnership
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.errors import LandscapeRecordError
 from elspeth.core.landscape.execution.artifacts import ArtifactRepository
 from elspeth.core.landscape.execution.node_states import NodeStateRepository
@@ -492,7 +492,7 @@ class SinkEffectFinalization:
                 raise LandscapeRecordError("sink effect finalization has stale lease owner")
             if effect.generation != request.generation:
                 raise LandscapeRecordError("sink effect finalization has stale generation")
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             if not lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now):
                 raise LandscapeRecordError("sink effect finalization lease has expired")
         primary_effect_ids = {str(member.primary_effect_id) for member in members if member.primary_effect_id is not None}

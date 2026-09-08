@@ -32,12 +32,13 @@ from elspeth.contracts.sink_effects import (
 )
 from elspeth.core.landscape._helpers import now
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_transaction_time
+from elspeth.core.landscape.database_clock import landscape_clock_resolution, read_landscape_decision_time
 from elspeth.core.landscape.errors import LandscapeRecordError, SinkEffectLeaseLiveError
 from elspeth.core.landscape.execution.sink_effect_attempt_results import (
     decode_sink_effect_returned_result,
     encode_sink_effect_returned_result,
 )
+from elspeth.core.landscape.lease_deadlines import DeadlineKey, DeadlineKind, record_issued_deadline
 from elspeth.core.landscape.model_loaders import SinkEffectAttemptLoader, SinkEffectLoader
 from elspeth.core.landscape.run_coordination_repository import fenced_leader_transaction
 from elspeth.core.landscape.schema import (
@@ -66,14 +67,10 @@ def _aligned_lease_ttl(conn: Connection, ttl: timedelta) -> timedelta:
     """Return the DURATION to add to database time so the deadline outlasts ``ttl``.
 
     A duration, never an instant: this reads no clock, it rounds ``ttl`` up to
-    a whole multiple of the clock's own resolution. ADR-047 puts the stamp and
-    every later liveness test on that one clock, and SQLite's is whole-second,
-    so a raw ``database_now + ttl`` is compared as though it had been stamped
-    at the top of the second: a sub-second lease then lapses at the next
-    boundary after ``1 - fraction`` seconds, with a floor of zero, instead of
-    lasting its TTL. Rounding up makes the stamp instant's own discarded
-    fraction the worst the comparison can cost. Whole-second TTLs -- which is
-    every lease TTL in ``src`` -- are unchanged on both dialects.
+    a whole multiple of the coarsest supported comparison precision. SQLite
+    retains whole-second alignment for compatibility even though fresh
+    decisions now sample milliseconds. Whole-second TTLs, used by every
+    production caller, are unchanged on both dialects.
     """
     resolution = landscape_clock_resolution(conn)
     return -(-ttl // resolution) * resolution
@@ -87,11 +84,10 @@ def lease_is_live(conn: Connection, effect_id: str, liveness: ColumnElement[bool
     """Decide, in SQL, whether the effect's lease satisfies ``liveness`` right now.
 
     ADR-047: the caller builds ``liveness`` as ``lease_expires_at >= database_now``
-    from the transaction clock it read under the row lock, so the deadline
+    from the fresh database clock it read under the row lock, so the deadline
     comparison is a predicate bound to Landscape database time — neither
     dialect's datetime convention nor a process clock enters the decision. A
-    deadline equal to database time is still live (whole-second SQLite time
-    makes that boundary reachable); a NULL deadline is not live.
+    deadline equal to database time is still live; a NULL deadline is not live.
     """
     return (
         conn.execute(
@@ -190,16 +186,13 @@ class SinkEffectLifecycle:
             # ADR-047: the claim decides liveness and stamps its deadline from
             # Landscape database time read under the row lock, never from the
             # process clock — a drifted worker cannot claim early or long.
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             if row.lease_owner is not None and row.lease_owner != owner and lease_live:
                 raise SinkEffectLeaseLiveError("sink effect preparation has a live claim owned by another worker")
             self._require_predecessor_finalized(conn, row)
             generation = int(row.generation) + 1
-            # ADR-047: the TTL is rounded up to the clock's resolution before
-            # it is added, or SQLite's whole second discards the stamp
-            # instant's own fraction and a sub-second lease lapses at the next
-            # boundary instead of after its TTL.
+            # Bind eligibility and issuance to this one post-lock sample.
             expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             claimed = conn.execute(
                 sink_effects_table.update()
@@ -218,6 +211,12 @@ class SinkEffectLifecycle:
             )
             if claimed.rowcount != 1:
                 raise LandscapeRecordError("sink effect preparation claim CAS lost unexpectedly")
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
 
     def complete_plan(
@@ -428,17 +427,14 @@ class SinkEffectLifecycle:
             row = self._lock_effect(conn, effect_id, include_stream=True, coordination_token=coordination_token)
             if row.state == SinkEffectState.RESERVED.value:
                 raise LandscapeRecordError("sink effect must be prepared before lease acquisition")
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             if row.state != SinkEffectState.PREPARED.value:
                 if row.state == SinkEffectState.IN_FLIGHT.value and row.lease_owner == owner and lease_live:
                     return SinkEffectLease(row.effect_id, row.lease_owner, row.generation, _utc(row.lease_expires_at))
                 raise LandscapeRecordError(f"sink effect cannot acquire lease from state {row.state!r}")
             self._require_predecessor_finalized(conn, row)
-            # ADR-047: the TTL is rounded up to the clock's resolution before
-            # it is added, or SQLite's whole second discards the stamp
-            # instant's own fraction and a sub-second lease lapses at the next
-            # boundary instead of after its TTL.
+            # Bind eligibility and issuance to this one post-lock sample.
             expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             generation = int(row.generation) + 1
             conn.execute(
@@ -452,6 +448,12 @@ class SinkEffectLifecycle:
                     lease_expires_at=expires_at,
                     updated_at=database_now,
                 )
+            )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
             )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
 
@@ -473,7 +475,7 @@ class SinkEffectLifecycle:
             verb="heartbeat_lease",
         ) as conn:
             row = self._lock_effect(conn, effect_id, include_stream=False, coordination_token=coordination_token)
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             # Expiry alone does not depose a RESERVED preparation holder. A
             # competing claim wins by changing owner/generation under this
@@ -486,15 +488,18 @@ class SinkEffectLifecycle:
                 or (row.state == SinkEffectState.IN_FLIGHT.value and not lease_live)
             ):
                 raise LandscapeRecordError("sink effect lease heartbeat has stale owner or generation")
-            # ADR-047: the TTL is rounded up to the clock's resolution before
-            # it is added, or SQLite's whole second discards the stamp
-            # instant's own fraction and a sub-second lease lapses at the next
-            # boundary instead of after its TTL.
+            # Bind eligibility and issuance to this one post-lock sample.
             expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             conn.execute(
                 sink_effects_table.update()
                 .where(sink_effects_table.c.effect_id == effect_id)
                 .values(lease_heartbeat_at=database_now, lease_expires_at=expires_at, updated_at=database_now)
+            )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
             )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
 
@@ -515,7 +520,7 @@ class SinkEffectLifecycle:
             verb="takeover_expired",
         ) as conn:
             row = self._lock_effect(conn, effect_id, include_stream=False, coordination_token=coordination_token)
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, effect_id, sink_effects_table.c.lease_expires_at >= database_now)
             if row.state == SinkEffectState.FINALIZED.value:
                 raise LandscapeRecordError("finalized sink effect cannot be taken over")
@@ -524,10 +529,7 @@ class SinkEffectLifecycle:
             if lease_live:
                 raise SinkEffectLeaseLiveError("sink effect lease has not expired")
             generation = int(row.generation) + 1
-            # ADR-047: the TTL is rounded up to the clock's resolution before
-            # it is added, or SQLite's whole second discards the stamp
-            # instant's own fraction and a sub-second lease lapses at the next
-            # boundary instead of after its TTL.
+            # Bind eligibility and issuance to this one post-lock sample.
             expires_at = database_now + _aligned_lease_ttl(conn, ttl)
             conn.execute(
                 sink_effects_table.update()
@@ -544,14 +546,21 @@ class SinkEffectLifecycle:
                     updated_at=database_now,
                 )
             )
+            record_issued_deadline(
+                conn,
+                key=DeadlineKey(DeadlineKind.SINK_EFFECT, (effect_id,)),
+                expires_at=expires_at,
+                window_seconds=_aligned_lease_ttl(conn, ttl).total_seconds(),
+            )
             return SinkEffectLease(effect_id, owner, generation, expires_at)
 
     def lease_validity_seconds(self, effect_id: str) -> float | None:
         """Seconds the effect's lease stays live at Landscape database time; ``None`` once it has lapsed or never existed.
 
-        Both operands come from the database in one read: the stored deadline
-        and the transaction clock (ADR-047). A caller pacing a wait for a
-        foreign lease uses this instead of subtracting the deadline from its
+        Both operands come from the database: the stored deadline and a fresh
+        Landscape sample (ADR-047). This unlocked estimate is advisory; a
+        subsequent mutation rechecks eligibility under its locks. A caller
+        pacing a wait for a foreign lease uses this instead of subtracting the deadline from its
         own process clock, so its budget and the repository's takeover
         decision are measured on the same clock.
         """
@@ -562,7 +571,7 @@ class SinkEffectLifecycle:
             ).scalar_one_or_none()
             if deadline is None:
                 return None
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
         remaining = (_utc(deadline) - database_now).total_seconds()
         return None if remaining < 0.0 else remaining
 
@@ -774,7 +783,7 @@ class SinkEffectLifecycle:
                 raise LandscapeRecordError(f"sink effect attempt {attempt_id!r} does not exist")
             effect = self._lock_effect(conn, optimistic.effect_id, include_stream=True, coordination_token=coordination_token)
             attempt = self._lock_attempt(conn, attempt_id)
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
             if (
                 lease.effect_id != effect.effect_id
@@ -896,7 +905,7 @@ class SinkEffectLifecycle:
             operation = self._lock_operation(conn, optimistic.effect_id)
             attempt = self._lock_attempt(conn, attempt_id)
             timestamp = now()
-            database_now = read_landscape_transaction_time(conn)
+            database_now = read_landscape_decision_time(conn)
             lease_live = lease_is_live(conn, str(effect.effect_id), sink_effects_table.c.lease_expires_at >= database_now)
             if recovery_lease is None:
                 if effect.generation != attempt.generation:
