@@ -319,9 +319,10 @@ def test_mutation_whose_test_asserts_the_fix_exists_is_proven(repo: Path) -> Non
     assert result.proven is True, result.evidence
 
 
-def test_mutation_runs_never_write_bytecode_so_a_same_size_revert_cannot_reuse_the_fix(repo: Path) -> None:
+def test_mutation_runs_never_write_bytecode_so_a_same_size_revert_cannot_reuse_the_fix(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Python trusts a .pyc by source mtime (1 s) + size; a same-size revert in the same second would run the FIX's
     bytecode and read 'did not go red' (round two, nondeterministic). Every run prove-it launches refuses to write bytecode."""
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)  # an inherited setting must not pass this for the code
     (repo / "src" / "target.py").write_text("VALUE = 2\n", encoding="utf-8")  # same size as the base's VALUE = 1
     command = f"{sys.executable} -c 'import sys; assert sys.dont_write_bytecode; import target; assert target.VALUE == 2'"
     claim = _claim(repo, f"mutation: {command} :: src/target.py")
