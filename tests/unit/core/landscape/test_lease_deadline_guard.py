@@ -29,6 +29,36 @@ _KEY = DeadlineKey(DeadlineKind.ITEM, ("item",))
 _PROBE = Table("deadline_probe", MetaData(), Column("id", Integer, primary_key=True))
 
 
+@pytest.mark.parametrize(
+    "kind, identity",
+    [
+        (DeadlineKind.LEADER, ("run", "worker", "2")),
+        (DeadlineKind.WORKER, ("run", "worker")),
+        (DeadlineKind.ITEM, ("item",)),
+        (DeadlineKind.SINK_EFFECT, ("effect",)),
+    ],
+)
+def test_deadline_keys_are_hashable_full_identities(kind: DeadlineKind, identity: tuple[str, ...]) -> None:
+    key = DeadlineKey(kind, identity)
+    assert {key: "issued"}[DeadlineKey(kind, identity)] == "issued"
+    if kind is DeadlineKind.LEADER:
+        assert DeadlineKey(kind, ("run", "worker", "3")) not in {key: "issued"}
+
+
+@pytest.mark.parametrize("identity", ["x", ["x"], {"x"}, frozenset({"x"}), {"x": "value"}])
+def test_deadline_key_rejects_other_iterable_carriers(identity: object) -> None:
+    # A one-element iterable can pass arity/member checks while violating the
+    # immutable tuple key contract. A freezing call alone cannot validate it.
+    with pytest.raises(ValueError, match="identity requires"):
+        DeadlineKey(DeadlineKind.ITEM, identity)
+
+
+@pytest.mark.parametrize("identity", [(), ("x", "y"), ("",), (None,), (3,), (["x"],)])
+def test_deadline_key_rejects_wrong_arity_and_non_string_members(identity: tuple[object, ...]) -> None:
+    with pytest.raises(ValueError, match="identity requires"):
+        DeadlineKey(DeadlineKind.ITEM, identity)
+
+
 @pytest.fixture
 def engine(tmp_path: Path) -> Iterator[Engine]:
     engine = create_engine(f"sqlite:///{tmp_path / 'guard.db'}", pool_size=1, max_overflow=0)
@@ -121,6 +151,15 @@ def test_no_obligation_does_not_read_clock(engine: Engine) -> None:
         with engine.begin() as conn:
             record_issued_deadline(conn, key=_KEY, expires_at=_NOW, window_seconds=10)
             forget_issued_deadline(conn, key=_KEY)
+
+
+def test_forgetting_unissued_key_preserves_other_obligation(engine: Engine) -> None:
+    absent = DeadlineKey(DeadlineKind.WORKER, ("run", "worker"))
+    with patch("elspeth.core.landscape.lease_deadlines.read_landscape_decision_time", return_value=_NOW), engine.begin() as conn:
+        record_issued_deadline(conn, key=_KEY, expires_at=_NOW + timedelta(seconds=10), window_seconds=10)
+        forget_issued_deadline(conn, key=absent)
+        forget_issued_deadline(conn, key=absent)
+        assert has_issued_deadline(conn, key=_KEY)
 
 
 def test_rollback_and_savepoint_do_not_leak_obligations(engine: Engine) -> None:
