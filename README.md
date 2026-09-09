@@ -620,10 +620,14 @@ See [CHANGELOG.md](CHANGELOG.md) for the release-by-release detail.
 
 ## Sense/Decide/Act model
 
-```text
-SENSE (Sources)  →  DECIDE (Transforms + Pure-Config Gates)  →  ACT (Sinks)
-     │                       │                        │
-  Load data            Process & classify       Route to outputs
+```mermaid
+graph LR
+    S["SENSE (Sources)<br/>Load data"]
+    D["DECIDE (Transforms + Pure-Config Gates)<br/>Process & classify"]
+    A["ACT (Sinks)<br/>Route to outputs"]
+
+    S --> D
+    D --> A
 ```
 
 | Stage | What It Does | Examples |
