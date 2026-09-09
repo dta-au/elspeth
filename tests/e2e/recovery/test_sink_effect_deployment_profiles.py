@@ -21,6 +21,7 @@ from sqlalchemy import Connection, select
 from sqlalchemy.exc import OperationalError
 from typer.testing import CliRunner
 
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.contracts.config.runtime import RuntimeCheckpointConfig
 from elspeth.contracts.coordination import (
     DEFAULT_RUN_HEARTBEAT_SECONDS,
@@ -31,7 +32,6 @@ from elspeth.contracts.coordination import (
 from elspeth.contracts.scheduler import SchedulerEventType, TokenWorkStatus
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.core.checkpoint import CheckpointManager
-from elspeth.core.config import load_settings_from_yaml_string
 from elspeth.core.landscape import LandscapeDB, run_coordination_repository, run_lifecycle_repository
 from elspeth.core.landscape.database_clock import read_landscape_decision_time
 from elspeth.core.landscape.scheduler_repository import TokenSchedulerRepository
@@ -590,7 +590,15 @@ def _run_cli_follower_until_seat_dead(
     )
     if result.exit_code != 2:
         raise AssertionError(f"CLI follower exited {result.exit_code}, expected seat-dead exit 2: {result.output}") from result.exception
-    if '"event": "seat_dead"' not in result.output or "Use `elspeth resume" not in result.output:
+    # elspeth-5dd23f4df9: the seat-dead event names BOTH recovery verbs — the
+    # takeover (`elspeth resume`) and, for the run resume must refuse, the
+    # finalize (`elspeth abandon`); the console arm picks between them by
+    # consulting the shared gates.
+    if (
+        '"event": "seat_dead"' not in result.output
+        or f'"hint": "elspeth resume {run_id}"' not in result.output
+        or f'"abandon_hint": "elspeth abandon {run_id}"' not in result.output
+    ):
         raise AssertionError(f"CLI follower omitted its seat-dead recovery evidence: {result.output}")
 
 

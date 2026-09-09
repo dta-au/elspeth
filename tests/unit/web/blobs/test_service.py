@@ -4430,7 +4430,7 @@ class TestCopyBlobsForFork:
         def fail_delete(*args, **kwargs):
             raise UnformattableCleanupError("primary cleanup failure")
 
-        monkeypatch.setattr(blob_service, "_delete_blob_row_locked", fail_delete)
+        monkeypatch.setattr(blob_service, "_delete_fork_blob_row_locked", fail_delete)
         with pytest.raises(error_class) as caught:
             await blob_service.cleanup_blobs_for_fork(session_id, target_session_id, operation_id)
         assert caught.value is integrity_failure
@@ -4452,8 +4452,9 @@ class TestCopyBlobsForFork:
 
         def fail_delete_commit(connection) -> None:
             nonlocal commit_failed
-            if not commit_failed and list(storage.parent.glob(f".{storage.name}.delete-*")):
+            if not commit_failed and list(storage.parent.glob(f".{target.id}.delete-*")):
                 commit_failed = True
+                connection.rollback()
                 raise OperationalError("COMMIT", {}, RuntimeError("injected cleanup commit failure"))
             original_commit(connection)
 
@@ -4476,7 +4477,7 @@ class TestCopyBlobsForFork:
         assert "PermissionError: injected restore permission failure" in failure.detail
         assert "manual reconciliation required" in failure.detail
         assert str(storage) in failure.detail
-        tombstones = list(storage.parent.glob(f".{storage.name}.delete-*"))
+        tombstones = list(storage.parent.glob(f".{target.id}.delete-*"))
         assert len(tombstones) == 1
         assert str(tombstones[0]) in failure.detail
 
@@ -4940,15 +4941,23 @@ class TestFinalizeRunOutputBlobsPartialFailure:
     ) -> None:
         run_id, session_id_str = run_env
         execute = _execute_context(db_engine, session_id)
-        rejected = await self._create_linked_blob(blob_service, session_id, run_id, execute, "large.csv", b"x" * 11)
-        accepted = await self._create_linked_blob(blob_service, session_id, run_id, execute, "small.csv", b"x")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "first.csv")
+        await self._create_linked_blob(blob_service, session_id, run_id, execute, "second.csv")
+        # Put the rejected content first in the actual authority's work order:
+        # this proves the batch continues after rejection, with exact quota
+        # accounting independent of randomly generated blob identifiers.
+        rejected, accepted = blob_service._session_operation_authority.mutate(
+            execute, lambda transaction: transaction.blobs.list_pending_run_output_blobs(run_id=run_id)
+        )
+        Path(rejected.storage_path).write_bytes(b"x" * 11)
+        Path(accepted.storage_path).write_bytes(b"x")
         monkeypatch.setattr(blob_service, "_max_storage_per_session", 10)
         rejected_path = Path(rejected.storage_path)
         if cleanup_fails:
             original_unlink = Path.unlink
 
             def fail_rejected_unlink(path: Path, missing_ok: bool = False) -> None:
-                if path == rejected_path:
+                if path.parent == rejected_path.parent and path.name.startswith(f".{rejected.id}.output-delete-"):
                     raise PermissionError("quota cleanup refused")
                 original_unlink(path, missing_ok=missing_ok)
 
@@ -4961,12 +4970,20 @@ class TestFinalizeRunOutputBlobsPartialFailure:
         assert result.errors[0].exc_type == "BlobQuotaExceededError"
         assert result.errors[0].detail == str(BlobQuotaExceededError(session_id_str, current_bytes=0, limit_bytes=10))
         assert [error.exc_type for error in result.errors] == (
-            ["BlobQuotaExceededError", "PermissionError"] if cleanup_fails else ["BlobQuotaExceededError"]
+            ["BlobQuotaExceededError", "PermissionError", "RecoveryFailed[PermissionError]"]
+            if cleanup_fails
+            else ["BlobQuotaExceededError"]
         )
         with db_engine.connect() as conn:
             status = conn.execute(select(blobs_table.c.status).where(blobs_table.c.id == str(rejected.id))).scalar_one()
         assert status == "error"
-        assert rejected_path.exists() is cleanup_fails
+        assert not rejected_path.exists()
+        tombstones = list(rejected_path.parent.glob(f".{rejected.id}.output-delete-*"))
+        if cleanup_fails:
+            (tombstone,) = tombstones
+            assert tombstone.read_bytes() == b"x" * 11
+        else:
+            assert not tombstones
 
     @pytest.mark.asyncio
     async def test_continues_after_concurrent_deletion(

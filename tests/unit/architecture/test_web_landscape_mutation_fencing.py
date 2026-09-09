@@ -732,12 +732,19 @@ _EXPECTED_DML_WRITE_SET: frozenset[tuple[str, str]] = frozenset(
 # must never prevent detection of added, removed, moved, or replaced identities.
 # ADR-048 completion removes dead writers, adds explicit connection composition,
 # and forwards exact member/leader/item authorities through every live caller.
-_EXPECTED_CALL_COUNT = 274
-_EXPECTED_PRODUCTION_CALLER_SHA256 = "92e579b2c4ee6a39a03689c9fd21f52bbfbbb5528876e3541106d97ddb547a6b"
+# 0.8.0 MERGE of `elspeth abandon` (release 3ab58f336) onto ADR-048 completion:
+# callers 274 -> 275 and coordination 23 -> 25, subordinate and internal
+# UNCHANGED. Attributed by row identity from this gate's scanners run on a
+# clean export of d1ab0aa1b and on the merged tree, nothing removed:
+#   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_lifecycle.complete_run#1
+#   + engine/orchestrator/abandon.py _acquire_leaderless_run_seat -> factory.run_coordination.acquire_run_leadership#1
+#   + engine/orchestrator/abandon.py abandon_leaderless_run -> factory.run_coordination.release_seat#1
+_EXPECTED_CALL_COUNT = 275
+_EXPECTED_PRODUCTION_CALLER_SHA256 = "d0824a8cd25f6e8d537549a6a9b77465dd4e8b4153a7f5b2cedb8273f9ba7017"
 _EXPECTED_SUBORDINATE_EDGE_COUNT = 136
 _EXPECTED_SUBORDINATE_EDGE_SHA256 = "0561dddd71e704031510290def021516e75e0d0668316c25a6e659ad2702c6fe"
-_EXPECTED_COORDINATION_CALL_COUNT = 23
-_EXPECTED_COORDINATION_CALL_SHA256 = "214a5dba39b8edea91a2c101f247fd44c1b005765042622fe4f2217260f73090"
+_EXPECTED_COORDINATION_CALL_COUNT = 25
+_EXPECTED_COORDINATION_CALL_SHA256 = "1c58e572672e06b38094c8c3c0b31e1c3201ce193e600272fa1514146acbf98c"
 _EXPECTED_INTERNAL_EDGE_COUNT = 88
 _EXPECTED_INTERNAL_EDGE_SHA256 = "fc1f6fe8a8d29cc56d7bdd8000d34d00c3136b4cb83d677c9b049d22f7ed89a8"
 
@@ -4295,11 +4302,19 @@ def _caller_authority_violations(units: Iterable[SourceUnit]) -> tuple[str, ...]
     return tuple(violations)
 
 
+# Takeover-CAS helpers admitted to take a dead leader's seat, each bound to
+# the literal entry-point label it records: the web orphan finaliser and the
+# `elspeth abandon` operator verb (release 3ab58f336). Keyed by exact owner so
+# a renamed or relocated helper is a new, unadmitted caller.
+_EXACT_TAKEOVER_HELPERS = {
+    ("src/elspeth/web/app.py", "_acquire_orphaned_run_leadership"): "orphan-finalize",
+    ("src/elspeth/engine/orchestrator/abandon.py", "_acquire_leaderless_run_seat"): "abandon",
+}
 _EXACT_ESTABLISHMENT_CALLERS = {
     "acquire_run_leadership": frozenset(
         {
             ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator._acquire_resume_leadership"),
-            ("src/elspeth/web/app.py", "_acquire_orphaned_run_leadership"),
+            *_EXACT_TAKEOVER_HELPERS,
         }
     ),
     "admit_follower": frozenset(
@@ -4453,10 +4468,11 @@ def _establishment_call_shape_violation(method: str, call: ast.Call) -> str | No
     ):
         return "authority-establishment worker is not owned mint_worker_id for the exact run"
     if method == "acquire_run_leadership":
+        admitted_entry_point = _EXACT_TAKEOVER_HELPERS.get((resolver.unit.path, _symbol(owner)))
         if not (
-            (resolver.unit.path, _symbol(owner)) == ("src/elspeth/web/app.py", "_acquire_orphaned_run_leadership")
+            admitted_entry_point is not None
             and isinstance(arguments["entry_point"], ast.Constant)
-            and arguments["entry_point"].value == "orphan-finalize"
+            and arguments["entry_point"].value == admitted_entry_point
         ):
             return "orphan leadership acquisition is not the exact admitted helper"
         return None
@@ -7083,7 +7099,17 @@ _REVIEWED_REGISTRY_MODULES = {
     "src/elspeth/core/landscape/journal.py": "96162bebbae30b8eaf5d26a2b9ae1ce48101e0cbc5983468af8824ab958e4ddc",
     # Installation in both engine constructors and bare-engine begin_write;
     # transaction ownership and engine/Connection event setup are also bound.
-    "src/elspeth/core/landscape/database.py": "a41206e20766c46a54831b529f229b395060fd1588b923b2240d248d99786d5a",
+    # a41206e2… -> d9712b63… on the first 0.8.0 integration: release 9768ede9d
+    # makes LandscapeDB._create_sqlcipher_engine reject an ambiguous first-wins
+    # query setting outright (judge-reviewed).
+    # d9712b63… -> the value below on the rebase onto release/0.8.0: release
+    # 3e6b6bf96 adds the @trust_boundary declaration over that same URL-parsing
+    # boundary (round-one judge-block remediation). Decorators are executable
+    # and therefore bound by this digest. Attributed by diffing the module
+    # against the previous integration: release contributed only that
+    # declaration, the branch only its install_deadline_guard calls; no
+    # deadline, clock, or journal code moved.
+    "src/elspeth/core/landscape/database.py": "9f58928f0881a31a45feaa8557c1ada48432e578d4c6773ecb559bcc2b314156",
 }
 
 
@@ -8463,7 +8489,7 @@ def admit_follower(self, *, run_id: str, worker_id: str, config_hash: str, windo
         seat = conn.execute(select(run_coordination_table.c.leader_worker_id, (run_coordination_table.c.leader_heartbeat_expires_at >= database_now).label('seat_live')).where(run_coordination_table.c.run_id == run_id)).one_or_none()
         seat_live = seat is not None and seat.leader_worker_id is not None and bool(seat.seat_live)
         if not seat_live:
-            raise JoinRefusedError(run_id, 'no live leader — use `elspeth resume` to take the seat')
+            raise JoinRefusedError(run_id, 'no live leader — take the seat with `elspeth resume`, or finalize the run with `elspeth abandon`')
         self._insert_worker_row(conn, run_id=run_id, worker_id=worker_id, role='follower', window_seconds=window_seconds, entry_point='join', database_now=database_now)
         record_coordination_event(conn, run_id=run_id, event_type='worker_register', worker_id=worker_id, leader_epoch=None, recorded_at=database_now, context={'role': 'follower', 'entry_point': 'join'})
         self._finalize_follower_admission_on(conn, run_id=run_id, worker_id=worker_id, window_seconds=window_seconds)
@@ -11893,20 +11919,23 @@ def test_establishment_rejects_shadowed_default_and_mismatched_resume_snapshot()
         assert _establishment_call_shape_violation("acquire_run_leadership", call) is not None
 
 
-def test_establishment_orphan_extraction_is_one_named_helper_with_one_run_bound_mint() -> None:
+@pytest.mark.parametrize(("path", "helper"), sorted(_EXACT_TAKEOVER_HELPERS))
+def test_establishment_orphan_extraction_is_one_named_helper_with_one_run_bound_mint(path: str, helper: str) -> None:
+    entry_point = _EXACT_TAKEOVER_HELPERS[(path, helper)]
     source = (
         "from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id\n"
-        "def _acquire_orphaned_run_leadership(repositories, *, run_id):\n"
+        f"def {helper}(repositories, *, run_id):\n"
         "    return repositories.run_coordination.acquire_run_leadership(run_id=run_id, worker_id=mint_worker_id(run_id), "
-        "window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point='orphan-finalize')\n"
+        f"window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, entry_point={entry_point!r})\n"
     )
-    call = _establishment_test_call(source, "acquire_run_leadership", path="src/elspeth/web/app.py")
+    call = _establishment_test_call(source, "acquire_run_leadership", path=path)
     assert _establishment_call_shape_violation("acquire_run_leadership", call) is None
     for mutated in (
         source.replace("mint_worker_id(run_id)", "mint_worker_id(other)"),
-        source.replace("def _acquire_orphaned_run_leadership", "def other_helper"),
+        source.replace(f"def {helper}", "def other_helper"),
+        source.replace(f"entry_point={entry_point!r}", "entry_point='resume-later'"),
     ):
-        call = _establishment_test_call(mutated, "acquire_run_leadership", path="src/elspeth/web/app.py")
+        call = _establishment_test_call(mutated, "acquire_run_leadership", path=path)
         assert _establishment_call_shape_violation("acquire_run_leadership", call) is not None
 
 

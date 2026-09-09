@@ -184,6 +184,7 @@ def test_telemetry_failure_is_acknowledged_without_formatting_external_error() -
         run_id="run-1",
         telemetry_emit=fail_delivery,
         underlying_client=FakeOpenAIClient(response=provider_response()),
+        **mock_audit_authority(),
     )
     with capture_logs() as records:
         response = client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])
@@ -217,6 +218,7 @@ def test_telemetry_programming_errors_propagate_after_audit(failure: Exception) 
         run_id="run-1",
         telemetry_emit=fail_delivery,
         underlying_client=FakeOpenAIClient(response=provider_response()),
+        **mock_audit_authority(),
     )
     with pytest.raises(type(failure)) as raised:
         client.chat_completion(model="gpt-4", messages=[ChatMessage(role="user", content="Hello")])

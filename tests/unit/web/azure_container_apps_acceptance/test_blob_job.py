@@ -11,7 +11,7 @@ import pytest
 from azure.core.exceptions import ResourceExistsError
 from azure.storage.blob import BlobClient, BlobServiceClient
 
-from elspeth.core.config import load_settings_from_yaml_string
+from elspeth.config_loading import load_settings_from_yaml_string
 from elspeth.plugins.sinks.json_sink import JSONSinkConfig
 from elspeth.web import azure_blob_acceptance_job as job
 

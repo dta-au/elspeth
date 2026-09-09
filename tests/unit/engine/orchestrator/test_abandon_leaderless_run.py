@@ -72,12 +72,12 @@ def _leaderless_run(
     token_ids: list[str] = []
     for index in range(token_count):
         _row, token = setup.factory.data_flow.create_row_with_token(
-            setup.run_id,
             setup.source_node_id,
             index,
             {"value": index},
             source_row_index=index,
             ingest_sequence=index,
+            coordination_token=setup.coordination_token,
         )
         token_ids.append(token.token_id)
     register_test_worker(setup.db, run_id=setup.run_id, worker_id=_FOLLOWER_WORKER_ID)

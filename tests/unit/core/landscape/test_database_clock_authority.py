@@ -154,7 +154,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "4e63924457b8d23d40888e21e78fb06168122d1b0da863c1281352e4ba71e644"
+_CLOCK_BOUNDARY_DIGEST = "d82814612b86a992f644d362efb695ba2f3684dee60b5f3c19cc76fcb1b54533"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -336,6 +336,15 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.heartbeat_lease"),
         ("src/elspeth/core/landscape/scheduler_repository.py", "TokenSchedulerRepository.recover_expired_leases"),
         ("src/elspeth/engine/orchestrator/resume.py", "ResumeCoordinator.resume"),
+        # `elspeth abandon` (release/0.8.0): the operator verb reads the seat
+        # through live_leader, judges resumability through
+        # check_run_status_resumable, and takes/vacates the seat through
+        # acquire_run_leadership / release_seat. Three identities added from
+        # the live inventory on this tree, none removed; the digest below is
+        # re-derived from the same scan.
+        ("src/elspeth/engine/orchestrator/abandon.py", "_resume_verdict"),
+        ("src/elspeth/engine/orchestrator/abandon.py", "abandon_leaderless_run"),
+        ("src/elspeth/engine/orchestrator/abandon.py", "inspect_leaderless_run"),
     }
 )
 

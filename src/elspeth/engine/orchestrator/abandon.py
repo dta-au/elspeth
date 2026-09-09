@@ -36,7 +36,7 @@ from sqlalchemy import func, select
 
 from elspeth.contracts import RunStatus
 from elspeth.contracts.checkpoint import ResumeCheck
-from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, mint_worker_id
+from elspeth.contracts.coordination import DEFAULT_RUN_LIVENESS_WINDOW_SECONDS, CoordinationToken, mint_worker_id
 from elspeth.contracts.enums import TerminalPath
 from elspeth.contracts.errors import AbandonRefusedError
 from elspeth.contracts.freeze import freeze_fields
@@ -46,9 +46,6 @@ from elspeth.core.landscape.database import LandscapeDB
 from elspeth.core.landscape.factory import RecorderFactory
 from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
 from elspeth.core.landscape.schema import token_outcomes_table, token_work_items_table, tokens_table
-
-ABANDON_ENTRY_POINT = "abandon"
-"""``run_coordination_events`` entry-point label the takeover CAS records."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +217,22 @@ def inspect_leaderless_run(db: LandscapeDB, run_id: str) -> LeaderlessRunPreflig
     )
 
 
+def _acquire_leaderless_run_seat(factory: RecorderFactory, *, run_id: str) -> CoordinationToken:
+    """Take the dead leader's seat through the takeover CAS (epoch+1) for one abandon.
+
+    The mutation-fencing gate admits exactly this helper for the ``abandon``
+    entry point, the way it admits ``web/app.py``'s orphan finaliser for
+    ``orphan-finalize``: one run-bound ``mint_worker_id``, the nominal
+    liveness window, and a literal entry-point label.
+    """
+    return factory.run_coordination.acquire_run_leadership(
+        run_id=run_id,
+        worker_id=mint_worker_id(run_id),
+        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
+        entry_point="abandon",
+    )
+
+
 def abandon_leaderless_run(db: LandscapeDB, run_id: str) -> AbandonOutcome:
     """Take the dead leader's seat and finalize the run as INTERRUPTED.
 
@@ -244,20 +257,14 @@ def abandon_leaderless_run(db: LandscapeDB, run_id: str) -> AbandonOutcome:
         raise AbandonRefusedError(run_id, preflight.refusal)
 
     factory = RecorderFactory(db)
-    worker_id = mint_worker_id(run_id)
-    coordination_token = factory.run_coordination.acquire_run_leadership(
-        run_id=run_id,
-        worker_id=worker_id,
-        window_seconds=DEFAULT_RUN_LIVENESS_WINDOW_SECONDS,
-        entry_point=ABANDON_ENTRY_POINT,
-    )
+    coordination_token = _acquire_leaderless_run_seat(factory, run_id=run_id)
     factory.run_lifecycle.complete_run(RunStatus.INTERRUPTED, coordination_token=coordination_token)
     abandoned_tokens = _read_run_work(db, run_id).abandoned_tokens
     factory.run_coordination.release_seat(token=coordination_token)
     return AbandonOutcome(
         run_id=run_id,
         run_status=RunStatus.INTERRUPTED,
-        worker_id=worker_id,
+        worker_id=coordination_token.worker_id,
         leader_epoch=coordination_token.leader_epoch,
         abandoned_tokens=abandoned_tokens,
     )
