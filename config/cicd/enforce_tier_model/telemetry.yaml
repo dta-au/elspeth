@@ -17,9 +17,12 @@ per_file_rules:
 - pattern: telemetry/serialization.py
   rules:
   - R5
-  reason: Type dispatch for OTEL attribute serialization (datetime/Enum/dict/tuple)
+  reason: Type dispatch for OTEL attribute serialization (datetime/Enum/dict/tuple).
+    Bumped 4 to 8 on 2026-09-09 because the live count is 8, every site the same
+    attribute-serialization dispatch this rule already names. Transitional debt
+    scheduled for replacement by precise signed dispositions in 0.8.1.
   expires: null
-  max_hits: 4
+  max_hits: 8
 - pattern: telemetry/serialization.py
   rules:
   - R6

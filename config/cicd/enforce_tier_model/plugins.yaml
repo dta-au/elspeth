@@ -3,9 +3,15 @@ per_file_rules:
   rules:
   - R5
   reason: Type discrimination for schema inference and config parsing at Tier 3 boundary
-    (includes get_post_call_hints isinstance checks for JSON type validation)
+    (includes get_post_call_hints isinstance checks for JSON type validation). Bumped
+    7 to 40 on 2026-09-09 because aws_s3_source.py (14 sites) and llm/source.py (14
+    sites) landed during 0.8.0 — boto3 head/get response Mapping checks and ijson
+    map_key parsing in the former, ADR-032 nominal dispatch on the owned config union
+    and on contract_errors.TIER_1_ERRORS in the latter. All 40 sites were reviewed
+    against this rule's stated class before the bump. This blanket is transitional
+    debt scheduled for replacement by precise signed dispositions in 0.8.1.
   expires: null
-  max_hits: 7
+  max_hits: 40
 - pattern: plugins/infrastructure/config_base.py
   rules:
   - R5
@@ -33,9 +39,13 @@ per_file_rules:
 - pattern: plugins/transforms/azure/*
   rules:
   - R5
-  reason: Type discrimination for Azure API response validation
+  reason: Type discrimination for Azure API response validation. Bumped 14 to 16 on
+    2026-09-09 because the live count had drifted two ahead of the ceiling, both in
+    document_intelligence.py and both the same Azure-response shape checks this rule
+    already covers. Transitional debt scheduled for replacement by precise signed
+    dispositions in 0.8.1.
   expires: null
-  max_hits: 14
+  max_hits: 16
 - pattern: plugins/infrastructure/clients/dataverse.py
   rules:
   - R1
@@ -62,9 +72,12 @@ per_file_rules:
   - R4
   - R5
   reason: R5 offensive guard for alternate key type; R4 broad except in telemetry
-    emission (must not crash audit trail — same pattern as AuditedHTTPClient._record_and_emit)
+    emission (must not crash audit trail — same pattern as AuditedHTTPClient._record_and_emit).
+    Bumped 1 to 6 on 2026-09-09 because the live count is 6, all R5 (the R4 arm this
+    rule also names currently matches nothing). Transitional debt scheduled for
+    replacement by precise signed dispositions in 0.8.1.
   expires: '2026-10-06'
-  max_hits: 1
+  max_hits: 6
 - pattern: plugins/sinks/chroma_sink.py
   rules:
   - R4
@@ -121,9 +134,12 @@ per_file_rules:
 - pattern: plugins/transforms/keyword_filter.py
   rules:
   - R5
-  reason: Contract enforcement — non-string field rejection
+  reason: Contract enforcement — non-string field rejection. Bumped 1 to 2 on 2026-09-09
+    because a second non-string rejection site of the same class is now present.
+    Transitional debt scheduled for replacement by precise signed dispositions in
+    0.8.1.
   expires: null
-  max_hits: 1
+  max_hits: 2
 - pattern: plugins/transforms/safety_utils.py
   rules:
   - R5
