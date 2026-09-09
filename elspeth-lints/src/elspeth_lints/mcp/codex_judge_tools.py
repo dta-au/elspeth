@@ -25,8 +25,10 @@ from typing import Any
 from elspeth_lints.core.judge import AgentToolScope, _tool_scope_decision
 from elspeth_lints.core.source_excerpt import scrub_secrets
 
-_MAX_READ_LINES = 400
-_MAX_RESULT_CHARS = 50_000
+# 400 rationed reads to 8+ calls per 3,000-line test file and starved the
+# 2026-09-09 sitting; the cap bounds one response's size, not the evidence.
+_MAX_READ_LINES = 2000
+_MAX_RESULT_CHARS = 200_000
 _MAX_FILE_RESULTS = 500
 _MAX_SCANNED_FILES = 20_000
 # Search the current codebase, not dependency installations, previous checkouts,

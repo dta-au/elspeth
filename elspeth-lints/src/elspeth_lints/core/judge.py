@@ -1237,13 +1237,16 @@ def _call_openrouter(
 # excerpt — identical input to the OpenRouter path. The tool-augmented mode
 # (``tool_scope`` set) lets the judge READ the surrounding source to resolve a
 # question the excerpt can't answer (e.g. "where does this parameter come
-# from?", "is the audit event recorded before this ceremony?"). The CLI permits
-# this only on non-signing reaudit runs. Signing paths stay blinded to the
-# bounded, scrubbed excerpt because tool reads happen inside the external agent
-# transport and raw tool output cannot be routed back through the local source
-# scrubber before it can influence a persisted rationale. What tool mode trades
-# away is verdict reproducibility, so the deterministic temperature=0 OpenRouter
-# path stays canonical for decay sweeps. See elspeth-ab5e093fa3.
+# from?", "is the audit event recorded before this ceremony?"). Signing paths
+# used ``--judge-tools readonly`` from 2026-07-27, because the excerpt-blinded
+# judge misjudged boundary code it could not see; the older "signing stays
+# blinded" rule is retired. Tool output does NOT round-trip through the local
+# source scrubber, so a persisted rationale can quote whatever the judge read:
+# the judge is an agentic peer with the same checkout access an agent working
+# here already has (operator ruling 2026-09-09), and its rationale is committed
+# verbatim. What tool mode trades away is verdict reproducibility, so the
+# deterministic temperature=0 OpenRouter path stays canonical for decay sweeps.
+# See elspeth-ab5e093fa3.
 #
 # SECURITY — the load-bearing guard. ``permission_mode="default"``
 # auto-approves read-only tools, so a ``can_use_tool`` callback is NEVER
@@ -1268,8 +1271,12 @@ _TOOL_SCOPE_GREP_NON_CONTENT_OUTPUT_MODES: frozenset[str] = frozenset({"count", 
 # (see ``_consume_agent_messages``), never a silent partial. 12 was twice
 # insufficient for real entries in the 2026-07-09 sitting (heartbeat R7 and a
 # large composer validator both hit the cap on consecutive runs while ruling
-# on genuinely deep call chains); 24 keeps the bound while covering them.
-_AGENT_TOOL_MODE_DEFAULT_MAX_TURNS: int = 24
+# on genuinely deep call chains); 24 kept the bound while covering them, then
+# starved the 2026-09-09 sitting three rounds running ("could not read the
+# named tests within the investigation budget" on a 3,000-line test file at
+# 400 lines per read). The bound is a loop guard, not an evidence ration:
+# 200 leaves a pathological run bounded while no honest investigation hits it.
+_AGENT_TOOL_MODE_DEFAULT_MAX_TURNS: int = 200
 
 # Basenames that must never be read even if they somehow sit inside an allowed
 # root — defense in depth. The HMAC signing key lived in a repo ``.env`` once
@@ -1291,7 +1298,9 @@ callers of the function, the definition of a type, or the call site that
 establishes an invariant. The working directory is the checkout root: tests,
 documentation, scripts, configuration, and source are all available, including
 pinning tests named in a rationale. An external allowlist directory is also
-readable. Writes, shell, and network are unavailable.
+readable. Writes and network are unavailable. On the Codex transport a
+read-only shell is also available: prefer `grep -n` to locate a named test or
+symbol, then read the surrounding lines, rather than paging a large file.
 Finding paths are relative to the scanner's source root, normally src/elspeth,
 whereas tool paths are relative to the checkout. For example, locate a finding
 at web/blobs/service.py with Glob **/web/blobs/service.py, then read the returned
@@ -2104,7 +2113,8 @@ def _codex_prompt(request: JudgeRequest, *, tool_mode: bool) -> str:
     dynamic_text = "\n\n".join(block["text"] for block in user_blocks)
     tool_addendum = (
         _TOOL_MODE_ADDENDUM + "\nOn this Codex transport, Read/Grep/Glob are named "
-        "read_file/grep_files/glob_files on the elspeth_judge_tools MCP server.\n"
+        "read_file/grep_files/glob_files on the elspeth_judge_tools MCP server, and "
+        "your own shell tool works read-only in the checkout root.\n"
         if tool_mode
         else ""
     )
@@ -2237,10 +2247,12 @@ def _call_codex_cli(
 
     ``codex exec`` authenticates through the operator's installed Codex account
     state (``CODEX_HOME`` / ``HOME``), while the subprocess environment omits
-    every signing/provider/application secret.  User config, repo rules, shell,
-    web, apps, hooks, goals, memories, remote plugins, and subagents are
-    disabled.  Tool mode registers exactly one local MCP server whose three
-    read-only tools enforce ``AgentToolScope``; blinded mode registers no MCP.
+    every signing/provider/application secret.  User config, repo rules, web,
+    apps, hooks, goals, memories, remote plugins, and subagents are disabled.
+    Tool mode runs in the checkout with Codex's native shell available under
+    the read-only sandbox, plus one local MCP server whose three read-only
+    tools enforce ``AgentToolScope``; blinded mode runs in an empty temporary
+    directory and registers no MCP.
 
     Codex currently exposes no per-call completion-token cap, so ``max_tokens``
     is accepted for the common transport contract but not forwarded.  The
@@ -2256,12 +2268,15 @@ def _call_codex_cli(
         'web_search="disabled"',
         "-c",
         f'model_reasoning_effort="{CODEX_JUDGE_REASONING_EFFORT}"',
-        "-c",
-        "features.shell_tool=false",
-        "-c",
-        "features.unified_exec=false",
-        "-c",
-        "features.shell_snapshot=false",
+        # Codex's own shell tool stays ENABLED under ``--sandbox read-only``
+        # (operator ruling 2026-09-09): the judge investigates the checkout
+        # with grep/sed/cat at native speed and no per-call budget. Before
+        # this, three read-only MCP tools with a 24-call cap and 400-line
+        # reads starved the judge on any multi-thousand-line file, and an
+        # entry blocked three consecutive rounds as "could not read the named
+        # tests within the investigation budget". Read-only sandboxing is
+        # the write control; credential stripping in ``_codex_child_env`` is
+        # the [O1] control. Neither depends on the shell being off.
         "-c",
         "features.apps=false",
         "-c",
@@ -2298,8 +2313,11 @@ def _call_codex_cli(
             "never",
             "--output-schema",
             str(schema_path),
+            # Tool mode runs IN the checkout so the native shell and the MCP
+            # reader see the same tree; blinded mode keeps the empty temp
+            # directory so a shell has nothing to look at.
             "--cd",
-            str(temp_root),
+            str(tool_scope.cwd if tool_scope is not None else temp_root),
             *base_config,
         ]
         if tool_scope is not None:

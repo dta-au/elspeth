@@ -56,9 +56,13 @@ The Codex subprocess authenticates from the installed CLI account state, not
 from a provider key passed by the signing shell. Its environment is reduced to
 executable/home/locale/TLS essentials: the HMAC key, override tokens, provider
 API keys, cloud credentials, and arbitrary application environment do not cross
-the process boundary. User config and repo rules are ignored; shell, web, apps,
-hooks, goals, memories, remote plugins, and subagents are disabled. The only
-tool-mode capability is the three-tool read-only MCP server.
+the process boundary. User config and repo rules are ignored; web, apps,
+hooks, goals, memories, remote plugins, and subagents are disabled. In tool
+mode the child runs in the checkout root with Codex's own shell available under
+the `read-only` sandbox (operator ruling 2026-09-09: a 24-call, 400-line MCP
+ration starved the judge three rounds running on a 3,000-line test file), plus
+the three-tool read-only MCP server as a scrubbed supplement. Read-only
+sandboxing is the write control; credential stripping is the [O1] control.
 
 Why: the excerpt-blinded judge systematically misjudged boundary code it could
 not see — verdicts flipped on whether a function's `def` line happened to fall

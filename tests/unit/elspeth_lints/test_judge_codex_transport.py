@@ -102,8 +102,14 @@ def test_codex_cli_transport_isolated_blinded_invocation(monkeypatch: pytest.Mon
     assert reasoning_setting == 'model_reasoning_effort="high"'
     assert command.count(reasoning_setting) == 1
     assert sum(part.startswith("model_reasoning_effort=") for part in command) == 1
-    assert "features.shell_tool=false" in command
-    assert "features.unified_exec=false" in command
+    # The native shell stays available under the read-only sandbox (operator
+    # ruling 2026-09-09); blinded mode simply has nothing to look at because
+    # it runs in an empty temporary directory.
+    assert "features.shell_tool=false" not in command
+    assert "features.unified_exec=false" not in command
+    assert "features.shell_snapshot=false" not in command
+    cd_target = Path(command[command.index("--cd") + 1])
+    assert cd_target.name.startswith("elspeth-judge-codex-")
     assert 'web_search="disabled"' in command
     assert "features.apps=false" in command
     assert "features.hooks=false" in command
@@ -154,7 +160,12 @@ def test_codex_cli_readonly_mode_registers_only_scoped_mcp_tools(
     assert 'mcp_servers.elspeth_judge_tools.enabled_tools=["read_file", "grep_files", "glob_files"]' in joined
     assert "mcp_servers.elspeth_judge_tools.required=true" in command
     assert 'mcp_servers.elspeth_judge_tools.default_tools_approval_mode="approve"' in command
-    assert "features.shell_tool=false" in command
+    # Tool mode runs IN the checkout with Codex's native read-only shell on:
+    # the MCP reader is a supplement, not the judge's only pair of eyes.
+    assert "features.shell_tool=false" not in command
+    assert "features.unified_exec=false" not in command
+    assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == ["--sandbox", "read-only"]
+    assert command[command.index("--cd") + 1] == str(source_root.resolve())
 
 
 def test_codex_cli_missing_binary_is_configuration_error(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -45,9 +45,14 @@ on the **Codex CLI harness with read-only tool access**:
 `--judge-transport codex-cli --judge-tools readonly`. The Codex child
 authenticates from the installed CLI account, but receives a minimal environment
 that excludes the operator HMAC key, override tokens, provider API keys, and
-cloud credentials. Shell, web, apps, hooks, goals, memories, remote plugins, and
-subagents are disabled. Read/Grep/Glob context comes only from the sealed
-path-confined MCP reader. Its scope is the entire checkout, including tests,
+cloud credentials. Web, apps, hooks, goals, memories, remote plugins, and
+subagents are disabled. The child's working directory is the checkout root and
+Codex's own shell stays available under the `read-only` sandbox, alongside the
+path-confined MCP reader (operator ruling 2026-09-09: a 24-call, 400-line
+reader ration starved the judge for three rounds on a correct rationale, and it
+blocked entries as "could not read the named tests"). Read-only sandboxing is
+the write control and credential stripping is the [O1] control; neither depends
+on the shell being off. Its scope is the entire checkout, including tests,
 docs, scripts, configuration, and hidden tracked code, plus any external
 allowlist directory. The judge is a peer reviewer: give it real symbols and
 test nodeids and let it inspect their evidence. Tool paths start at the
