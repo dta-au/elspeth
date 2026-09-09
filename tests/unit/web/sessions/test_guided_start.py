@@ -850,6 +850,62 @@ async def test_guided_start_tier_one_failure_survives_a_lost_fence_instead_of_re
 
 
 @pytest.mark.asyncio
+async def test_guided_start_ordinary_failure_settlement_fence_loss_rejoins_until_the_bounded_limit(tmp_path) -> None:
+    """The ordinary-failure arm's lost settlement fence is a rejoin, bounded, then fail-closed.
+
+    When ``fail_guided_operation`` finds the fence gone the attempt has no
+    authority to settle, so the loop continues to a fresh reservation; a
+    later attempt may replay a winner. When every attempt loses its fence the
+    same way, the loop does not spin: it ends in the terminal
+    ``AuditIntegrityError`` naming the exhausted rejoin, and the attempt body
+    ran exactly ``_GUIDED_FENCE_REJOIN_ATTEMPTS`` times.
+    """
+    from sqlalchemy import text
+
+    from elspeth.contracts.errors import AuditIntegrityError
+    from elspeth.web.sessions.protocol import GuidedOperationFenceLostError
+    from elspeth.web.sessions.routes.composer.guided import _GUIDED_FENCE_REJOIN_ATTEMPTS
+
+    app, service = _make_app(tmp_path)
+    client = TestClient(app)
+    session = await service.create_session("alice", "T", "local")
+
+    async def _expire_then_lose_fence(fence, **_kwargs):
+        # A rival worker took the seat: the row's lease is gone, so the next
+        # reservation can take over and the settlement here has no authority.
+        with service._engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE guided_operations SET lease_expires_at = :expired "
+                    "WHERE session_id = :session_id AND operation_id = :operation_id"
+                ),
+                {
+                    "expired": datetime.now(UTC) - timedelta(seconds=1),
+                    "session_id": str(fence.session_id),
+                    "operation_id": fence.operation_id,
+                },
+            )
+        raise GuidedOperationFenceLostError(fence)
+
+    with (
+        patch.object(
+            service,
+            "seed_or_complete_guided_start_operation",
+            side_effect=TypeError("ordinary first-party defect"),
+        ) as attempt,
+        patch.object(service, "fail_guided_operation", side_effect=_expire_then_lose_fence) as settlement,
+        pytest.raises(AuditIntegrityError, match="every rejoin attempt without a joinable winner"),
+    ):
+        client.post(
+            f"/api/sessions/{session.id}/guided/start",
+            json={"profile": "tutorial", "intent": _START_INTENT, "operation_id": str(uuid.uuid4())},
+        )
+
+    assert attempt.call_count == _GUIDED_FENCE_REJOIN_ATTEMPTS
+    assert settlement.call_count >= _GUIDED_FENCE_REJOIN_ATTEMPTS
+
+
+@pytest.mark.asyncio
 async def test_guided_start_unclassified_failure_is_recorded_with_its_failure_code(tmp_path) -> None:
     """A first-party bug settles AND leaves a server-side record.
 

@@ -554,7 +554,18 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
         try:
             return await asyncio.shield(reserve_task)
         except asyncio.CancelledError as cancellation:
-            cleanup_diagnostics: list[tuple[BaseException, str]] = []
+            # Cancellation cleanup must all run and must all be seen. The
+            # reserve task is drained, a claim this caller now owns is failed
+            # as ``request_cancelled``, and the session lease is closed in a
+            # ``finally`` so the close is attempted even when the status write
+            # fails. A cleanup failure is not a footnote to the cancellation:
+            # it escapes in its own right with the cancellation as its
+            # ``__context__`` (and a second failure chains the first), so a
+            # lease this process could not release, or a status row it could
+            # not write, is never reduced to a note or a log line. Only a
+            # fully clean cleanup re-raises the plain cancellation.
+            closed_lease = session_lease
+            session_lease = None
             try:
                 cancellation_outcome = await _join_shielded_task_after_cancellation(reserve_task)
                 if isinstance(cancellation_outcome, (GuidedOperationClaimed, GuidedOperationTakenOver)):
@@ -563,26 +574,15 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                             cancellation_outcome.fence,
                             failure_code="request_cancelled",
                             actor=_ACTOR,
-                            session_operation_context=session_lease.context,
+                            session_operation_context=closed_lease.context,
                         ),
                         name="guided-operation-cancelled-reserve-fail",
                     )
                     await _join_shielded_task_after_cancellation(fail_task)
-            except BaseException as cleanup_error:
-                cleanup_diagnostics.append((cleanup_error, "reservation_cancelled_cleanup"))
-                cancellation.add_note(f"Guided-operation reservation cancellation cleanup also failed with {type(cleanup_error).__name__}.")
-            try:
-                close_task = asyncio.create_task(session_lease.close(), name="guided-operation-cancelled-reserve-close")
-                await _join_shielded_task_after_cancellation(close_task)
-            except BaseException as close_error:
-                cleanup_diagnostics.append((close_error, "reservation_cancelled_close"))
-                cancellation.add_note(f"Session-operation reservation cancellation cleanup also failed with {type(close_error).__name__}.")
-            closed_lease = session_lease
-            session_lease = None
-            try:
-                raise cancellation from None
             finally:
-                _finish_guided_cleanup(cancellation, cleanup_diagnostics, closed_lease)
+                close_task = asyncio.create_task(closed_lease.close(), name="guided-operation-cancelled-reserve-close")
+                await _join_shielded_task_after_cancellation(close_task)
+            raise cancellation from None
         except BaseException as primary:
             closed_lease = session_lease
             session_lease = None
@@ -594,9 +594,10 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
                 # its own, not a footnote to the reservation failure it
                 # interrupted: raise both. The group keeps an integrity primary
                 # recognisable to ``_is_guided_integrity_failure`` and leaves
-                # nothing riding under a log line. The cancellation arm above
-                # is the one primary that must stay a plain ``CancelledError``,
-                # which is why its close fault is carried as a note instead.
+                # nothing riding under a log line. (The cancellation arm above
+                # lets its cleanup failure escape directly, with the
+                # cancellation as ``__context__``; the group form here is for
+                # two independent failures that both deserve the top level.)
                 raise BaseExceptionGroup(
                     "Guided operation reservation failed and its session lease could not be released",
                     [primary, close_error],

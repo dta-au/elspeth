@@ -203,8 +203,14 @@ async def test_acquire_reserve_race_releases_session_authority_before_join(monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fatal_diagnostic", [False, True])
-async def test_cancellation_after_reserve_started_fails_guided_before_releasing_session(monkeypatch, fatal_diagnostic: bool) -> None:
+@pytest.mark.parametrize("status_write_fails", [False, True])
+async def test_cancellation_after_reserve_started_fails_guided_before_releasing_session(monkeypatch, status_write_fails: bool) -> None:
+    """Cancellation after the reserve started fails the claim, then closes the lease.
+
+    A failed ``request_cancelled`` status write is a fault of this process's
+    own: it escapes with the cancellation as its context, after the lease is
+    still closed, and is never reduced to a note or a log line.
+    """
     session_id = uuid4()
     fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
     claimed = GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))
@@ -212,15 +218,7 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
     reserve_started = asyncio.Event()
     finish_reserve = asyncio.Event()
     events: list[str] = []
-    diagnostic_error = AuditIntegrityError("reservation logger integrity")
-
-    def fail_logging(*_args, **_kwargs):
-        assert session_lease.closed
-        events.append("diagnostic")
-        raise diagnostic_error
-
-    if fatal_diagnostic:
-        monkeypatch.setattr(guided_operations_module.slog, "error", fail_logging)
+    status_write_error = OSError("PRIVATE-STATUS-WRITE-DETAIL")
 
     class CancellationService(_Service):
         async def reserve_guided_operation(self, **kwargs):
@@ -237,8 +235,8 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
             assert kwargs["session_operation_context"] is session_lease.context
             assert not session_lease.closed
             events.append("failed")
-            if fatal_diagnostic:
-                raise OSError("reservation cleanup failed")
+            if status_write_fails:
+                raise status_write_error
             return GuidedOperationFailed(failure_code="request_cancelled")
 
     service = CancellationService([None])
@@ -260,17 +258,99 @@ async def test_cancellation_after_reserve_started_fails_guided_before_releasing_
     task.cancel()
     finish_reserve.set()
 
-    if fatal_diagnostic:
-        with pytest.raises(AuditIntegrityError) as caught:
-            await task
-        assert caught.value is diagnostic_error
-        assert isinstance(caught.value.__context__, asyncio.CancelledError)
-        assert events == ["failed", "diagnostic"]
-    else:
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert events == ["failed"]
+    with capture_logs() as logs:
+        if status_write_fails:
+            with pytest.raises(OSError) as caught:
+                await task
+            assert caught.value is status_write_error
+            assert isinstance(caught.value.__context__, asyncio.CancelledError)
+        else:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    assert events == ["failed"]
     assert session_lease.closed
+    assert [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-STATUS-WRITE-DETAIL" not in repr(logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("close_error", "status_write_error"),
+    [
+        (OSError("PRIVATE-LEASE-CLOSE"), None),
+        (AuditIntegrityError("lease close integrity"), None),
+        (AuditIntegrityError("lease close integrity"), OSError("PRIVATE-STATUS-WRITE")),
+    ],
+    ids=["ordinary_close", "integrity_close", "integrity_close_after_failed_status_write"],
+)
+async def test_cancellation_close_failure_escapes_with_the_cancellation_as_context(
+    monkeypatch, close_error: BaseException, status_write_error: BaseException | None
+) -> None:
+    """A lease the cancelled reservation could not release is raised, never noted or logged.
+
+    The close failure escapes in its own right, ordinary or integrity alike,
+    with the cancellation as its ``__context__``. When the status write failed
+    first, the close is still attempted and its failure chains the earlier one.
+    """
+    session_id = uuid4()
+    fence = GuidedOperationFence(session_id=session_id, operation_id=_request().operation_id, lease_token="secret", attempt=1)
+    claimed = GuidedOperationClaimed(fence=fence, lease_expires_at=datetime.now(UTC) + timedelta(minutes=1))
+    reserve_started = asyncio.Event()
+    finish_reserve = asyncio.Event()
+
+    class FailingCloseLease(_Lease):
+        async def close(self) -> None:
+            self.closed = True
+            raise close_error
+
+    session_lease = FailingCloseLease(_context(session_id))
+
+    class CancellationService(_Service):
+        async def reserve_guided_operation(self, **kwargs):
+            reserve_started.set()
+            try:
+                await finish_reserve.wait()
+            except asyncio.CancelledError:
+                await finish_reserve.wait()
+            return claimed
+
+        async def fail_guided_operation(self, actual_fence, **kwargs):
+            assert actual_fence == fence
+            assert not session_lease.closed
+            if status_write_error is not None:
+                raise status_write_error
+            return GuidedOperationFailed(failure_code="request_cancelled")
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    task = asyncio.create_task(
+        reserve_or_replay_guided_operation(
+            service=CancellationService([None]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    )
+    await reserve_started.wait()
+    task.cancel()
+    finish_reserve.set()
+
+    with capture_logs() as logs, pytest.raises(type(close_error)) as caught:
+        await task
+
+    assert caught.value is close_error
+    assert session_lease.closed
+    if status_write_error is None:
+        assert isinstance(caught.value.__context__, asyncio.CancelledError)
+    else:
+        assert caught.value.__context__ is status_write_error
+        assert isinstance(status_write_error.__context__, asyncio.CancelledError)
+    assert [entry for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-LEASE-CLOSE" not in repr(logs)
+    assert "PRIVATE-STATUS-WRITE" not in repr(logs)
 
 
 @pytest.mark.asyncio

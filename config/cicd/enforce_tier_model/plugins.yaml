@@ -903,25 +903,25 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[39]/body[2]/orelse[0]/value/values[1]'
   judge_metadata_signature: 'hmac-sha256:v2:5afe77fee4c7922d8c289c7905c5aaf7822ea9bb6ec0f3c41bb3c6d59e473b69'
-- key: plugins/infrastructure/clients/llm.py:R4:AuditedLLMClient:_emit_telemetry_after_audit:fp=bbfdc3112d58d4a4
+- key: plugins/infrastructure/clients/llm.py:R4:AuditedLLMClient:_emit_telemetry_after_audit:fp=f120de4dec1c6d06
   owner: john
   reason: |-
-    PRESCRIBED FORM — telemetry best-effort swallow under the audit>telemetry>logger primacy order; Tier-1 and programming errors re-raise first. In AuditedLLMClient._emit_telemetry_after_audit (plugins/infrastructure/clients/llm.py:337), `except Exception as tel_err` is the LAST of three clauses wrapping self._telemetry_emit(ExternalCallCompleted(...)): line 333-334 `except contract_errors.TIER_1_ERRORS: raise` (system bugs / audit integrity violations crash), line 335-336 `except (TypeError, AttributeError, KeyError, NameError): raise` (programming errors crash), and only THEN the broad catch for genuine telemetry-transport failures. The method name and comment state the doctrine: the audit record is already persisted (Landscape is the authoritative legal record), and telemetry is best-effort per the audit>telemetry>logger primacy order, so a telemetry emission failure must not corrupt or crash the already-audited call flow. This is not a silent failure: the broad catch emits logger.warning with error, error_type, run_id, state_id, operation_id and exc_info — the sanctioned last-resort logging channel precisely because the telemetry subsystem itself is the broken component here (CLAUDE.md permits logger for telemetry-system failures). "No silent failures" is honored: the failure is acknowledged on the logger, not dropped. The broad catch is correct because a transport failure can surface as many exception types, while the two re-raise clauses ensure our-code bugs and Tier-1 violations still crash. R4 flags `except Exception` generically. Per-line allowlist is the prescribed mechanism.
+    PRESCRIBED FORM - telemetry best-effort containment under the audit > telemetry > logger primacy order. `AuditedLLMClient._emit_telemetry_after_audit` is called only after `AuditedLLMClient._record_call` has already written the authoritative Landscape call row (every call site in this class records first, then emits), and the flagged `except Exception as tel_err` is the LAST of three arms around the single `self._telemetry_emit(event)` call: `contract_errors.TIER_1_ERRORS` re-raise first, then `(TypeError, AttributeError, KeyError, NameError)` re-raise as programming errors, so only a transport-level failure of the caller-supplied bare `Callable` reaches this arm. Event construction, including `stable_hash` of the request and response, runs BEFORE the `try`, so a first-party bug there crashes rather than being contained. The failure is acknowledged, not dropped: `logger.warning("telemetry_emit_failed", error_type=..., run_id=..., state_id=..., operation_id=..., call_type="llm")` names the exception class and the audit coordinates so the mirror gap is attributable; the exception text is deliberately omitted because an exporter error can carry endpoint detail. Pinned by tests/unit/plugins/clients/test_llm_telemetry.py::TestLLMClientTelemetry::test_telemetry_failure_does_not_corrupt_successful_call (a `RuntimeError` from the exporter leaves exactly one SUCCESS audit row and the call result intact), tests/unit/plugins/clients/test_llm_telemetry.py::TestLLMClientTelemetry::test_telemetry_emitted_after_landscape_recording (the audit row precedes the telemetry event) and tests/unit/plugins/clients/test_llm_telemetry.py::TestLLMClientTelemetry::test_no_telemetry_when_landscape_recording_fails (no telemetry is emitted when the audit write fails, so telemetry never stands in for audit).
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-10-06'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-07-08T12:10:35.501905+00:00'
-  judge_model: anthropic/claude-4.7-opus-20260416
-  judge_policy_hash: 'sha256:08052cb8f2c263c39dc61336444e6f2b2859292e283a902510827744f18d68da'
-  judge_confidence: 0.85
+  judge_recorded_at: '2026-09-09T04:24:15.024909+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM — this is the sanctioned telemetry best-effort pattern under the audit>telemetry>logger primacy order. The visible code shows the correct layered structure: TIER_1_ERRORS re-raise (audit integrity preserved), programming-error types (TypeError/AttributeError/KeyError/NameError) re-raise (our-code bugs crash), and only then the broad catch for genuine telemetry-transport failures, which are logged with full context via structured logger.warning including exc_info. The audit record is already persisted before this method runs, so telemetry failure must not corrupt the audited call flow, and logger is the policy-sanctioned last-resort channel when the telemetry subsystem itself is broken. The rationale correctly identifies the R4 concern and shows how the two prior narrow re-raise clauses prevent bug-suppression while permitting the transport-failure catch.
+    PRESCRIBED FORM — the R4 catch is deliberate best-effort telemetry containment, not silent loss of an audit-integrity gate. I verified `AuditedClientBase._record_call` at `src/elspeth/plugins/infrastructure/clients/base.py:119` and the LLM success and error paths at `src/elspeth/plugins/infrastructure/clients/llm.py:466` through `src/elspeth/plugins/infrastructure/clients/llm.py:824`: each records the authoritative call before invoking `_emit_telemetry_after_audit`, while the flagged block re-raises Tier-1 and identified programming errors and logs residual callback failure with audit coordinates. The three claimed pinning tests exist at `tests/unit/plugins/clients/test_llm_telemetry.py:427`, `tests/unit/plugins/clients/test_llm_telemetry.py:522`, and `tests/unit/plugins/clients/test_llm_telemetry.py:562`, and they verify audit-before-telemetry ordering, preservation of the successful audited result after exporter failure, and absence of telemetry when audit recording fails. R4 is not eligible for the `@trust_boundary` structural suppression.
   judge_signature_version: 2
-  scope_fingerprint: 734ab788c50e2c797bd58b4188ea6463c5c5d169577920f567ba0ad45bcffecf
-  judge_transport: openrouter
-  ast_path: 'body[38]/body[2]/body[1]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:90bec995a0daa7d4f3f6cb11bc0bac5d2d6927b6dffd5ddb69d6a664260662a0'
+  scope_fingerprint: 9ba46f17401173a83cb5670482c50e4cb3c12467351dae0e1a4a89bb3900bf6e
+  judge_transport: codex_cli
+  ast_path: 'body[41]/body[2]/body[2]/handlers[2]'
+  judge_metadata_signature: 'hmac-sha256:v2:be8b644e1fd9da20b3e1c98064cd57301026f70ae9959f42f9dd8a37b18686c1'
 - key: plugins/infrastructure/clients/retrieval/connection.py:R6:_host_url:fp=e0a7778bdc527de0
   owner: john
   reason: |-

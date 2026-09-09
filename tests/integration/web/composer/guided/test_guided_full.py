@@ -952,17 +952,28 @@ def test_guided_full_settlement_rejects_command_state_that_differs_from_the_obse
         )
 
     monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", stage_mismatched_state)
-    response = composer_test_client.post(
-        f"/api/sessions/{session['id']}/guided/plan",
-        json={
-            "operation_id": "00000000-0000-4000-8000-000000000056",
-            "intent": "Reject a mismatched checkpoint before publication.",
-        },
-    )
+    # ADR-008: the settlement's AuditIntegrityError escapes the route TYPED
+    # (never translated into the coded 500 envelope), while the durable row
+    # still records the failure as ``integrity_error`` for replay.
+    with pytest.raises(AuditIntegrityError, match="checkpoint content differs from the observed composition head"):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000056",
+                "intent": "Reject a mismatched checkpoint before publication.",
+            },
+        )
 
-    assert response.status_code == 500, response.text
-    assert response.json()["detail"]["failure_code"] == "integrity_error"
     with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000056")
+            )
+            .mappings()
+            .one()
+        )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
         states = conn.execute(select(composition_states_table.c.id).where(composition_states_table.c.session_id == session["id"])).all()
         assert states == [(str(existing.id),)]
         assert conn.scalar(select(func.count()).select_from(composition_proposals_table)) == 0
@@ -1346,22 +1357,31 @@ def test_guided_full_inline_custody_refuses_settle_ceiling_divergent_from_plan(c
         update={"max_blob_storage_per_session_bytes": 123 * 1024 * 1024}
     )
 
-    response = composer_test_client.post(
-        f"/api/sessions/{session['id']}/guided/plan",
-        json={
-            "operation_id": "00000000-0000-4000-8000-000000000031",
-            "intent": "Load my inline CSV and write it out as JSON.",
-        },
-    )
-
     # The command __post_init__ trips AuditIntegrityError, which the guided
     # machinery records as a terminal integrity failure — never a settled
-    # proposal.
-    assert response.status_code == 500, response.text
-    assert response.json()["detail"]["failure_code"] == "integrity_error"
+    # proposal. ADR-008: that Tier-1 exception escapes the route TYPED (never
+    # translated into the coded 500 envelope), while the durable row still
+    # records the failure as ``integrity_error`` for replay.
+    with pytest.raises(AuditIntegrityError, match="custody storage ceiling diverges from the plan-time ceiling"):
+        composer_test_client.post(
+            f"/api/sessions/{session['id']}/guided/plan",
+            json={
+                "operation_id": "00000000-0000-4000-8000-000000000031",
+                "intent": "Load my inline CSV and write it out as JSON.",
+            },
+        )
 
     engine = composer_test_client.app.state.session_engine
     with engine.connect() as conn:
+        operation = (
+            conn.execute(
+                select(guided_operations_table).where(guided_operations_table.c.operation_id == "00000000-0000-4000-8000-000000000031")
+            )
+            .mappings()
+            .one()
+        )
+        assert operation["status"] == "failed"
+        assert operation["failure_code"] == "integrity_error"
         assert conn.execute(select(func.count()).select_from(blobs_table)).scalar_one() == 0
         assert conn.execute(select(func.count()).select_from(composition_proposals_table)).scalar_one() == 0
         assert (
@@ -1656,6 +1676,77 @@ def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_pro
         operation_id=operation_id,
         phase="complete",
         reason="composer_complete",
+    )
+
+
+def test_guided_full_cancellation_atomic_settlement_integrity_failure_escapes_typed(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Tier-1 failure inside the atomic settlement outranks the cancellation.
+
+    The shielded staging settlement keeps running after the caller cancels
+    and stamps its failure onto the cancellation it re-raises. The route
+    settles the operation row under that failure's own code, but ADR-008
+    requires a registered Tier-1 error to bubble typed: the
+    ``AuditIntegrityError`` escapes as the primary with the cancellation
+    chained beneath it, instead of being demoted to the cause of a routine
+    ``CancelledError``.
+    """
+    service = composer_test_client.app.state.session_service
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def started_then_fails_integrity(command, *, session_operation_context):
+        _assert_compose_context_for(session_operation_context, session["id"])
+        settlement_started.set()
+        await release_settlement.wait()
+        raise AuditIntegrityError("injected atomic settlement integrity failure")
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", started_then_fails_integrity)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled integrity settlement"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000077"
+    escaped: BaseException | None = None
+
+    async def cancel_during_settlement() -> None:
+        nonlocal escaped
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while the settlement fails integrity."},
+                )
+            )
+            await asyncio.wait_for(settlement_started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            await asyncio.sleep(0)
+            release_settlement.set()
+            try:
+                await request_task
+            except BaseException as outcome:  # the escape TYPE is the subject under test
+                escaped = outcome
+
+    asyncio.run(cancel_during_settlement())
+
+    assert type(escaped) is AuditIntegrityError, f"expected the typed integrity failure to escape, got {escaped!r}"
+    assert str(escaped) == "injected atomic settlement integrity failure"
+    assert isinstance(escaped.__cause__, asyncio.CancelledError), "the interrupted cancellation is chained beneath the failure"
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "integrity_error"
+    _assert_guided_plan_terminal_progress(
+        composer_test_client,
+        session=session,
+        operation_id=operation_id,
+        phase="failed",
+        reason="service_setup_failed",
     )
 
 

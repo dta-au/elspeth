@@ -654,6 +654,28 @@ class TestStep4WireEmitter:
         assert "/private/result.jsonl" not in str(turn)
         assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
 
+    def test_unparseable_schema_declaration_projects_no_fields_and_blocks_confirmation(self) -> None:
+        # ``_wire_schema`` swallows the parser's ``ValueError`` on purpose: the
+        # review card must not render a rejected declaration as validated
+        # fields, and the rejection itself is not this projection's to report.
+        # ``build_step_4_wire_turn`` publishes it from ``CompositionState.validate``
+        # as a blocker and withholds ``can_confirm``; pin both halves together
+        # so the swallow can never become a silent acceptance.
+        state = _schema_output_state(["id: int", "email: not_a_type"])
+
+        turn = _wire_turn(state)
+
+        output = turn["payload"]["outputs"][0]
+        assert output["business_schema"] == {
+            "mode": "fixed",
+            "fields": [],
+            "guaranteed_fields": ["id"],
+            "required_fields": ["email"],
+        }
+        assert turn["payload"]["can_confirm"] is False
+        assert any("not_a_type" in blocker["message"] for blocker in turn["payload"]["blockers"])
+        assert validate_payload(TurnType.CONFIRM_WIRING, turn["payload"]) is None
+
     def test_field_mapper_options_summary_projects_only_the_allowlisted_knobs(self) -> None:
         # R2-F3: the review surfaces rendered the behavior discriminant only, so
         # a field_mapper read as a generic "transforms each incoming item" and

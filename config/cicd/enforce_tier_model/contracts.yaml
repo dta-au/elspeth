@@ -4455,3 +4455,22 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[34]/body[6]/test'
   judge_metadata_signature: 'hmac-sha256:v2:dc775e92d67ed58e2a20694b7d240bbd518e70bb7cf6a651c0bfb35b40b0b534'
+- key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=e77d4dc4343425f9
+  owner: john
+  reason: |-
+    R5 `isinstance(value, complex)` in `_try_normalize_code_constant` is one arm of the manifest's closed, type-directed normalization of Python code constants: the function takes `value: object` (any constant lifted from a code object, first-party by construction, not a Tier-3 input) and must map every supported constant type onto a stable JSON-encodable form so a function containing that constant hashes deterministically and stays resumable. This arm is required because `complex` is not JSON-encodable at all; without it a complex literal would fall through to `_UNSUPPORTED_MANIFEST_VALUE` and `_normalize_code_constant` would raise `FrameworkBugError`, making any function with a complex constant unhashable. `isinstance` is load-bearing AS `isinstance` here: the arm deliberately admits complex SUBCLASSES so that they are normalized on the same path, and the subclass case is then handled explicitly rather than collapsed. The real and imaginary parts are read through the base `complex.__complex__` so a subclass overriding `real`/`imag` cannot substitute the recorded value, and `type(value) is complex` decides whether the bare pair is returned or `_preserve_builtin_subclass_identity` records the subclass identity alongside it, so two different constants can never hash alike. Same structure and justification as the signed sibling arms for `bytes` and `re.Pattern` in this function. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_complex_subclass_constant_normalizes_distinct_from_its_base, which asserts the bare complex normalizes to its pair and a complex subclass normalizes to a distinct value carrying its identity.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-08'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-09T05:38:58.742512+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — at contracts/runtime_val_manifest.py:209, `_try_normalize_code_constant` is a type-directed serializer over an intentionally heterogeneous `object`; the complex check selects a supported representation rather than defensively rechecking a fixed contract or hiding failure. Lines 278-285 deliberately admit complex subclasses, distinguish the exact base type, and preserve subclass identity, while unsupported values reach the sentinel and raise through `_normalize_code_constant` at lines 339-346. The named test was verified at tests/unit/contracts/test_runtime_val_manifest.py:1989 and confirms both base-value normalization and distinct, override-resistant subclass normalization. This parameter is not external Tier-3 data, so the trust-boundary decorator is inapplicable.
+  judge_signature_version: 2
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
+  judge_transport: codex_cli
+  ast_path: 'body[34]/body[7]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:cf55348396ce547dfa4e0a7f0a183682a131c173c28cc601dcff21366bc0f8de'

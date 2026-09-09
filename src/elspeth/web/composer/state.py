@@ -6092,16 +6092,23 @@ def _check_schema_contracts(
         survives unchanged. Removed fields, fixed output firewalls, rewriting
         transforms, and unresolved fan-in all abstain.
         """
-        if isinstance(consumer, OutputSpec):
+        # ``consumer`` is a closed union of two exact, unsubclassed frozen
+        # dataclasses this module owns, so the exact-type form is the house
+        # idiom for discriminating it, and the terminal arm is the nominal
+        # fail-closed check over that closed union (ADR-032): a first-party
+        # typing-contract breach, so it crashes as ``TypeError``.
+        if type(consumer) is OutputSpec:
             consumer_id = f"output:{consumer.name}"
             consumer_component = consumer_id
-        else:
+        elif type(consumer) is NodeSpec:
             consumer_id = consumer.id
             consumer_component = f"node:{consumer.id}"
+        else:
+            raise TypeError(f"edge consumer must be a NodeSpec or OutputSpec, got {type(consumer).__name__}")
         try:
             consumer_options = consumer.options
             consumer_owner = consumer_component
-            if isinstance(consumer, NodeSpec) and node_type_nests_contract_options(consumer.node_type):
+            if type(consumer) is NodeSpec and node_type_nests_contract_options(consumer.node_type):
                 consumer_options, consumer_owner = get_aggregation_contract_options(consumer.options, owner=consumer_owner)
             consumer_schema_config = get_raw_schema_config(consumer_options, owner=consumer_owner)
         except ValueError:

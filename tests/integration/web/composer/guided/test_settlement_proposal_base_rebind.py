@@ -70,6 +70,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from elspeth.contracts.composer_llm_audit import ComposerChatTurnStatus
+from elspeth.contracts.errors import AuditIntegrityError
 from elspeth.contracts.freeze import deep_thaw
 from elspeth.contracts.session_operation import SessionOperationKind
 from elspeth.web.composer.guided.planning import guided_private_reviewed_facts
@@ -608,20 +609,16 @@ def test_a_guided_full_staging_refuses_rather_than_bricking_a_reviewing_walk(
     session_id, _retained, staged = _stage_schema8_topology_intent_proposal(client, monkeypatch)
     before = _head_record(client, session_id)
 
-    refused = client.post(
-        f"/api/sessions/{session_id}/guided/plan",
-        json={"operation_id": str(uuid4()), "intent": "Forget the steps, just build the whole pipeline."},
-    )
-
-    assert refused.status_code == 500, refused.json()
-    detail = refused.json()["detail"]
-    assert detail["error_type"] == "guided_operation_terminal_failure"
-    assert detail["failure_code"] == "integrity_error"
-    # The refusal message names the pending proposal so the operator can chase
-    # it in the audit trail; the closed failure vocabulary is what reaches the
-    # client. Pin the boundary, so a later "make the error more helpful" edit
-    # cannot quietly turn a server-side diagnostic into an egress.
-    assert staged["next_turn"]["payload"]["proposal_id"] not in refused.text
+    # ADR-008: the staging refusal is an AuditIntegrityError and escapes the
+    # route TYPED (never translated into the coded terminal envelope). The
+    # refusal message names the pending walk so the operator can chase it in
+    # the audit trail; what reaches a client is the app-level audit-integrity
+    # handler's static detail, which carries no server-side diagnostic text.
+    with pytest.raises(AuditIntegrityError, match="still reviewing a proposal"):
+        client.post(
+            f"/api/sessions/{session_id}/guided/plan",
+            json={"operation_id": str(uuid4()), "intent": "Forget the steps, just build the whole pipeline."},
+        )
     after = _head_record(client, session_id)
     assert (after.id, after.version) == (before.id, before.version), "a refused staging must not advance the head"
     proposals = asyncio.run(client.app.state.session_service.list_composition_proposals(UUID(session_id)))

@@ -8156,7 +8156,15 @@ class SessionServiceImpl:
         actor: str,
         session_operation_context: SessionOperationContext,
     ) -> CompositionProposalRecord:
-        """Reject a pending proposal by appending an event, then updating status."""
+        """Reject a pending proposal by appending an event, then updating status.
+
+        Raise contract, in order: ``KeyError`` when no proposal row exists for
+        ``proposal_id`` in this session, and ``ProposalStateConflictError``
+        only when the row exists but its status is no longer ``"pending"``
+        (another writer already made it terminal). Nothing else in this
+        method raises ``ProposalStateConflictError``; the route-level
+        auto-reject on a validation failure relies on that distinction.
+        """
         sid = str(session_id)
         pid = str(proposal_id)
         event_id = str(uuid.uuid4())

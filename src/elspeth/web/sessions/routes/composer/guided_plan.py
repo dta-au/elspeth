@@ -211,11 +211,14 @@ async def _publish_guided_full_terminal_preserving_primary(
     awaiting the sink is genuine task cancellation and must keep unwinding.
     ``Task.cancelling()`` distinguishes the two: an injected cancel
     increments the enclosing task's cancelling count, a sink-internal
-    ``CancelledError`` does not. Other ``BaseException`` subclasses still
-    escape.
+    ``CancelledError`` does not. A Tier-1 integrity failure raised by the sink
+    is the mandatory error channel and escapes rather than becoming a
+    diagnostic; other ``BaseException`` subclasses still escape.
     """
     try:
         await progress(event)
+    except contract_errors.TIER_1_ERRORS:
+        raise
     except asyncio.CancelledError as progress_exc:
         enclosing_task = asyncio.current_task()
         if enclosing_task is not None and enclosing_task.cancelling() > 0:
@@ -790,6 +793,16 @@ async def post_guided_plan(
         )
         await _await_with_deferred_cancellation(progress(terminal_event))
         if settlement_failure is not None:
+            if isinstance(settlement_failure, contract_errors.TIER_1_ERRORS):
+                # The atomic settlement failed with a registered Tier-1 error
+                # while this cancellation was pending. The operation row is
+                # settled above under that failure's own code; ADR-008 then
+                # requires the integrity failure itself to bubble typed rather
+                # than ride as the cause of a ``CancelledError`` the caller
+                # would read as a routine cancel. It is the primary here and
+                # the cancellation it interrupted is chained beneath it — the
+                # same posture as the ordinary Tier-1 arm below.
+                raise settlement_failure from exc
             raise exc from settlement_failure
         if disconnected:
             raise HTTPException(
@@ -801,6 +814,59 @@ async def post_guided_plan(
         if joined_winner is not None:
             return joined_winner
         raise_guided_operation_failure(failed or GuidedOperationFailed(failure_code=cancel_failure_code))
+    except contract_errors.TIER_1_ERRORS as exc:
+        # ADR-008: a registered Tier-1 failure bubbles typed and aborts. The
+        # durable row still records THAT the operation failed and why
+        # (``integrity_error``), so a retry on the same operation id replays
+        # a deterministic terminal envelope — but the original exception is
+        # what escapes this route. It is never translated into the closed
+        # ``HTTPException`` the ordinary arm below raises, and a lost
+        # settlement fence cannot downgrade the abort into a rejoin: the
+        # settlement verifies the fence as the first statement of its locked
+        # transaction, so a lost fence means this worker recorded nothing
+        # and a rival owns the operation. Either way the Tier-1 exception is
+        # re-raised, with the settlement fault chained as its cause when the
+        # settlement itself could not be written.
+        failure_code = _guided_full_failure_code(exc)
+        try:
+            await service.fail_guided_operation_with_audit(
+                GuidedOperationFailureCommand(
+                    fence=reserved.fence,
+                    failure_code=failure_code,
+                    actor="composer_route",
+                    audit_evidence=GuidedAuditEvidence(
+                        invocations=recorder.invocations,
+                        llm_calls=recorder.llm_calls,
+                        planner_attempts=recorder.planner_attempts,
+                        chat_turns=recorder.chat_turns,
+                    ),
+                ),
+                session_operation_context=reserved.session_operation_context,
+            )
+        except GuidedOperationFenceLostError as fence_lost:
+            fence_loss_observed = True
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=failure_code,
+                secondary=fence_lost,
+                site="tier1_settlement_fence_lost",
+            )
+            raise exc from fence_lost
+        except Exception as settlement_exc:
+            _note_guided_full_secondary_failure(
+                request=request,
+                primary_failure_code=failure_code,
+                secondary=settlement_exc,
+                site="tier1_failure_settlement",
+            )
+            raise exc from settlement_exc
+        await _publish_guided_full_terminal_preserving_primary(
+            request=request,
+            progress=progress,
+            primary_outcome=failure_code,
+            event=_guided_full_failed_progress_event(failure_code),
+        )
+        raise
     except Exception as exc:
         failure_code = _guided_full_failure_code(exc)
         try:

@@ -31,7 +31,7 @@ from elspeth.web.sessions.models import (
     session_operation_fences_table,
     sessions_table,
 )
-from elspeth.web.sessions.protocol import CompositionStateData
+from elspeth.web.sessions.protocol import CompositionStateData, ProposalStateConflictError
 from elspeth.web.sessions.schema import initialize_session_schema
 from elspeth.web.sessions.service import SessionServiceImpl
 from elspeth.web.sessions.telemetry import build_sessions_telemetry
@@ -905,6 +905,58 @@ async def test_proposal_blob_validation_and_delete_share_one_serial_order(tmp_pa
         with pytest.raises(BlobNotFoundError):
             await blob_service.get_blob(blob.id, session_operation_context=context)
         assert await session_service.list_composition_proposals(session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_reject_composition_proposal_raises_conflict_only_for_a_terminal_row(service) -> None:
+    """Pin the raise contract the route-level auto-reject sentinel depends on.
+
+    A missing row is ``KeyError`` (corruption of our own data, never
+    swallowed); a row that exists but is no longer pending is
+    ``ProposalStateConflictError``, the benign status race the accept route
+    suppresses before surfacing the validation failure as 422.
+    """
+    session_id = (await service.create_session("alice", "Reject contract", "local")).id
+    async with _session_operation_context(service, session_id, SessionOperationKind.COMPOSE) as context:
+        proposal = await service.create_composition_proposal(
+            session_id=session_id,
+            tool_call_id="call_set_pipeline",
+            tool_name="set_pipeline",
+            summary="Replace the pipeline.",
+            rationale="Requested by the user.",
+            affects=("graph",),
+            arguments_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            arguments_redacted_json={"sources": {"primary": {"plugin": "csv", "options": {}}}},
+            base_state_id=None,
+            actor="composer-web:user-alice",
+            session_operation_context=context,
+        )
+
+    async with _session_operation_context(service, session_id, SessionOperationKind.PROPOSAL) as context:
+        with pytest.raises(KeyError):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=uuid4(),
+                actor="user:alice",
+                session_operation_context=context,
+            )
+        rejected = await service.reject_composition_proposal(
+            session_id=session_id,
+            proposal_id=proposal.id,
+            actor="user:alice",
+            session_operation_context=context,
+        )
+        assert rejected.status == "rejected"
+        with pytest.raises(ProposalStateConflictError, match="must be pending to reject; got 'rejected'"):
+            await service.reject_composition_proposal(
+                session_id=session_id,
+                proposal_id=proposal.id,
+                actor="user:alice",
+                session_operation_context=context,
+            )
+
+    events = await service.list_proposal_events(session_id)
+    assert [event.event_type for event in events] == ["proposal.created", "proposal.rejected"]
 
 
 @pytest.mark.asyncio
