@@ -1679,6 +1679,73 @@ def test_guided_full_cancel_after_atomic_settlement_still_publishes_terminal_pro
     )
 
 
+def test_guided_full_cancellation_atomic_settlement_ordinary_failure_keeps_the_cancellation(
+    composer_test_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ORDINARY settlement failure stays the cause; the cancellation is primary.
+
+    The sibling test below pins the Tier-1 escape. This one pins the other
+    side of the same guard, and it is the half that had no coverage: an
+    adversarial review (2026-09-09) deleted the ``TIER_1_ERRORS`` test
+    entirely — promoting EVERY settlement failure to primary — and all 240
+    tests in the commit's blast radius stayed green. Without this test the
+    discrimination is free to rot.
+
+    ADR-008 registers no ordinary ``RuntimeError``, so the caller's
+    cancellation remains the authoritative outcome and the settlement fault
+    rides as its cause.
+    """
+    service = composer_test_client.app.state.session_service
+    settlement_started = asyncio.Event()
+    release_settlement = asyncio.Event()
+
+    async def started_then_fails_ordinary(command, *, session_operation_context):
+        _assert_compose_context_for(session_operation_context, session["id"])
+        settlement_started.set()
+        await release_settlement.wait()
+        raise RuntimeError("injected ordinary settlement failure")
+
+    monkeypatch.setattr(service, "stage_guided_full_pipeline_proposal", started_then_fails_ordinary)
+    session = composer_test_client.post("/api/sessions", json={"title": "guided cancelled ordinary settlement"}).json()
+    operation_id = "00000000-0000-4000-8000-000000000078"
+    escaped: BaseException | None = None
+
+    async def cancel_during_settlement() -> None:
+        nonlocal escaped
+        async with AsyncClient(
+            transport=ASGITransport(app=composer_test_client.app),
+            base_url="http://test",
+        ) as client:
+            request_task = asyncio.create_task(
+                client.post(
+                    f"/api/sessions/{session['id']}/guided/plan",
+                    json={"operation_id": operation_id, "intent": "Cancel while the settlement fails ordinarily."},
+                )
+            )
+            await asyncio.wait_for(settlement_started.wait(), timeout=3)
+            request_task.cancel("primary caller cancellation")
+            await asyncio.sleep(0)
+            release_settlement.set()
+            try:
+                await request_task
+            except BaseException as outcome:  # the escape TYPE is the subject under test
+                escaped = outcome
+
+    asyncio.run(cancel_during_settlement())
+
+    assert isinstance(escaped, asyncio.CancelledError), f"the cancellation must stay primary, got {escaped!r}"
+    assert type(escaped.__cause__) is RuntimeError, "the ordinary settlement failure rides as the cancellation's cause"
+    assert str(escaped.__cause__) == "injected ordinary settlement failure"
+
+    with composer_test_client.app.state.session_engine.connect() as conn:
+        operation = (
+            conn.execute(select(guided_operations_table).where(guided_operations_table.c.operation_id == operation_id)).mappings().one()
+        )
+    assert operation["status"] == "failed"
+    assert operation["failure_code"] == "operation_failed", "an unregistered failure is not an integrity error"
+
+
 def test_guided_full_cancellation_atomic_settlement_integrity_failure_escapes_typed(
     composer_test_client,
     monkeypatch: pytest.MonkeyPatch,

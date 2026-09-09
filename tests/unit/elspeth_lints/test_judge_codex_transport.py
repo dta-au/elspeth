@@ -9,6 +9,7 @@ model or consumes operator credentials.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,12 @@ from elspeth_lints.core.judge import (
     _call_codex_cli,
     call_judge,
 )
+
+# Matches any Codex `-c` setting that turns a shell capability OFF, in any
+# quoting or spacing: features.shell_tool=false, features.unified_exec="false",
+# features.shell_snapshot = 'false'. Written as a pattern because an exact
+# string membership assertion is defeated by requoting alone.
+_SHELL_FEATURE_SETTING = re.compile(r"""^\s*features\.(shell_tool|unified_exec|shell_snapshot)\s*=\s*['"]?false['"]?\s*$""")
 
 
 def _request() -> JudgeRequest:
@@ -105,9 +112,7 @@ def test_codex_cli_transport_isolated_blinded_invocation(monkeypatch: pytest.Mon
     # The native shell stays available under the read-only sandbox (operator
     # ruling 2026-09-09); blinded mode simply has nothing to look at because
     # it runs in an empty temporary directory.
-    assert "features.shell_tool=false" not in command
-    assert "features.unified_exec=false" not in command
-    assert "features.shell_snapshot=false" not in command
+    assert [part for part in command if _SHELL_FEATURE_SETTING.match(part)] == []
     cd_target = Path(command[command.index("--cd") + 1])
     assert cd_target.name.startswith("elspeth-judge-codex-")
     assert 'web_search="disabled"' in command
@@ -162,8 +167,14 @@ def test_codex_cli_readonly_mode_registers_only_scoped_mcp_tools(
     assert 'mcp_servers.elspeth_judge_tools.default_tools_approval_mode="approve"' in command
     # Tool mode runs IN the checkout with Codex's native read-only shell on:
     # the MCP reader is a supplement, not the judge's only pair of eyes.
-    assert "features.shell_tool=false" not in command
-    assert "features.unified_exec=false" not in command
+    #
+    # Asserted by PATTERN, not by exact list membership. An adversarial review
+    # (2026-09-09) disabled the shell as `features.shell_tool="false"` — the
+    # quoting style the sibling `web_search="disabled"` flag in this very
+    # function already uses — and an exact `not in command` membership test
+    # stayed green. Any spelling that turns a shell feature off must fail here.
+    shell_features = [part for part in command if _SHELL_FEATURE_SETTING.match(part)]
+    assert shell_features == [], f"the judge's shell must not be disabled in any spelling, found: {shell_features}"
     assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == ["--sandbox", "read-only"]
     assert command[command.index("--cd") + 1] == str(source_root.resolve())
 
