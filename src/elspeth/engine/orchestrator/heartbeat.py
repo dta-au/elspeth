@@ -24,7 +24,7 @@ communicates through :class:`threading.Event` flags:
 Design invariants enforced here:
 
 - **BUSY = liveness-unknown** — a heartbeat ``OperationalError`` whose DBAPI
-  message is SQLite write-lock contention (``_is_lock_contention``), or a
+  message is SQLite or PostgreSQL lock contention (``_is_lock_contention``), or a
   rolled-back lease deadline rejection (``LeaseDeadlineExpiredError``), is
   logged at DEBUG and counted toward the ``heartbeat_degraded`` threshold
   ``k``; the thread never sets the latch on either. An ``OperationalError``
@@ -87,7 +87,7 @@ _DEFAULT_DEGRADED_THRESHOLD: int = 3
 
 
 def _is_lock_contention(exc: OperationalError) -> bool:
-    """True only for SQLite write-lock contention (SQLITE_BUSY / SQLITE_LOCKED).
+    """True only for SQLite or PostgreSQL lock contention.
 
     ``begin_write`` takes the WAL write lock at BEGIN IMMEDIATE and raises
     ``OperationalError("database is locked")`` after the 5000 ms busy_timeout
@@ -102,6 +102,10 @@ def _is_lock_contention(exc: OperationalError) -> bool:
     about contention and is reported as non-contention — this predicate gates
     a fatal latch, so its unknown case must fail closed.
 
+    PostgreSQL's shorter lock timeout fires before its statement timeout. Only
+    the lock-timeout primary message is contention; statement timeouts and
+    explicit query cancellation remain fatal database failures.
+
     Every other ``OperationalError`` — unable to open the database file, disk
     I/O error, a readonly database — is an audit-store failure rather than
     contention, and the heartbeat must not silently count it as a busy tick.
@@ -109,7 +113,8 @@ def _is_lock_contention(exc: OperationalError) -> bool:
     origin = exc.orig
     if origin is None:
         return False
-    return "is locked" in str(origin).lower()
+    message = str(origin).lower()
+    return "is locked" in message or message.split("\n", 1)[0] == "canceling statement due to lock timeout"
 
 
 class _HeartbeatRepository(Protocol):
@@ -349,8 +354,8 @@ class RunHeartbeatThread:
            vanished registry row) → corruption, not contention: latch the
            exception for ``check_and_raise()`` to re-raise at the next drain
            boundary (fail closed); never raises on this thread's stack.
-        4. Write-lock contention ``OperationalError`` (``_is_lock_contention``:
-           the DBAPI message is SQLITE_BUSY / SQLITE_LOCKED) → liveness-unknown;
+        4. Lock contention ``OperationalError`` (``_is_lock_contention``:
+           SQLite lock contention or PostgreSQL lock timeout) → liveness-unknown;
            DEBUG log, count toward degraded threshold, continue.
         5. Any other ``OperationalError`` (unable to open the database file,
            disk I/O error, readonly database) → an audit-store failure with no

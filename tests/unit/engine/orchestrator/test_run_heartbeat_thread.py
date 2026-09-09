@@ -371,6 +371,46 @@ class TestBusyTolerated:
         assert not thread._coordination_lost_event.is_set()
         thread.check_and_raise()  # must not raise
 
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    def test_postgresql_lock_timeout_records_degradation(self, driver: str) -> None:
+        postgres = pytest.importorskip(driver)
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE",
+            None,
+            postgres.errors.LockNotAvailable(
+                'canceling statement due to lock timeout\nCONTEXT:  while locking tuple (0,1) in relation "run_coordination"'
+            ),
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        assert not thread.coordination_lost
+        thread.check_and_raise()
+
+    @pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+    @pytest.mark.parametrize("reason", ["statement timeout", "user request"])
+    def test_postgresql_non_lock_cancellation_remains_fatal(self, driver: str, reason: str) -> None:
+        postgres = pytest.importorskip(driver)
+        failure = OperationalError(
+            "SELECT run_coordination FOR UPDATE", None, postgres.errors.QueryCanceled(f"canceling statement due to {reason}")
+        )
+        repo = _StubRepo()
+        repo.side_effect = failure
+        thread = _make_thread(repo, degraded_threshold=1)
+
+        thread._step_beat()
+
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
+
     @pytest.mark.parametrize(
         "driver_message",
         ["unable to open database file", "disk I/O error", "attempt to write a readonly database"],

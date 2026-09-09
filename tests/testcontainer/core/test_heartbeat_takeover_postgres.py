@@ -24,9 +24,9 @@ from elspeth.core.landscape.schema import run_coordination_events_table, run_coo
 pytestmark = pytest.mark.testcontainer
 
 
-@pytest.fixture(scope="module")
-def postgres_url() -> Iterator[str]:
-    with postgres_test_target(driver="psycopg") as url:
+@pytest.fixture(scope="module", params=["psycopg", "psycopg2"])
+def postgres_url(request: pytest.FixtureRequest) -> Iterator[str]:
+    with postgres_test_target(driver=request.param) as url:
         yield url
 
 
@@ -191,6 +191,7 @@ def test_postgresql_blocked_heartbeat_returns_and_stop_completes(postgres_url: s
             assert stopped.wait(8), "heartbeat stop remained blocked behind a PostgreSQL row lock"
             assert errors == []
             assert heartbeat._consecutive_busy == 1
+            heartbeat.check_and_raise()
             with db.engine.connect() as observer:
                 recorded = (
                     observer.execute(
