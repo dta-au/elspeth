@@ -38,10 +38,11 @@ _ROOT = Path(__file__).resolve().parents[4]
 # a harmless audit timestamp.
 _CLOCK_AUTHORITY_VERBS = frozenset(
     {
-        "_acquire_export_leadership_on",
+        "_acquire_terminal_leadership_on",
         "_acquire_run_leadership_on",
         "_rotate_expired_leases",
         "acquire_export_leadership",
+        "acquire_reconciliation_leadership",
         "acquire_lease",
         "acquire_run_leadership",
         "admit_follower",
@@ -125,7 +126,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
     "src/elspeth/engine/orchestrator/",
 )
 # D8.1 (elspeth-43ddb79074): e4471634… → e48a6829…, +2 identities: the export seat
-# (acquire_export_leadership / _acquire_export_leadership_on, ADR-048 §4) reads the
+# (acquire_export_leadership / _acquire_terminal_leadership_on, ADR-048 §4) reads the
 # Landscape clock to judge the lapsed seat it takes. Re-derived from the printed output.
 # BARRIER-ADOPT (elspeth-ee18e446ff, ADR-030 D4): e48a6829… → ba944a5b…, +1 identity:
 # reset_adoption_marker_to_pending moved off a bare begin_write onto
@@ -154,7 +155,7 @@ _AUTHORITY_SCOPE_PREFIXES = (
 # tree. The digest below was re-derived by RUNNING the gate on that tree, never computed
 # by reasoning about rows: it hashes the source tree's DISCOVERY ORDER, so the order of
 # this literal is not load-bearing and was resolved purely for readability.
-_CLOCK_BOUNDARY_DIGEST = "d82814612b86a992f644d362efb695ba2f3684dee60b5f3c19cc76fcb1b54533"
+_CLOCK_BOUNDARY_DIGEST = "e41b6c7f0c6ce3321053df8a51817b6488f321cb5d4e0283895c244d6d8233ac"
 
 
 def _name_has_clock_marker(name: str) -> bool:
@@ -215,6 +216,11 @@ class _FunctionRecord:
 # authority definition requires an explicit review of this gate.
 _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
     {
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership"),
+        ("src/elspeth/core/landscape/run_lifecycle_repository.py", "RunLifecycleRepository.materialize_cancelled_permit"),
+        ("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.mark_executing"),
+        ("src/elspeth/core/landscape/run_start_admission.py", "RunStartAdmissionRepository.reset_prepared_initialization"),
+        ("src/elspeth/engine/orchestrator/run_lifecycle.py", "RunLifecycleCoordinator.initialize_database_phase"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.create_checkpoint"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "RecoveryManager.can_resume"),
@@ -269,7 +275,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
         ("src/elspeth/core/landscape/execution/source_completion_recovery.py", "SourceCompletionReconciler.reconcile"),
         ("src/elspeth/core/landscape/execution_repository.py", "ExecutionRepository.complete_aggregation_result"),
         ("src/elspeth/core/landscape/reproducibility.py", "update_grade_after_purge"),
-        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_export_leadership_on"),
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_terminal_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._acquire_run_leadership_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._finalize_follower_admission_on"),
         ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository._finalize_leader_registration_on"),
@@ -355,6 +361,7 @@ _REVIEWED_CLOCK_BOUNDARY_IDENTITIES = frozenset(
 # no direct SQL decision.
 _REQUIRED_AUTHORITY_PUBLIC_SURFACE = frozenset(
     {
+        ("src/elspeth/core/landscape/run_coordination_repository.py", "RunCoordinationRepository.acquire_reconciliation_leadership"),
         ("src/elspeth/core/checkpoint/manager.py", "CheckpointManager.delete_checkpoints"),
         ("src/elspeth/core/checkpoint/recovery.py", "check_run_status_resumable"),
         ("src/elspeth/core/landscape/execution/sink_effects.py", "SinkEffectRepository.acquire_lease"),
@@ -4545,7 +4552,7 @@ def _worker_registration_contract_violations(source: str) -> tuple[str, ...]:
     expected_callers = {
         "register_run_leader_on": ("leader", "entry_point"),
         "_acquire_run_leadership_on": ("leader", "entry_point"),
-        "_acquire_export_leadership_on": ("leader", '"export"'),
+        "_acquire_terminal_leadership_on": ("leader", "purpose"),
         "admit_follower": ("follower", '"join"'),
     }
     observed: set[str] = set()
@@ -4825,7 +4832,7 @@ def _worker_registration_source() -> str:
     for name, role, entry in (
         ("register_run_leader_on", "leader", "entry_point"),
         ("_acquire_run_leadership_on", "leader", "entry_point"),
-        ("_acquire_export_leadership_on", "leader", '"export"'),
+        ("_acquire_terminal_leadership_on", "leader", "purpose"),
         ("admit_follower", "follower", '"join"'),
     ):
         source += (

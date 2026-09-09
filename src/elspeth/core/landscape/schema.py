@@ -375,7 +375,9 @@ def _optional_enum_in_check(column_name: str, enum_type: type[StrEnum]) -> str:
 #        (ix_scheduler_events_run_token_time is replaced by
 #        ix_scheduler_events_run_token_seq). Pre-1.0 delete-and-recreate
 #        boundary; no migration, rollback_permitted: false.
-SQLITE_SCHEMA_EPOCH = 38
+#   39 → immutable web run-start permit binding and recoverable pre-effect
+#        admission state. Pre-1.0 delete-and-recreate boundary; no migration.
+SQLITE_SCHEMA_EPOCH = 39
 
 schema_identity_table = create_schema_identity_table(metadata)
 
@@ -486,6 +488,21 @@ runs_table = Table(
     ),
 )
 Index("uq_runs_export_witness", runs_table.c.run_id, runs_table.c.status, runs_table.c.completed_at, unique=True)
+
+run_start_admissions_table = Table(
+    "run_start_admissions",
+    metadata,
+    Column("run_id", String(64), ForeignKey("runs.run_id"), primary_key=True),
+    Column("permit_id", String, nullable=False, unique=True),
+    Column("permit_epoch", Integer, nullable=False),
+    Column("subject_hash", String(64), nullable=False),
+    Column("state", String(16), nullable=False),
+    CheckConstraint("permit_epoch > 0", name="ck_run_start_admissions_epoch"),
+    CheckConstraint("length(trim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="sqlite"),
+    CheckConstraint("length(btrim(permit_id)) > 0", name="ck_run_start_admissions_permit").ddl_if(dialect="postgresql"),
+    CheckConstraint(_LowerHex64Check("subject_hash"), name="ck_run_start_admissions_hash"),
+    CheckConstraint("state IN ('prepared', 'executing')", name="ck_run_start_admissions_state"),
+)
 
 run_attributions_table = Table(
     "run_attributions",

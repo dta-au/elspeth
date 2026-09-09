@@ -1483,7 +1483,7 @@ def create_execution_router() -> APIRouter:
         """Cancel a run. Idempotent on terminal runs."""
         await _verify_run_ownership(run_id, user, request)
         try:
-            await service.cancel(run_id)
+            await service.cancel(run_id, user=user)
             status = await _load_run_status_with_accounting(run_id, app=request.app, service=service)
         except _RunStatusNotFoundError:
             raise _run_not_found_http() from None
