@@ -51,19 +51,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r \".tool_input.file_path // empty\" | { read -r f; [ -n \"$f\" ] || exit 0; ruff format \"$f\" 2>/dev/null; ruff check --select E9,F63,F7,F82 \"$f\"; }"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.venv/bin/python\" \"${CLAUDE_PROJECT_DIR}/.agents/skills/prove-it/stop_hook.py\"",
-            "timeout": 30,
-            "statusMessage": "prove-it: checking for an unproven completion"
+            "command": "jq -r \".tool_input.file_path // empty\" | { read -r f; [ -n \"$f\" ] || exit 0; case \"$f\" in *.py|*.pyi) ;; *) exit 0 ;; esac; ruff format \"$f\" 2>/dev/null; ruff check --select E9,F63,F7,F82 \"$f\"; }"
           }
         ]
       }

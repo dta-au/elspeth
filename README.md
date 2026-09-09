@@ -1099,6 +1099,7 @@ See [Architecture Documentation](ARCHITECTURE.md) for C4 diagrams and detailed d
 
 | Document | Audience | Content |
 | -------- | -------- | ------- |
+| [ROADMAP.md](ROADMAP.md) | All | Main work packages, proposed delivery sequence and decisions needed before scheduling |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Developers | C4 diagrams, data flows, component details |
 | [PLUGIN.md](PLUGIN.md) | Plugin Authors | How to create sources, transforms, sinks |
 | [docs/architecture/requirements.md](docs/architecture/requirements.md) | All | Compatibility pointer to current requirement, contract, and assurance sources |
