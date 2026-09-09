@@ -13,6 +13,7 @@ import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import structlog
 
@@ -53,6 +54,9 @@ from elspeth.web.composer.guided.protocol import GuidedStep
 from elspeth.web.composer.guided.resolved import SinkResolved, SourceResolved
 from elspeth.web.composer.state import CompositionState
 from elspeth.web.plugin_policy.models import PluginAvailabilitySnapshot
+
+if TYPE_CHECKING:
+    from typing import TypeIs
 
 slog = structlog.get_logger()
 
@@ -258,6 +262,19 @@ type Step2SinkChatResult = (
     | GuidedStepDeferredManagementResult
     | Step2SinkResolvedResult
 )
+
+
+def is_guided_step_chat_empty_result(outcome: Step1SourceChatResult | Step2SinkChatResult) -> TypeIs[GuidedStepChatEmptyResult]:
+    """Discriminate the empty member of a step-chat union by exact type.
+
+    A ``TypeIs`` guard (PEP 742) so mypy narrows BOTH arms: a caller that
+    falls through the negative branch holds the non-empty members, every one
+    of which declares ``chat``. Strict ``type() is`` on purpose — the unions
+    are closed sets of exact frozen dataclasses this package owns, and a
+    subclass arriving here would be a first-party contract violation to
+    surface, not an empty result to route.
+    """
+    return type(outcome) is GuidedStepChatEmptyResult
 
 
 # Synthetic message returned to the user when the LLM is transiently

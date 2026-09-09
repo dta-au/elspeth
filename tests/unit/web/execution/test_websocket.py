@@ -434,6 +434,84 @@ class TestWebSocketTimeoutRecovery:
         assert websocket.sent_json == []
         assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
 
+    @pytest.mark.asyncio
+    async def test_run_row_vanishing_after_seed_is_integrity_failure_not_4004(self) -> None:
+        """A run row the seed snapshot found cannot legitimately disappear.
+
+        No ELSPETH writer deletes a ``runs`` row: ``decide_and_soft_archive``
+        physically deletes only a session with no durable history and
+        soft-archives one that has a run, and run admission shares the
+        per-session ARCHIVE fence, so the ``runs.session_id`` cascade never
+        fires for an existing run. So ``_RunStatusNotFoundError`` on the idle recheck is Tier-1
+        referential corruption, not the seed path's client-facing not-found:
+        it must take the 1011 integrity path and escape, never a benign 4004.
+        """
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        vanished = routes._RunStatusNotFoundError()
+        initial = routes._LoadedRunStatus(
+            response=RunStatusResponse(
+                run_id=run_id,
+                status="running",
+                started_at=datetime.now(tz=UTC),
+                finished_at=None,
+                error=None,
+                landscape_run_id=None,
+            ),
+            record=FakeRunRecord(),
+        )
+        with (
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=[initial, vanished]),
+            ),
+            patch.object(routes.asyncio, "wait_for", new=AsyncMock(spec=routes.asyncio.wait_for, side_effect=TimeoutError())),
+            patch.object(routes.slog, "error") as logged,
+            pytest.raises(routes._RunStatusIntegrityError) as caught,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert caught.value.__cause__ is vanished
+        assert websocket.close_code == 1011
+        assert "not found" not in (websocket.close_reason or "").lower()
+        assert websocket.sent_json == []
+        logged.assert_called_once_with(
+            "websocket_run_status_integrity_error",
+            run_id=run_id,
+            phase="idle_recheck",
+            exc_class="_RunStatusIntegrityError",
+        )
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
+
+    @pytest.mark.asyncio
+    async def test_seed_not_found_still_closes_4004_without_raising(self) -> None:
+        """The seed-phase sentinel keeps the client-facing 4004 the judge
+        accepted for that arm (web.yaml, ``websocket_run_progress`` R6
+        ``fp=406b6b78b3682f23``): no event has been streamed yet, and the
+        1011-and-raise reclassification above is scoped to the idle recheck,
+        where the seed snapshot has already proven the row existed."""
+        from elspeth.web.execution import routes
+
+        run_id = str(uuid4())
+        app = _create_ws_test_app()
+        websocket = FakeWebSocket(app)
+        with (
+            patch.object(
+                routes,
+                "_load_run_status_snapshot_with_accounting",
+                new=AsyncMock(spec=routes._load_run_status_snapshot_with_accounting, side_effect=[routes._RunStatusNotFoundError()]),
+            ),
+            patch.object(routes.slog, "error") as logged,
+        ):
+            await _websocket_endpoint(app)(websocket, run_id, ticket=_issue_ws_ticket(app, run_id))
+        assert websocket.close_code == 4004
+        assert websocket.sent_json == []
+        logged.assert_not_called()
+        assert app.state.broadcaster.unsubscribe_calls == [(run_id, app.state.broadcaster.queue)]
+
     @staticmethod
     def _make_authed_app(execution_service: FakeExecutionService) -> FastAPI:
         auth = FakeAuthProvider(UserIdentity(user_id=_TEST_USER_ID, username="testuser"))

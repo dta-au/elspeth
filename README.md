@@ -6,10 +6,10 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 ![Status: 0.8.0](https://img.shields.io/badge/status-0.8.0-green.svg)
 
-> [!IMPORTANT]
 > **Pre-release status:** ELSPETH may be suitable for carefully evaluated,
 > use-case-specific applications, but it is not yet ready for general production use.
 > Before relying on it, validate ELSPETH against your requirements and risk controls.
+>
 > **AI Generated Code:** ELSPETH is an AI generated and reviewed rapid prototype that is
 > in active development with major systems subject to change. Limited user testing
 > has been conducted on a small set of use cases.

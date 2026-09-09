@@ -27,3 +27,22 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[61]/body[13]/body[5]/handlers[0]'
   judge_metadata_signature: 'hmac-sha256:v2:170ccd7a96942168fd99b0bde12c25c6638b888588fa36037704aadfea0522bf'
+- key: composer_mcp/server.py:R6:create_server:call_tool:fp=8b55c92c236e9381
+  owner: john
+  reason: |-
+    The flagged handler is `except (ValueError, TypeError) as canon_result_exc` in the finally block of create_server.call_tool, on canonicalization of our own handler's result_dict - not the Tier-3 argument path an earlier draft described. It does not swallow: it stores the exception in result_canonicalization_failure, reclassifies status to ComposerToolStatus.PLUGIN_CRASH, nulls result_canonical, result_hash and version_after so no synthesized evidence is recorded under SUCCESS, lets audit_recorder.record(invocation) write the PLUGIN_CRASH row, then raises the stored exception from the finally, discarding the pending success return. Pinned by tests/unit/composer_mcp/test_call_tool_audit.py::test_result_canonicalization_failure_is_plugin_crash_never_sentinel, which asserts the isError response, one PLUGIN_CRASH invocation, and result_canonical/result_hash/version_after all None.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T21:39:48.811207+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.99
+  judge_rationale: |-
+    RULE MISFIRES — the R6 premise is false because this handler defers rather than swallows the canonicalization exception. Verified composer_mcp/server.py:921-970: it stores the exception, reclassifies the invocation as PLUGIN_CRASH, clears result evidence, records the invocation, and then re-raises the stored exception, discarding the pending success return. The named pinning test at tests/unit/composer_mcp/test_call_tool_audit.py:353-385 verifies the error response, single PLUGIN_CRASH audit row, and absent result_canonical, result_hash, and version_after.
+  judge_signature_version: 2
+  scope_fingerprint: 53f76357686392e51977ad7458528f569067352aa167e234b22075885451e0fa
+  judge_transport: codex_cli
+  ast_path: 'body[61]/body[13]/body[14]/finalbody[6]/body[0]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:60d0f610ae7f5e6e6a00a5efb62c09c553c1453de6e7cab5dd37125f138f5888'

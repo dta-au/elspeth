@@ -15413,19 +15413,18 @@ def test_recovery_partial_state_custody_integrity_failure_is_not_contained(tmp_p
 
 @pytest.mark.asyncio
 async def test_send_message_shielded_llm_call_persist_completes_under_a_real_outer_cancel(tmp_path, monkeypatch) -> None:
-    """The first ``contextlib.suppress(asyncio.CancelledError)`` in send_message.
+    """The shielded join of ``_persist_llm_calls`` in send_message's cancel handler.
 
     ``test_send_message_persists_cancelled_llm_call_audit_sidecar`` proves the
     sidecar row lands on the cancelled path, but the composer's own
-    ``CancelledError`` never cancels the ROUTE task there, so ``await
-    asyncio.shield(...)`` returns normally and the suppression arm is not
-    exercised. This test cancels the route task while the shielded
-    ``_persist_llm_calls`` is in flight, which is the only way the suppressed
-    ``CancelledError`` is actually raised.
+    ``CancelledError`` never cancels the ROUTE task there, so the join returns
+    normally and its cancellation-absorbing arm is not exercised. This test
+    cancels the route task while the persist task is in flight, which is the
+    only way the join actually has a ``CancelledError`` to absorb.
 
-    Two things are pinned. (1) Completion semantics: the shielded coroutine is
-    NOT cancelled — it runs to completion and the audit sidecar row is durable,
-    which is why absorbing the outer await's re-raise loses no work. (2) The
+    Two things are pinned. (1) Completion semantics: the persist task is NOT
+    cancelled — it runs to completion and the audit sidecar row is durable,
+    which is why absorbing the route task's cancellation loses no work. (2) The
     cancel chain is restored: the handler's own terminal ``raise`` re-raises the
     original ``CancelledError``, so the request still finishes as cancelled.
     """
@@ -15487,10 +15486,10 @@ async def test_send_message_shielded_llm_call_persist_completes_under_a_real_out
     assert tool_call["call"]["status"] == "cancelled"
     assert tool_call["call"]["messages_hash"] == llm_call.messages_hash
 
-    # Discriminator for the suppression itself: the handler's remaining
-    # cancellation bookkeeping runs only because the suppress absorbed the
-    # shield's re-raise. Without it the CancelledError would leave the handler
-    # at that line and no cancelled snapshot would ever be published.
+    # Discriminator for the join itself: the handler's remaining cancellation
+    # bookkeeping runs only because the shielded join absorbed the route
+    # task's cancellation. Without it the CancelledError would leave the
+    # handler at that line and no cancelled snapshot would ever be published.
     snapshot = await app.state.composer_progress_registry.get_latest(str(service.session.id))
     assert snapshot.phase == "cancelled"
     assert snapshot.reason == "client_cancelled"

@@ -34,6 +34,7 @@ from elspeth.contracts.errors import AuditIntegrityError, FrameworkBugError
 from elspeth.contracts.hashing import stable_hash
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.catalog.schemas import PluginSchemaInfo, PluginSummary
+from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.errors import InvariantError
 from elspeth.web.composer.no_tool_policy import (
@@ -2048,7 +2049,7 @@ async def test_checkpoint_internal_failure_propagates_without_retry(make_service
     service = make_service()
     failure = error_type("internal defect")
     service._call_advisor_with_audit = _AsyncRecorder(side_effect=failure)
-    persist = AsyncMock()
+    persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
     monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", persist)
     with pytest.raises(error_type) as raised:
         await service._run_advisor_checkpoint(phase="end", state=simple_state, recorder=make_recorder(), **_fenced_session(service))
@@ -2091,7 +2092,7 @@ async def test_end_gate_starts_no_advisor_attempt_after_compose_deadline(
     service = make_service()
     service._call_advisor_with_audit = _AsyncRecorder(return_value=("CLEAN", {}))
     recorder = make_recorder()
-    checkpoint_persist = AsyncMock()
+    checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
     monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
 
     with pytest.raises(ComposerConvergenceError) as exc_info:

@@ -1802,19 +1802,19 @@ allow_hits:
     RULE MISFIRES: `uri_params` is not a fixed-contract record and this is not a read at all - it is a conditional REMOVAL. The dict is built in the preceding loop from whatever leftover query keys the operator's URL carried that are not SQLite connect kwargs, so every one of its keys is optional by construction and most URLs supply none of them. In the read-only branch the code asserts its own storage mode with `uri_params['mode'] = 'ro'` and then guarantees the absence of a conflicting `immutable` flag, which would otherwise tell SQLite the file cannot change beneath a connection opened against a live audit database. Absence of that key is the overwhelmingly common valid input, so subscripting or `del` would raise on ordinary read-only encrypted URLs; the `None` default is the idiomatic ensure-absent and discards nothing an operator authored elsewhere. Nothing is fabricated and no Tier-1 field is being defaulted: no value is read out of the pop, and the result is never stored - it is dropped so the file URI rendered below cannot carry the flag.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T10:32:05.403756+00:00'
+  judge_recorded_at: '2026-09-09T01:12:41.712421+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES: `uri_params` is a locally constructed collection of optional, operator-authored URI parameters, and `pop("immutable", None)` is used to ensure that an optional key is absent rather than to read or default a required value. The visible loop shows that `immutable` exists only if supplied in the external URL, while the read-only branch deliberately removes it before rendering the SQLite URI, so an absent key is valid and no missing-key bug, Tier-1 field default, or fabricated value is concealed. R9 is not decorator-suppressible, so the structural `@trust_boundary` alternative does not apply.
+    RULE MISFIRES: the visible code constructs `uri_params` from optional, operator-authored URL query keys, so the presence of `immutable` is not guaranteed by a fixed contract. Here `pop("immutable", None)` is an explicit ensure-absent operation in the `read_only` branch, not a read that substitutes a default or fabricates a value; the discarded return is never used, and the resulting parameters are immediately serialized into the SQLite file URI. R9's missing-key premise therefore does not apply at this site, and R9 is not eligible for the `@trust_boundary` structural alternative.
   judge_signature_version: 2
-  scope_fingerprint: 740674f96626447f9c9c24da3bea2ab010bc749b6b5792b00b4bc249dcd2055c
+  scope_fingerprint: 7808d514c50fb8032f54ba4c0476ebe37f0ca1d919458f02c57147ac4423f7ff
   judge_transport: codex_cli
   ast_path: 'body[66]/body[5]/body[12]/body[1]/value'
-  judge_metadata_signature: 'hmac-sha256:v2:2a7d86135984d2c3660e2b6bc56b431fc6758102586120d6f11c8a81953dead1'
+  judge_metadata_signature: 'hmac-sha256:v2:b83097c0285e65170aca028f3838d240458399bb1fabe97255bae147dd48c370'
 - key: core/landscape/execution/node_states.py:R1:_validate_transform_success_reason:fp=fef8223c7ed48bac
   owner: john
   reason: |-
@@ -3716,25 +3716,6 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[24]/body[8]/body[2]/test/values[0]'
   judge_metadata_signature: 'hmac-sha256:v2:118239859b5ce8a8e146acd40819f1f6a5d7e85af7bc9e9365a2f0dd9987d0d3'
-- key: core/landscape/database.py:R5:LandscapeDB:_create_sqlcipher_engine:fp=5dc624d8f4c8467b
-  owner: john
-  reason: |-
-    database.py:1228 `value = raw_value if isinstance(raw_value, str) else raw_value[0]`. FLAGGED PATTERN: isinstance narrowing a declared library union. Third site over SQLAlchemy's `URL.query` union (`str | tuple[str, ...]`), but unlike the pair at 174/176 this one deliberately DISCARDS the multi-occurrence case by taking `raw_value[0]`, and that asymmetry is the justification. The values here are being forwarded into `sqlite3.connect()` keyword arguments and SQLite URI parameters, and every one of those is scalar by definition: `check_same_thread` and `uri` are coerced to bool, `timeout` to float, `detect_types` and `cached_statements` to int, and the leftovers become `uri_params` entries that are rendered into a single `file:` URI. There is no kwarg here that could accept a tuple, so a repeated query parameter has no meaningful representation and last-wins/first-wins is a genuine choice rather than a dropped error; taking `[0]` matches how SQLAlchemy's own pysqlite dialect extracts connect arguments on the unencrypted path, which the block comment above cites as the parity target. This is not a Tier-3 parse of untrusted input either — `make_url` has already parsed the URL and the SQLCipher-specific validation above (driver must be SQLite, database must be file-backed, not `:memory:`) has already raised on the shapes this function refuses. INVALIDATED IF: a genuinely list-valued SQLite connect parameter is added to `_CONNECT_KWARGS` (silently dropping its later values would then be a real defect and the site must handle the tuple arm); or the SQLCipher path stops mirroring the non-encrypted `create_engine` extraction, which is the parity argument that makes first-wins the right choice rather than an arbitrary one.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-11-28'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-08-30T23:14:23.636705+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.94
-  judge_rationale: |-
-    RULE MISFIRES — the visible loop receives each `raw_value` under SQLAlchemy's declared `str | tuple[str, ...]` contract, so the `isinstance` expression discriminates two legitimate union arms rather than defensively re-checking a supposedly fixed type or concealing a contract violation. The rationale specifically accounts for the tuple arm: all downstream connect and URI parameters are scalar, and selecting the first occurrence deliberately mirrors the cited non-encrypted SQLAlchemy extraction behavior; nothing in the excerpt contradicts that explanation. This is not a function-parameter-rooted Tier-3 boundary case established by the excerpt, so the structural decorator nudge does not apply.
-  judge_signature_version: 2
-  scope_fingerprint: 6588ef6a4996d13770646da430ff774520f6216990df6aa361adb18a7262f995
-  judge_transport: codex_cli
-  ast_path: 'body[65]/body[5]/body[11]/body[0]/value/test'
-  judge_metadata_signature: 'hmac-sha256:v2:32703a449c1db82480dbb637b72692f9eeec7216646245ba3f0c075e501ae86e'
 - key: core/landscape/database.py:R5:_landscape_identity_issue:fp=40ea24b6957390eb
   owner: john
   reason: |-

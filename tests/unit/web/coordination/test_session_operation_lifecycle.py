@@ -660,6 +660,84 @@ async def test_cancelled_acquire_releases_safe_exact_context_from_non_exact_work
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("release_error", "expected_escape"),
+    [
+        pytest.param(None, "cancellation", id="release-succeeds"),
+        pytest.param(
+            OSError("invalid-context-release-secret-detail"), "cancellation", id="ordinary-release-failure"
+        ),  # secret-scan: allow-this-line
+        pytest.param(AuditIntegrityError("invalid-context release integrity failed"), "integrity", id="integrity-release-failure"),
+    ],
+)
+async def test_cancelled_invalid_context_release_joins_blocked_release_and_preserves_failures(
+    release_error: BaseException | None, expected_escape: str
+) -> None:
+    """Cancellation arriving while a rejected context is being released.
+
+    This is the invalid-context branch of ``SessionOperationLease.acquire``:
+    the authority already minted a context, validation rejected it, and the
+    caller is cancelled while that context's release is still in the worker.
+    The release must finish under repeated cancellation, an ordinary release
+    failure and the validation failure survive only as class-name notes on the
+    cancellation, and a Tier-1 release failure escapes as its own instance.
+    """
+    authority = _FakeAuthority()
+    authority.release_allowed.clear()
+    authority.release_error = release_error
+    returned_context = SessionOperationContext(
+        fence=authority.fence,
+        operation_kind=SessionOperationKind.EXECUTE,
+    )
+    authority.acquire_result = returned_context
+    acquire_task = asyncio.create_task(_acquire(authority, operation_kind=SessionOperationKind.COMPOSE))
+    await _wait_for_thread_event(authority.release_called)
+
+    acquire_task.cancel("first-invalid-context-cancellation")
+    await asyncio.sleep(0)
+    assert acquire_task.done() is False
+    acquire_task.cancel("second-invalid-context-cancellation")
+    await asyncio.sleep(0)
+    assert acquire_task.done() is False
+    authority.release_allowed.set()
+    await _wait_for_thread_event(authority.release_finished)
+
+    if expected_escape == "integrity":
+        with pytest.raises(AuditIntegrityError) as integrity_raised:
+            await acquire_task
+        raised_value: BaseException = integrity_raised.value
+        assert raised_value is release_error
+        assert isinstance(raised_value.__cause__, asyncio.CancelledError)
+        assert raised_value.__cause__.args == ("first-invalid-context-cancellation",)
+    else:
+        with pytest.raises(asyncio.CancelledError) as cancellation_raised:
+            await acquire_task
+        raised_value = cancellation_raised.value
+        assert raised_value.args == ("first-invalid-context-cancellation",)
+
+    rendered = "".join(traceback.format_exception(raised_value))
+    retained = _lifecycle_traceback_local_text(raised_value)
+    notes = "\n".join(raised_value.__notes__)
+    assert "Session-operation context validation also failed with RuntimeError." in notes
+    assert "different operation kind" not in rendered
+    if release_error is None:
+        assert "invalid-context release also failed" not in notes
+    elif expected_escape == "cancellation":
+        assert "Session-operation invalid-context release also failed with OSError." in notes
+        assert "invalid-context-release-secret-detail" not in rendered
+        assert "invalid-context-release-secret-detail" not in retained
+    assert "release_error=" not in retained
+    assert "release_task=" not in retained
+    assert "acquire_tasks=[]" in retained
+    assert "name='session-operation-acquire'" not in retained
+    assert len(authority.acquire_calls) == 1
+    assert authority.release_attempts == [returned_context]
+    assert authority.release_calls == [returned_context]
+    assert authority.renew_calls == []
+    assert authority.lease_active is (release_error is not None)
+
+
+@pytest.mark.asyncio
 async def test_wrong_kind_acquired_context_is_released_before_protocol_failure_surfaces() -> None:
     authority = _FakeAuthority()
     returned_context = SessionOperationContext(
@@ -674,6 +752,33 @@ async def test_wrong_kind_acquired_context_is_released_before_protocol_failure_s
     assert len(authority.acquire_calls) == 1
     assert authority.release_calls == [returned_context]
     assert type(authority.release_calls[0]) is SessionOperationContext
+    assert authority.renew_calls == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_context_release_failure_is_reduced_to_a_note_without_retaining_detail() -> None:
+    authority = _FakeAuthority()
+    authority.release_error = OSError("invalid-context-release-secret-detail")  # secret-scan: allow-this-line
+    returned_context = SessionOperationContext(
+        fence=authority.fence,
+        operation_kind=SessionOperationKind.EXECUTE,
+    )
+    authority.acquire_result = returned_context
+
+    with pytest.raises(RuntimeError, match="operation kind") as raised:
+        await _acquire(authority, operation_kind=SessionOperationKind.COMPOSE)
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    retained = _lifecycle_traceback_local_text(raised.value)
+    assert "Session-operation invalid-context release also failed with OSError." in "\n".join(raised.value.__notes__)
+    assert "invalid-context-release-secret-detail" not in rendered
+    assert "invalid-context-release-secret-detail" not in retained
+    assert "release_task=" not in retained
+    assert "acquire_tasks=[]" in retained
+    assert "name='session-operation-acquire'" not in retained
+    assert authority.release_attempts == [returned_context]
+    assert authority.release_calls == [returned_context]
+    assert authority.lease_active is True
     assert authority.renew_calls == []
 
 
@@ -1490,6 +1595,37 @@ async def test_cancelled_acquire_ordinary_cleanup_failure_still_yields_cancellat
 
     assert "OSError" in "\n".join(raised.value.__notes__)
     assert "release-secret-detail" not in "".join(traceback.format_exception(raised.value))
+    retained = _lifecycle_traceback_local_text(raised.value)
+    assert "release-secret-detail" not in retained
+    assert "cleanup_task=" not in retained
+    assert "acquire_tasks=[]" in retained
+    assert "name='session-operation-acquire'" not in retained
+
+
+@pytest.mark.asyncio
+async def test_cancelled_acquire_ordinary_acquire_failure_is_reduced_to_a_note_without_retaining_detail() -> None:
+    authority = _FakeAuthority()
+    authority.acquire_allowed.clear()
+    authority.acquire_error = OSError("acquire-secret-detail")  # secret-scan: allow-this-line
+    acquire_task = asyncio.create_task(_acquire(authority))
+    await _wait_for_thread_event(authority.acquire_started)
+
+    acquire_task.cancel("acquire-cancellation")
+    authority.acquire_allowed.set()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await acquire_task
+
+    rendered = "".join(traceback.format_exception(raised.value))
+    retained = _lifecycle_traceback_local_text(raised.value)
+    assert raised.value.args == ("acquire-cancellation",)
+    assert "Session-operation acquire cancellation cleanup also failed with OSError." in "\n".join(raised.value.__notes__)
+    assert "acquire-secret-detail" not in rendered
+    assert "acquire-secret-detail" not in retained
+    assert "acquire_tasks=[]" in retained
+    assert "name='session-operation-acquire'" not in retained
+    assert "cleanup_task=" not in retained
+    assert authority.release_attempts == []
+    assert authority.renew_calls == []
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,7 @@ from elspeth.core.canonical import canonical_json
 from elspeth.web.catalog.policy_view import PolicyCatalogView
 from elspeth.web.catalog.protocol import CatalogService
 from elspeth.web.composer import no_tool_policy as _no_tool_policy_module
+from elspeth.web.composer.advisor_audit import persist_advisor_checkpoint_pass
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.guided.planning import GuidedRevisionAuthority
 from elspeth.web.composer.guided.profile import EMPTY_PROFILE, TUTORIAL_PROFILE
@@ -3687,7 +3688,7 @@ class TestComposeTimeout:
         )
         passing_preflight = ValidationResult(is_valid=True, checks=[], errors=[])
         progress_events: list[ComposerProgressEvent] = []
-        checkpoint_persist = AsyncMock()
+        checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
 
         async def terminal_response_after_deadline(*_args: object, **_kwargs: object) -> Any:
@@ -3730,7 +3731,7 @@ class TestComposeTimeout:
             settings=_make_settings(composer_timeout_seconds=0.005),
         )
         service._run_advisor_checkpoint = _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl)  # type: ignore[method-assign]
-        checkpoint_persist = AsyncMock()
+        checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",
@@ -3795,7 +3796,7 @@ class TestComposeTimeout:
         await sessions.update_composer_preferences(UUID(session_id), trust_mode="auto_commit", density_default="high", actor="user:test")
         monkeypatch.setattr(service, "_run_advisor_checkpoint", _REAL_RUN_ADVISOR_CHECKPOINT.__get__(service, ComposerServiceImpl))
         failure = error_type("advisor internal failure")
-        checkpoint_persist = AsyncMock()
+        checkpoint_persist = AsyncMock(spec=persist_advisor_checkpoint_pass)
         monkeypatch.setattr("elspeth.web.composer.service.persist_advisor_checkpoint_pass", checkpoint_persist)
         source_arguments = {
             "plugin": "csv",

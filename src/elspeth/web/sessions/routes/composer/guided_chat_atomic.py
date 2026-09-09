@@ -56,7 +56,6 @@ from elspeth.web.composer.guided.state_machine import (
 from elspeth.web.composer.pipeline_proposal import composition_content_hash
 from elspeth.web.composer.source_inspection import SourceInspectionFacts, inspect_blob_content
 from elspeth.web.sessions._guided_step_chat import (
-    GuidedStepChatEmptyResult,
     GuidedStepChatOnlyResult,
     GuidedStepDeferredClarificationResult,
     GuidedStepDeferredIntentResult,
@@ -66,6 +65,7 @@ from elspeth.web.sessions._guided_step_chat import (
     Step1SourceResolvedResult,
     Step2SinkResolvedResult,
     StepChatResult,
+    is_guided_step_chat_empty_result,
     resolve_deferred_intent_management_chat_with_auto_drop,
     resolve_step_1_source_chat_with_auto_drop,
     resolve_step_2_sink_chat_with_auto_drop,
@@ -136,8 +136,8 @@ from .._helpers import (
 from ..guided_operations import (
     GuidedOperationExpired,
     GuidedOperationLease,
+    guided_operation_failure_error,
     guided_operation_lease_guard,
-    raise_guided_operation_failure,
     reserve_or_replay_guided_operation,
 )
 from .guided_chat_intent_management import (
@@ -710,15 +710,11 @@ async def run_guided_chat_provider_attempt(
             api_key=endpoint_api_key,
             reasoning_effort=settings.composer_discovery_reasoning_effort,
         )
-        # KEEP ``isinstance``: this is the NEGATIVE arm of an eight-member owned
-        # union (``Step1SourceChatResult``) and every other member is read for
-        # ``.chat`` and returned. ``type(...) is not GuidedStepChatEmptyResult``
-        # gives mypy no negative-arm narrowing, so the exact-type form forfeits
-        # the static proof that ``.chat`` exists (measured 2026-09-09: 4
-        # union-attr / arg-type / return-value errors on this file alone). The
-        # positive ``type(...) is`` checks a few lines down discriminate single
-        # members and stay exact.
-        if not isinstance(source_outcome, GuidedStepChatEmptyResult):
+        # NEGATIVE arm of the eight-member owned union ``Step1SourceChatResult``:
+        # every non-empty member is read for ``.chat`` and returned. The guard is
+        # exact-type discrimination declared ``TypeIs``, so mypy narrows this arm
+        # to the non-empty members without ``isinstance`` admitting a subclass.
+        if not is_guided_step_chat_empty_result(source_outcome):
             if revision_form == "source":
                 assistant_message = (
                     _form_directed_withheld_resolution_message(revision_form)
@@ -761,9 +757,9 @@ async def run_guided_chat_provider_attempt(
             reasoning_effort=settings.composer_discovery_reasoning_effort,
             mark_schema_loaded=mark_schema_loaded,
         )
-        # KEEP ``isinstance`` — same negative-arm narrowing requirement as the
-        # Step-1 branch above, over ``Step2SinkChatResult``.
-        if not isinstance(sink_outcome, GuidedStepChatEmptyResult):
+        # Same exact-type ``TypeIs`` negative arm as Step 1, over
+        # ``Step2SinkChatResult``.
+        if not is_guided_step_chat_empty_result(sink_outcome):
             if revision_form == "output":
                 assistant_message = (
                     _form_directed_withheld_resolution_message(revision_form)
@@ -2523,7 +2519,7 @@ async def post_guided_chat_schema8(
                 except GuidedOperationFenceLostError:
                     rejoin_after_lock = True
                 else:
-                    raise_guided_operation_failure(failed)
+                    raise guided_operation_failure_error(failed)
             finally:
                 await lease_guard.finish_active_exception()
         if rejoin_after_lock:

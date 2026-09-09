@@ -1671,12 +1671,29 @@ def create_execution_router() -> APIRouter:
                     # Re-check authoritative run status instead of sending an
                     # ad-hoc payload outside the RunEvent contract.
                     try:
-                        current_snapshot = await _load_run_status_snapshot_with_accounting(UUID(run_id), app=websocket.app, service=service)
-                    except _RunStatusNotFoundError:
-                        await websocket.close(code=4004, reason="Run not found")
-                        break
+                        try:
+                            current_snapshot = await _load_run_status_snapshot_with_accounting(
+                                UUID(run_id), app=websocket.app, service=service
+                            )
+                        except _RunStatusNotFoundError as vanished_exc:
+                            # Tier-1 referential corruption, NOT the seed path's
+                            # client-facing not-found. The seed snapshot proved
+                            # this run row existed, and no ELSPETH writer deletes
+                            # a ``runs`` row: ``decide_and_soft_archive`` physically
+                            # deletes only a session with NO durable history and
+                            # soft-archives one that has a run, and run admission
+                            # shares the per-session ARCHIVE fence, so the
+                            # ``runs.session_id`` cascade never fires for an
+                            # existing run. A row that vanished mid-stream is
+                            # an invariant breach, reclassified here so the
+                            # integrity arm below records it, closes 1011 and
+                            # re-raises; closing 4004 would launder corruption
+                            # into a benign client answer.
+                            raise _RunStatusIntegrityError(
+                                f"Run {run_id} row vanished after the seed snapshot proved it existed"
+                            ) from vanished_exc
                     except (ValidationError, _RunStatusIntegrityError) as integrity_exc:
-                        # Same Tier-1 accounting integrity failure as the seed
+                        # Same Tier-1 integrity failure handling as the seed
                         # path, on the idle-timeout recheck. Record the detail
                         # before signalling internal-error close (see seed
                         # handler above for the logging-channel rationale).

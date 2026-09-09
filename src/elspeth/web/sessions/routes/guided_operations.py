@@ -162,51 +162,14 @@ def guided_response_hash(response: BaseModel) -> str:
     return stable_hash(strict_response.model_dump(mode="json"))
 
 
-def raise_guided_operation_failure(
-    outcome: GuidedOperationFailed,
-) -> Never:
+def raise_guided_operation_failure(outcome: GuidedOperationFailed) -> Never:
     """Raise the closed HTTP failure represented by a terminal operation.
 
-    ``unproducible_output_fields`` names the reviewed output fields no reviewed
-    source declares or observes, when the planner exhausted its budget on a
-    request that carried that gap (R2-F4). Without it the operator reads only
-    "the provider returned an invalid response" — a dead end — while the server
-    holds the exact, actionable cause. Guided-only by construction: freeform has
-    no reviewed output, so the mirrored freeform table in
-    ``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP`` deliberately has no
-    counterpart. That is the same guided-only divergence as "highlighted" in the
-    ``policy_blocked`` copy, and for the same reason — this surface knows a fact
-    the other cannot.
-
-    The names are the operator's own step-2 ``custom_inputs`` strings (field
-    review admits ``chosen`` only from the reviewed sources' observed columns
-    and forbids custom names from overlapping them), so returning them to the
-    same operator discloses nothing. They ride BOTH as a structured field for
-    API consumers and appended to ``detail``, because the web client projects
-    only a fixed set of envelope keys and would otherwise drop the structured
-    form silently.
+    The envelope itself is built by ``guided_operation_failure_error`` at the
+    end of this module; a handler that must show its own raise (a broad
+    ``except`` whose only outcome is this envelope) raises that directly.
     """
-
-    if outcome.failure_code not in _SAFE_FAILURES:
-        raise AuditIntegrityError("Guided operation returned an unknown failure code")
-    status_code, detail = _SAFE_FAILURES[outcome.failure_code]
-    body: dict[str, object] = {
-        "error_type": "guided_operation_terminal_failure",
-        "failure_code": outcome.failure_code,
-        "detail": detail,
-    }
-    if outcome.unproducible_output_fields:
-        body["unproducible_output_fields"] = list(outcome.unproducible_output_fields)
-        # States only what is known — that nothing reviewed supplies these
-        # fields — never that the pipeline "would fail at runtime", which this
-        # surface cannot prove for a source whose field inventory is unknown
-        # rather than empty.
-        body["detail"] = (
-            f"{detail} No reviewed source declares or observes these output fields: "
-            f"{', '.join(outcome.unproducible_output_fields)}. Add a step that produces them, or remove them "
-            "from the output's fields."
-        )
-    raise HTTPException(status_code=status_code, detail=body)
+    raise guided_operation_failure_error(outcome)
 
 
 async def _replay_completed[ResponseT: BaseModel](
@@ -621,16 +584,23 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
             finally:
                 _finish_guided_cleanup(cancellation, cleanup_diagnostics, closed_lease)
         except BaseException as primary:
-            cleanup_diagnostics = []
-            try:
-                close_task = asyncio.create_task(session_lease.close(), name="guided-operation-failed-reserve-close")
-                await _join_shielded_task_after_cancellation(close_task)
-            except BaseException as close_error:
-                cleanup_diagnostics.append((close_error, "reservation_failed_close"))
-                primary.add_note(f"Session-operation reservation cleanup also failed with {type(close_error).__name__}.")
             closed_lease = session_lease
             session_lease = None
-            _finish_guided_cleanup(primary, cleanup_diagnostics, closed_lease)
+            close_task = asyncio.create_task(closed_lease.close(), name="guided-operation-failed-reserve-close")
+            try:
+                await _join_shielded_task_after_cancellation(close_task)
+            except BaseException as close_error:
+                # A session lease this process could not release is a fault of
+                # its own, not a footnote to the reservation failure it
+                # interrupted: raise both. The group keeps an integrity primary
+                # recognisable to ``_is_guided_integrity_failure`` and leaves
+                # nothing riding under a log line. The cancellation arm above
+                # is the one primary that must stay a plain ``CancelledError``,
+                # which is why its close fault is carried as a note instead.
+                raise BaseExceptionGroup(
+                    "Guided operation reservation failed and its session lease could not be released",
+                    [primary, close_error],
+                ) from None
             raise
 
     if outcome is None:
@@ -694,3 +664,52 @@ async def reserve_or_replay_guided_operation[ResponseT: BaseModel](
             raise AuditIntegrityError("Guided operation disappeared while a caller was joining it")
         outcome = observed
         observed_by_get = True
+
+
+def guided_operation_failure_error(outcome: GuidedOperationFailed) -> HTTPException:
+    """Build the closed HTTP failure represented by a terminal operation.
+
+    ``raise_guided_operation_failure`` is the ``Never`` form most call sites
+    want; a handler that must show its own raise (a broad ``except`` whose
+    only outcome is this envelope) raises the built error directly instead.
+
+    ``unproducible_output_fields`` names the reviewed output fields no reviewed
+    source declares or observes, when the planner exhausted its budget on a
+    request that carried that gap (R2-F4). Without it the operator reads only
+    "the provider returned an invalid response" — a dead end — while the server
+    holds the exact, actionable cause. Guided-only by construction: freeform has
+    no reviewed output, so the mirrored freeform table in
+    ``routes/_helpers.py::_FREEFORM_PLANNER_FAILURE_HTTP`` deliberately has no
+    counterpart. That is the same guided-only divergence as "highlighted" in the
+    ``policy_blocked`` copy, and for the same reason — this surface knows a fact
+    the other cannot.
+
+    The names are the operator's own step-2 ``custom_inputs`` strings (field
+    review admits ``chosen`` only from the reviewed sources' observed columns
+    and forbids custom names from overlapping them), so returning them to the
+    same operator discloses nothing. They ride BOTH as a structured field for
+    API consumers and appended to ``detail``, because the web client projects
+    only a fixed set of envelope keys and would otherwise drop the structured
+    form silently.
+    """
+
+    if outcome.failure_code not in _SAFE_FAILURES:
+        raise AuditIntegrityError("Guided operation returned an unknown failure code")
+    status_code, detail = _SAFE_FAILURES[outcome.failure_code]
+    body: dict[str, object] = {
+        "error_type": "guided_operation_terminal_failure",
+        "failure_code": outcome.failure_code,
+        "detail": detail,
+    }
+    if outcome.unproducible_output_fields:
+        body["unproducible_output_fields"] = list(outcome.unproducible_output_fields)
+        # States only what is known — that nothing reviewed supplies these
+        # fields — never that the pipeline "would fail at runtime", which this
+        # surface cannot prove for a source whose field inventory is unknown
+        # rather than empty.
+        body["detail"] = (
+            f"{detail} No reviewed source declares or observes these output fields: "
+            f"{', '.join(outcome.unproducible_output_fields)}. Add a step that produces them, or remove them "
+            "from the output's fields."
+        )
+    return HTTPException(status_code=status_code, detail=body)

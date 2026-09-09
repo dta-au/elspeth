@@ -70,7 +70,9 @@ def _fenced_session(service: Any) -> tuple[str, SessionOperationContext]:
     """A session id plus the COMPOSE operation held over it, with a sessions
     service that records every ``add_message`` (the audit row write)."""
     if service._sessions_service is None:
-        service._sessions_service = MagicMock(spec=SessionServiceProtocol, add_message=AsyncMock(return_value=None))
+        service._sessions_service = MagicMock(
+            spec=SessionServiceProtocol, add_message=AsyncMock(spec=SessionServiceProtocol.add_message, return_value=None)
+        )
     session_id = str(uuid.uuid4())
     context = SessionOperationContext(
         fence=SessionOperationFence(

@@ -827,6 +827,54 @@ async def test_reservation_integrity_error_propagates_after_close(monkeypatch, c
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reservation_failure",
+    [RuntimeError("reservation failed"), AuditIntegrityError("reservation integrity")],
+    ids=["ordinary_primary", "integrity_primary"],
+)
+async def test_reservation_failure_close_fault_propagates_alongside_the_reservation_failure(
+    monkeypatch, reservation_failure: BaseException
+) -> None:
+    """A session lease the failed reservation could not release is raised, not logged.
+
+    The cancellation arm keeps its close fault as a note because cancellation
+    must stay a plain ``CancelledError``; the ordinary-failure arm has no such
+    constraint, so both faults propagate together and an integrity primary is
+    still recognisable through the group.
+    """
+
+    class FailingCloseLease(_Lease):
+        def __init__(self, context: SessionOperationContext) -> None:
+            super().__init__(context)
+            self.close_error = OSError("PRIVATE-LEASE-CLOSE")
+
+        async def close(self) -> None:
+            self.closed = True
+            raise self.close_error
+
+    session_id = uuid4()
+    session_lease = FailingCloseLease(_context(session_id))
+
+    async def acquire(_cls, _authority, **_kwargs):
+        return session_lease
+
+    monkeypatch.setattr(SessionOperationLease, "acquire", classmethod(acquire))
+    with capture_logs() as logs, pytest.raises(BaseExceptionGroup) as caught:
+        await reserve_or_replay_guided_operation(
+            service=_Service([None, reservation_failure]),
+            session_id=session_id,
+            kind="guided_reenter",
+            request=_request(),
+            replay=lambda _locator: _never(),
+        )
+    assert caught.value.exceptions == (reservation_failure, session_lease.close_error)
+    assert session_lease.closed
+    assert guided_operations_module._is_guided_integrity_failure(caught.value) is isinstance(reservation_failure, AuditIntegrityError)
+    assert [entry["event"] for entry in logs if entry["event"] == "guided.operation_cleanup_failed"] == []
+    assert "PRIVATE-LEASE-CLOSE" not in repr(logs)
+
+
+@pytest.mark.asyncio
 async def test_fork_reverse_close_failures_are_recorded_outside_http_exception_notes() -> None:
     class FailingLease(_Lease):
         async def close(self) -> None:

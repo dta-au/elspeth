@@ -1558,29 +1558,29 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 25
       redacted_hash: 8efc9ea678cbf6b0
-- key: engine/orchestrator/heartbeat.py:R5:RunHeartbeatThread:_beat_once:fp=d2bd0a36f7ad0650
+- key: engine/orchestrator/heartbeat.py:R5:RunHeartbeatThread:_beat_once:fp=74786ab4e1078383
   owner: john
   reason: |-
     RULE MISFIRES: isinstance(snapshot, WorkerMembershipLost) is nominal discrimination of the two declared first-party worker_heartbeat outcomes, CoordinationSnapshot | WorkerMembershipLost. Both concrete classes are ELSPETH-owned in contracts/coordination.py, and _HeartbeatRepository.worker_heartbeat and RunCoordinationRepository.worker_heartbeat declare the union. The refusal arm logs membership loss, sets _coordination_lost_event and returns; check_and_raise converts that latch into RunWorkerEvictedError at the drain boundary. Only the snapshot arm reads worker_role and leader_worker_id. There is no coercion, fabricated snapshot, or external-input shape guessing. The check is the ADR-032 internal-union dispatch form, not a parameter-rooted Tier-3 boundary. Verified tests: tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestFatalLatchEvicted::test_check_and_raise_raises_after_eviction and TestBeatsCorrectly::test_healthy_beat_does_not_set_latch. Both are in the passing heartbeat module selection.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T10:39:24.888938+00:00'
+  judge_recorded_at: '2026-09-09T01:25:44.500080+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: this is nominal dispatch over the declared first-party union `CoordinationSnapshot | WorkerMembershipLost`, not defensive revalidation or external-data shape guessing. `RunCoordinationRepository.worker_heartbeat` explicitly returns those owned outcomes at run_coordination_repository.py:1078-1146, while `WorkerMembershipLost` and `CoordinationSnapshot` are concrete frozen dataclasses at contracts/coordination.py:132-183. The named control is verified: `RunHeartbeatThread.check_and_raise` converts the membership-loss latch into `RunWorkerEvictedError` at heartbeat.py:216-237, and the cited eviction and healthy-path tests exercise that behavior at test_run_heartbeat_thread.py:182-191 and 563-583. `_beat_once` has no external-data parameter, so this is not a parameter-rooted Tier-3 boundary eligible for the decorator.
+    RULE MISFIRES: the check performs nominal dispatch over the declared first-party return union, not defensive revalidation or external-input shape guessing. Both outcomes are ELSPETH-owned concrete dataclasses (contracts/coordination.py:132 and :160), while both _HeartbeatRepository.worker_heartbeat (engine/orchestrator/heartbeat.py:112) and RunCoordinationRepository.worker_heartbeat (core/landscape/run_coordination_repository.py:1115) declare and produce CoordinationSnapshot | WorkerMembershipLost. The named downstream control is verified: RunHeartbeatThread.check_and_raise raises RunWorkerEvictedError from the latch at heartbeat.py:246, and the cited eviction and healthy-path tests exercise the two branches at test_run_heartbeat_thread.py:648 and :197. This is neither a Tier-3 parameter-rooted boundary nor a candidate for @trust_boundary.
   judge_signature_version: 2
-  scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
+  scope_fingerprint: e8a077708d2a9827a8ed37c5c85110241fceba1e990cf3a8f1ef9c31f1731553
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[9]/body[1]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:e085fff29a1b7f2e0db4c6609953b819f0bfc522a7533fcb87508f877d9f6d4d'
+  ast_path: 'body[16]/body[9]/body[1]/body[2]/test'
+  judge_metadata_signature: 'hmac-sha256:v2:4e00c5a8bc5f03d326ad65ad74e74016b3848693aac700d9966bc2abaeadef09'
   judge_excerpt_redactions:
     - pattern: dotenv_secret_assignment
       byte_count: 18
-      redacted_hash: 9c42b26cdc3e2897
+      redacted_hash: 89daa3322abb17b6
 - key: engine/processor.py:R5:RowProcessor:__init__:fp=523a4df2d20b0d30
   owner: john
   reason: |-
@@ -1762,82 +1762,63 @@ allow_hits:
     - pattern: dotenv_secret_assignment
       byte_count: 26
       redacted_hash: 876506cc9e2ad46b
-- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_emit_degraded:fp=641a8d26ae2b549c
+- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_emit_degraded:fp=f3bb048617605d8d
   owner: john
   reason: |-
     PRESCRIBED FORM: the residual arm of `_emit_degraded`, and it transports the failure rather than absorbing it. `contract_errors.TIER_1_ERRORS` is caught first and `SQLAlchemyError` second, so what reaches this arm is neither audit corruption nor DB availability - it is an unexpected failure of the diagnostic writer itself, or of the injected `now_fn` clock evaluated in the call arguments. Those are programming or owned-contract faults, and the handler makes them authoritative: `_capture_fatal(exc)` publishes the exception into `_fatal_exc` and sets `_fatal_event`, with `logger.error(..., exc_info=exc)` preserving the traceback. Re-raising would be strictly worse, not safer: this method is invoked from inside `_beat_once`'s `OperationalError` handler, so a raise would unwind past the beat loop and stop liveness updates entirely, while the owner learns the same fact either way through `raise_fatal_failure`. Containment here keeps the thread beating AND surfaces the failure. `FollowerProcessor._drain_loop` consumes the latch at every iteration; the fresh-run and resume finalizers consume it after joining the thread and before emitting a successful summary.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:53:30.789593+00:00'
+  judge_recorded_at: '2026-09-09T01:20:34.962399+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    PRESCRIBED FORM: the broad residual handler transports unexpected owned-code failures through `RunHeartbeatThread._capture_fatal` instead of suppressing them. The authoritative gate is `RunHeartbeatThread.raise_fatal_failure`, which re-raises the stored exception verbatim (heartbeat.py:239-251), after `_capture_fatal` publishes it before setting the event (heartbeat.py:271-280). Its reachability is verified at every follower drain iteration and before each claim (follower.py:375-380), after heartbeat shutdown and before successful fresh-run and resume summaries (run_lifecycle.py:608-628; resume.py:841-860), with finalizer checks covering other exits (run_lifecycle.py:706-717). The behavioral test `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestHeartbeatDegraded::test_degraded_failure_is_latched_at_drain_boundary` verifies that diagnostic-writer failures are re-raised with their identity preserved (test_run_heartbeat_thread.py:433-446). Thus R4's suppression concern does not materialize here, and R4 is not eligible for the trust-boundary decorator.
+    PRESCRIBED FORM: the broad residual handler transports unexpected owned-code failures through the fatal latch rather than silently suppressing or coercing them. RunHeartbeatThread._capture_fatal stores the original exception before setting the event, and raise_fatal_failure re-raises it (src/elspeth/engine/orchestrator/heartbeat.py:269 and :301); the repository control also confirms that record_heartbeat_degraded converts only SQLAlchemyError into its declared result while non-DB programming faults propagate (src/elspeth/core/landscape/run_coordination_repository.py:293 and :1089). The named consumers are verified: FollowerProcessor._drain_loop checks the fatal latch every iteration and before each claim, with teardown checking it after joining (src/elspeth/engine/orchestrator/follower.py:327 and :347), while the fresh-run finalizer checks it after stop and teardown (src/elspeth/engine/orchestrator/run_lifecycle.py:706). This is therefore deliberate cross-thread fail-closed propagation, and R4 is not eligible for the trust-boundary decorator.
   judge_signature_version: 2
-  scope_fingerprint: d02604bdd5d7162dfd9a499a65a823b31f0d01c684c07932cac27049470353d3
+  scope_fingerprint: 0c07a96c135fe73ef437b91dae3405cff940ee8cf8c10b80bea54f491d560b3a
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[10]/body[1]/handlers[2]'
-  judge_metadata_signature: 'hmac-sha256:v2:d5b9d7e138961e3e025580c7c157e4bafb3a9999391aa1e2d09e7ed5e06e51dd'
-- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_run:fp=fe7e74c15a231daa
+  ast_path: 'body[16]/body[10]/body[1]/handlers[1]'
+  judge_metadata_signature: 'hmac-sha256:v2:c71c552eb3fc966b43cba436f5dc0ab9a8f8a0750737a90a6ba3dc1deb8dfb11'
+- key: engine/orchestrator/heartbeat.py:R4:RunHeartbeatThread:_run:fp=5e11cda1cf2d86c5
   owner: john
   reason: |-
     PRESCRIBED FORM: this is the thread-entry transport arm of a daemon thread whose documented contract is that it never raises on its own stack. Everything inside the loop already has typed handlers in `_beat_once`, so what reaches this arm is a failure OUTSIDE them: the injected `wait_fn` clock, or the last-resort `logger` call inside one of those handlers. It catches `BaseException` rather than `Exception` because an uncaught daemon-thread exception is consumed by `threading.excepthook` and disappears, leaving `_fatal_event` clear while `raise_fatal_failure` reports the thread healthy - a silent false negative on liveness. The handler does not swallow: `_capture_fatal` publishes the exception object into `_fatal_exc` before setting `_fatal_event`, and `raise_fatal_failure` re-raises that same object unchanged, with `OrchestrationInvariantError` as the fail-closed backstop for a bare latch. The latch is consumed unconditionally: `FollowerProcessor._drain_loop` calls `raise_fatal_failure` at the top of every iteration and again in `ensure_leader_live_before_claim`, and `FollowerProcessor._run_bound` calls it in the `finally` after departure. Re-raising here is not an option - there is no caller frame on this stack to receive it.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:53:29.102603+00:00'
+  judge_recorded_at: '2026-09-09T01:24:05.648424+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the broad catch transports a daemon-thread failure rather than suppressing it: `_capture_fatal` stores the original exception before setting the latch at heartbeat.py:278-280, and `raise_fatal_failure` re-raises that same object at heartbeat.py:246-251. The named controls are verified: `FollowerProcessor._drain_loop` and `ensure_leader_live_before_claim` poll the latch at follower.py:375-380, while `FollowerProcessor._run_bound` polls it after teardown at follower.py:327-341. The other production owners also consume it on every exit through finally blocks in `RunLifecycleCoordinator.run` at run_lifecycle.py:706-717 and `ResumeCoordinator.resume` at resume.py:1238-1249, so the visible control flow supports the rationale's fail-closed transport semantics rather than a silent false-negative.
+    PRESCRIBED FORM: the broad catch transports failures from a daemon-thread stack rather than suppressing them. `RunHeartbeatThread._capture_fatal` stores the original exception before publishing the latch, and `raise_fatal_failure` re-raises that same object (`src/elspeth/engine/orchestrator/heartbeat.py:269` and `:301`). The control-location claim is verified: `FollowerProcessor._run_bound` checks after teardown (`follower.py:341`), while the fresh-run and resume owners do likewise (`run_lifecycle.py:717` and `resume.py:1249`); the logger-failure identity test confirms delivery to the owner (`test_run_heartbeat_thread.py:671`). R4 therefore fires syntactically, but this is fail-closed cross-thread exception propagation, not silent recovery.
   judge_signature_version: 2
   scope_fingerprint: 6691f64664948f8e8cc02d3d894b682c620964a33049cb6058b88eb27ee05233
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[7]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:f84e426b7b9ba4a4df10976eed0f7bd9eebfdcc3ed3f5c710dac0a09bde18ea4'
-- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_beat_once:fp=f2de67e306c5becc
-  owner: john
-  reason: |-
-    PRESCRIBED FORM: the latch-and-defer shape for a Tier-1 failure detected on a thread that structurally cannot raise to the run. `_beat_once` is documented as never raising; a Tier-1 integrity failure from `worker_heartbeat` (e.g. the `run_workers` row vanished, which that verb classifies as `AuditIntegrityError` rather than a coordination outcome) is corruption, not the DB contention the swallow-and-continue doctrine covers. The handler therefore fails closed rather than silently: `_capture_fatal` stores the exception in `_fatal_exc` and sets `_fatal_event`, and `logger.error(..., exc_info=exc)` keeps the traceback. `check_and_raise` re-raises the stored object FIRST, ahead of the coordination-lost latch, so audit corruption outranks eviction semantics; `raise_fatal_failure` is the same re-raise without the eviction arm. Every path that reaches the latch consumes it: `FollowerProcessor._drain_loop` calls `raise_fatal_failure` at the top of each iteration and in `ensure_leader_live_before_claim`, and `_run_bound`'s `finally` calls it after `_best_effort_depart`. The exception identity is preserved, not reclassified.
-  safety: |-
-    Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
-  judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:53:41.927366+00:00'
-  judge_model: gpt-5.6-sol
-  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
-  judge_rationale: |-
-    PRESCRIBED FORM: the R6 handler is explicit cross-thread exception transport, not silent suppression. The flagged arm records the original Tier-1 exception through `RunHeartbeatThread._capture_fatal` (heartbeat.py:355), which stores it before setting the event (heartbeat.py:271), and `raise_fatal_failure` re-raises that same object (heartbeat.py:239). I verified the named follower controls at follower.py:327 and follower.py:375, as well as the other heartbeat-owner teardown gates at resume.py:1238 and run_lifecycle.py:706, all of which surface the fatal latch after joining the thread. R6 is not eligible for `@trust_boundary`, and the logging is diagnostic rather than the integrity control.
-  judge_signature_version: 2
-  scope_fingerprint: 66d2f3530d43d8578ccea73de2497c7fdd08a0720186defc49042c700b080901
-  judge_transport: codex_cli
-  ast_path: 'body[15]/body[9]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:3a5dfd95380e1b7b7eeba20cc8890bcc9b6f59dcc5414483ae434d2674a31392'
-- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_emit_degraded:fp=99d5c6723d1a37b4
+  ast_path: 'body[16]/body[7]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:2e4eb49aada16ecc69ea1c97c2c065950f6c326cf74c07dee80acea6ef3d781c'
+- key: engine/orchestrator/heartbeat.py:R6:RunHeartbeatThread:_emit_degraded:fp=93781bf890965e58
   owner: john
   reason: |-
     PRESCRIBED FORM: the Tier-1 arm of `_emit_degraded`, and its ORDER is the point. `record_heartbeat_degraded` writes a forensic `heartbeat_degraded` coordination event; the arm below it catches `SQLAlchemyError` to contain a DB fault on that best-effort write. Placing `contract_errors.TIER_1_ERRORS` first is what stops an audit-integrity type that also derives from `SQLAlchemyError` from being downgraded into that DB-availability arm and lost. It is read as a live module attribute, so the PEP 562 `__getattr__` in `elspeth.contracts.errors` re-materialises the tuple on every access and a type registered after import is still caught here - a from-import would have snapshotted an empty tuple and silently reopened the hole. The handler does not swallow: `_capture_fatal` publishes the exception into `_fatal_exc` and sets `_fatal_event`, and `logger.error(..., exc_info=exc)` keeps the traceback. Re-raising is not available - this method runs inside `_beat_once`'s `OperationalError` handler on the beat thread, which has no frame to receive it. `raise_fatal_failure` re-raises the stored object at the owner's next boundary.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:52:24.905317+00:00'
+  judge_recorded_at: '2026-09-09T01:29:39.528358+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.94
   judge_rationale: |-
-    RULE MISFIRES: this handler transports the Tier-1 failure across the heartbeat-thread boundary rather than swallowing it. `_capture_fatal` stores the exception and publishes `_fatal_event`, while the verified `RunHeartbeatThread.raise_fatal_failure` control re-raises that same object at heartbeat.py:239-251; owner paths invoke the control through `check_and_raise` at run_lifecycle.py:498-500 and unconditionally after teardown at run_lifecycle.py:706-717. The ordering and live lookup are pinned by `tests/unit/engine/orchestrator/test_run_heartbeat_thread.py::TestHeartbeatDegraded::test_late_registered_database_integrity_failure_is_not_diagnostic_loss`, which registers a Tier-1 `SQLAlchemyError` subclass after import and verifies it is re-raised unchanged. R6 therefore mistakes explicit cross-thread fatal propagation for silent suppression.
+    PRESCRIBED FORM: the exception is transported to the owning thread rather than silently swallowed. `RunHeartbeatThread._capture_fatal` stores the exception and sets the fatal event (heartbeat.py:301), while `raise_fatal_failure` re-raises that same object (heartbeat.py:269); the leader and follower teardown paths invoke that control in `finally` blocks (run_lifecycle.py:706 and follower.py:327). The behavioral tests also confirm that degraded-event integrity failures are re-raised at the boundary (test_run_heartbeat_thread.py:462), so the R6 concern is satisfied despite the rationale's unsupported claim that the ordering against the generic second arm is itself load-bearing. The decorator alternative does not apply because R6 is not suppressible by `@trust_boundary`.
   judge_signature_version: 2
-  scope_fingerprint: d02604bdd5d7162dfd9a499a65a823b31f0d01c684c07932cac27049470353d3
+  scope_fingerprint: 0c07a96c135fe73ef437b91dae3405cff940ee8cf8c10b80bea54f491d560b3a
   judge_transport: codex_cli
-  ast_path: 'body[15]/body[10]/body[1]/handlers[0]'
-  judge_metadata_signature: 'hmac-sha256:v2:e9783a09d4f7f5b84a469e88295251a87b0c9c36233622e16b3bfa869b4cb451'
+  ast_path: 'body[16]/body[10]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:7a86456f6e0e8b43b7fde426fa6c9de4de744c14a24df5eb6e10e79688403f6c'
 - key: engine/processor.py:R5:RowProcessor:_execute_transform_with_retry:is_retryable:fp=8e823b590bd4a7b6
   owner: john
   reason: |-
@@ -1857,3 +1838,26 @@ allow_hits:
   judge_transport: codex_cli
   ast_path: 'body[78]/body[35]/body[5]/body[2]/value'
   judge_metadata_signature: 'hmac-sha256:v2:cc1d6c31f473531e51762b9d6bc5e93669facad48ab9ce701310ed22eaca99b4'
+- key: engine/orchestrator/follower.py:R6:FollowerProcessor:_best_effort_depart:fp=a35dcc30d3aa0dc7
+  owner: john
+  reason: |-
+    PRESCRIBED FORM: narrow containment of one teardown write, with the reclaim control named. depart_worker is a single member-fenced transaction that already reifies the benign 'finalize departed this row first' race as its declared idempotent no-op, so the only residual failure contained here is OperationalError; IntegrityError, Tier-1 audit errors and programming faults all propagate — pinned in tests/unit/engine/orchestrator/test_follower_processor.py::TestBestEffortDepartContainment by test_operational_error_is_contained_and_recorded, test_integrity_error_propagates and test_audit_integrity_error_propagates. Nothing is fabricated on the contained path; the handler logs at WARNING with exc_info and the finally still runs raise_fatal_failure. Reclaim is the leader's sweep (dead_non_leader_workers then evict_worker), reachable because _run_bound stops the heartbeat before this call — pinned by that file's ::TestFollowerHeartbeatLifecycle::test_unexpected_drain_failure_stops_heartbeat_then_departs.
+  safety: |-
+    Suppression gated by cicd-judge; see judge_rationale below.
+  expires: '2026-12-07'
+  judge_verdict: ACCEPTED
+  judge_recorded_at: '2026-09-08T21:44:24.388629+00:00'
+  judge_model: gpt-5.6-sol
+  judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
+  judge_confidence: 0.97
+  judge_rationale: |-
+    PRESCRIBED FORM: this is narrow containment of an OperationalError from a teardown-only departure attempt, not a catch-all that hides integrity or programming failures; engine/orchestrator/follower.py:463-486 catches only OperationalError and records a warning with traceback. RunCoordinationRepository.depart_worker is a member-fenced atomic transaction whose inactive-member case is an idempotent no-op, while audit-integrity failures remain raised (core/landscape/run_coordination_repository.py:1256-1297). The alternate reclaim control is verified: _run_bound stops the heartbeat before departure and still invokes raise_fatal_failure (engine/orchestrator/follower.py:327-341), and SchedulerDrainCoordinator.run_maintenance calls dead_non_leader_workers followed by evict_worker, which performs a fenced eviction and records the event (engine/scheduler_drain.py:340-395; core/landscape/run_coordination_repository.py:1299-1391,1431-1468). The cited tests exist and pin OperationalError containment, IntegrityError and AuditIntegrityError propagation, and heartbeat-stop-before-depart ordering at tests/unit/engine/orchestrator/test_follower_processor.py:1312-1338 and 1710-1746. R6 is outside the decorator's R1/R5 scope.
+  judge_signature_version: 2
+  scope_fingerprint: bc022f9d3fbf54783dee2b7a72fc0d0d20d485e367b7de3c7b15803f217e2ad7
+  judge_transport: codex_cli
+  ast_path: 'body[18]/body[6]/body[1]/handlers[0]'
+  judge_metadata_signature: 'hmac-sha256:v2:0103d0aa3a1d35d48fc2243f9cc586858640340378d7bdb5b6679439a13e0e07'
+  judge_excerpt_redactions:
+    - pattern: dotenv_secret_assignment
+      byte_count: 18
+      redacted_hash: 5309b3cb55ffa5e4

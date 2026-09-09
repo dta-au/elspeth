@@ -77,7 +77,6 @@ from ._helpers import (
     asyncio,
     client_cancelled_progress_event,
     composer_turn_end_assistant_row,
-    contextlib,
     convergence_progress_event,
     freeform_planner_progress_reason,
     get_current_user,
@@ -88,6 +87,7 @@ from ._helpers import (
     validation_errors_for_composer_surface,
 )
 from .composer.pipeline_settlement import PipelineRouteSettlement, settle_auto_commit_intent
+from .guided_operations import _join_shielded_task_after_cancellation
 
 
 def _requests_audit_grade_messages_view(
@@ -1035,18 +1035,19 @@ def register_message_routes(router: APIRouter) -> None:
                 ) from exc
             except asyncio.CancelledError as exc:
                 # Client-disconnect or operator cancel during the
-                # composer-engaged window. Publish a discriminated
-                # ``cancelled`` snapshot under ``asyncio.shield`` so the
-                # registry update reaches /_active and per-session pollers
-                # even though the outer task is being torn down. The
-                # nested except absorbs the CancelledError that ``await
-                # asyncio.shield`` re-raises on the cancelling task — the
-                # shielded coroutine itself runs to completion in the
-                # background.
+                # composer-engaged window. The route task is already
+                # cancelling, so a plain await of either write below would
+                # re-raise CancelledError before the write is durable. Each
+                # runs as its own task joined through the shielded-join
+                # helper: the audit sidecar row lands and the discriminated
+                # ``cancelled`` snapshot reaches /_active and per-session
+                # pollers, repeated cancellation of this task is absorbed
+                # while they finish, and the cancel chain is restored by the
+                # handler's terminal ``raise`` (or HTTP 499) below.
                 llm_calls = _llm_calls_from_exception(exc)
                 if llm_calls:
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.shield(
+                    await _join_shielded_task_after_cancellation(
+                        asyncio.create_task(
                             _persist_llm_calls(
                                 service,
                                 session.id,
@@ -1054,20 +1055,19 @@ def register_message_routes(router: APIRouter) -> None:
                                 compose_base_state_id,
                                 plugin_crash_pending=True,
                                 session_operation_context=compose_operation_lease.context,
-                            )
+                            ),
+                            name="send-message-cancelled-llm-call-persist",
                         )
-                with contextlib.suppress(asyncio.CancelledError):
-                    # The shielded publish runs to completion in the
-                    # background; the outer await re-raises CancelledError
-                    # on the cancelling task, which we deliberately swallow
-                    # because we already know we're being cancelled and
-                    # ``raise`` two lines below restores the cancel chain.
-                    await asyncio.shield(
+                    )
+                await _join_shielded_task_after_cancellation(
+                    asyncio.create_task(
                         _publish_progress(
                             progress_sink,
                             event=client_cancelled_progress_event(),
-                        )
+                        ),
+                        name="send-message-cancelled-progress-publish",
                     )
+                )
                 terminal_status = "cancelled"
                 if _is_client_disconnect_cancel(exc):
                     # Disconnect-initiated cancellation (our

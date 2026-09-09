@@ -4195,263 +4195,263 @@ allow_hits:
     R5 `isinstance(value, bytes)` encodes a bytes constant as hex. It is required because bytes are not JSON-encodable at all; without this arm a bytes literal would fall through to `_UNSUPPORTED_MANIFEST_VALUE` and `_normalize_code_constant` would raise FrameworkBugError, making any function with a bytes constant unhashable and therefore unresumable. Hex is chosen over a text decode because it is total -- arbitrary bytes have no guaranteed text form. Invalidated if a lossy encoding were substituted, which would let two different byte strings hash alike.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:41:59.088334+00:00'
+  judge_recorded_at: '2026-09-09T01:03:37.689150+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is deliberate type discrimination in a manifest serializer, not a defensive re-check that masks a fixed-contract violation. The visible code converts bytes losslessly to hex, distinguishes exact `bytes` from subclasses, and preserves subclass identity, while unsupported constants remain explicitly rejectable rather than silently coerced or defaulted. This is not a Tier-3 parameter boundary eligible for the decorator because `value` is a code constant being classified for normalization, not external-origin input being promoted to Tier 2.
+    RULE MISFIRES — this `isinstance` is explicit type dispatch over heterogeneous Python code constants, not a defensive re-check of a fixed Tier-1/Tier-2 contract. The visible arm losslessly represents bytes using `bytes.hex(value)`, preserves subclass identity separately, and neither suppresses a malformed value nor fabricates a fallback. The function is not shown as a Tier-3 boundary over an external parameter, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[5]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:cb8162aa33fd8db6fdeba2e14dc5a72c470df1f32ced38605ff6991042f4d374'
+  judge_metadata_signature: 'hmac-sha256:v2:c3c5577c06a717d5ec395908597b613e1aaeb19f21c9918103122cee23a4d712'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=0f6d6f31fa4e9a52
   owner: john
   reason: |-
     RULE MISFIRES: this isinstance(value, float) arm in _try_normalize_code_constant classifies a Python code-object constant (ELSPETH-owned interpreter objects reachable from co_consts, not external data) after the exact-type pass-through `type(value) in (str, int, float, bool)` has returned bare floats. Reaching it therefore means value is a float SUBCLASS instance, and the arm records the carrier identity through _type_identity together with the base value via float.__float__ instead of flattening it. Nominal dispatch over the builtin hierarchy producing a distinct manifest entry; no coercion, no admission. The alternative, a bare float, made a subclass carrier change invisible to the resume-trust manifest, the defect fixed alongside this rationale. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_primitive_subclass_constant_normalizes_distinct_from_its_base[float] and ::test_plain_primitive_and_bool_constants_pass_through_unchanged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:43:04.844880+00:00'
+  judge_recorded_at: '2026-09-09T01:05:05.895415+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: this `isinstance` is nominal type dispatch in a deterministic manifest normalizer, not a defensive re-check that masks a fixed-contract violation. In `src/elspeth/contracts/runtime_val_manifest.py:289`, exact built-in primitives pass through first, so the float arm at line 298 can only classify a float subclass and preserves both its carrier identity and base value. The named tests at `tests/unit/contracts/test_runtime_val_manifest.py:1962` and line 1982 specifically pin subclass distinction and unchanged exact-primitive handling. The value is not an external parameter, so the structural Tier-3 decorator contract does not apply.
+    RULE MISFIRES: this `isinstance(value, float)` is nominal dispatch within a heterogeneous code-constant normalizer, not a defensive re-check that hides a fixed-contract violation. The exact-type pass-through at runtime_val_manifest.py:295-305 ensures this arm handles only float subclasses and records both carrier identity and the base value; tests/unit/contracts/test_runtime_val_manifest.py:1962 and :1982 verify subclass distinction and unchanged plain primitives. The parameter is not external Tier-3 data, so the `@trust_boundary` decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[12]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:c63124b447558044a8d7cc58568c412fda81c5b1370055219bfc58bf10eadeec'
+  judge_metadata_signature: 'hmac-sha256:v2:6e1baaa5d474d22aa716833cc9c249358a4c48962d21f2ec382c857c2a0e64d6'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=129080c8096c45f4
   owner: john
   reason: |-
     RULE MISFIRES: `isinstance(value, BuiltinFunctionType)` opens the arm that gives C-level callables a stable identity string instead of a hashed implementation, because there is no Python source behind them to hash. It is type discrimination inside a normalizer whose parameter is declared `object` and whose job is to encode every carrier Python can put in a code constant — not a defensive re-check of a shape ELSPETH already guarantees. In CPython `BuiltinFunctionType` IS `BuiltinMethodType`, so this arm also catches C methods bound to an object; the branch then splits on whether `__module__` is a real string and, failing that, on the receiver, and REFUSES anything it cannot name by returning `_UNSUPPORTED_MANIFEST_VALUE`, which `_normalize_code_constant` converts into `FrameworkBugError`. Nothing is coerced, defaulted or fabricated on any path out of this arm. The adjacent C-level-carrier behaviour is pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_normalize_code_constant_records_member_descriptor_owner_and_name. Invalidated if builtin callables acquired hashable Python implementations.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:08.948645+00:00'
+  judge_recorded_at: '2026-09-09T01:05:26.388593+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES: `_try_normalize_code_constant` accepts an intentionally unconstrained `object` and uses `isinstance(value, BuiltinFunctionType)` as nominal type discrimination among the heterogeneous values that Python may store as code constants, not as a defensive re-check of an ELSPETH-guaranteed shape. The visible branch emits an identity only when it can name the builtin from a string module or a typed bound owner; otherwise it returns `_UNSUPPORTED_MANIFEST_VALUE`, which `_normalize_code_constant` turns into `FrameworkBugError`, so it neither hides a contract violation nor coerces, defaults, or fabricates data. The cited member-descriptor test does not directly pin this builtin-callable arm, but the exemption is independently established by the complete visible control flow rather than by that adjacent test claim.
+    RULE MISFIRES: the visible function is a heterogeneous code-constant normalizer, and the flagged `isinstance` performs declared variant discrimination rather than defensively rechecking a fixed-contract shape. The builtin-callable arm produces an explicit stable identity only when the callable can be named; otherwise it returns `_UNSUPPORTED_MANIFEST_VALUE`, which `_normalize_code_constant` visibly converts into `FrameworkBugError`, so no malformed value is silently coerced, defaulted, or fabricated. The cited member-descriptor test does not pin the flagged builtin-callable branch, but that mismatch is not load-bearing because the visible control flow independently establishes the exemption.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[23]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a0e10b862a90b597bf064d54e546ba92dae60e925e6b648896b1e1d00a8cd2da'
+  judge_metadata_signature: 'hmac-sha256:v2:f7cd76d1404fd8b35bf886135824f147b525b1693e444148ac23af7513955b7d'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=1e15232ca6838c46
   owner: john
   reason: |-
     R5 `isinstance(value, dict)` is the dict-constant arm. Keys and values are normalized independently and the resulting pairs sorted by canonical JSON, because dict constants may be built from unordered sources and the encoding must be order-independent for the hash to be stable. It also propagates unsupported keys OR values, so a dict with one unencodable member fails loudly rather than being partially hashed. Invalidated if the pair sort were removed, which would reintroduce order-dependence into the manifest hash.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:09.412489+00:00'
+  judge_recorded_at: '2026-09-09T01:06:27.961641+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance(value, dict)` is a declared variant-dispatch arm in a recursive normalizer, not a defensive re-check that hides a fixed-contract violation. The visible code handles lists, sets, dictionaries, bytes, patterns, and other constant forms separately; the dictionary branch canonicalizes both keys and values, rejects any unsupported member, and sorts the resulting pairs for order-independent hashing. No external-parameter boundary decorator applies at this site because the finding is not rooted in a function parameter shown to carry Tier-3 data.
+    RULE MISFIRES — `_try_normalize_code_constant` accepts an `object` and uses nominal `isinstance` branches to discriminate among the supported constant types, rather than defensively re-checking a fixed-contract value or hiding a contract failure. The dict arm at contracts/runtime_val_manifest.py:253 recursively normalizes both keys and values, rejects any unsupported member, and sorts the normalized pairs for deterministic hashing; lines 265-267 also deliberately distinguish exact dicts from subclasses and preserve subclass identity. This is not a Tier-3 boundary function over external parameter data, so the decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[4]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:f37074c9ec4e1792769b4c5fa4270255ed49a59c8c3ef4c7b038394c25d01c7c'
+  judge_metadata_signature: 'hmac-sha256:v2:56009d94b11a5cbd217ee85640310ddc31bb44a4fbd88f16842b14e9a0820b92'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=551a29e6c28547e2
   owner: john
   reason: |-
     R5 `isinstance(value, list)` is the list-constant arm, structurally parallel to the tuple arm above but a separate carrier: a list and a tuple with identical contents encode under different keys (`{"list": ...}` versus `{"tuple": ...}`) so that a literal changing carrier changes the manifest hash. It applies the same all-or-nothing unsupported propagation. Invalidated if the two carriers were ever collapsed into one encoding, which would make a real code change invisible.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:26.391481+00:00'
+  judge_recorded_at: '2026-09-09T01:06:42.592093+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance(value, list)` is explicit type discrimination within a heterogeneous code-constant normalizer, not a defensive re-check that masks a fixed-contract violation. The visible branches preserve carrier identity by encoding lists and tuples under distinct keys, propagate unsupported nested values atomically, and separately retain builtin-subclass identity. The rationale directly addresses R5 and is consistent with the code; no Tier-3 boundary or external-parameter basis for `@trust_boundary` is established.
+    RULE MISFIRES — this `isinstance(value, list)` is explicit type dispatch in a canonical manifest encoder, not defensive revalidation or concealment of a contract violation. The visible tuple, list, set/frozenset, and dict arms encode distinct runtime carriers under distinct keys, while unsupported nested values propagate `_UNSUPPORTED_MANIFEST_VALUE`; the list check is therefore necessary to preserve type identity in the manifest hash. The value is not established as external Tier-3 input, so the structural trust-boundary decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:23d0d3a96dcb4e4bfec758d71d043880b4f959be47acfe4477251d3cb2ac588c'
+  judge_metadata_signature: 'hmac-sha256:v2:0dc1af718f2b710d5840bf0f9f10c636d24c542edcd868b80effbe2edd677a10'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=6e9376080585d541
   owner: john
   reason: |-
     R5 `isinstance(value, (set, frozenset))` is the set-constant arm. Its distinguishing job is DETERMINISM: set iteration order is not stable across interpreter runs, so the normalized elements are sorted by canonical JSON before encoding. Without that sort the manifest hash for identical code would differ between runs and every resume would be reported as untrusted. The two set carriers share the arm because they share the sorting treatment, and are then told apart on line 169. Invalidated if the canonical-JSON sort key were removed or made non-total.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:30.388168+00:00'
+  judge_recorded_at: '2026-09-09T01:07:03.225158+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is type-directed normalization of a deliberately heterogeneous `object`, not a defensive re-check that masks a fixed-contract violation. The visible branches distinguish supported constant carriers, preserve set versus frozenset identity, and canonically sort their normalized elements so unordered iteration cannot destabilize the manifest hash. The value is not presented as Tier-3 external input, so the `@trust_boundary` alternative does not apply.
+    RULE MISFIRES — `_try_normalize_code_constant` accepts `object` and performs explicit type-directed normalization, so this `isinstance` is a set/frozenset dispatch arm rather than a defensive re-check of a guaranteed contract. The visible branch preserves deterministic manifests by sorting normalized members with `_normalized_sort_key`, distinguishes set from frozenset immediately afterward, and preserves builtin-subclass identity instead of hiding an invalid value. This is not a Tier-3 boundary function eligible for the decorator because `value` is a Python code constant being canonically encoded, not external-origin data.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:a64e4d19f855e3f5a8aefe2693f787e5c0cfa3f30c5547d212d6cef381b9d8cd'
+  judge_metadata_signature: 'hmac-sha256:v2:b035004576988a1c595f8cc6c5738f1e421355e12ee1c70ee61c74670af7830f'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=755572398c34d601
   owner: john
   reason: |-
     RULE MISFIRES: this isinstance(value, int) arm in _try_normalize_code_constant classifies a Python code-object constant (ELSPETH-owned interpreter objects reachable from co_consts, not external data) after the exact-type pass-through `type(value) in (str, int, float, bool)` has returned bare ints and bools. Reaching it therefore means value is an int SUBCLASS instance (bool cannot be subclassed and is passed through above), and the arm records the carrier identity through _type_identity together with the base value via int.__int__ instead of flattening it. Nominal dispatch over the builtin hierarchy producing a distinct manifest entry; no coercion, no admission. The alternative, a bare int, made a subclass carrier change invisible to the resume-trust manifest, the defect fixed alongside this rationale. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_primitive_subclass_constant_normalizes_distinct_from_its_base[int] and ::test_plain_primitive_and_bool_constants_pass_through_unchanged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:56.868312+00:00'
+  judge_recorded_at: '2026-09-09T01:07:20.724008+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: the flagged `isinstance(value, int)` is nominal dispatch for manifest normalization, not a defensive shape re-check that hides a fixed-contract violation. The preceding exact-type branch returns ordinary `int` and `bool` values, so this arm consistently identifies an `int` subclass and preserves both its carrier identity and base integer value as a distinct manifest entry; it neither admits malformed data nor silently substitutes a default. This is not a Tier-3 parameter boundary eligible for `@trust_boundary`, so the structural decorator alternative does not apply.
+    RULE MISFIRES: the visible exact-type branch passes through bare `int` and `bool` values before the flagged arm, so `isinstance(value, int)` here discriminates an `int` subclass within a heterogeneous code-constant normalizer. The arm does not conceal a fixed-contract violation, admit malformed data, or fabricate a fallback; it preserves the subclass carrier identity alongside the base integer value for the manifest. The rationale is site-specific and names behavioral tests for both subclass distinction and ordinary primitive pass-through. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[11]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:582eafec856a8502c9a36a6f2a1c90b909994c7a5c8d793586390cef6aca62f7'
+  judge_metadata_signature: 'hmac-sha256:v2:ccc548d5931cc257f5a8daf48db63646ace9f6dba36a25d41edf25e0e35ae2dd'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=797cbd6926bd222c
   owner: john
   reason: |-
     R5 `isinstance(value, tuple)` is the tuple-constant arm of the code-constant normalizer. Tuples are the common compound constant in `co_consts` (they hold `__annotations__` payloads and folded literals). The arm normalizes elementwise and then propagates `_UNSUPPORTED_MANIFEST_VALUE` if ANY element is unsupported, so an unencodable element fails the whole constant rather than being silently dropped from the hash input -- the failure surfaces at `_normalize_code_constant`, which raises FrameworkBugError. Invalidated if partial encoding of a tuple constant were ever accepted, which would let a code change go unnoticed by the manifest.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:44:42.554630+00:00'
+  judge_recorded_at: '2026-09-09T01:08:00.965806+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
   judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — `_try_normalize_code_constant` deliberately accepts `object` and discriminates among supported runtime-constant variants, so the tuple check is not a defensive revalidation of a fixed contract. The tuple arm normalizes every element and propagates the unsupported sentinel if any element fails (`src/elspeth/contracts/runtime_val_manifest.py:209`), while the named `_normalize_code_constant` gate converts that sentinel into `FrameworkBugError` (`src/elspeth/contracts/runtime_val_manifest.py:333`); nothing is silently dropped, coerced, or fabricated. This is not a Tier-3 parameter boundary, so the decorator contract does not apply.
+    RULE MISFIRES — `_try_normalize_code_constant` accepts an unconstrained `object`, and the flagged `isinstance(value, tuple)` performs necessary runtime type dispatch for a heterogeneous code-constant normalizer rather than defensively re-checking a fixed contract. The visible tuple arm recursively normalizes every element and propagates `_UNSUPPORTED_MANIFEST_VALUE` when any element is unsupported, so it neither fabricates a replacement nor silently drops an unencodable element. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`; the subject is a Python code constant being classified by its runtime variant.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[1]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:101547648fb81cf0a0d25dd442637880acada414ea869d680d76e4adbdc93597'
+  judge_metadata_signature: 'hmac-sha256:v2:dd8157cb4c9114ee3c1c2300c02975847ca15cd282d32bdfe220adf7c942179c'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=9fb915dd7b99cc5b
   owner: john
   reason: |-
     RULE MISFIRES: inside the already-admitted `(set, frozenset)` arm this selects which of the two carriers is being encoded, and it now decides three things together: the `"set"` versus `"frozenset"` key, the UNBOUND iterator (`set.__iter__` / `frozenset.__iter__`) used to read members, and `exact_type`, which routes a subclass through `_preserve_builtin_subclass_identity` rather than the bare encoding. The unbound iterator is the substance: a subclass overriding `__iter__` cannot alter the member sequence that gets hashed. The carrier key matters because a mutable set and a frozenset with equal contents are different constants in the source, and encoding them identically would let a `set` literal be edited to a `frozenset` without moving the manifest hash — exactly the drift this manifest exists to catch. `value` is declared `object` and this function dispatches across every constant carrier, so this is normalizer dispatch, not a re-check of an owned contract; members that cannot be encoded still propagate `_UNSUPPORTED_MANIFEST_VALUE` rather than being dropped. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_normalize_code_constant_canonicalizes_sets.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:42:42.756888+00:00'
+  judge_recorded_at: '2026-09-09T01:09:17.265108+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.97
   judge_rationale: |-
-    RULE MISFIRES: `_try_normalize_code_constant` accepts `object` and explicitly dispatches among multiple concrete constant carriers, so the flagged check is type discrimination rather than defensive revalidation of a fixed owned contract. Within the already-established `(set, frozenset)` arm, `isinstance(value, set)` selects distinct carrier semantics, including the manifest key and the matching unbound iterator, while unsupported members remain explicitly unsupported rather than being silently dropped or defaulted. The proposed test reference is not needed to establish this disposition because the complete visible branch directly demonstrates the check's purpose and behavior.
+    RULE MISFIRES: the flagged inner `isinstance` occurs after the `(set, frozenset)` carrier arm has already been selected and discriminates between two intentionally distinct encodings, iterators, and exact-type paths; it neither masks a contract violation nor defensively revalidates a fixed contract. The `object` parameter and adjacent tuple, list, dict, and primitive arms confirm that `_try_normalize_code_constant` is a heterogeneous normalizer dispatcher, not a Tier-2 consumer. The named test was verified at tests/unit/contracts/test_runtime_val_manifest.py:1608 and establishes basic set canonicalization, although it does not independently pin every claimed frozenset/subclass property; those mechanics are nevertheless explicit in the visible code. This is not a Tier-3 external-parameter boundary, so the decorator contract does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[3]/body[2]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:07b064c019faabe4e369ea44ae8ee0df0b910dbab1447a82085966ef2b28ae86'
+  judge_metadata_signature: 'hmac-sha256:v2:0acb04f92eb11c245291014f0a785b6dd6c9f43c3fa9e5c989546dd89c38a660'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=cf6362202e13667e
   owner: john
   reason: |-
     RULE MISFIRES: this isinstance(value, str) arm in _try_normalize_code_constant classifies a Python code-object constant (co_consts and the values reachable from them are ELSPETH-owned interpreter objects, not external data) after the exact-type pass-through `type(value) in (str, int, float, bool)` has already returned bare primitives. Reaching it therefore means value is a str SUBCLASS instance, and the arm records the carrier identity through _type_identity together with the base value via str.__str__ instead of flattening it to the bare string. This is nominal dispatch over the builtin hierarchy that produces a distinct manifest entry; it neither coerces malformed data nor admits anything. The alternative, a bare string, made a subclass carrier change invisible to the resume-trust manifest, which is the defect fixed alongside this rationale. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_primitive_subclass_constant_normalizes_distinct_from_its_base[str] and ::test_plain_primitive_and_bool_constants_pass_through_unchanged.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:44:31.441711+00:00'
+  judge_recorded_at: '2026-09-09T01:09:47.705489+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES: runtime_val_manifest.py:289-299 first passes through exact primitive types, then uses nominal `isinstance` dispatch solely to distinguish builtin subclasses and preserve their carrier identity in the manifest; it does not hide a contract violation, coerce malformed data, or admit an invalid value. The cited regression at tests/unit/contracts/test_runtime_val_manifest.py:1962 verifies that primitive subclasses normalize differently from their bare bases, while the test at line 1982 verifies unchanged pass-through for exact primitives. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`.
+    RULE MISFIRES: the visible exact-type pass-through at line 298 ensures the flagged arm is reached only for a `str` subclass, and the arm performs intentional nominal dispatch to preserve both the subclass identity and its base string value in the manifest. It neither suppresses a contract failure nor coerces or admits malformed data, so R5's defensive-revalidation premise does not apply at this site. The site is not a parameter-rooted Tier-3 boundary, so the decorator contract is inapplicable.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[10]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:059efd8cf4dfc523e187fba247ea1d0919961fdfc07ffb404fed40cef6832f7c'
+  judge_metadata_signature: 'hmac-sha256:v2:0588a1f81e45c1a185d74866691440d5dbcbe9e63ac95c99628190fdb6d3bf12'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=cfe3b24a2cbf8051
   owner: john
   reason: |-
     PRESCRIBED FORM: this is the discriminator of a REFUSAL arm. It is reached only when a builtin callable's `__module__` is not a string, which in CPython is the case for every C method bound to an object, since `BuiltinFunctionType` is `BuiltinMethodType`. `isinstance(bound_owner, type)` then splits the two receivers: bound to a CLASS the callable has a stable name and is encoded as a `builtin` identity built from `_type_identity(bound_owner)`; bound to an INSTANCE it has no stable identity, and the function returns `_UNSUPPORTED_MANIFEST_VALUE`, which `_normalize_code_constant` converts into `FrameworkBugError` naming the offending type. That is an offensive refusal, not a fall-through, a default, or a fabricated entry — the module declines to record a name that would give false confidence in the manifest. `value` is declared `object`, so this is carrier classification rather than a re-check of a shape ELSPETH guarantees. Adjacent C-level-carrier encoding pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_normalize_code_constant_records_member_descriptor_owner_and_name. Invalidated if instance-bound builtins became statically nameable.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:45:25.654434+00:00'
+  judge_recorded_at: '2026-09-09T01:10:13.991121+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.97
+  judge_confidence: 0.98
   judge_rationale: |-
-    PRESCRIBED FORM: the `isinstance` at contracts/runtime_val_manifest.py:327 discriminates an intentionally heterogeneous `object` carrier and does not defensively re-check a fixed contract. The unsupported instance-bound arm returns `_UNSUPPORTED_MANIFEST_VALUE` at lines 329-330, and the named control `_normalize_code_constant` converts that sentinel into `FrameworkBugError` at lines 333-339, establishing an offensive fail-closed refusal without coercion, fabrication, or silent recovery. The cited test at tests/unit/contracts/test_runtime_val_manifest.py:1616 covers the adjacent member-descriptor identity arm rather than this builtin-receiver split, so it is not credited as pinning evidence for the flagged branch, but the visible control flow itself establishes conformance. The decorator contract does not apply because this function classifies internally owned code constants rather than external-origin parameter data.
+    RULE MISFIRES — the flagged `isinstance(bound_owner, type)` is explicit carrier discrimination within an `object`-typed normalization routine, not a defensive re-check of a guaranteed Tier-1 or Tier-2 shape. The visible branches either construct a deterministic identity for a class-bound builtin or return `_UNSUPPORTED_MANIFEST_VALUE`, and the visible `_normalize_code_constant` control converts that refusal into a typed `FrameworkBugError`; nothing is silently coerced, fabricated, or suppressed. This is not a Tier-3 parameter boundary suitable for `@trust_boundary`, and acceptance does not depend on the cited adjacent-carrier test.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[23]/body[3]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:38568d0984b4e81c9d282fb74ea7fdf812ba839372384996108984c739fb04b5'
+  judge_metadata_signature: 'hmac-sha256:v2:50d326a8927469c0376d68b77b1637eaf796ff03523d465821c81d0155bb8969'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=de9bd1d1b161fa46
   owner: john
   reason: |-
     R5 `isinstance(value, CodeType)` is the first arm of `_try_normalize_code_constant`, the walker that renders a function's `co_consts` into a deterministic JSON tree for the Runtime-VAL resume-trust manifest. A nested code object -- a comprehension, lambda, or nested def -- must be recursively normalized rather than encoded by identity, because a CodeType's repr and id change on every interpreter run and would make the manifest hash nondeterministic, breaking the resume comparison this module exists to serve. The subject is an owned CPython runtime object obtained by introspection, never external data. Invalidated if code objects stopped appearing in the constants the manifest hashes.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:43:28.461433+00:00'
+  judge_recorded_at: '2026-09-09T01:10:33.512078+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — `_try_normalize_code_constant` intentionally discriminates among heterogeneous CPython constant types, and the `CodeType` check selects the recursive normalization arm rather than defensively revalidating a fixed contract. The visible tuple, list, and set branches confirm that `value: object` is a genuine tagged-union-style walker input, while the rationale specifically explains why nested code objects require deterministic structural encoding. This is owned runtime introspection data, not a Tier-3 parameter boundary, so the trust-boundary decorator does not apply.
+    RULE MISFIRES — `_try_normalize_code_constant` intentionally discriminates among the heterogeneous value types permitted in a code object's `co_consts`; the `CodeType` check is a normalization dispatch arm, not a defensive re-check of a guaranteed homogeneous contract or an attempt to hide a violation. The visible code immediately converts a nested code object into a deterministic structural representation, consistent with the stated manifest-hashing purpose, and does not suppress, coerce, or fabricate malformed data. The value is described as an owned CPython introspection result rather than Tier-3 input, so the trust-boundary decorator does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[0]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:d56bde0e6dee69f1bc185123f6f2b6a514c8402f4e5f1d12f5524cde6a2988f1'
+  judge_metadata_signature: 'hmac-sha256:v2:59d96223c618255fa67068c2318e93fb6867bfface3c7282247d564a49e70177'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=ed3ba9cb81e9cc33
   owner: john
   reason: |-
     RULE MISFIRES: this is the class arm of a normalizer declared over `object`, and it encodes a class constant as a `_type_identity` module:qualname string rather than expanding it. Its ORDER carries meaning: the `get_origin` annotation arm and `_typing_special_form_name` run first, because parameterised generics and typing special forms would otherwise be flattened to a bare type identity that loses their arguments. It is not a defensive re-check of a shape ELSPETH already guarantees — `value` is whatever the code object carried — and a class that cannot produce a string identity is REFUSED rather than defaulted: `_type_identity` raises `FrameworkBugError` when the class's module or qualname is not a string. Nothing is coerced, suppressed or fabricated. Pinned by tests/unit/contracts/test_runtime_val_manifest.py::test_normalize_code_constant_rejects_non_string_type_identity, which sets a class's `__module__` to an int and requires `FrameworkBugError` matching 'type identity'. Invalidated if class constants started needing structural expansion here rather than an identity string.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:43:42.038238+00:00'
+  judge_recorded_at: '2026-09-09T01:12:02.508312+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.98
+  judge_confidence: 0.99
   judge_rationale: |-
-    RULE MISFIRES: `_try_normalize_code_constant` accepts `object` and uses ordered runtime-type discrimination to encode distinct code-constant variants, so `isinstance(value, type)` is a class-specific normalization arm rather than a defensive re-check of a guaranteed contract. The visible code preserves parameterized annotations and typing special forms in earlier arms, then represents a class through `_type_identity(value)` without supplying a default, swallowing an error, coercing the class, or fabricating data. This is not a Tier-3 parameter boundary eligible for the decorator because `value` is owned code-object content being deterministically classified, not external-origin input.
+    RULE MISFIRES: `_try_normalize_code_constant` is explicitly a heterogeneous normalizer over `object` at src/elspeth/contracts/runtime_val_manifest.py:209, so the flagged `isinstance(value, type)` classification arm is not a defensive re-check of a guaranteed shape. The ordering at src/elspeth/contracts/runtime_val_manifest.py:314-325 preserves parameterized annotations and typing special forms before encoding a class identity, while `_type_identity` at lines 142-150 raises `FrameworkBugError` for non-string identity fields rather than coercing or defaulting them. The claimed pinning test was verified at tests/unit/contracts/test_runtime_val_manifest.py:1649-1659 and requires that rejection. This is not a Tier-3 external-parameter boundary, so the decorator alternative does not apply.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[21]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:5f86d59b2d3eee5e54128afc117e143ab2b76eb5f74cc8254e7dc45269a0c2f7'
+  judge_metadata_signature: 'hmac-sha256:v2:4ec8034f1d9fe102f1795c90bf9a94573263171e008a53e9e5fe7fe3ede5fff8'
 - key: contracts/runtime_val_manifest.py:R5:_try_normalize_code_constant:fp=fa6f61fdc7ab0e26
   owner: john
   reason: |-
     R5 `isinstance(value, re.Pattern)` reifies a compiled regex constant into its pattern string and flags. This is load-bearing for the manifest's purpose: a compiled pattern is an opaque object whose identity says nothing about its content, so without unpacking it an edit to a validation regex would leave the manifest hash unchanged and a resumed run would trust code that had actually changed. Invalidated if `flags` stopped being part of the encoding, since the same pattern text under different flags matches differently.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-12-07'
+  expires: '2026-12-08'
   judge_verdict: ACCEPTED
-  judge_recorded_at: '2026-09-08T12:44:00.176941+00:00'
+  judge_recorded_at: '2026-09-09T01:12:24.743437+00:00'
   judge_model: gpt-5.6-sol
   judge_policy_hash: 'sha256:f1b6f8bf56c4aca42b0a591ca75762788c727d9c7d023b4c036a774f86691ccb'
-  judge_confidence: 0.99
+  judge_confidence: 0.98
   judge_rationale: |-
-    RULE MISFIRES — this `isinstance` is deliberate runtime discrimination among heterogeneous code-constant kinds, not a defensive re-check of a fixed Tier-1 or Tier-2 contract and not a mechanism that hides a contract violation. The visible branch normalizes both `value.pattern` and `value.flags`, so edits to either matching semantics component affect the manifest representation; unsupported nested patterns are explicitly propagated as `_UNSUPPORTED_MANIFEST_VALUE`. The site is not a Tier-3 boundary case eligible for the decorator because the value being classified is a code constant rather than external data.
+    RULE MISFIRES — this `isinstance` is a discriminating branch in a heterogeneous code-constant normalizer, not a defensive re-check that hides a fixed-contract violation. The branch explicitly preserves the compiled regex’s pattern and flags in the manifest, and the surrounding branches confirm that `_try_normalize_code_constant` intentionally dispatches across multiple supported runtime types. The rationale is site-specific and explains the audit-integrity consequence of omitting this representation.
   judge_signature_version: 2
-  scope_fingerprint: 7be739c7bffbaa722f192d75498d6e3ae877cfd9fc666b23b875d3a3f6dc941c
+  scope_fingerprint: 781c10840ec9ccdcfdd8ae33e64c3b985411d30f5837b2ab91606a096694206e
   judge_transport: codex_cli
   ast_path: 'body[34]/body[6]/test'
-  judge_metadata_signature: 'hmac-sha256:v2:92caae31f25315b8c778698b7078fdb71da84f9d83c8fad2dde8a573dac52693'
+  judge_metadata_signature: 'hmac-sha256:v2:dc775e92d67ed58e2a20694b7d240bbd518e70bb7cf6a651c0bfb35b40b0b534'

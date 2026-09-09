@@ -345,21 +345,26 @@ class SessionOperationLease:
             lease_seconds=lease_seconds,
             renew_interval_seconds=renew_interval_seconds,
         )
-        acquire_task: asyncio.Task[SessionOperationContext] = asyncio.create_task(
-            run_sync_in_worker(
-                authority.acquire,
-                session_id=session_id,
-                operation_kind=operation_kind,
-                owner_instance_id=owner_instance_id,
-                lease_seconds=lease_seconds,
-            ),
-            name="session-operation-acquire",
-        )
+        # Held in a list so the finished task (whose repr carries its result or
+        # exception) can be dropped from this frame on every path before a
+        # failure escapes; a plain local cannot be deleted on one branch only.
+        acquire_tasks: list[asyncio.Task[SessionOperationContext]] = [
+            asyncio.create_task(
+                run_sync_in_worker(
+                    authority.acquire,
+                    session_id=session_id,
+                    operation_kind=operation_kind,
+                    owner_instance_id=owner_instance_id,
+                    lease_seconds=lease_seconds,
+                ),
+                name="session-operation-acquire",
+            )
+        ]
         try:
-            context = await asyncio.shield(acquire_task)
+            context = await asyncio.shield(acquire_tasks[0])
         except asyncio.CancelledError as cancellation:
             cleanup_task = asyncio.create_task(
-                _finish_cancelled_acquire(authority, acquire_task),
+                _finish_cancelled_acquire(authority, acquire_tasks[0]),
                 name="session-operation-cancelled-acquire-cleanup",
             )
             cleanup_error = await _join_shielded_task_after_cancellation(cleanup_task)
@@ -368,10 +373,12 @@ class SessionOperationLease:
                 (("Session-operation acquire cancellation cleanup", cleanup_error),),
                 group_message="Session operation acquire cancellation integrity failures",
             )
-            del cleanup_error
+            del cleanup_error, cleanup_task
+            acquire_tasks.clear()
             if cancelled_escaping is cancellation:
                 raise
             raise cancelled_escaping from cancellation
+        acquire_tasks.clear()
         context_error = _acquired_context_error(context, requested_kind=operation_kind)
         if context_error is not None:
             release_task = asyncio.create_task(
@@ -395,7 +402,7 @@ class SessionOperationLease:
                     ),
                     group_message="Session operation invalid-context integrity failures",
                 )
-                del release_error
+                del release_error, release_task
                 if escaping is cancellation:
                     raise
                 raise escaping from cancellation
@@ -406,6 +413,7 @@ class SessionOperationLease:
                     note_prefix="Session-operation invalid-context release",
                     group_message="Session operation context validation and release failed",
                 )
+            del release_task
             raise escaping
         return cls(
             authority,
