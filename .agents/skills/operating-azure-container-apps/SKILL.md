@@ -55,7 +55,7 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
 
 1. **Discover, do not remember.** Resolve the subscription, resource group,
    environment, app, active revision, replica names, identity, registry,
-   Key Vault and workspace from live Azure state.
+   runtime and schema-owner Key Vaults and workspace from live Azure state.
 2. **One immutable identity, one digest.** The registry image is a
    digest-preserving copy of the GHCR image (`docker buildx imagetools
    create`); a second build never shares a digest. Deploy `@sha256:`, never a
@@ -80,8 +80,11 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
    timeout is fixed; `ELSPETH_WEB__COMPOSER_TRANSPORT_IDLE_CEILING_SECONDS` is
    a required parameter with no default and is the minimum across every hop.
 9. **Never bake credentials into the image or the template.** Secrets are
-   versioned Key Vault references resolved by the user-assigned identity;
-   never print a value or a resolved reference.
+   versioned Key Vault references. Only `doctor-schema-init` attaches the
+   schema-owner identity and reads owner URLs from its dedicated vault. Web
+   and runtime Jobs attach the runtime identity; the web `AZURE_CLIENT_ID`
+   must match its client ID. The root provisioner has no identity. Never
+   print a value or a resolved reference.
 10. **Rollback is conditional.** Only when the compatibility record says
     `rollback_permitted: true`; a Scenario A install says `false`, so repair
     forward.
@@ -89,6 +92,12 @@ the selected worktree with an explicit `PYTHONPATH` covering `src` and
     changed surface; the full suite runs once when the body of work is done.
 
 ## Normal deploy workflow
+
+For an older shared-identity installation, complete the existing-service
+runbook's **One-time credential isolation migration** first: rotate the owner
+password, remove old owner secrets from the runtime vault, revoke old access
+and deploy the full workload configuration. New parameters and an image-only
+update cannot revoke credentials already exposed by the old vault.
 
 Load [the command cheat sheet](references/command-cheatsheet.md) and follow
 it in order.

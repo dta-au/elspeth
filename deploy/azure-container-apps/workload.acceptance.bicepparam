@@ -7,6 +7,8 @@ using 'workload.bicep'
 
 param environmentResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/elspeth-acc-RUN-ID/providers/Microsoft.App/managedEnvironments/elspeth-env'
 param identityResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/elspeth-acc-RUN-ID/providers/Microsoft.ManagedIdentity/userAssignedIdentities/elspeth-id'
+param identityClientId = '00000000-0000-0000-0000-000000000000'
+param schemaOwnerIdentityResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/elspeth-acc-RUN-ID/providers/Microsoft.ManagedIdentity/userAssignedIdentities/elspeth-schema-owner-id'
 param nfsStorageName = 'elspeth'
 param candidateSourceSha = '0000000000000000000000000000000000000000'
 param containerAppName = 'elspeth-web'
@@ -20,12 +22,22 @@ param maxReplicas = 1
 param terminationGracePeriodSeconds = 60
 param composerTransportIdleCeilingSeconds = 210
 param runtimeRoleLabel = 'a'
+param acceptanceRuntimeSecretUrls = {
+  a: {
+    sessionDbUrl: 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-session-db-url-runtime-a/00000000000000000000000000000000'
+    landscapeUrl: 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-landscape-url-runtime-a/00000000000000000000000000000000'
+  }
+  b: {
+    sessionDbUrl: 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-session-db-url-runtime-b/00000000000000000000000000000000'
+    landscapeUrl: 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-landscape-url-runtime-b/00000000000000000000000000000000'
+  }
+}
 param webCpu = '1.0'
 param webMemory = '2Gi'
-param sessionDbUrlRuntimeSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-session-db-url-runtime-a/00000000000000000000000000000000'
-param landscapeUrlRuntimeSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-landscape-url-runtime-a/00000000000000000000000000000000'
-param sessionDbUrlSchemaOwnerSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-session-db-url-schema-owner/00000000000000000000000000000000'
-param landscapeUrlSchemaOwnerSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-landscape-url-schema-owner/00000000000000000000000000000000'
+param sessionDbUrlRuntimeSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-session-db-url-runtime/00000000000000000000000000000000'
+param landscapeUrlRuntimeSecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-landscape-url-runtime/00000000000000000000000000000000'
+param sessionDbUrlSchemaOwnerSecretUrl = 'https://elspeth-skv-example.vault.azure.net/secrets/elspeth-session-db-url-schema-owner/00000000000000000000000000000000'
+param landscapeUrlSchemaOwnerSecretUrl = 'https://elspeth-skv-example.vault.azure.net/secrets/elspeth-landscape-url-schema-owner/00000000000000000000000000000000'
 param secretKeySecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-secret-key/00000000000000000000000000000000'
 param shareableLinkSigningKeySecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-shareable-link-signing-key/00000000000000000000000000000000'
 param fingerprintKeySecretUrl = 'https://elspeth-kv-example.vault.azure.net/secrets/elspeth-fingerprint-key/00000000000000000000000000000000'

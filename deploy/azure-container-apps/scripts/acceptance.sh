@@ -159,10 +159,11 @@ load_inventory() {
   local inventory="$EVIDENCE_DIR/inventory.json"
   require_file "$inventory"
   KEY_VAULT_NAME=$(jq -er '.keyVaultName.value' "$inventory")
+  SCHEMA_OWNER_KEY_VAULT_NAME=$(jq -er '.schemaOwnerKeyVaultName.value' "$inventory")
   LOG_ANALYTICS_CUSTOMER_ID=$(jq -er '.logAnalyticsCustomerId.value' "$inventory")
   POSTGRES_RESOURCE_ID=$(jq -er '.postgresServerResourceId.value' "$inventory")
   APP_DOMAIN=$(jq -er '.environmentDefaultDomain.value' "$inventory")
-  export KEY_VAULT_NAME LOG_ANALYTICS_CUSTOMER_ID POSTGRES_RESOURCE_ID APP_DOMAIN
+  export KEY_VAULT_NAME SCHEMA_OWNER_KEY_VAULT_NAME LOG_ANALYTICS_CUSTOMER_ID POSTGRES_RESOURCE_ID APP_DOMAIN
 }
 stage_image() {
   : "${ACR_LOGIN_SERVER:?set existing registry login server}"
@@ -502,7 +503,6 @@ stage_prepare() {
   fi
   printf '{}\n' >"$EVIDENCE_DIR/empty-body.json"
   P3_SESSION_ID=$(prepare_session p3 "$P3_YAML")
-  P3_SINK_PATH="${P3_SINK_PATH//\{session_id\}/$P3_SESSION_ID}"
   P4_SESSION_ID=$(prepare_session p4 "$PROBE_YAML")
   api_post "/api/sessions/${P4_SESSION_ID}/messages" "$P4_MESSAGE_BODY" "$EVIDENCE_DIR/prepared-p4-message.json"
   : >"$EVIDENCE_DIR/p2-session-ids.txt"
@@ -537,6 +537,7 @@ stage_probes() {
   : "${P2_SESSION_IDS:?set fresh executable sessions JSON array}"
   : "${P4_SESSION_ID:?set prepared progress session}" "${P3_SESSION_ID:?set prepared long-run session}"
   : "${P3_SINK_PATH:?set shared NFS physical CSV path}" "${P3_SINK_KEY_FIELD:?set stable unique CSV key}"
+  P3_SINK_PATH="${P3_SINK_PATH//\{session_id\}/$P3_SESSION_ID}"
   local trials="${PROBE_TRIALS:-20}"
   positive_integer "$trials"
   test "$trials" -ge 20 || fail probe_trials_insufficient
@@ -719,29 +720,33 @@ stage_cleanup() {
     test "$SECONDS" -lt "$deadline" || { fail resource_graph_cleanup_timeout; return 1; }
     sleep "$ELSPETH_POLL_SECONDS"
   done
-  local vault_args=()
-  if test -z "${KEY_VAULT_NAME:-}"; then
-    # ARM may fail before returning outputs. Discover any tombstone in this
-    # disposable ownership boundary; never guess its generated resource name.
-    az_capture keyvault list-deleted >"$EVIDENCE_DIR/deleted-vaults.json"
-    KEY_VAULT_NAME=$(jq -er --arg group "/resourcegroups/${RESOURCE_GROUP}/" \
-      '[.[] | select(.properties.vaultId | ascii_downcase | contains($group)) | .name]
-      | if length == 0 then "" elif length == 1 then .[0] else error("vault_inventory_ambiguous") end' \
-      "$EVIDENCE_DIR/deleted-vaults.json")
-    if test -z "$KEY_VAULT_NAME"; then
-      test ! -f "$EVIDENCE_DIR/binding.json" || { fail cleanup_vault_unresolved; return 1; }
-      CLEANED_UP=1
-      return 0
+  local vault_args=() vault_names=() name role scheduled
+  if test -f "$EVIDENCE_DIR/binding.json"; then
+    test -n "${KEY_VAULT_NAME:-}" && test -n "${SCHEMA_OWNER_KEY_VAULT_NAME:-}" \
+      && test "$KEY_VAULT_NAME" != "$SCHEMA_OWNER_KEY_VAULT_NAME" \
+      || { fail cleanup_vault_unresolved; return 1; }
+  fi
+  # A failed ARM deployment may not return outputs. Discover every tombstone
+  # in this disposable group, and also retain the known output inventory.
+  az_capture keyvault list-deleted >"$EVIDENCE_DIR/deleted-vaults.json"
+  jq -r --arg group "/resourcegroups/${RESOURCE_GROUP,,}/" \
+    --arg runtime "${KEY_VAULT_NAME:-}" --arg owner "${SCHEMA_OWNER_KEY_VAULT_NAME:-}" \
+    '[.[] | select(.properties.vaultId | ascii_downcase | contains($group)) | .name]
+    + [$runtime, $owner] | map(select(length > 0)) | unique | .[]' \
+    "$EVIDENCE_DIR/deleted-vaults.json" >"$EVIDENCE_DIR/cleanup-vault-names.txt"
+  mapfile -t vault_names <"$EVIDENCE_DIR/cleanup-vault-names.txt"
+  for name in "${vault_names[@]}"; do
+    role=""
+    if test "$name" = "${KEY_VAULT_NAME:-}"; then role=runtime; fi
+    if test "$name" = "${SCHEMA_OWNER_KEY_VAULT_NAME:-}"; then role=schema-owner; fi
+    if az_capture keyvault purge --name "$name" --location "$AZURE_LOCATION" >"$EVIDENCE_DIR/vault-${name}-purge.json"; then
+      if test -n "$role"; then vault_args+=("--${role}-key-vault-purged"); fi
+    else
+      az_capture keyvault show-deleted --name "$name" --location "$AZURE_LOCATION" >"$EVIDENCE_DIR/vault-${name}-tombstone.json"
+      scheduled=$(jq -er '.properties.scheduledPurgeDate' "$EVIDENCE_DIR/vault-${name}-tombstone.json")
+      if test -n "$role"; then vault_args+=("--${role}-scheduled-purge-date" "$scheduled"); fi
     fi
-  fi
-  if az_capture keyvault purge --name "$KEY_VAULT_NAME" --location "$AZURE_LOCATION" >"$EVIDENCE_DIR/vault-purge.json"; then
-    vault_args=(--key-vault-purged)
-  else
-    az_capture keyvault show-deleted --name "$KEY_VAULT_NAME" --location "$AZURE_LOCATION" >"$EVIDENCE_DIR/vault-tombstone.json"
-    local scheduled
-    scheduled=$(jq -er '.properties.scheduledPurgeDate' "$EVIDENCE_DIR/vault-tombstone.json")
-    vault_args=(--scheduled-purge-date "$scheduled")
-  fi
+  done
   if test -f "$EVIDENCE_DIR/binding.json"; then
     load_binding
     verify_receipt resource-graph-cleanup resource-graph-cleanup resource-graph-cleanup-validate \

@@ -250,15 +250,51 @@ def test_resource_graph_projection_rejects_malformed_documents() -> None:
 
 def test_resource_graph_cleanup_details_record_exactly_one_vault_fate() -> None:
     tombstoned = resource_graph_cleanup_details(
-        resource_group="rg", remaining_resources=0, key_vault_purged=False, scheduled_purge_date=datetime(2026, 12, 4, 10, tzinfo=UTC)
+        resource_group="rg",
+        remaining_resources=0,
+        runtime_key_vault_purged=False,
+        runtime_scheduled_purge_date=datetime(2026, 12, 4, 10, tzinfo=UTC),
+        schema_owner_key_vault_purged=True,
+        schema_owner_scheduled_purge_date=None,
     )
     assert tombstoned == {**VALID["resource-graph-cleanup"](), "resource_group_sha256": hashlib.sha256(b"rg").hexdigest()}
-    purged = resource_graph_cleanup_details(resource_group="rg", remaining_resources=0, key_vault_purged=True, scheduled_purge_date=None)
-    assert purged["key_vault_purged"] is True and purged["key_vault_tombstoned"] is False and purged["scheduled_purge_date"] is None
+    purged = resource_graph_cleanup_details(
+        resource_group="rg",
+        remaining_resources=0,
+        runtime_key_vault_purged=True,
+        runtime_scheduled_purge_date=None,
+        schema_owner_key_vault_purged=True,
+        schema_owner_scheduled_purge_date=None,
+    )
+    assert purged["runtime_key_vault_purged"] is True
+    assert purged["runtime_key_vault_tombstoned"] is False and purged["runtime_scheduled_purge_date"] is None
     with pytest.raises(AcceptanceCheckError, match="resource_graph_cleanup"):
-        resource_graph_cleanup_details(resource_group="rg", remaining_resources=1, key_vault_purged=True, scheduled_purge_date=None)
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=1,
+            runtime_key_vault_purged=True,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=True,
+            schema_owner_scheduled_purge_date=None,
+        )
     with pytest.raises(AcceptanceInputError):
-        resource_graph_cleanup_details(resource_group="rg", remaining_resources=0, key_vault_purged=False, scheduled_purge_date=None)
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=0,
+            runtime_key_vault_purged=False,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=True,
+            schema_owner_scheduled_purge_date=None,
+        )
+    with pytest.raises(AcceptanceInputError):
+        resource_graph_cleanup_details(
+            resource_group="rg",
+            remaining_resources=0,
+            runtime_key_vault_purged=True,
+            runtime_scheduled_purge_date=None,
+            schema_owner_key_vault_purged=False,
+            schema_owner_scheduled_purge_date=None,
+        )
 
 
 def test_traffic_projection_rejects_malformed_documents() -> None:

@@ -42,6 +42,10 @@ for a Scenario A install. Otherwise keep the candidate and repair forward.
 
 ## Prerequisites
 
+An installation made with the shared-identity bundle must first complete the
+credential isolation migration below. An image-only update cannot change
+vault access, Job identities or the web container's `AZURE_CLIENT_ID`.
+
 - Azure CLI with the `containerapp` extension, `jq`, `curl`, Docker Buildx,
   `cosign`, and an authenticated `az login` context with `Contributor` on the
   resource group and `AcrPush` (or an existing copy) on the registry.
@@ -88,6 +92,52 @@ az containerapp revision list --name "$CONTAINER_APP" --resource-group "$RESOURC
 
 Require `activeRevisionsMode == "Single"`, exactly one active revision at
 100 %, and a `@sha256:` image reference. Stop on anything else.
+
+### One-time credential isolation migration
+
+Treat this as an infrastructure/configuration change with its own reviewed
+what-if, before the ordinary image-only procedure. Retain the current
+parameters and inspect live role assignments, including inherited grants;
+Incremental deployment does not remove old secrets or role assignments.
+
+1. Deploy the updated `environment.bicep` using the installation's retained
+   environment inputs in Incremental mode. Preserve the existing runtime
+   resources. Capture its outputs, including `schemaOwnerKeyVaultName`,
+   `schemaOwnerKeyVaultUri`, `schemaOwnerIdentityResourceId` and
+   `identityClientId`. Grant the operator Secrets Officer on both vaults as
+   shown in the cold-install runbook.
+2. Rotate the schema-owner PostgreSQL password through the operator's private
+   database/secret workflow. Store new versioned owner URLs only in the new
+   schema-owner vault. Delete the old owner URL secrets (all their versions)
+   from the runtime vault and remove any other owner-password secret stored
+   there. Do not rerun `bootstrap-roles.sql`: its cold-only role creation is
+   unsuitable for an existing database. Rotation invalidates credentials
+   previously readable by runtime replicas; terminate existing sessions for
+   that owner role during the maintenance window to revoke established access.
+3. Create a candidate copy of the retained workload parameters. Set
+   `schemaOwnerIdentityResourceId` and `identityClientId` from the new outputs
+   and replace only the two schema-owner URL references with their new pinned
+   versions. Preserve runtime URL and application-key versions. Validate the
+   candidate and review the full workload what-if. The expected migration
+   changes include the schema-init Job identity, its owner-secret references,
+   removal of identity from `provision-storage`, and web `AZURE_CLIENT_ID`.
+4. Deploy the candidate workload with `deployWebApp=false` in Incremental
+   mode; run `doctor-runtime`. Then deploy that same file with
+   `deployWebApp=true` and prove rollout and public behaviour using steps 6–7.
+   Do not run `doctor-schema-init` on an already initialized installation.
+5. Remove any old grant that lets the runtime identity read the owner vault
+   or owner credentials, including inherited assignments if present. Confirm
+   only the schema-init Job attaches the schema-owner identity and the root
+   provisioner has no identity. From the runtime identity, verify that owner
+   vault secret reads are denied; from the web container, exercise an Azure
+   plugin using managed identity. Recheck the live runtime vault contains no
+   schema-owner credentials and retain the migrated workload parameters.
+
+Keep the service in maintenance until credential rotation, old-secret removal
+and access checks are complete. Do not restore the old shared-access
+configuration during image rollback. After migration, resume the image-only
+procedure below; its requirement to preserve identities and secret versions
+applies to the migrated configuration.
 
 ## 2. Verify and publish the exact source
 

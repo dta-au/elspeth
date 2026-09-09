@@ -7,7 +7,8 @@ The bundle composes Azure Verified Modules (versions pinned in the
 [platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md) §1.2)
 into a virtual network, a Container Apps environment, Azure Database for
 PostgreSQL Flexible Server, an NFS 4.1 Azure Files share, Key Vault, Log
-Analytics, a user-assigned managed identity, the web app and its Jobs.
+Analytics, separate runtime and schema-owner managed identities and vaults,
+the web app and its Jobs.
 
 > **Status.** Skeleton prepared by Phase 6b before the first live run; steps
 > marked **LIVE** are completed from the 6b-7 acceptance. Until the sanitized
@@ -126,9 +127,10 @@ the verified `ACR_RESOURCE_ID`. Set the actual administrator login and network
 configuration in that local file. Both the operator's SQL client and Key Vault
 client need access: run from a host on the private network (with private DNS),
 or explicitly configure the operator IP allowlists for the bootstrap window.
-Grant the operator Key Vault Secrets Officer separately from the runtime
-identity's Secrets User role. Never grant the runtime identity secret-write
-permission. Keep public database access disabled after bootstrap.
+Grant the operator Key Vault Secrets Officer on both vaults separately from
+the identities' Secrets User roles. Never grant the runtime identity access
+to the schema-owner vault or secret-write permission. Keep public database
+access disabled after bootstrap.
 
 ```bash
 : "${ELSPETH_POSTGRES_ADMIN_PASSWORD:?export the administrator password without printing it}"
@@ -157,10 +159,24 @@ false` (Container Apps cannot mount an NFS share that requires encryption in
 transit), the NFS share with `rootSquash: NoRootSquash`, and the
 `privatelink.file.core.windows.net` zone; the Flexible Server (`version 17`,
 password authentication enabled, public network access disabled, private
-endpoint plus `privatelink.postgres.database.azure.com`); the Key Vault (RBAC);
-the Log Analytics workspace; and the identity with `AcrPull` on the existing
-registry, `Key Vault Secrets User` on the vault and the blob role on the
-payload container.
+endpoint plus `privatelink.postgres.database.azure.com`); two Key Vaults (RBAC);
+the Log Analytics workspace; and separate runtime and schema-owner identities
+with `AcrPull` on the existing registry. Both identities read application keys
+from the runtime vault; only the schema-owner identity reads owner database
+URLs from the schema-owner vault. The runtime identity has the blob role on
+the payload container.
+
+Before uploading secrets, grant the selected operator access to both vaults:
+
+```bash
+: "${OPERATOR_OBJECT_ID:?object id of the signed-in operator principal}"
+for output_name in keyVaultName schemaOwnerKeyVaultName; do
+  vault_name=$(jq -er --arg key "$output_name" '.[$key].value' "$OPERATOR_DIR/environment-outputs.json")
+  vault_id=$(az keyvault show --name "$vault_name" --query id --output tsv)
+  az role assignment create --assignee-object-id "$OPERATOR_OBJECT_ID" \
+    --role 'Key Vault Secrets Officer' --scope "$vault_id" --output none
+done
+```
 
 ## 3. Publish the image by digest
 
@@ -228,19 +244,25 @@ each file and captures only its version ID. Keep the directory outside Git:
 ```bash
 : "${SECRET_VALUE_DIR:?absolute directory containing the selected secret value files}"
 KEY_VAULT_NAME=$(jq -er '.keyVaultName.value' "$OPERATOR_DIR/environment-outputs.json")
+SCHEMA_OWNER_KEY_VAULT_NAME=$(jq -er '.schemaOwnerKeyVaultName.value' "$OPERATOR_DIR/environment-outputs.json")
 for secret_name in elspeth-session-db-url-runtime elspeth-landscape-url-runtime \
   elspeth-session-db-url-schema-owner elspeth-landscape-url-schema-owner \
   elspeth-secret-key elspeth-shareable-link-signing-key elspeth-fingerprint-key \
   elspeth-operator-metrics-bearer-token; do
   test -s "$SECRET_VALUE_DIR/$secret_name"
-  az keyvault secret set --vault-name "$KEY_VAULT_NAME" --name "$secret_name" \
+  case "$secret_name" in
+    *-schema-owner) secret_vault=$SCHEMA_OWNER_KEY_VAULT_NAME ;;
+    *) secret_vault=$KEY_VAULT_NAME ;;
+  esac
+  az keyvault secret set --vault-name "$secret_vault" --name "$secret_name" \
     --file "$SECRET_VALUE_DIR/$secret_name" --encoding utf-8 --query id --output tsv \
     >"$OPERATOR_DIR/$secret_name.version"
 done
 unset PGPASSWORD ELSPETH_SCHEMA_OWNER_PASSWORD ELSPETH_RUNTIME_PASSWORD
 ```
 
-If using a Composer endpoint key, upload its file in the same manner and
+Only the two schema-owner database URLs belong in the schema-owner vault.
+If using a Composer endpoint key, upload its file to the runtime vault and
 export its secret name as `COMPOSER_ENDPOINT_SECRET_NAME` before step 5.
 
 ## 5. Provision storage
@@ -268,7 +290,8 @@ az deployment group create --name elspeth-jobs --resource-group "$RESOURCE_GROUP
 bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" provision-storage
 ```
 
-The Job runs a digest-pinned root image (the runtime image is `USER 1654` and
+The Job has no managed identity and runs a digest-pinned public root image
+(the runtime image is `USER 1654` and
 the platform offers no `runAsUser`) and creates `/mnt/elspeth/data`,
 `/mnt/elspeth/data/blobs` and `/mnt/elspeth/payloads` as `1654:1654`, mode
 `0700`. The helper waits for `Succeeded` on the exact started execution and
@@ -285,7 +308,8 @@ bash deploy/azure-container-apps/scripts/run-job.sh "$RESOURCE_GROUP" doctor-sch
 ```
 
 `doctor-schema-init` runs `elspeth doctor deployment --init-schema --json`
-with the schema-owner URLs. `--init-schema` initializes only `MISSING` or
+with the schema-owner identity and URLs from its dedicated vault. The web app
+and runtime doctor never attach that identity. `--init-schema` initializes only `MISSING` or
 repairable schemas; `STALE` is a stop, not a migration.
 
 ## 7. Prove runtime credentials
@@ -314,6 +338,8 @@ sticky`, `minReplicas: 2`, `maxReplicas: 4`, `terminationGracePeriodSeconds:
 `ELSPETH_WEB__DEPLOYMENT_TARGET=azure-container-apps`,
 `ELSPETH_WEB__DEPLOYMENT_STATE_MODE=external-postgresql`,
 `ELSPETH_WEB__HOST=0.0.0.0`, `WEB_CONCURRENCY=1`, `ELSPETH_WEB__LOG_JSON=true`.
+`AZURE_CLIENT_ID` is set from the required `identityClientId` parameter to
+select the attached runtime identity for Azure plugins.
 
 ## 9. Verify
 
@@ -363,6 +389,6 @@ az group delete --name "$RESOURCE_GROUP" --yes
 az graph query -q "Resources | where resourceGroup =~ '${RESOURCE_GROUP}' | count"
 ```
 
-A production Key Vault has purge protection on and cannot be purged; record
-its soft-delete tombstone. Registry images are not owned by the resource
+Both production Key Vaults have purge protection on and cannot be purged;
+record both soft-delete tombstones. Registry images are not owned by the resource
 group and are left in place.

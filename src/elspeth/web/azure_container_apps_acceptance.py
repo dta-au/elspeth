@@ -492,9 +492,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_binding_arguments(cleanup)
     cleanup.add_argument("--count", required=True, help="`az graph query` JSON")
     cleanup.add_argument("--resource-group", required=True)
-    vault = cleanup.add_mutually_exclusive_group(required=True)
-    vault.add_argument("--key-vault-purged", action="store_true")
-    vault.add_argument("--scheduled-purge-date")
+    runtime_vault = cleanup.add_mutually_exclusive_group(required=True)
+    runtime_vault.add_argument("--runtime-key-vault-purged", action="store_true")
+    runtime_vault.add_argument("--runtime-scheduled-purge-date")
+    owner_vault = cleanup.add_mutually_exclusive_group(required=True)
+    owner_vault.add_argument("--schema-owner-key-vault-purged", action="store_true")
+    owner_vault.add_argument("--schema-owner-scheduled-purge-date")
 
     probes = commands.add_parser("replica-probes")
     _add_binding_arguments(probes)
@@ -679,8 +682,14 @@ def _dispatch(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         cleanup_details = resource_graph_cleanup_details(
             resource_group=args.resource_group,
             remaining_resources=project_resource_graph_count(_document(args.count)),
-            key_vault_purged=args.key_vault_purged,
-            scheduled_purge_date=None if args.scheduled_purge_date is None else _timestamp_argument(args.scheduled_purge_date),
+            runtime_key_vault_purged=args.runtime_key_vault_purged,
+            runtime_scheduled_purge_date=None
+            if args.runtime_scheduled_purge_date is None
+            else _timestamp_argument(args.runtime_scheduled_purge_date),
+            schema_owner_key_vault_purged=args.schema_owner_key_vault_purged,
+            schema_owner_scheduled_purge_date=None
+            if args.schema_owner_scheduled_purge_date is None
+            else _timestamp_argument(args.schema_owner_scheduled_purge_date),
         )
         sys.stdout.write(f"{_receipt_line(args, 'resource-graph-cleanup', cleanup_details)}\n")
     elif args.command == "replica-probes":

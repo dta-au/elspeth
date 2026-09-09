@@ -32,7 +32,7 @@ the operator procedures are the three runbooks
 | file | scope | content |
 |---|---|---|
 | `main.bicep` | subscription | resource group + `environment.bicep`; tags the group with `elspeth.acceptance-run-id` when given |
-| `environment.bicep` | resource group | VNet (delegated infrastructure subnet + private-endpoint subnet, NSG allowing 445/2049), Log Analytics, user-assigned identity, four private DNS zones, Premium FileStorage account with the NFS share (`NoRootSquash`, encryption in transit off), StorageV2 account with the payload blob container (identity is Blob Data Contributor on that container only), Key Vault (RBAC, Secrets User for the identity), Flexible Server (password auth, both databases, private endpoint, optional operator firewall rule), the Container Apps environment (Log Analytics destination, NFS storage definition), and `AcrPull` on the **existing** registry |
+| `environment.bicep` | resource group | VNet (delegated infrastructure subnet + private-endpoint subnet, NSG allowing 445/2049), Log Analytics, separate runtime and schema-owner identities and Key Vaults, four private DNS zones, Premium FileStorage account with the NFS share (`NoRootSquash`, encryption in transit off), StorageV2 account with the payload blob container (runtime identity is Blob Data Contributor on that container only), Flexible Server (password auth, both databases, private endpoint, optional operator firewall rule), the Container Apps environment (Log Analytics destination, NFS storage definition), and `AcrPull` for both identities on the **existing** registry |
 | `modules/registry-pull-role.bicep` | registry's resource group | the `AcrPull` assignment on the existing registry |
 | `workload.bicep` | resource group | the `elspeth-web` app (digest-pinned image, Key Vault secret references, NFS volume, startup/liveness/readiness probes, session affinity, scale, grace period) and the manual Jobs `provision-storage` (root image), `doctor-schema-init` (schema-owner URLs, `doctor deployment --init-schema --json`), `doctor-runtime[-a|-b]` (runtime URLs, `doctor deployment --json`) and optional `verify-blob-managed-identity` (production source/sink lifecycles) |
 | `main.example.bicepparam` / `environment.example.bicepparam` | | production stack parameters |
@@ -47,6 +47,23 @@ Incremental mode before starting any Job. After storage provisioning and both
 doctors succeed, deploying with `deployWebApp=true` creates the app. The pinned
 managed-environment AVM uses the storage definition name as its physical NFS
 share name, so both are `elspeth`.
+
+Only `doctor-schema-init` attaches the schema-owner identity and reads owner
+database URLs from the schema-owner vault. Both identities read application
+keys from the runtime vault; web replicas cannot access owner credentials.
+The root `provision-storage` Job has no managed identity. The required
+`identityClientId` sets web `AZURE_CLIENT_ID` for Azure plugin authentication;
+`schemaOwnerIdentityResourceId` selects the schema-init Job identity.
+Existing shared-identity installations need the credential isolation migration
+in the redeploy runbook before using the ordinary image-only path.
+
+Acceptance parameters carry both roles in `acceptanceRuntimeSecretUrls`:
+`{a: {sessionDbUrl, landscapeUrl}, b: {sessionDbUrl, landscapeUrl}}`.
+The production, A and B parameter files carry this same object and preserve
+the production runtime URL parameters. Every deployment retains the production
+and both acceptance roles' application-scoped secret references through the
+final Single-revision pass; `runtimeRoleLabel` selects one pair per revision,
+including after restart.
 
 `scripts/resolve-workload-parameters.sh` writes concrete operator-local ARM
 JSON from environment outputs, verified image digests and Key Vault version

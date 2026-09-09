@@ -272,9 +272,12 @@ VALID: dict[str, Callable[[], dict[str, object]]] = {
         "mechanism": "resource_graph_query",
         "resource_group_sha256": SHA,
         "remaining_resources": 0,
-        "key_vault_purged": False,
-        "key_vault_tombstoned": True,
-        "scheduled_purge_date": "2026-12-04T10:00:00Z",
+        "runtime_key_vault_purged": False,
+        "runtime_key_vault_tombstoned": True,
+        "runtime_scheduled_purge_date": "2026-12-04T10:00:00Z",
+        "schema_owner_key_vault_purged": True,
+        "schema_owner_key_vault_tombstoned": False,
+        "schema_owner_scheduled_purge_date": None,
     },
 }
 
@@ -622,14 +625,17 @@ class TestKindSemantics:
 
     def test_resource_graph_cleanup_requires_zero_resources_and_exactly_one_vault_fate(self) -> None:
         purged = VALID["resource-graph-cleanup"]()
-        purged.update({"key_vault_purged": True, "key_vault_tombstoned": False, "scheduled_purge_date": None})
+        purged.update({"runtime_key_vault_purged": True, "runtime_key_vault_tombstoned": False, "runtime_scheduled_purge_date": None})
         _validate("resource-graph-cleanup", purged)
         for mutation in (
             {"remaining_resources": 1},
-            {"key_vault_purged": True},
-            {"key_vault_purged": True, "key_vault_tombstoned": False},
-            {"scheduled_purge_date": None},
-            {"scheduled_purge_date": "2026-12-04T10:00:00+00:00"},
+            {"runtime_key_vault_purged": True},
+            {"runtime_key_vault_purged": True, "runtime_key_vault_tombstoned": False},
+            {"runtime_scheduled_purge_date": None},
+            {"runtime_scheduled_purge_date": "2026-12-04T10:00:00+00:00"},
+            {"schema_owner_key_vault_purged": False},
+            {"schema_owner_key_vault_tombstoned": True},
+            {"schema_owner_scheduled_purge_date": "2026-12-04T10:00:00Z"},
         ):
             details = VALID["resource-graph-cleanup"]()
             details.update(mutation)
