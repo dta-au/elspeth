@@ -17,8 +17,10 @@ keeps them out of the LLM-audit opt-in view.
 
 A compose that runs without a session (``session_id is None`` — the eval
 harnesses and direct unit invocations) has no session audit store to write
-to; those emit telemetry only, exactly as the withheld-turn disclosure row
-already behaves. A session WITHOUT the turn's operation context is a defect,
+to, so there is no row and therefore nothing to mirror: the persist helpers
+return before either telemetry emitter is entered, which keeps "the row is
+already committed" true on every path that reaches an emitter's exporter
+guard. A session WITHOUT the turn's operation context is a defect,
 not a sessionless compose: every session write is fenced (P4-D6 family A2b),
 so the write refuses rather than running unfenced.
 
@@ -263,13 +265,15 @@ async def persist_advisor_checkpoint_pass(
     line claiming a pass the legal record does not hold is the inversion the
     logging policy forbids.
     """
-    if session_id is not None:
-        await _persist_advisor_audit_row(
-            sessions=sessions,
-            session_id=session_id,
-            session_operation_context=session_operation_context,
-            envelope=advisor_checkpoint_pass_audit_envelope(record),
-        )
+    if session_id is None:
+        # No session store: no row, so nothing to mirror.
+        return
+    await _persist_advisor_audit_row(
+        sessions=sessions,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        envelope=advisor_checkpoint_pass_audit_envelope(record),
+    )
     record_advisor_checkpoint_pass(
         session_id=session_id,
         phase=record.phase,
@@ -291,13 +295,15 @@ async def persist_advisor_terminal_publication(
 
     Same ordering contract as :func:`persist_advisor_checkpoint_pass`.
     """
-    if session_id is not None:
-        await _persist_advisor_audit_row(
-            sessions=sessions,
-            session_id=session_id,
-            session_operation_context=session_operation_context,
-            envelope=advisor_terminal_publication_audit_envelope(publication),
-        )
+    if session_id is None:
+        # No session store: no row, so nothing to mirror.
+        return
+    await _persist_advisor_audit_row(
+        sessions=sessions,
+        session_id=session_id,
+        session_operation_context=session_operation_context,
+        envelope=advisor_terminal_publication_audit_envelope(publication),
+    )
     record_advisor_terminal_publication(
         session_id=session_id,
         branch=publication.branch,

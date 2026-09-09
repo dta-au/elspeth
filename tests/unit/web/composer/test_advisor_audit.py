@@ -220,9 +220,10 @@ class TestAuditPrimacy:
         assert sink.events == []
 
     @pytest.mark.asyncio
-    async def test_sessionless_compose_emits_telemetry_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_sessionless_compose_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """No session means no session audit store (eval harnesses, direct
-        unit invocation): the event still fires, attributed to no session."""
+        unit invocation): there is no row, so no mirror event fires either —
+        every path into the emitters has a committed row behind it."""
         sink = _OrderedSink()
         monkeypatch.setattr(advisor_audit, "record_advisor_checkpoint_pass", sink.telemetry)
         monkeypatch.setattr(advisor_audit, "record_advisor_terminal_publication", sink.telemetry)
@@ -232,8 +233,7 @@ class TestAuditPrimacy:
             sessions=None, session_id=None, session_operation_context=None, publication=_publication()
         )
 
-        assert [kind for kind, _ in sink.events] == ["telemetry", "telemetry"]
-        assert all(payload["session_id"] is None for _, payload in sink.events)
+        assert sink.events == []
 
     @pytest.mark.asyncio
     async def test_session_without_its_operation_context_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
