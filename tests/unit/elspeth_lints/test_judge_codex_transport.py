@@ -60,6 +60,23 @@ _EXPECTED_BASE_CONFIG: tuple[str, ...] = (
     "features.personality=false",
 )
 _MCP_CONFIG_PREFIX = "mcp_servers.elspeth_judge_tools."
+# Every option the judge's argv may carry. Positive, so an unlisted flag fails
+# by being unrecognised rather than by matching a prefix someone predicted.
+_EXPECTED_ARGV_FLAGS = frozenset(
+    {
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "--model",
+        "--json",
+        "--color",
+        "--output-schema",
+        "--cd",
+        "-c",
+    }
+)
 # The complete set of MCP keys the transport may register, pinned so the
 # exemption above cannot be used to smuggle a setting in. `.enabled=false`
 # was a measured bypass before this existed.
@@ -82,12 +99,20 @@ def _assert_judge_shell_is_enabled(command: list[str]) -> None:
     novel override form fails by being unrecognised rather than by matching a
     pattern someone thought to write down.
     """
-    # Every other way to set a config value is refused outright, so the
-    # list comparison below cannot be sidestepped by an attached form.
-    for part in command:
-        assert not part.startswith("--disable"), f"--disable is Codex's documented equivalent of features.<name>=false: {part!r}"
-        assert not part.startswith("--config"), f"config must be passed as a bare -c pair, not attached: {part!r}"
-        assert part == "-c" or not part.startswith("-c"), f"attached -c value bypasses the config pin: {part!r}"
+    # POSITIVE flag allowlist. Every option the judge's argv may carry is named
+    # here; anything else fails by being unrecognised.
+    #
+    # This replaces five `startswith` blocklists. A fifth adversarial review
+    # (2026-09-09) pointed out that those were the very filter shape the comment
+    # above declares unsound, and walked through them the same way its
+    # predecessors walked through the config filters: `-p` is Codex's short
+    # `--profile`, and `--enable <FEATURE>` is the documented `-c
+    # features.<name>=true`, which was measured to override an explicit
+    # `features.apps=false` in either order. `--add-dir` and `--oss` were also
+    # unrefused. One positive assertion catches all of them, and every flag
+    # Codex adds in future, at once.
+    flags = {part for part in command if part.startswith("-") and part != "-"}
+    assert flags <= _EXPECTED_ARGV_FLAGS, f"unrecognised flag on the judge's argv: {sorted(flags - _EXPECTED_ARGV_FLAGS)}"
     config_values = [command[index + 1] for index, part in enumerate(command) if part == "-c"]
     mcp_values = [value for value in config_values if value.startswith(_MCP_CONFIG_PREFIX)]
     base_values = [value for value in config_values if not value.startswith(_MCP_CONFIG_PREFIX)]
@@ -112,9 +137,6 @@ def _assert_judge_shell_is_enabled(command: list[str]) -> None:
     assert "--ignore-user-config" in command, "a CODEX_HOME config.toml can disable the shell the judge depends on"
     assert "--ignore-rules" in command, "repo execpolicy rules must not reach the judge"
     assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == ["--sandbox", "read-only"]
-    for part in command:
-        assert not part.startswith("--dangerously"), f"read-only sandboxing is the judge's write control: {part!r}"
-        assert not part.startswith("--profile"), f"a profile layers unpinned config over this argv: {part!r}"
 
 
 def _request() -> JudgeRequest:
