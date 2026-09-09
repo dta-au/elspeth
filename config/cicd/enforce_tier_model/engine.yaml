@@ -12,30 +12,6 @@ allow_hits:
     be carried. The rationale above was re-verified against the current code
     at this site.
   expires: '2026-08-31'
-- key: engine/barrier_coordination.py:R9:BarrierIntakeCoordinator:_token_for_intake:fp=bd0144bf60360666
-  owner: john
-  reason: |-
-    Prescribed state-machine fallback, not a hidden missing-key defect. `_token_for_intake()` (`src/elspeth/engine/barrier_coordination.py:252`) documents that barrier intake intentionally checks the live in-memory stash first, then rehydrates from the journal: "Live stash first" and "Without a live stash, the durable row is still authoritative". The flagged line (`src/elspeth/engine/barrier_coordination.py:268`) uses `hold = self._live_barrier_holds.pop(row.token_id, None)` to distinguish those two valid paths. The default sentinel is consumed by control flow immediately below: a hit returns the stashed token; a miss branches on `self._resume_checkpoint_id` between fresh-leader journal rehydration at offset zero (normal follower handoffs) and resume-leader rehydration with the audit-derived attempt offset stamped with checkpoint provenance — the same semantics as the restore path.
-  safety: |-
-    Pending cicd-judge re-justification: the barrier-subsystem extraction
-    (elspeth-e76a186916) moved this function unchanged from
-    RowProcessor to BarrierIntakeCoordinator, so the prior ACCEPTED verdict
-    (which binds to the exact code and location the judge inspected) could not
-    be carried. The rationale above was re-verified against the current code
-    at this site.
-  expires: '2026-08-31'
-- key: engine/barrier_coordination.py:R1:BarrierIntakeCoordinator:_token_for_intake:fp=bfa42186dd99991f
-  owner: john
-  reason: |-
-    ACCEPT because `src/elspeth/engine/barrier_coordination.py:271-278` is not masking a required key in an in-memory Tier-1 object; it is consuming an intentionally sparse aggregate query result whose API defines absence as "no prior node_states rows". The enclosing `_token_for_intake` resume arm derives the resume attempt offset from audit state with `max_attempts = self._execution.get_max_node_state_attempts(self._run_id, [row.token_id])` and `attempt_offset=max_attempts.get(row.token_id, -1) + 1`. The callee's contract at `src/elspeth/core/landscape/execution_repository.py:630-634` says: "Tokens with no node_states rows are absent from the result (callers treat absence as max_attempt = -1, i.e. offset 0)." This suppression is bound to that exact sparse-result contract; if the repository later guarantees one entry per requested token or changes absence semantics, this `.get(row.token_id, -1)` justification no longer applies and the site must be re-reviewed.
-  safety: |-
-    Pending cicd-judge re-justification: the barrier-subsystem extraction
-    (elspeth-e76a186916) moved this function unchanged from
-    RowProcessor to BarrierIntakeCoordinator, so the prior ACCEPTED verdict
-    (which binds to the exact code and location the judge inspected) could not
-    be carried. The rationale above was re-verified against the current code
-    at this site.
-  expires: '2026-08-31'
 - key: engine/error_boundary.py:R5:reraise_if_engine_crash_through:fp=ebeeba143fd8094a
   owner: john
   reason: |-
