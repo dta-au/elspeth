@@ -23,11 +23,11 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 from elspeth.core.url_validation import validate_credential_safe_https_url
-from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync_in_worker
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_auth_audit_in_worker, run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
 from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict, bcrypt_password_bytes
 from elspeth.web.auth.middleware import get_current_user
-from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, UserIdentity
+from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable, IdentityClaims, UserIdentity
 from elspeth.web.auth.protocol import AuthProvider, CredentialAuthProvider
 from elspeth.web.auth.sso import (
     COOKIE_NAME,
@@ -395,19 +395,8 @@ def create_auth_router() -> APIRouter:
             except LocalAuthRegistrationConflict as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except AsyncWorkerAdmissionTimeoutError as exc:
-                # MUST precede ``except OSError``: ``AsyncWorkerAdmissionTimeoutError``
-                # subclasses ``TimeoutError``, which subclasses ``OSError``, so
-                # without this arm a saturated worker pool is reported as
-                # "outbox could not be written" and sends the operator to
-                # diagnose a disk that is fine.
-                #
-                # 503, matching ``sso_complete`` below: the registration never
-                # ran, nothing was written, and the remedy is to retry once the
-                # pool drains — which is what 503 says and 500 does not. No
-                # ``auth_failure`` row: this is not a failed authentication and
-                # the category vocabulary has no member for a refused
-                # registration, so inventing one here would put a meaning in the
-                # trail that no reader of that column expects.
+                # Admission failed before registration started. This precedes
+                # OSError because TimeoutError inherits from it.
                 raise HTTPException(status_code=503, detail="Registration is temporarily unavailable; retry shortly") from exc
             except OSError as exc:
                 raise HTTPException(status_code=500, detail="Email verification outbox could not be written") from exc
@@ -438,10 +427,6 @@ def create_auth_router() -> APIRouter:
         except LocalAuthRegistrationConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except AsyncWorkerAdmissionTimeoutError as exc:
-            # Same refusal as the email-verified branch above. There is no
-            # ``except OSError`` to be mistaken for here, so the pre-existing
-            # behaviour was a bare 500 rather than a wrong diagnosis — still the
-            # wrong status for work that never started and is safe to retry.
             raise HTTPException(status_code=503, detail="Registration is temporarily unavailable; retry shortly") from exc
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=token)
@@ -622,6 +607,30 @@ def create_auth_router() -> APIRouter:
             error=_single_query_value(request, "error"),
         )
         cookie_value = request.cookies[COOKIE_NAME] if COOKIE_NAME in request.cookies else None
+        failure_audited = False
+
+        def record_callback_failure(exc: SsoLoginError | AuthProviderUnavailable) -> None:
+            nonlocal failure_audited
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=failure_category(exc),
+                failure_stage="sso_callback",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            failure_audited = True
+
+        def upsert_and_audit(claims: IdentityClaims) -> AdmittedIdentity:
+            try:
+                return runtime.upsert_identity(claims)
+            except SsoLoginError as exc:
+                # Identity changes can commit before refusing a rebound or
+                # dormant login. Audit that refusal in the same worker even
+                # when the browser has already disconnected.
+                record_callback_failure(exc)
+                raise
 
         def record_login(identity: AdmittedIdentity) -> None:
             recorder.record_login_success(
@@ -640,7 +649,7 @@ def create_auth_router() -> APIRouter:
                 validator=runtime.validator,
                 claim_checks=runtime.claim_checks,
                 map_identity=runtime.map_identity,
-                upsert_identity=runtime.upsert_identity,
+                upsert_identity=upsert_and_audit,
                 record_login=record_login,
                 handoffs=runtime.handoffs,
                 request_id=request.state.request_id,
@@ -648,15 +657,8 @@ def create_auth_router() -> APIRouter:
             )
         except (SsoLoginError, AuthProviderUnavailable) as exc:
             category = failure_category(exc)
-            recorder.record_auth_failure(
-                request,
-                provider=settings.auth_provider,
-                failure_category=category,
-                failure_stage="sso_callback",
-                user_id=None,
-                username=None,
-                exception_class=type(exc).__name__,
-            )
+            if not failure_audited:
+                await run_auth_audit_in_worker(record_callback_failure, exc)
             location = failure_location(client.public_base_url, category)
 
         response = RedirectResponse(location, status_code=302)
@@ -671,21 +673,7 @@ def create_auth_router() -> APIRouter:
         response: Response,
         _rate_limit: None = Depends(check_auth_rate_limit),
     ) -> TokenResponse:
-        """Trade the handoff code for the session token. The only place one is minted.
-
-        ``complete_login`` is synchronous and does three database round trips
-        — the conditional UPDATE that claims the handoff, the identity read,
-        and the ``token_issued`` audit write — so it runs on the worker pool
-        rather than on the event loop. Under external-postgresql each of those
-        is a network hop, and a lock wait on ``sso_handoffs`` held inline would
-        stall every unrelated request this worker is serving.
-
-        The offload is done HERE rather than inside the service because the
-        service's function is the synchronous one; wrapping it at the one call
-        site keeps ``complete_login`` directly testable without a running loop.
-        The same seam is why this route, not the service, owns the pool's
-        admission refusal below.
-        """
+        """Trade the handoff code for the session token. The only place one is minted."""
         runtime = await _sso_runtime(request)
         settings: WebSettings = request.app.state.settings
         recorder = _auth_audit_recorder(request)
@@ -701,27 +689,40 @@ def create_auth_router() -> APIRouter:
                 login_request_id=login_request_id,
             )
 
+        def complete_and_audit() -> TokenResponse:
+            # Keep consumption and its audit in one worker submission: a
+            # disconnected caller must not interrupt an already-started claim
+            # between its admission decision and the required audit write.
+            try:
+                session = complete_login(
+                    body.code,
+                    handoffs=runtime.handoffs,
+                    read_identity=runtime.read_identity,
+                    issuer=runtime.issuer,
+                    record_token_issued=record_token_issued,
+                )
+            except SsoLoginError as exc:
+                recorder.record_auth_failure(
+                    request,
+                    provider=settings.auth_provider,
+                    failure_category=exc.category,
+                    failure_stage="sso_complete",
+                    user_id=None,
+                    username=None,
+                    exception_class=type(exc).__name__,
+                )
+                raise HTTPException(status_code=401, detail=exc.detail) from exc
+            return TokenResponse(access_token=session.access_token)
+
         try:
-            session = await run_sync_in_worker(
-                complete_login,
-                body.code,
-                handoffs=runtime.handoffs,
-                read_identity=runtime.read_identity,
-                issuer=runtime.issuer,
-                record_token_issued=record_token_issued,
-            )
+            token_response = await run_sync_in_worker(complete_and_audit)
         except AsyncWorkerAdmissionTimeoutError as exc:
-            # The pool is saturated, so this request never reached
-            # ``complete_login`` — the handoff was not claimed and is still
-            # redeemable once the pool drains. It is NOT an ``SsoLoginError``,
-            # and without this arm it would leave the route as an unaudited
-            # 500 on a path where every other outcome is audited.
-            #
-            # 503 with ``provider_unavailable``, matching how ``/me`` answers
-            # ``AuthProviderUnavailable`` below: every ``sso_*`` category tells
-            # the browser to start the login again, which would be wrong advice
-            # here — the correct remedy is to wait and present the same code.
-            recorder.record_auth_failure(
+            # The handoff has not been consumed. A reserved bounded worker
+            # records this refusal even when ordinary workers are saturated.
+            # Audit failures propagate; never claim an audited refusal when
+            # the required write could not be admitted or persisted.
+            await run_auth_audit_in_worker(
+                recorder.record_auth_failure,
                 request,
                 provider=settings.auth_provider,
                 failure_category=PROVIDER_UNAVAILABLE_CATEGORY,
@@ -731,20 +732,8 @@ def create_auth_router() -> APIRouter:
                 exception_class=type(exc).__name__,
             )
             raise HTTPException(status_code=503, detail="Sign-in could not be completed right now — try again shortly") from exc
-        except SsoLoginError as exc:
-            recorder.record_auth_failure(
-                request,
-                provider=settings.auth_provider,
-                failure_category=exc.category,
-                failure_stage="sso_complete",
-                user_id=None,
-                username=None,
-                exception_class=type(exc).__name__,
-            )
-            raise HTTPException(status_code=401, detail=exc.detail) from exc
-
         _mark_sensitive_auth_response_uncacheable(response)
-        return TokenResponse(access_token=session.access_token)
+        return token_response
 
     @router.get("/me", response_model=UserProfileResponse)
     async def me(

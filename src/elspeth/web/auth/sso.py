@@ -662,6 +662,16 @@ def discovery_endpoints(document: object, *, issuer: str, expected_origins: froz
         raise SsoDiscoveryFailed(str(exc)) from exc
 
 
+async def _read_bounded_response(response: httpx.Response, *, max_bytes: int, overflow_error: SsoLoginError) -> bytes:
+    """Stop consuming the decoded response as soon as its size exceeds the cap."""
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise overflow_error
+        body.extend(chunk)
+    return bytes(body)
+
+
 async def fetch_discovery_endpoints(
     *,
     issuer: str,
@@ -685,17 +695,21 @@ async def fetch_discovery_endpoints(
     """
     url = f"{issuer.rstrip('/')}{_DISCOVERY_PATH}"
     try:
-        async with httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT, follow_redirects=False, transport=transport) as client:
-            response = await client.get(url)
+        async with (
+            httpx.AsyncClient(timeout=_DISCOVERY_TIMEOUT, follow_redirects=False, transport=transport) as client,
+            client.stream("GET", url) as response,
+        ):
             response.raise_for_status()
-            body = response.content
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_DISCOVERY_BYTES,
+                overflow_error=SsoDiscoveryFailed("discovery document exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
         # Class name only. str(exc) on a connect error can carry the resolved
         # IP of the IdP, and on an InvalidURL the offending URL itself.
         raise SsoDiscoveryFailed(f"discovery request failed ({type(exc).__name__})") from exc
 
-    if len(body) > _MAX_DISCOVERY_BYTES:
-        raise SsoDiscoveryFailed("discovery document exceeds the maximum accepted size")
     try:
         document = json.loads(body)
     except ValueError as exc:
@@ -969,13 +983,6 @@ async def redeem_authorization_code(
     Every failure is ``SsoTokenExchangeFailed``. The HTTP status is named in
     the detail because it is the one fact an operator needs and it is not
     IdP-authored text; the response body never is.
-
-    THE SIZE BOUND IS ENFORCED WHILE STREAMING, not after. A bound checked
-    against an already-buffered body is not a bound: the whole response is in
-    this worker's memory by the time it is refused, so the counterparty — an
-    IdP that is impersonated, compromised, or merely broken — sets the cost of
-    every login attempt rather than the cap doing so. Measured before this was
-    fixed: 1 MiB read against a 64 KiB bound.
     """
     headers = {
         "Authorization": _client_secret_basic(client_id, client_secret),
@@ -988,37 +995,24 @@ async def redeem_authorization_code(
         "client_id": client_id,
         "code_verifier": verifier,
     }
-    body = bytearray()
     try:
         async with (
             httpx.AsyncClient(timeout=_TOKEN_TIMEOUT, follow_redirects=False, transport=transport) as client,
             client.stream("POST", token_endpoint, data=form, headers=headers) as response,
         ):
-            # Status first, exactly as before — and now it costs nothing at
-            # all, because the status line and headers arrive ahead of the
-            # body and no chunk has been pulled yet.
             if response.status_code != 200:
                 raise SsoTokenExchangeFailed(f"token endpoint returned HTTP {response.status_code}")
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > _MAX_TOKEN_RESPONSE_BYTES:
-                    # Leaving the ``async with`` closes the response, so the
-                    # rest of the body is never pulled off the connection.
-                    raise SsoTokenExchangeFailed("token response exceeds the maximum accepted size")
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_TOKEN_RESPONSE_BYTES,
+                overflow_error=SsoTokenExchangeFailed("token response exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
         # Class name only: str(exc) can carry the resolved address of the IdP.
-        #
-        # This handler now spans the BODY read as well as the request, which it
-        # has to: with a streamed response a ReadTimeout or ReadError can fire
-        # mid-body, and that is the same failure for the same reason as one
-        # during the request. The refusals raised inside the block are
-        # ``SsoTokenExchangeFailed``, which is not an ``httpx.HTTPError``, so
-        # they travel out past this handler untouched rather than being
-        # relabelled as a transport failure.
         raise SsoTokenExchangeFailed(f"token request failed ({type(exc).__name__})") from exc
 
     try:
-        document = json.loads(bytes(body))
+        document = json.loads(body)
     except ValueError as exc:
         raise SsoTokenExchangeFailed("token response is not valid JSON") from exc
     return parse_token_response(document)
@@ -1081,20 +1075,8 @@ async def fetch_userinfo(
     whose ``sub`` matches. Anything else — including a transport failure —
     is ``sso_userinfo_invalid``: the profile declared it cannot build an
     identity without this call, so there is no login to fall back to.
-
-    THE 64 KiB BOUND IS ENFORCED WHILE STREAMING, not after, for the reason
-    ``redeem_authorization_code`` gives: a bound applied to an already-
-    buffered body has already paid for every byte it then refuses. It bounds
-    DECODED bytes — the document the spec bounds and the parse below would
-    cost — which is also the bound that holds against a compressed body,
-    since ``aiter_bytes`` decompresses incrementally and the loop stops
-    within one chunk of the cap however small the wire body was.
-
-    The two header checks stay ahead of the body, in the order they were
-    already in, and now cost nothing: headers arrive before the first chunk.
     """
     headers = {"Authorization": f"Bearer {access_token}", "Accept": "application/json"}
-    body = bytearray()
     try:
         async with (
             httpx.AsyncClient(timeout=_USERINFO_TIMEOUT, follow_redirects=False, transport=transport) as client,
@@ -1105,21 +1087,16 @@ async def fetch_userinfo(
             content_type = response.headers["content-type"] if "content-type" in response.headers else ""
             if _media_type(content_type) != "application/json":
                 raise SsoUserinfoInvalid("userinfo response is not application/json")
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > _MAX_USERINFO_BYTES:
-                    # Leaving the ``async with`` closes the response, so the
-                    # rest of the body is never pulled off the connection.
-                    raise SsoUserinfoInvalid("userinfo response exceeds the maximum accepted size")
+            body = await _read_bounded_response(
+                response,
+                max_bytes=_MAX_USERINFO_BYTES,
+                overflow_error=SsoUserinfoInvalid("userinfo response exceeds the maximum accepted size"),
+            )
     except httpx.HTTPError as exc:
-        # Spans the body read too, now that there is one to fail: a mid-body
-        # ReadTimeout is the same failure as one during the request. The
-        # refusals above are ``SsoUserinfoInvalid``, not ``httpx.HTTPError``,
-        # so they pass through rather than being relabelled.
         raise SsoUserinfoInvalid(f"userinfo request failed ({type(exc).__name__})") from exc
 
     try:
-        document = json.loads(bytes(body))
+        document = json.loads(body)
     except ValueError as exc:
         raise SsoUserinfoInvalid("userinfo response is not valid JSON") from exc
     return parse_userinfo(document, expected_subject=expected_subject)
@@ -1219,36 +1196,6 @@ def failure_location(public_base_url: str, category: str) -> str:
     return _spa_location(public_base_url, {"error": category})
 
 
-async def _off_the_event_loop[**P, T](func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
-    """Run one synchronous seam of the login walk on the shared worker pool.
-
-    The seams ``login_callback`` is handed — the identity upsert, the Landscape
-    ``login`` write, the handoff insert — are plain ``def``s doing database
-    work, and under external-postgresql each is a network round trip. Called
-    inline from this coroutine they hold the event loop for the whole trip, so
-    one contended identity table stalls every unrelated request on the worker.
-    They stay synchronous and are offloaded HERE rather than being made async,
-    which keeps the injection contract (``HandoffStore``, and the callables
-    ``SsoRuntime`` binds) exactly as it was.
-
-    THE TRANSLATION IS THE POINT OF THE WRAPPER. ``run_sync_in_worker`` refuses
-    admission with ``AsyncWorkerAdmissionTimeoutError`` once the process-wide
-    pool is saturated. Left as itself that is a bare ``TimeoutError`` leaving
-    ``login_callback``, past a route handler that catches ``SsoLoginError`` and
-    ``AuthProviderUnavailable`` and nothing else — an UNAUDITED 500 on the one
-    path where every other outcome is audited. ``AuthProviderUnavailable`` is
-    where it belongs: it is the single member of the closed category set whose
-    remedy is "wait" rather than "start again" (see
-    ``PROVIDER_UNAVAILABLE_CATEGORY``), and a saturated pool is a container
-    that cannot serve this login right now. The class, not a message, carries
-    that — the same rule the failure taxonomy above is built on.
-    """
-    try:
-        return await run_sync_in_worker(func, *args, **kwargs)
-    except AsyncWorkerAdmissionTimeoutError as exc:
-        raise AuthProviderUnavailable("the login could not be admitted to a worker: the request pool is saturated") from exc
-
-
 async def login_callback(
     query: CallbackQuery,
     cookie_value: str | None,
@@ -1269,11 +1216,8 @@ async def login_callback(
     Injected rather than imported: the identity upsert and the audit write
     live in ``web.sessions`` and the Landscape, which ``web.auth`` does not
     depend on, and the route is where a ``Request`` exists to derive the
-    audit row's client host and request id from. They stay SYNCHRONOUS and are
-    run through ``_off_the_event_loop`` at the three call sites below, so the
-    database work they do never sits on the loop and the injection contract is
-    untouched. Taking them as callables lets THIS function own the order —
-    which is the property worth a test:
+    audit row's client host and request id from. Taking them as callables
+    lets THIS function own the order — which is the property worth a test:
 
     1. cookie → state → IdP error → code, none of it remote;
     2. token exchange;
@@ -1287,15 +1231,11 @@ async def login_callback(
     The login row is written before the handoff exists, so a handoff can
     never be redeemed for a login the trail does not record. Admission
     (active / pending / disabled) is NOT decided here — see the comment at
-    the upsert, and ``complete_login``. That invariant survives a saturated
-    worker pool as well: the refusal aborts step 8 wherever it lands, and the
-    handoff is the last thing step 8 does, so there is never a live handoff
-    whose ``login`` row is missing.
+    the upsert, and ``complete_login``.
 
     ``AuthProviderUnavailable`` is re-raised as itself: it is a 503 and the
     browser's remedy is to wait, so it must not be reclassified as an
-    ID-token failure, which says "start again". It is also what a saturated
-    worker pool becomes (``_off_the_event_loop``), for the same reason.
+    ID-token failure, which says "start again".
     """
     code, transaction = open_callback(
         query,
@@ -1358,17 +1298,20 @@ async def login_callback(
     # first login is exactly how a pending row comes to exist. The refusal
     # for a pending or disabled identity belongs to ``complete``, where the
     # token would otherwise be minted, and it is recorded there.
-    #
-    # Each of the three is awaited separately rather than bundled into one
-    # worker call: the ORDER above is the contract, and one call doing all
-    # three would move that order inside a helper where no test of this
-    # function can see it.
-    identity = await _off_the_event_loop(upsert_identity, claims)
-    await _off_the_event_loop(record_login, identity)
+    def finish_login() -> str:
+        # One worker submission keeps persistence and its required audit in
+        # order even if the caller disconnects after the worker has started.
+        identity = upsert_identity(claims)
+        record_login(identity)
 
-    handoff = new_handoff_code()
-    await _off_the_event_loop(handoffs.issue, code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
-    return handoff_location(client.public_base_url, handoff)
+        handoff = new_handoff_code()
+        handoffs.issue(code_hash=handoff_code_hash(handoff), identity_id=identity.identity_id, request_id=request_id)
+        return handoff_location(client.public_base_url, handoff)
+
+    try:
+        return await run_sync_in_worker(finish_login)
+    except AsyncWorkerAdmissionTimeoutError as exc:
+        raise AuthProviderUnavailable("the login could not be admitted to a worker: the request pool is saturated") from exc
 
 
 # ── complete ─────────────────────────────────────────────────────────────

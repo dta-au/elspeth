@@ -507,6 +507,10 @@ stating it can still break the glass.
 | `identity_dormancy_days` | int | No | `90` | Dormancy window for an activated identity (R9). A login by an `active` identity whose previous login is **older than** this many days drops it back to `pending` with `disable_reason='dormant'`, writes an `identity_disabled` audit row, and refuses the login at the admission gate; an administrator must re-activate it. A re-pend takes the identity's **admission**, not its roles, quota or org-tree edges — the same posture R3's rebound disable takes — so re-activating it restores the access it already held, whichever role the administrator picks (including `none`), and the `identity_activated` audit row names those retained roles in its metadata. Use `POST /api/auth/admin/roles/{role_id}/revoke` to remove one; activation is not a way to strip authority. Exactly this many days is still admitted. An identity that has never logged in (`last_login_at` is NULL — a pre-provisioned row) is not dormant, and becomes measurable from its second login. The **last active human administrator is exempt** (D34): they are not re-pended and their login proceeds, so a single-admin container cannot walk itself to zero administrators by being left alone; the exemption writes its own `auth_events` row (`identity_disabled` with `outcome='failure'` and `failure_category='dormancy_last_admin_exempt'`). Must be greater than 0 |
 | `identity_pending_retention_days` | int | No | `90` | Intended retention for a never-activated pending identity before it is purged. Must be greater than 0. Validated only; no runtime path reads it in this release |
 
+Dormancy applies to both local and SSO identities. Administrator reactivation
+starts a fresh dormancy window: the later of the previous login and activation
+must exceed the configured number of days before the identity is re-pended.
+
 An SSO first login lands **pending** and is activated by an administrator. The
 provider verified who the person is; it did not decide whether this container
 admits them. `sso_admin_subjects` is the one exception, and only for the first

@@ -89,7 +89,10 @@ def _backdate_login(engine: Engine, identity_id: str, *, days: int) -> None:
         conn.execute(
             update(identities_table)
             .where(identities_table.c.identity_id == identity_id)
-            .values(last_login_at=datetime.now(UTC) - timedelta(days=days))
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=days),
+                activated_at=datetime.now(UTC) - timedelta(days=days),
+            )
         )
 
 
@@ -139,16 +142,11 @@ async def test_a_dormant_local_login_is_re_pended_and_refused_at_the_admission_w
 
 
 async def test_the_last_local_admins_dormancy_is_exempted_and_only_this_row_records_it(
-    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority]
+    tmp_path: Path, substrate: tuple[Engine, RepositoryIdentityAuthority], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """D34 through the local wiring: nothing changes on the identity, so the row is all there is.
+    """The local wiring records D34 before advancing the login timestamp."""
+    from elspeth.web.auth.audit import AuthAuditRecorder
 
-    The exemption row is written by the WIRING, after ``ensure_identity``
-    returns, because there is no state change for a failed audit to roll back.
-    That makes it deletable without breaking anything the authority asserts --
-    which is precisely why it needs a test here rather than only in the
-    authority's own suite.
-    """
     engine, authority = substrate
     settings = _local_settings(tmp_path, identity_dormancy_days=30)
     provider = _provider(settings, authority)
@@ -164,6 +162,16 @@ async def test_the_last_local_admins_dormancy_is_exempted_and_only_this_row_reco
     )
     assert authority.count_active_human_admins() == 1
     _backdate_login(engine, root_id, days=400)
+    previous_login = authority.read_identity_summary(identity_id=root_id).last_login_at
+
+    def refuse_audit(*args, **kwargs):
+        raise RuntimeError("exemption audit unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AuthAuditRecorder, "record_identity_dormancy_exempted", refuse_audit)
+        with pytest.raises(RuntimeError, match="exemption audit unavailable"):
+            await provider.login("root", "password123")
+    assert authority.read_identity_summary(identity_id=root_id).last_login_at == previous_login
 
     # NOT refused: the sole administrator keeps their admission and logs in.
     assert await provider.login("root", "password123")

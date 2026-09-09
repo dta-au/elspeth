@@ -387,7 +387,10 @@ def _backdate_login(engine, identity_id: str, *, days: int) -> None:
         conn.execute(
             update(identities_table)
             .where(identities_table.c.identity_id == identity_id)
-            .values(last_login_at=datetime.now(UTC) - timedelta(days=days))
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=days),
+                activated_at=datetime.now(UTC) - timedelta(days=days),
+            )
         )
 
 
@@ -430,13 +433,10 @@ def test_a_dormant_login_is_re_pended_at_the_wiring_and_writes_the_system_disabl
     assert (metadata["cause"], metadata["state"], metadata["dormancy_days"]) == ("dormant", "pending", 30)
 
 
-def test_the_last_admins_dormancy_is_exempted_and_the_exemption_is_the_only_evidence(tmp_path: Path, substrate) -> None:
-    """D34 end to end: nothing changes on the identity, so the row is all there is.
+def test_the_last_admins_dormancy_is_exempted_and_the_exemption_is_the_only_evidence(tmp_path: Path, substrate, monkeypatch) -> None:
+    """D34's audit must succeed before the login erases its dormancy evidence."""
+    from elspeth.web.auth.audit import AuthAuditRecorder
 
-    The wiring is the only place this row can be written -- the authority
-    reports the exemption and changes no state, so there is nothing for a
-    callback inside its transaction to protect.
-    """
     engine, authority = substrate
     idp = FakeIdP()
     settings = _oidc_wired(tmp_path, idp, identity_dormancy_days=30, sso_admin_subjects=["root"])
@@ -448,6 +448,16 @@ def test_the_last_admins_dormancy_is_exempted_and_the_exemption_is_the_only_evid
     assert seeded.access_state == "active"
     assert authority.count_active_human_admins() == 1
     _backdate_login(engine, seeded.identity_id, days=400)
+    previous_login = authority.read_identity_summary(identity_id=seeded.identity_id).last_login_at
+
+    def refuse_audit(*args, **kwargs):
+        raise RuntimeError("exemption audit unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(AuthAuditRecorder, "record_identity_dormancy_exempted", refuse_audit)
+        with pytest.raises(RuntimeError, match="exemption audit unavailable"):
+            wiring.upsert_identity(_identity_claims("root", "root@example.com"))
+    assert authority.read_identity_summary(identity_id=seeded.identity_id).last_login_at == previous_login
 
     bound = wiring.upsert_identity(_identity_claims("root", "root@example.com"))
 

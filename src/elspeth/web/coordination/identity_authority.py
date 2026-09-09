@@ -434,8 +434,7 @@ class IdentityDormant:
     first-login-only bootstrap seed cannot re-fire -- leaves the row
     ``active``, and an ``identity_disabled`` event for it would assert a
     state change that did not happen.  That case is reported on
-    ``EnsureIdentityOutcome.dormancy_exempted_since`` and audited by the
-    caller, which is the same split R3 makes with ``rebound_refused``.
+    ``IdentityDormancyExempted`` event in the same transaction.
 
     ``last_login_at`` is the login this dormancy was measured FROM, read
     before the current login overwrote it.  It is the whole forensic content
@@ -448,6 +447,16 @@ class IdentityDormant:
     last_login_at: datetime
     dormancy_days: int
     re_pended_at: datetime
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IdentityDormancyExempted:
+    """D34 kept the last human administrator active despite dormancy."""
+
+    record: IdentityRecord
+    last_login_at: datetime
+    dormancy_days: int
 
 
 @final
@@ -912,7 +921,7 @@ def _rebound_pair(*, baseline: str | None, current: str | None) -> tuple[str, st
     return (baseline, current)
 
 
-def _dormant_since(last_login_at: Any, *, now: datetime, dormancy_days: int) -> datetime | None:
+def _dormant_since(last_login_at: Any, *, now: datetime, dormancy_days: int, activated_at: Any = None) -> datetime | None:
     """The login R9 measures from when this identity is dormant, otherwise ``None``.
 
     NULL ``last_login_at`` IS NOT INFINITE DORMANCY.  The column is nullable
@@ -939,9 +948,17 @@ def _dormant_since(last_login_at: Any, *, now: datetime, dormancy_days: int) -> 
     if last_login_at is None:
         return None
     since = _ensure_utc(last_login_at)
-    if now - since <= timedelta(days=dormancy_days):
+    # Re-admission starts a fresh window even if approval took longer than
+    # the configured period. Never-used identities remain exempt above.
+    if activated_at is not None:
+        since = max(since, _ensure_utc(activated_at))
+    # Settings permit arbitrary positive integers; timedelta has a smaller
+    # representable range and must not turn a valid setting into a login 500.
+    if (now - since).total_seconds() <= dormancy_days * 86_400:
         return None
-    return since
+    # The event names last_login_at, so preserve the actual login evidence
+    # even when a later activation supplied the effective window start.
+    return _ensure_utc(last_login_at)
 
 
 def _profile_refresh_values(claims: IdentityClaims, *, access_state: str) -> dict[str, str]:
@@ -1308,7 +1325,7 @@ class RepositoryIdentityAuthority:
         identity_dormancy_days: int,
         record_admission: RecordAdmission,
         record_rebound: Callable[[IdentityRebound], None],
-        record_dormant: Callable[[IdentityDormant], None],
+        record_dormant: Callable[[IdentityDormant | IdentityDormancyExempted], None],
     ) -> EnsureIdentityOutcome:
         """Resolve ``(provider, subject)`` to its identity row, creating it once.
 
@@ -1353,10 +1370,9 @@ class RepositoryIdentityAuthority:
         sweep, and R9 does not need one -- an identity nobody logs into
         cannot use the access it is holding.  ``record_dormant`` fires inside
         the transaction under the same rule as ``record_rebound`` and, like
-        it, ONLY when the identity was actually re-pended: D34's last-admin
-        exemption changes no state and is reported on
-        ``dormancy_exempted_since`` for the caller to audit, because there is
-        no state change for a failed audit to roll back.
+        it, for both a re-pend and D34's last-admin exemption. A failed
+        exemption audit must roll back the login timestamp; otherwise the
+        next attempt would no longer observe the dormancy being exempted.
 
         ``identity_dormancy_days`` is passed IN rather than read here.  This
         class holds an engine and nothing else -- no ``WebSettings``, no
@@ -1423,43 +1439,19 @@ class RepositoryIdentityAuthority:
             winner = self.read_identity_by_natural_key(provider=claims.provider, subject=claims.subject)
             if winner is None:
                 raise
-            with self._engine.begin() as conn:
-                now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
-                conn.execute(
-                    update(identities_table)
-                    .where(identities_table.c.identity_id == winner.identity_id)
-                    .values(
-                        last_login_at=now,
-                        username=claims.username,
-                        **_profile_refresh_values(claims, access_state=winner.access_state),
-                    )
-                )
-            # ``activated_now`` is False and ``record_admission`` does NOT
-            # fire: the winner wrote the activation pair, and a second one
-            # would claim an administrator acted twice.
-            #
-            # ``rebound_refused`` is False for the same reason it is not
-            # re-evaluated here: this path exists because the row was created
-            # by another writer moments ago, so its baseline was taken from
-            # the very claims in hand and cannot already disagree with them.
-            #
-            # ``dormancy_exempted_since`` is None and R9 is not evaluated for
-            # the same reason again: the winner inserted this row in the
-            # moment before, so its ``last_login_at`` cannot be older than
-            # any window an operator can configure.
-            return EnsureIdentityOutcome(
-                record=IdentityRecord(
-                    identity_id=winner.identity_id,
-                    provider=winner.provider,
-                    subject=winner.subject,
-                    username=claims.username,
-                    access_state=winner.access_state,
-                ),
-                created=False,
-                activated_now=False,
-                quota_written=False,
-                rebound_refused=False,
-                dormancy_exempted_since=None,
+            # Concurrent verified responses can disagree about the same
+            # provider subject. Re-read under the authority's locks and run
+            # R3/R9 before any profile refresh or admission decision.
+            return self._ensure_identity_once(
+                claims=claims,
+                activate=activate,
+                quota_tokens_per_day=quota_tokens_per_day,
+                quota_storage_bytes=quota_storage_bytes,
+                identity_dormancy_days=identity_dormancy_days,
+                record_admission=record_admission,
+                record_rebound=record_rebound,
+                record_dormant=record_dormant,
+                lock_admin_population=True,
             )
 
     def _ensure_identity_once(
@@ -1472,7 +1464,7 @@ class RepositoryIdentityAuthority:
         identity_dormancy_days: int,
         record_admission: RecordAdmission,
         record_rebound: Callable[[IdentityRebound], None],
-        record_dormant: Callable[[IdentityDormant], None],
+        record_dormant: Callable[[IdentityDormant | IdentityDormancyExempted], None],
         lock_admin_population: bool,
     ) -> EnsureIdentityOutcome:
         """One attempt.  Raises ``IntegrityError`` when another writer wins.
@@ -1595,7 +1587,9 @@ class RepositoryIdentityAuthority:
                 # dormant local account holds exactly the access a dormant
                 # IdP account does.
                 dormant_since = (
-                    _dormant_since(existing.last_login_at, now=now, dormancy_days=identity_dormancy_days)
+                    _dormant_since(
+                        existing.last_login_at, now=now, dormancy_days=identity_dormancy_days, activated_at=existing.activated_at
+                    )
                     if bound.access_state == "active"
                     else None
                 )
@@ -1631,6 +1625,13 @@ class RepositoryIdentityAuthority:
                             raise _AdminLockRequired
                         if _active_human_admin_count(admin_holders, now) <= 1:
                             dormancy_exempted_since = dormant_since
+                            record_dormant(
+                                IdentityDormancyExempted(
+                                    record=bound,
+                                    last_login_at=dormant_since,
+                                    dormancy_days=identity_dormancy_days,
+                                )
+                            )
 
                 if dormant_since is not None and dormancy_exempted_since is None:
                     # The re-pend.  ``pending``, not ``disabled``: R9's remedy
@@ -1738,9 +1739,8 @@ class RepositoryIdentityAuthority:
                     activated_now=False,
                     quota_written=False,
                     rebound_refused=False,
-                    # Set only on D34's exemption, which changed nothing: the
-                    # caller writes the row that records the decision not to
-                    # re-pend, and the login proceeds.
+                    # D34's exemption was audited before the login timestamp
+                    # changed, within this transaction.
                     dormancy_exempted_since=dormancy_exempted_since,
                 )
 
@@ -1996,7 +1996,14 @@ class RepositoryIdentityAuthority:
                 conn.execute(
                     update(identities_table)
                     .where(identities_table.c.identity_id == identity_id)
-                    .values(access_state="active", activated_at=now, activated_by_identity_id=None)
+                    .values(
+                        access_state="active",
+                        activated_at=now,
+                        activated_by_identity_id=None,
+                        disabled_at=None,
+                        disabled_by_identity_id=None,
+                        disable_reason=None,
+                    )
                 )
                 bound = _record_from_row(existing, access_state="active")
                 role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()

@@ -65,6 +65,7 @@ from elspeth.web.coordination.identity_authority import (
     AdminAlreadyBootstrapped,
     IdentityActivated,
     IdentityAlreadyDisabled,
+    IdentityDormancyExempted,
     IdentityDormant,
     IdentityRebound,
     RepositoryIdentityAuthority,
@@ -168,14 +169,19 @@ def build_sso_wiring(
             current_email=event.current_email,
         )
 
-    def _record_dormant(event: IdentityDormant) -> None:
+    def _record_dormant(event: IdentityDormant | IdentityDormancyExempted) -> None:
         # Runs INSIDE ensure_identity's transaction, like _record_rebound: a
         # re-pend this trail cannot hold does not commit. No request -- the
         # refused login writes its own auth_failure row with the request
         # context and the sso_access_pending category (the row is pending
         # now, so `admit` is what refuses it), and the two join on
         # identity_id.
-        audit_recorder.record_identity_dormant(
+        record = (
+            audit_recorder.record_identity_dormancy_exempted
+            if isinstance(event, IdentityDormancyExempted)
+            else audit_recorder.record_identity_dormant
+        )
+        record(
             provider=provider,
             identity_id=event.record.identity_id,
             username=event.record.username,
@@ -244,32 +250,6 @@ def build_sso_wiring(
             record_rebound=_record_rebound,
             record_dormant=_record_dormant,
         )
-        if outcome.dormancy_exempted_since is not None:
-            # R9/D34: the identity was dormant past the window and is the
-            # last active human admin, so the authority left it ACTIVE and
-            # this login proceeds. The exemption changed no state, which is
-            # why it is audited here rather than by a callback inside the
-            # authority's transaction -- there is nothing for a failed audit
-            # to roll back -- and why the row is written even though the walk
-            # continues normally. It is the only record that the exemption
-            # fired at all.
-            #
-            # THIS ADDS NO LOCKOUT PATH FOR THE ONE IDENTITY D34 PROTECTS,
-            # which is worth stating because it is the obvious objection: a
-            # Landscape outage here fails the sole administrator's login.
-            # It already did. ``callback_login`` awaits ``record_login``
-            # unconditionally on the very next line of the walk, so the same
-            # outage fails every login of every identity whether or not this
-            # row is attempted. Writing it here rather than after that row
-            # keeps the exemption from being the one Landscape write the walk
-            # is willing to lose.
-            audit_recorder.record_identity_dormancy_exempted(
-                provider=provider,
-                identity_id=outcome.record.identity_id,
-                username=outcome.record.username,
-                last_login_at=outcome.dormancy_exempted_since,
-                dormancy_days=settings.identity_dormancy_days,
-            )
         if outcome.rebound_refused:
             # R3, and the ONLY place this refusal can be raised: the authority
             # writes the state change, but a refusal is a login-path concept

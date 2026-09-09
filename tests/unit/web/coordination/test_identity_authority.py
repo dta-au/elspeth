@@ -1472,7 +1472,11 @@ def _backdate_login(engine, identity_id: str, *, days: int, seconds: int = 0) ->
     """
     stamped = datetime.now(UTC) - timedelta(days=days, seconds=seconds)
     with engine.begin() as conn:
-        conn.execute(update(identities_table).where(identities_table.c.identity_id == identity_id).values(last_login_at=stamped))
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == identity_id)
+            .values(last_login_at=stamped, activated_at=stamped)
+        )
     return stamped
 
 
@@ -1494,6 +1498,88 @@ def _active_sso_admin(authority: RepositoryIdentityAuthority, actor: IdentityAdm
     record = _login(authority, _sso_claims(subject, email=f"{subject}@example.com")).record
     _activate(authority, actor, record.identity_id, role="none")
     return record, _grant(authority, actor, record.identity_id, "admin")
+
+
+def test_first_login_collision_rechecks_the_winners_verified_email(authority, monkeypatch) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    original_once = RepositoryIdentityAuthority._ensure_identity_once
+    first_attempt = True
+
+    def competing_login(self, **kwargs):
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            competing = dict(kwargs)
+            competing["claims"] = _sso_claims("ada", email="previous@example.com")
+            original_once(self, **competing)
+            raise IntegrityError("natural-key collision", {}, RuntimeError("winner inserted"))
+        return original_once(self, **kwargs)
+
+    monkeypatch.setattr(RepositoryIdentityAuthority, "_ensure_identity_once", competing_login)
+    outcome = _login(authority, _sso_claims("ada", email="replacement@example.com"))
+    assert outcome.rebound_refused is True
+    assert outcome.record.access_state == "disabled"
+    assert authority.read_identity_summary(identity_id=outcome.record.identity_id).disable_reason == "rebound"
+
+
+def test_a_delayed_reactivation_starts_a_fresh_dormancy_window(engine, authority) -> None:
+    root = _sso_bootstrap(authority, "root")
+    actor = _actor(root.record.identity_id)
+    ada = _active_sso_identity(authority, actor, "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    assert _login(authority, _sso_claims("ada")).record.access_state == "pending"
+    # Approval takes longer than the dormancy window after the refused login.
+    _backdate_login(engine, ada.identity_id, days=200)
+    _activate(authority, actor, ada.identity_id, role="none")
+    assert _login(authority, _sso_claims("ada")).record.access_state == "active"
+
+
+@pytest.mark.parametrize("days", [1_000_000_000, 10**100])
+def test_large_valid_dormancy_window_does_not_overflow(engine, authority, days) -> None:
+    root = _sso_bootstrap(authority, "root")
+    ada = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+    _backdate_login(engine, ada.identity_id, days=400)
+    assert _login(authority, _sso_claims("ada"), identity_dormancy_days=days).record.access_state == "active"
+
+
+@pytest.mark.parametrize("sole_admin", [False, True])
+def test_dormancy_event_preserves_actual_login_when_activation_is_newer(engine, authority, sole_admin) -> None:
+    root = _sso_bootstrap(authority, "root")
+    if sole_admin:
+        record = root.record
+        claims = _sso_claims("root", email="root@old.example")
+    else:
+        record = _active_sso_identity(authority, _actor(root.record.identity_id), "ada")
+        claims = _sso_claims("ada")
+    actual_login = _backdate_login(engine, record.identity_id, days=400)
+    with engine.begin() as conn:
+        conn.execute(
+            update(identities_table)
+            .where(identities_table.c.identity_id == record.identity_id)
+            .values(activated_at=datetime.now(UTC) - timedelta(days=200))
+        )
+    events = _Recorder()
+    outcome = _login(authority, claims, record_dormant=events)
+    assert outcome.record.access_state == ("active" if sole_admin else "pending")
+    assert len(events.outcomes) == 1
+    assert events.outcomes[0].last_login_at == actual_login
+
+
+def test_failed_exemption_audit_preserves_dormancy_for_the_next_attempt(engine, authority) -> None:
+    root = _sso_bootstrap(authority, "root")
+    stamped = _backdate_login(engine, root.record.identity_id, days=400)
+
+    def refuse(event):
+        raise RuntimeError("audit unavailable")
+
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        _login(authority, _sso_claims("root", email="root@old.example"), record_dormant=refuse)
+    assert _as_utc(_identity_row(engine, root.record.identity_id).last_login_at) == _as_utc(stamped)
+    events = _Recorder()
+    outcome = _login(authority, _sso_claims("root", email="root@old.example"), record_dormant=events)
+    assert outcome.record.access_state == "active"
+    assert [type(event).__name__ for event in events.outcomes] == ["IdentityDormancyExempted"]
 
 
 def test_dormancy_re_pends_the_identity_and_writes_the_disable_event(engine, authority) -> None:
@@ -1571,6 +1657,9 @@ def test_the_dormancy_predicate_admits_the_window_itself_and_refuses_one_second_
     # SQLite produces it and what the lint rule against naive literals wants.
     naive = (now - timedelta(days=200)).replace(tzinfo=None)
     assert _dormant_since(naive, now=now, dormancy_days=90) is not None
+    old_login = now - timedelta(days=200)
+    assert _dormant_since(old_login, now=now, dormancy_days=90, activated_at=now - timedelta(days=90)) is None
+    assert _dormant_since(old_login, now=now, dormancy_days=90, activated_at=now - timedelta(days=91)) == old_login
 
 
 def test_dormancy_is_measured_across_a_real_login_on_both_sides_of_the_window(engine, authority) -> None:
@@ -1672,10 +1761,9 @@ def test_dormancy_of_the_last_active_human_admin_leaves_them_active_and_admitted
     row = _identity_row(engine, root.record.identity_id)
     assert row.access_state == "active"
     assert row.disable_reason is None and row.disabled_at is None
-    # NO identity_disabled event: asserting a disable that did not happen
-    # would put false evidence in the trail. The caller writes the
-    # exemption's own row from ``dormancy_exempted_since``.
-    assert recorder.outcomes == []
+    # The exemption has a distinct event, recorded before advancing the
+    # timestamp so audit failure cannot erase the condition on retry.
+    assert [type(event).__name__ for event in recorder.outcomes] == ["IdentityDormancyExempted"]
     assert authority.count_active_human_admins() == 1
 
 
@@ -2048,6 +2136,10 @@ def test_bootstrap_binds_a_re_pended_admin_without_duplicating_its_grant(engine,
     )
 
     assert outcome.record.identity_id == eve.identity_id
+    recovered = _identity_row(engine, eve.identity_id)
+    assert recovered.disabled_at is None
+    assert recovered.disabled_by_identity_id is None
+    assert recovered.disable_reason is None
     assert [row.role_id for row in _role_rows(engine, eve.identity_id)] == [admin_grant.role_id]
     assert outcome.role is None
     assert [grant.role_id for grant in outcome.retained_roles] == [admin_grant.role_id]

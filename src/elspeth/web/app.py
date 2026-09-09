@@ -82,6 +82,7 @@ from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.identity_authority import (
+    IdentityDormancyExempted,
     IdentityDormant,
     IdentityRebound,
     IdentityRetired,
@@ -1061,7 +1062,7 @@ def _build_local_auth_provider(
             current_email=event.current_email,
         )
 
-    def _record_dormant(event: IdentityDormant) -> None:
+    def _record_dormant(event: IdentityDormant | IdentityDormancyExempted) -> None:
         # R9 does NOT exclude local auth the way R3 does: R3's exclusion rests
         # on facts about the local subject (it IS the username, freeing it
         # retires the identity, an email change would lock the person out),
@@ -1071,7 +1072,12 @@ def _build_local_auth_provider(
         #
         # Runs INSIDE ensure_identity's transaction: a re-pend this trail
         # cannot hold does not commit.
-        audit_recorder.record_identity_dormant(
+        record = (
+            audit_recorder.record_identity_dormancy_exempted
+            if isinstance(event, IdentityDormancyExempted)
+            else audit_recorder.record_identity_dormant
+        )
+        record(
             provider="local",
             identity_id=event.record.identity_id,
             username=event.record.username,
@@ -1095,20 +1101,6 @@ def _build_local_auth_provider(
             record_rebound=_record_rebound,
             record_dormant=_record_dormant,
         )
-        if outcome.dormancy_exempted_since is not None:
-            # R9/D34: the identity was dormant past the window and is the last
-            # active human admin, so the authority left it ACTIVE and this
-            # login proceeds. The exemption changed no state, which is why it
-            # is audited here rather than by a callback inside the authority's
-            # transaction -- there is nothing for a failed audit to roll back
-            # -- and why this row is the only record that it fired at all.
-            audit_recorder.record_identity_dormancy_exempted(
-                provider="local",
-                identity_id=outcome.record.identity_id,
-                username=outcome.record.username,
-                last_login_at=outcome.dormancy_exempted_since,
-                dormancy_days=settings.identity_dormancy_days,
-            )
         return outcome
 
     issuer = SessionTokenIssuer(

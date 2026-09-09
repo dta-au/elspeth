@@ -856,12 +856,10 @@ class AuthAuditRecorder:
         that a business-rule refusal keeps its own category rather than being
         filed as an authorization denial.
 
-        THIS ROW IS THE ONLY EVIDENCE THE EXEMPTION HAPPENED. Nothing changes
-        on the identity -- that is what an exemption is -- so an
-        administrator asking why a container still holds a dormant sole admin
-        has no other trace to read. It is written by the caller AFTER
-        ``ensure_identity`` returns rather than inside its transaction,
-        because there is no state change for a failed audit to roll back.
+        This row is the evidence that the exemption happened. The authority
+        invokes it inside its transaction, before advancing last_login_at.
+        An audit failure therefore preserves the old timestamp so the next
+        login must reconsider and record the exemption.
         """
         with self._open_landscape(AuthAuditOperation.IDENTITY_DORMANCY_EXEMPTED) as db:
             RecorderFactory(db).auth_audit.record_auth_event(

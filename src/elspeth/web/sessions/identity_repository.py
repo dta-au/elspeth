@@ -94,13 +94,11 @@ class EnsureIdentityOutcome:
     # the login, R9's carve-out leaves the row active and ADMITS it --
     # re-pending the sole administrator would walk the container to zero
     # active admins by doing nothing, and refusing them would lock the same
-    # door from the other side. What the caller owes is an ``auth_events``
-    # row recording the exemption; there is no state change for a failed
-    # audit to roll back, which is why this is reported here rather than
-    # through a callback fired inside the authority's transaction.
+    # door from the other side. The authority records the exemption through
+    # its transactional callback before updating the login timestamp.
     #
-    # ONE FIELD, NOT A FLAG PLUS A TIMESTAMP. The caller needs the previous
-    # login to write the row -- ``identities`` is current state and the same
+    # ONE FIELD, NOT A FLAG PLUS A TIMESTAMP. This preserves the previous
+    # observation -- ``identities`` is current state and the same
     # transaction overwrote that column -- and a separate bool would be a
     # second source of truth for the same fact, free to disagree with it.
     #

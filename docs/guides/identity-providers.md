@@ -370,6 +370,17 @@ name parts and the ABN are not carried in the ID token. Its endpoints must all
 be served from the issuer's own origin. The ABN is recorded against the
 identity as its organisation identifier.
 
+Successful identity binding refreshes the stored name, email, and ABN,
+including the first login of an identity an administrator pre-provisioned.
+Absent optional claims preserve their stored values. The subject-to-email
+rebound check runs before those fields are updated.
+
+An identity (local or SSO) that has previously logged in and then exceeds
+`identity_dormancy_days` (90 by default) returns to pending at its next login
+and needs administrator reactivation. Reactivation starts a new window. The
+last active human administrator remains active so the deployment retains an
+administrator; that exemption is recorded in the authentication audit trail.
+
 ---
 
 ## Keeping the client secret out of the repository

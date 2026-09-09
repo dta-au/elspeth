@@ -285,7 +285,10 @@ def _re_pend_for_dormancy(harness: _Harness, identity_id: str, username: str) ->
         conn.execute(
             update(identities_table)
             .where(identities_table.c.identity_id == identity_id)
-            .values(last_login_at=datetime.now(UTC) - timedelta(days=2))
+            .values(
+                last_login_at=datetime.now(UTC) - timedelta(days=2),
+                activated_at=datetime.now(UTC) - timedelta(days=2),
+            )
         )
     outcome = harness.authority.ensure_identity(
         claims=_local_claims(username),
