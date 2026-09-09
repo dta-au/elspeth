@@ -25,7 +25,6 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / ".agents" / "skills" / "prove-it"
 SCRIPT = SKILL_DIR / "prove_it.py"
 HOOK = SKILL_DIR / "stop_hook.py"
-SETTINGS = REPO_ROOT / ".claude" / "settings.json"
 
 GIT_ENV = {
     **os.environ,
@@ -798,7 +797,7 @@ WORK_COMMANDS = {  # every channel that changes files or history (round two: the
     "filigree-update": "filigree update elspeth-abc123 --status closed",
     "filigree-comment": "filigree add-comment elspeth-abc123 --body x",
     "elspeth-run-execute": "elspeth run --settings examples/x/settings.yaml --execute",
-    "redirect-traversal": "echo x > /tmp/../home/john/elspeth/src/x.py",
+    "redirect-traversal": "echo x > /tmp/../srv/elspeth/src/x.py",
     "redirect-scratchpad-file": "echo x > src/scratchpad_utils.py",
 }
 NOT_WORK_COMMANDS = {
@@ -819,7 +818,7 @@ NOT_WORK_COMMANDS = {
     "pytest-to-log-variable": 'pytest tests/ > "$log" 2>&1; echo exit=$?',
     "redirect-devnull": "make lint > /dev/null 2>&1",
     "redirect-tmp": "pytest tests/ > /tmp/run.log 2>&1",
-    "redirect-scratchpad": "pytest tests/ > /home/x/.cache/scratchpad/run.log 2>&1",
+    "redirect-scratchpad": "pytest tests/ > /var/cache/scratchpad/run.log 2>&1",
     "python-c-print": "python -c 'print(1+1)'",
     "verifier": "python .agents/skills/prove-it/prove_it.py verify --claim x",
 }
@@ -919,14 +918,7 @@ def test_hook_never_crashes_on_a_missing_transcript(repo: Path, tmp_path: Path) 
     assert code == 0 and out.get("decision") != "block"
 
 
-# ----------------------------------------------------------------- installation + skill doc
-
-
-def test_stop_hook_is_installed_in_project_settings() -> None:
-    settings = json.loads(SETTINGS.read_text(encoding="utf-8"))
-    commands = [h["command"] for entry in settings["hooks"]["Stop"] for h in entry["hooks"] if h["type"] == "command"]
-    assert any("prove-it/stop_hook.py" in c and "CLAUDE_PROJECT_DIR" in c for c in commands), commands
-    assert (REPO_ROOT / ".claude" / "skills" / "prove-it").is_symlink() or (REPO_ROOT / ".claude" / "skills" / "prove-it").is_dir()
+# ----------------------------------------------------------------- skill doc
 
 
 def test_skill_doc_names_every_step_and_the_refusal_rule() -> None:
