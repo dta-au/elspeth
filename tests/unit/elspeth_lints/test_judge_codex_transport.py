@@ -60,6 +60,19 @@ _EXPECTED_BASE_CONFIG: tuple[str, ...] = (
     "features.personality=false",
 )
 _MCP_CONFIG_PREFIX = "mcp_servers.elspeth_judge_tools."
+# The complete set of MCP keys the transport may register, pinned so the
+# exemption above cannot be used to smuggle a setting in. `.enabled=false`
+# was a measured bypass before this existed.
+_EXPECTED_MCP_KEYS = frozenset(
+    {
+        f"{_MCP_CONFIG_PREFIX}command",
+        f"{_MCP_CONFIG_PREFIX}args",
+        f"{_MCP_CONFIG_PREFIX}env",
+        f"{_MCP_CONFIG_PREFIX}enabled_tools",
+        f"{_MCP_CONFIG_PREFIX}required",
+        f"{_MCP_CONFIG_PREFIX}default_tools_approval_mode",
+    }
+)
 
 
 def _assert_judge_shell_is_enabled(command: list[str]) -> None:
@@ -81,9 +94,27 @@ def _assert_judge_shell_is_enabled(command: list[str]) -> None:
     assert tuple(base_values) == _EXPECTED_BASE_CONFIG, (
         f"the judge's Codex config changed; every -c value must be pinned here. unexpected: {sorted(set(base_values) - set(_EXPECTED_BASE_CONFIG))}"
     )
-    # Tool mode adds MCP registrations; blinded mode adds none. Neither may
-    # smuggle a feature setting in under the MCP prefix.
-    assert all("features" not in value for value in mcp_values), f"an MCP setting must not carry a feature override: {mcp_values}"
+    # The MCP exemption above is a hole unless the exempted keys are themselves
+    # pinned: a fourth review measured `mcp_servers.elspeth_judge_tools.enabled=false`
+    # flipping the server off in `codex mcp list --json` while every other
+    # assertion passed. Keys only — the values carry interpreter and root paths.
+    mcp_keys = {value.split("=", 1)[0] for value in mcp_values}
+    assert mcp_keys <= _EXPECTED_MCP_KEYS, f"unexpected MCP setting on the judge's reader: {sorted(mcp_keys - _EXPECTED_MCP_KEYS)}"
+
+    # The judge's OTHER controls, each measured as a live bypass by the same
+    # review. These are not shell settings, but each one blinds or unleashes
+    # the judge just as effectively.
+    #
+    # --ignore-user-config was asserted ONLY in the blinded test, so a
+    # CODEX_HOME config.toml could resolve shell_tool false in tool mode
+    # (measured). --dangerously-bypass-approvals-and-sandbox removes the
+    # read-only sandbox, which is the WRITE control the whole design rests on.
+    assert "--ignore-user-config" in command, "a CODEX_HOME config.toml can disable the shell the judge depends on"
+    assert "--ignore-rules" in command, "repo execpolicy rules must not reach the judge"
+    assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == ["--sandbox", "read-only"]
+    for part in command:
+        assert not part.startswith("--dangerously"), f"read-only sandboxing is the judge's write control: {part!r}"
+        assert not part.startswith("--profile"), f"a profile layers unpinned config over this argv: {part!r}"
 
 
 def _request() -> JudgeRequest:
@@ -329,3 +360,16 @@ def test_judge_investigation_budget_is_a_loop_guard_not_a_ration() -> None:
 
     assert _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS >= 200, "a judge that runs out of calls mid-investigation emits a false BLOCK"
     assert _MAX_READ_LINES >= 2000, "400-line reads cost 8+ calls on a single 3000-line test file"
+
+
+def test_codex_transport_timeout_allows_a_real_investigation() -> None:
+    """`_CODEX_CLI_TIMEOUT_SECONDS` is referenced by no other test in the repo.
+
+    A fourth adversarial review reverted it 600 -> 5 with the whole
+    `tests/unit/elspeth_lints/` suite green. Every real judge call would then
+    die as a JudgeTransportError, which reads as an infrastructure fault
+    rather than as the deliberate throttle it would be.
+    """
+    from elspeth_lints.core.judge import _CODEX_CLI_TIMEOUT_SECONDS
+
+    assert _CODEX_CLI_TIMEOUT_SECONDS >= 600, "a tool-using judge routinely takes minutes to investigate a deep call chain"
