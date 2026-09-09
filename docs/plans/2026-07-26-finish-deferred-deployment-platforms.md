@@ -1,5 +1,14 @@
 # Finish Deferred Deployment Platforms Implementation Plan
 
+> **Resumption update — 2026-09-10:** This is the historical broad-platform
+> design, not the current ACA execution checklist. Use
+> [ACA pivot and remaining multi-replica work](2026-09-10-aca-pivot-and-replica-residuals.md)
+> for the task-by-task disposition, delivered ACA scope, and unfinished runtime
+> work. Its scope and acceptance ruling supersede the old dependency graph,
+> epoch/worktree commands and mandatory live-run closure below. Kubernetes and
+> generated profiles are outside the ACA task; durable handoff, tickets,
+> progress and shared rate limits are not implicitly complete.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish the deferred Kubernetes, Azure Container Apps, and machine-readable platform-profile work without relying on an unsafe zero-overlap assumption.

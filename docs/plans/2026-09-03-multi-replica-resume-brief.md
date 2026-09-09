@@ -1,5 +1,10 @@
 # Deferred platform / DAG reacceptance — resume brief
 
+> **Historical brief:** For the 2026-09-10 ACA-focused resumption, use
+> [ACA pivot and remaining multi-replica work](2026-09-10-aca-pivot-and-replica-residuals.md).
+> Branch, tracker, missing-writer and blocker statements below are the dated
+> September 3 investigation, not instructions to repeat the old integration.
+
 **Written:** 2026-09-03. **Supersedes:** `HANDOFF-2026-08-02.md` (captured
 2026-08-02T23:09:02+10:00), which must not be used for planning. Every anchor
 below was measured against the live tree, the live filigree database, and git
