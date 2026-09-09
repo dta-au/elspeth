@@ -1147,6 +1147,22 @@ jobs:
           # pin once an upstream fix ships. PyJWT advisories PYSEC-2026-175/177/
           # 178/179 are NOT ignored — they are resolved by the uv.lock bump to
           # PyJWT 2.13.0 (constraint already permitted it).
+          #
+          # CVE-2026-45830 / CVE-2026-45831 / CVE-2026-45833 (added 2026-09-10)
+          # likewise have no fixed chromadb release. All three are defects in the
+          # ChromaDB *server*: cross-tenant read/write through missing
+          # authorization validation on /api/v2/tenants/... (45830), a
+          # SimpleRBACAuthorizationProvider that checks the permission but never
+          # the tenant/database/collection it applies to (45831), and
+          # trust_remote_code arbitrary code execution reachable by a caller
+          # holding UPDATE_COLLECTION (45833). ELSPETH never runs that server: it
+          # is a client only — chromadb.Client / PersistentClient / HttpClient in
+          # plugins/infrastructure/clients/retrieval/chroma.py, sinks/chroma_sink.py
+          # and infrastructure/probe_factory.py — and registers no authorization
+          # provider and no /api/v2 route. An operator who points HttpClient at a
+          # Chroma server they host owns that server's exposure; this ignore does
+          # not extend to it. Remove all four chromadb ignores and bump the pin
+          # once upstream ships a fix.
           uv run --with "pip-audit>=2.9,<3" pip-audit \
             --strict \
             --requirement requirements-audit.txt \
@@ -1154,6 +1170,9 @@ jobs:
             --disable-pip \
             --ignore-vuln PYSEC-2025-183 \
             --ignore-vuln CVE-2026-45829 \
+            --ignore-vuln CVE-2026-45830 \
+            --ignore-vuln CVE-2026-45831 \
+            --ignore-vuln CVE-2026-45833 \
             --progress-spinner=off
 
       - name: Check Python dependency licenses

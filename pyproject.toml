@@ -152,7 +152,7 @@ aws = [
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
     "jinja2>=3.1,<4",
-    "cryptography>=49,<50",
+    "cryptography>=50,<51",
 ]
 
 mcp = [
@@ -233,7 +233,7 @@ all = [
     "boto3>=1.40,<2",
     "botocore[crt]>=1.40,<2",
     "ijson>=3.3,<4",
-    "cryptography>=49,<50",
+    "cryptography>=50,<51",
     # mcp dependencies
     "mcp>=1.27,<2",
     # tracing dependencies
