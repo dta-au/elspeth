@@ -82,6 +82,7 @@ from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
 from elspeth.web.coordination.identity_authority import (
+    IdentityDormant,
     IdentityRebound,
     IdentityRetired,
     RepositoryIdentityAuthority,
@@ -1060,20 +1061,55 @@ def _build_local_auth_provider(
             current_email=event.current_email,
         )
 
+    def _record_dormant(event: IdentityDormant) -> None:
+        # R9 does NOT exclude local auth the way R3 does: R3's exclusion rests
+        # on facts about the local subject (it IS the username, freeing it
+        # retires the identity, an email change would lock the person out),
+        # and none of them says anything about how long an account has sat
+        # unused. A dormant local account holds exactly the access a dormant
+        # IdP account does, so this callback really fires here.
+        #
+        # Runs INSIDE ensure_identity's transaction: a re-pend this trail
+        # cannot hold does not commit.
+        audit_recorder.record_identity_dormant(
+            provider="local",
+            identity_id=event.record.identity_id,
+            username=event.record.username,
+            last_login_at=event.last_login_at,
+            dormancy_days=event.dormancy_days,
+        )
+
     def _admit_identity(claims: IdentityClaims) -> EnsureIdentityOutcome:
         # D12 puts a first login behind an administrator by default. A local
         # deployment with OPEN registration has already declared that anyone
         # may admit themselves, so it would be incoherent to hold back the
         # people who did so before this table existed while admitting every
         # newcomer instantly.
-        return identity_authority.ensure_identity(
+        outcome = identity_authority.ensure_identity(
             claims=claims,
             activate=settings.registration_mode == "open",
             quota_tokens_per_day=settings.quota_default_tokens_per_day,
             quota_storage_bytes=settings.quota_default_storage_bytes,
+            identity_dormancy_days=settings.identity_dormancy_days,
             record_admission=_record_admission,
             record_rebound=_record_rebound,
+            record_dormant=_record_dormant,
         )
+        if outcome.dormancy_exempted_since is not None:
+            # R9/D34: the identity was dormant past the window and is the last
+            # active human admin, so the authority left it ACTIVE and this
+            # login proceeds. The exemption changed no state, which is why it
+            # is audited here rather than by a callback inside the authority's
+            # transaction -- there is nothing for a failed audit to roll back
+            # -- and why this row is the only record that it fired at all.
+            audit_recorder.record_identity_dormancy_exempted(
+                provider="local",
+                identity_id=outcome.record.identity_id,
+                username=outcome.record.username,
+                last_login_at=outcome.dormancy_exempted_since,
+                dormancy_days=settings.identity_dormancy_days,
+            )
+        return outcome
 
     issuer = SessionTokenIssuer(
         signing_key=derive_session_token_key(settings.secret_key),

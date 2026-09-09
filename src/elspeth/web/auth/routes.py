@@ -23,7 +23,7 @@ from elspeth.contracts.errors import FrameworkBugError
 from elspeth.contracts.trust_boundary import observation_boundary
 from elspeth.core.landscape.auth_audit_repository import AUTH_AUDIT_PRINCIPAL_MAX_LENGTH
 from elspeth.core.url_validation import validate_credential_safe_https_url
-from elspeth.web.async_workers import run_sync_in_worker
+from elspeth.web.async_workers import AsyncWorkerAdmissionTimeoutError, run_sync_in_worker
 from elspeth.web.auth.audit import AuthAuditWriter, classify_authentication_failure
 from elspeth.web.auth.local import LocalAuthProvider, LocalAuthRegistrationConflict, bcrypt_password_bytes
 from elspeth.web.auth.middleware import get_current_user
@@ -31,6 +31,7 @@ from elspeth.web.auth.models import AuthenticationError, AuthProviderUnavailable
 from elspeth.web.auth.protocol import AuthProvider, CredentialAuthProvider
 from elspeth.web.auth.sso import (
     COOKIE_NAME,
+    PROVIDER_UNAVAILABLE_CATEGORY,
     AdmittedIdentity,
     CallbackQuery,
     SsoLoginError,
@@ -393,6 +394,21 @@ def create_auth_router() -> APIRouter:
                 )
             except LocalAuthRegistrationConflict as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except AsyncWorkerAdmissionTimeoutError as exc:
+                # MUST precede ``except OSError``: ``AsyncWorkerAdmissionTimeoutError``
+                # subclasses ``TimeoutError``, which subclasses ``OSError``, so
+                # without this arm a saturated worker pool is reported as
+                # "outbox could not be written" and sends the operator to
+                # diagnose a disk that is fine.
+                #
+                # 503, matching ``sso_complete`` below: the registration never
+                # ran, nothing was written, and the remedy is to retry once the
+                # pool drains — which is what 503 says and 500 does not. No
+                # ``auth_failure`` row: this is not a failed authentication and
+                # the category vocabulary has no member for a refused
+                # registration, so inventing one here would put a meaning in the
+                # trail that no reader of that column expects.
+                raise HTTPException(status_code=503, detail="Registration is temporarily unavailable; retry shortly") from exc
             except OSError as exc:
                 raise HTTPException(status_code=500, detail="Email verification outbox could not be written") from exc
             response.status_code = 202
@@ -421,6 +437,12 @@ def create_auth_router() -> APIRouter:
             )
         except LocalAuthRegistrationConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except AsyncWorkerAdmissionTimeoutError as exc:
+            # Same refusal as the email-verified branch above. There is no
+            # ``except OSError`` to be mistaken for here, so the pre-existing
+            # behaviour was a bare 500 rather than a wrong diagnosis — still the
+            # wrong status for work that never started and is safe to retry.
+            raise HTTPException(status_code=503, detail="Registration is temporarily unavailable; retry shortly") from exc
         _mark_sensitive_auth_response_uncacheable(response)
         return TokenResponse(access_token=token)
 
@@ -649,7 +671,21 @@ def create_auth_router() -> APIRouter:
         response: Response,
         _rate_limit: None = Depends(check_auth_rate_limit),
     ) -> TokenResponse:
-        """Trade the handoff code for the session token. The only place one is minted."""
+        """Trade the handoff code for the session token. The only place one is minted.
+
+        ``complete_login`` is synchronous and does three database round trips
+        — the conditional UPDATE that claims the handoff, the identity read,
+        and the ``token_issued`` audit write — so it runs on the worker pool
+        rather than on the event loop. Under external-postgresql each of those
+        is a network hop, and a lock wait on ``sso_handoffs`` held inline would
+        stall every unrelated request this worker is serving.
+
+        The offload is done HERE rather than inside the service because the
+        service's function is the synchronous one; wrapping it at the one call
+        site keeps ``complete_login`` directly testable without a running loop.
+        The same seam is why this route, not the service, owns the pool's
+        admission refusal below.
+        """
         runtime = await _sso_runtime(request)
         settings: WebSettings = request.app.state.settings
         recorder = _auth_audit_recorder(request)
@@ -666,13 +702,35 @@ def create_auth_router() -> APIRouter:
             )
 
         try:
-            session = complete_login(
+            session = await run_sync_in_worker(
+                complete_login,
                 body.code,
                 handoffs=runtime.handoffs,
                 read_identity=runtime.read_identity,
                 issuer=runtime.issuer,
                 record_token_issued=record_token_issued,
             )
+        except AsyncWorkerAdmissionTimeoutError as exc:
+            # The pool is saturated, so this request never reached
+            # ``complete_login`` — the handoff was not claimed and is still
+            # redeemable once the pool drains. It is NOT an ``SsoLoginError``,
+            # and without this arm it would leave the route as an unaudited
+            # 500 on a path where every other outcome is audited.
+            #
+            # 503 with ``provider_unavailable``, matching how ``/me`` answers
+            # ``AuthProviderUnavailable`` below: every ``sso_*`` category tells
+            # the browser to start the login again, which would be wrong advice
+            # here — the correct remedy is to wait and present the same code.
+            recorder.record_auth_failure(
+                request,
+                provider=settings.auth_provider,
+                failure_category=PROVIDER_UNAVAILABLE_CATEGORY,
+                failure_stage="sso_complete",
+                user_id=None,
+                username=None,
+                exception_class=type(exc).__name__,
+            )
+            raise HTTPException(status_code=503, detail="Sign-in could not be completed right now — try again shortly") from exc
         except SsoLoginError as exc:
             recorder.record_auth_failure(
                 request,

@@ -24,6 +24,8 @@ import base64
 import dataclasses
 import hashlib
 import json
+import threading
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
@@ -67,6 +69,7 @@ from elspeth.web.auth.sso import (
 )
 from elspeth.web.auth.urls import DiscoveredEndpoints
 from tests.helpers.fake_idp import FakeIdP
+from tests.unit.web.auth.conftest import saturated_worker_pool
 
 SECRET = "an-operator-transaction-secret-of-adequate-length-0123456789"
 REDIRECT = "https://elspeth.example.gov.au/api/auth/sso/callback"
@@ -87,11 +90,13 @@ class _Identity:
 
 
 class _Handoffs:
-    def __init__(self, journal: list[tuple[str, Any]]) -> None:
+    def __init__(self, journal: list[tuple[str, Any]], threads: list[tuple[str, int]]) -> None:
         self.journal = journal
+        self.threads = threads
         self.issued: list[tuple[str, str, str]] = []
 
     def issue(self, *, code_hash: str, identity_id: str, request_id: str) -> None:
+        self.threads.append(("handoff", threading.get_ident()))
         self.issued.append((code_hash, identity_id, request_id))
         self.journal.append(("handoff", code_hash))
 
@@ -104,20 +109,80 @@ class _Substrate:
 
     def __init__(self, *, access_state: str = "active") -> None:
         self.journal: list[tuple[str, Any]] = []
+        # Which THREAD each synchronous seam ran on. All three are database
+        # work, and ``login_callback`` is async, so the thread that ran them
+        # is a property of the callback worth pinning — see
+        # ``test_the_injected_sync_seams_never_run_on_the_event_loop``.
+        self.threads: list[tuple[str, int]] = []
         self.access_state = access_state
-        self.handoffs = _Handoffs(self.journal)
+        self.handoffs = _Handoffs(self.journal, self.threads)
         self.upserted: list[IdentityClaims] = []
         self.recorded: list[_Identity] = []
 
     def upsert(self, claims: IdentityClaims) -> _Identity:
+        self.threads.append(("upsert", threading.get_ident()))
         self.upserted.append(claims)
         identity = _Identity(identity_id=f"id-{claims.subject}", username=claims.username, access_state=self.access_state)
         self.journal.append(("upsert", identity))
         return identity
 
     def record_login(self, identity: Any) -> None:
+        self.threads.append(("login", threading.get_ident()))
         self.recorded.append(identity)
         self.journal.append(("login", identity))
+
+
+class _CountedBodyStream(httpx.AsyncByteStream):
+    """A response body handed over in chunks, counting what the reader PULLED.
+
+    "The oversized body was refused" is not the property the size caps exist
+    for, and a test that asserts only that passes against the buffered form
+    too: ``len(response.content) > cap`` refuses just as loudly, having
+    already paid for every byte a hostile or broken IdP chose to send. So
+    this double records what it actually yielded, and the assertions are on
+    that number — a cap enforced WHILE streaming stops pulling within one
+    chunk of the bound, while the buffered form pulls ``total_bytes``.
+    """
+
+    def __init__(self, content: bytes, *, chunk_bytes: int) -> None:
+        self.content = content
+        self.chunk_bytes = chunk_bytes
+        self.yielded_bytes = 0
+
+    @property
+    def total_bytes(self) -> int:
+        return len(self.content)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for start in range(0, len(self.content), self.chunk_bytes):
+            chunk = self.content[start : start + self.chunk_bytes]
+            self.yielded_bytes += len(chunk)
+            yield chunk
+
+
+class _StreamingTransport(httpx.AsyncBaseTransport):
+    """Answers every request with one chunked body from a :class:`_CountedBodyStream`.
+
+    ``httpx.MockTransport`` cannot stand in here: it hands back a fully
+    materialised body, so nothing distinguishes a reader that streamed from
+    one that buffered.
+    """
+
+    def __init__(
+        self,
+        stream: _CountedBodyStream,
+        *,
+        status_code: int = 200,
+        content_type: str = "application/json",
+    ) -> None:
+        self._stream = stream
+        self._status_code = status_code
+        self._content_type = content_type
+        self.requests: list[httpx.Request] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(self._status_code, headers={"content-type": self._content_type}, stream=self._stream)
 
 
 def _endpoints(idp: FakeIdP) -> DiscoveredEndpoints:
@@ -487,6 +552,31 @@ class TestRedeem:
             await self._redeem(idp, "c")
 
     @pytest.mark.asyncio
+    async def test_an_oversized_response_is_refused_without_reading_the_whole_body(self, idp: FakeIdP) -> None:
+        """The cap bounds what this worker READS, not what it has already read.
+
+        A 1 MiB body against a 64 KiB bound: the refusal must land after one
+        chunk past the cap, not after the megabyte is in memory. Buffering
+        first hands an unauthenticated counterparty the memory cost of every
+        login attempt it cares to start.
+        """
+        stream = _CountedBodyStream(b"x" * (1024 * 1024), chunk_bytes=8 * 1024)
+        with pytest.raises(SsoTokenExchangeFailed, match="maximum accepted size"):
+            await self._redeem(idp, "c", transport=_StreamingTransport(stream))
+        # 64 KiB is _MAX_TOKEN_RESPONSE_BYTES; one whole chunk may cross it
+        # before the bound is seen, and nothing beyond that may be pulled.
+        assert stream.yielded_bytes <= 64 * 1024 + stream.chunk_bytes
+        assert stream.yielded_bytes < stream.total_bytes
+
+    @pytest.mark.asyncio
+    async def test_a_non_200_costs_no_body_bytes_at_all(self, idp: FakeIdP) -> None:
+        """Headers arrive before the body, so the status refusal reads none of it."""
+        stream = _CountedBodyStream(b"x" * (128 * 1024), chunk_bytes=8 * 1024)
+        with pytest.raises(SsoTokenExchangeFailed, match="HTTP 500"):
+            await self._redeem(idp, "c", transport=_StreamingTransport(stream, status_code=500))
+        assert stream.yielded_bytes == 0
+
+    @pytest.mark.asyncio
     async def test_a_non_json_body_is_refused(self, idp: FakeIdP) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, content=b"<html>not json</html>")
@@ -571,6 +661,52 @@ class TestFetchUserinfo:
             await self._fetch(idp)
 
     @pytest.mark.asyncio
+    async def test_an_oversized_body_is_refused_without_reading_the_whole_body(self, idp: FakeIdP) -> None:
+        """Spec §Userinfo bounds the body at 64 KiB; the bound must cost 64 KiB, not a megabyte."""
+        stream = _CountedBodyStream(b"x" * (1024 * 1024), chunk_bytes=8 * 1024)
+        with pytest.raises(SsoUserinfoInvalid, match="maximum accepted size"):
+            await self._fetch(idp, transport=_StreamingTransport(stream))
+        # 64 KiB is _MAX_USERINFO_BYTES; one whole chunk may cross it before
+        # the bound is seen, and nothing beyond that may be pulled.
+        assert stream.yielded_bytes <= 64 * 1024 + stream.chunk_bytes
+        assert stream.yielded_bytes < stream.total_bytes
+
+    @pytest.mark.asyncio
+    async def test_a_body_split_across_chunks_is_reassembled_exactly(self, idp: FakeIdP) -> None:
+        """Under the cap, the streamed document must be the one the parse sees.
+
+        Every other transport in this file hands the body over in one piece,
+        which is the shape that cannot fail. Accumulating chunk by chunk is
+        what enforcing the bound mid-stream costs, and a reassembly that
+        dropped, duplicated or reordered a chunk would surface only here — as
+        a JSON parse failure on a body the buffered read used to hand over
+        intact. The chunk size divides nothing evenly, so the last chunk is
+        short and every boundary falls inside a token.
+        """
+        document = json.dumps({"sub": "ada", "given_name": "Ada", "family_name": "Lovelace", "abn": "12 345 678 901"}).encode()
+        stream = _CountedBodyStream(document, chunk_bytes=7)
+        claims = await self._fetch(idp, transport=_StreamingTransport(stream))
+        assert (claims.subject, claims.given_name, claims.family_name, claims.abn) == ("ada", "Ada", "Lovelace", "12 345 678 901")
+        assert stream.yielded_bytes == len(document), "under the cap every byte is read exactly once"
+
+    @pytest.mark.asyncio
+    async def test_the_header_checks_cost_no_body_bytes_at_all(self, idp: FakeIdP) -> None:
+        """Status and content-type are decided from headers, which arrive first.
+
+        Both refusals must therefore read none of the body — the order the
+        function already had, now paid for at the price the order implies.
+        """
+        wrong_status = _CountedBodyStream(b"x" * (128 * 1024), chunk_bytes=8 * 1024)
+        with pytest.raises(SsoUserinfoInvalid, match="HTTP 500"):
+            await self._fetch(idp, transport=_StreamingTransport(wrong_status, status_code=500))
+        assert wrong_status.yielded_bytes == 0
+
+        wrong_media_type = _CountedBodyStream(b"x" * (128 * 1024), chunk_bytes=8 * 1024)
+        with pytest.raises(SsoUserinfoInvalid, match="not application/json"):
+            await self._fetch(idp, transport=_StreamingTransport(wrong_media_type, content_type="text/plain"))
+        assert wrong_media_type.yielded_bytes == 0
+
+    @pytest.mark.asyncio
     async def test_a_redirect_is_not_followed(self, idp: FakeIdP) -> None:
         seen: list[str] = []
 
@@ -627,6 +763,50 @@ class TestLoginCallback:
         code = parse_qs(urlsplit("x://x/" + urlsplit(location).fragment).query)["code"][0]
         assert code not in json.dumps(substrate.handoffs.issued)
         assert len(code) >= 43, "token_urlsafe(32) is 43 characters: sized as a credential"
+
+    @pytest.mark.asyncio
+    async def test_the_injected_sync_seams_never_run_on_the_event_loop(self, idp: FakeIdP) -> None:
+        """All three are database work, and this function is async.
+
+        ``upsert_identity``, ``record_login`` and ``handoffs.issue`` are plain
+        ``def``s doing synchronous round trips — under external-postgresql,
+        over a network. Called inline from a coroutine they hold the event
+        loop for the whole trip, so one contended identity table stalls every
+        unrelated request on that worker.
+
+        The thread ident is the instrument: a seam that ran inline reports the
+        loop's own thread, and no assertion about ordering or results can tell
+        the two apart.
+        """
+        loop_thread = threading.get_ident()
+        substrate = _Substrate()
+        await _walk(idp, _client(idp), substrate)
+
+        assert [name for name, _ in substrate.threads] == ["upsert", "login", "handoff"]
+        assert all(thread != loop_thread for _, thread in substrate.threads), (
+            "a seam ran on the event loop's thread: the offload is not in the path"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_worker_pool_is_a_wait_rather_than_an_escaping_timeout(self, idp: FakeIdP) -> None:
+        """The offload's own failure mode must be a category the routes catch.
+
+        ``run_sync_in_worker`` refuses admission once the process-wide pool is
+        full. Untranslated that is a bare ``TimeoutError`` leaving
+        ``login_callback`` — past a route handler that catches only
+        ``SsoLoginError`` and ``AuthProviderUnavailable`` — and therefore an
+        UNAUDITED 500 on the one path where every other outcome is audited.
+
+        ``AuthProviderUnavailable`` is the honest destination: it is the one
+        member of the closed category set whose remedy is "wait" rather than
+        "start again" (see ``PROVIDER_UNAVAILABLE_CATEGORY``), and a saturated
+        pool is a container that cannot serve this login right now.
+        """
+        substrate = _Substrate()
+        async with saturated_worker_pool():
+            with pytest.raises(AuthProviderUnavailable):
+                await _walk(idp, _client(idp), substrate)
+        assert substrate.handoffs.issued == [], "no handoff may exist for a login that never completed"
 
     @pytest.mark.asyncio
     async def test_a_token_minted_for_a_different_nonce_is_refused(self, idp: FakeIdP) -> None:

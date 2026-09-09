@@ -75,13 +75,19 @@ def _actor(identity_id: str) -> IdentityAdminActor:
 
 
 def _login(authority: RepositoryIdentityAuthority, claims: IdentityClaims, *, record_rebound: Any = _noop) -> Any:
+    # ``identity_dormancy_days`` is passed wide enough that R9 cannot fire on
+    # these fixtures: this file pins R3's lock order, and a dormancy re-pend
+    # sharing the same retry protocol would change which refusal a red here
+    # is reporting.
     return authority.ensure_identity(
         claims=claims,
         activate=False,
         quota_tokens_per_day=None,
         quota_storage_bytes=None,
+        identity_dormancy_days=36_500,
         record_admission=_noop,
         record_rebound=record_rebound,
+        record_dormant=_noop,
     )
 
 

@@ -660,6 +660,7 @@ def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_reques
         note="approved",
         role="user",
         role_id="role-1",
+        retained_roles=(),
         tokens_per_day=1000,
         storage_bytes=2000,
         on_behalf_of=None,
@@ -679,6 +680,48 @@ def test_activation_writes_identity_role_and_quota_rows_in_order_with_the_reques
     assert (_metadata(rows[2])["tokens_per_day"], _metadata(rows[2])["storage_bytes"]) == (1000, 2000)
 
 
+def test_an_activation_that_granted_nothing_records_the_access_the_identity_kept(tmp_path: Any) -> None:
+    """R9 made "no ``role_granted`` row" stop meaning "no role".
+
+    A dormancy re-pend leaves an identity's grants standing, so an
+    administrator re-admitting it with ``role="none"`` writes only the
+    ``identity_activated`` row while the person comes back a deployment
+    administrator. Without ``retained_roles`` on that row the trail reads as
+    an admission with no authority, and the database contradicts it.
+
+    The roles go in the metadata rather than into ``role_granted`` rows of
+    their own: such a row asserts a grant, and each of these already has one
+    from the day it was actually made.
+    """
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_activated(
+        _request(),
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        actor_identity_id="identity-admin",
+        cause="admin_activation",
+        note="back from long service leave",
+        role=None,
+        role_id=None,
+        retained_roles=(("admin", None), ("reviewer", "compartment-7")),
+        tokens_per_day=None,
+        storage_bytes=None,
+        on_behalf_of=None,
+        console_request_id=None,
+    )
+    rows = _durable_rows(url)
+    # One row only: nothing was granted and no allowance was written, so
+    # neither sub-row may claim otherwise.
+    assert [row.event_type for row in rows] == ["identity_activated"]
+    # Each with its scope: a deployment-wide ``admin`` and a scoped grant
+    # are different authorities, and only the first is admin authority.
+    assert _metadata(rows[0])["retained_roles"] == [
+        {"role": "admin", "scope": None},
+        {"role": "reviewer", "scope": "compartment-7"},
+    ]
+
+
 def test_a_request_less_bootstrap_activation_writes_null_request_columns_and_an_operator_actor(tmp_path: Any) -> None:
     recorder, url = _durable_recorder(tmp_path)
     recorder.record_identity_activated(
@@ -691,6 +734,7 @@ def test_a_request_less_bootstrap_activation_writes_null_request_columns_and_an_
         note="seed",
         role="admin",
         role_id="role-1",
+        retained_roles=(),
         tokens_per_day=None,
         storage_bytes=None,
         on_behalf_of=None,
@@ -877,6 +921,7 @@ def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(m
             note="seed",
             role=None,
             role_id=None,
+            retained_roles=(),
             tokens_per_day=None,
             storage_bytes=None,
             on_behalf_of=None,
@@ -888,3 +933,109 @@ def test_an_admin_mutation_audit_failure_propagates_and_is_logged_by_operation(m
     operation_value = operation.value if isinstance(operation, audit_module.AuthAuditOperation) else operation
     assert operation_value == "identity_activated"
     assert "RAW_SQL_MARKER" not in repr(logs)
+
+
+# ── R9 dormancy: the re-pend and D34's exemption ─────────────────────────
+
+
+def test_dormancy_re_pend_is_recorded_as_a_system_disable_naming_the_state_it_reached(tmp_path: Any) -> None:
+    """The re-pend row: ``identity_disabled`` with ``cause=dormant`` and the state spelled out.
+
+    The event vocabulary is closed and its CHECK is hand-written, so a
+    fourteenth value would cost a Landscape epoch bump. ``cause`` already
+    distinguishes a retirement from a rebound; ``state`` is what stops a
+    reader having to infer ``pending`` from an event type that says
+    ``disabled``.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_dormant(
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome) == ("identity_disabled", "success")
+    # Not request-bound: the authority acted, not a request.
+    assert row.request_id is None and row.client_host is None and row.user_agent is None
+    metadata = _metadata(row)
+    assert metadata["actor"] == "system"
+    assert metadata["cause"] == "dormant"
+    assert metadata["state"] == "pending"
+    # Both numbers: the login the window was measured from -- which the
+    # identity row no longer holds -- and the window in force when it tripped.
+    assert metadata["last_login_at"] == "2026-01-01T00:00:00+00:00"
+    assert metadata["dormancy_days"] == 90
+
+
+def test_the_dormancy_exemption_row_says_the_disable_did_not_happen(tmp_path: Any) -> None:
+    """D34's row, and the one assertion that keeps it from lying.
+
+    The identity was NOT re-pended. ``outcome='failure'`` on the event type
+    the re-pend would have written is what says so, so a reader keying on
+    ``(event_type, outcome)`` cannot read this as a disable -- and it is the
+    only evidence the exemption fired at all, because an exemption changes
+    nothing on the identity.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_dormancy_exempted(
+        provider="oidc",
+        identity_id="identity-1",
+        username="root",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    (row,) = _durable_rows(url)
+    assert (row.event_type, row.outcome) == ("identity_disabled", "failure")
+    assert row.failure_category == "dormancy_last_admin_exempt"
+    metadata = _metadata(row)
+    assert metadata["actor"] == "system"
+    assert metadata["cause"] == "dormant"
+    assert metadata["exemption"] == "last_active_human_admin"
+    assert metadata["last_login_at"] == "2026-01-01T00:00:00+00:00"
+    assert metadata["dormancy_days"] == 90
+
+
+def test_the_two_dormancy_rows_are_distinguishable_from_each_other_and_from_a_rebound(tmp_path: Any) -> None:
+    """Three ``identity_disabled`` rows, three different meanings, one query away.
+
+    All three take the same event type because the vocabulary is closed. What
+    an administrator reads them by is ``(outcome, metadata.cause)``, and this
+    is the test that fails if a later edit collapses them.
+    """
+    from datetime import UTC, datetime
+
+    recorder, url = _durable_recorder(tmp_path)
+    recorder.record_identity_rebound(
+        provider="oidc",
+        identity_id="identity-1",
+        username="ada",
+        previous_email="ada@old.example",
+        current_email="ada@new.example",
+    )
+    recorder.record_identity_dormant(
+        provider="oidc",
+        identity_id="identity-2",
+        username="bob",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    recorder.record_identity_dormancy_exempted(
+        provider="oidc",
+        identity_id="identity-3",
+        username="root",
+        last_login_at=datetime(2026, 1, 1, tzinfo=UTC),
+        dormancy_days=90,
+    )
+    rows = _durable_rows(url)
+    assert [row.event_type for row in rows] == ["identity_disabled"] * 3
+    assert [(row.outcome, _metadata(row)["cause"]) for row in rows] == [
+        ("success", "rebound"),
+        ("success", "dormant"),
+        ("failure", "dormant"),
+    ]

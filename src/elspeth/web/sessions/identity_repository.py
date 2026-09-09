@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Final, cast, get_args
 
 from sqlalchemy import Row
@@ -84,6 +85,27 @@ class EnsureIdentityOutcome:
     # No default: this is a refusal, and a construction site that forgets it
     # must be a type error rather than an admission.
     rebound_refused: bool
+    # R9/D34: not None means this login was dormant past the container's
+    # window AND the identity is the last active human admin, so it was NOT
+    # re-pended. The value is the login the window was measured from.
+    #
+    # Reported rather than acted on, and the exact mirror of
+    # ``rebound_refused``: R3's carve-out leaves the row active and refuses
+    # the login, R9's carve-out leaves the row active and ADMITS it --
+    # re-pending the sole administrator would walk the container to zero
+    # active admins by doing nothing, and refusing them would lock the same
+    # door from the other side. What the caller owes is an ``auth_events``
+    # row recording the exemption; there is no state change for a failed
+    # audit to roll back, which is why this is reported here rather than
+    # through a callback fired inside the authority's transaction.
+    #
+    # ONE FIELD, NOT A FLAG PLUS A TIMESTAMP. The caller needs the previous
+    # login to write the row -- ``identities`` is current state and the same
+    # transaction overwrote that column -- and a separate bool would be a
+    # second source of truth for the same fact, free to disagree with it.
+    #
+    # No default, for the same reason ``rebound_refused`` has none.
+    dormancy_exempted_since: datetime | None
 
 
 # Write the ``identity_activated`` + ``quota_set`` pair for a first admission.

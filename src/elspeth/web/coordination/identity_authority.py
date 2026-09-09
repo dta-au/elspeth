@@ -107,6 +107,12 @@ _LIST_LIMIT_MAX: Final = 200
 # email baseline -- and a literal that drifts between the writer and the
 # reader would silently stop rebasing and re-trip R3 on the next login.
 REBOUND_DISABLE_REASON: Final = "rebound"
+# R9/D34: the ``disable_reason`` an automatic dormancy re-pend writes.  Named
+# for the same reason ``REBOUND_DISABLE_REASON`` is: ``activate_identity``
+# CLEARS it when an administrator re-admits the identity, and a literal that
+# drifted between the writer and that reader would leave an ``active`` row
+# still reading ``dormant`` to every admin surface that shows the column.
+DORMANT_DISABLE_REASON: Final = "dormant"
 
 
 # ---------------------------------------------------------------------------
@@ -338,11 +344,23 @@ class IdentityActivated:
     """Outcome of ``activate_identity``, ``pre_provision_identity`` and ``bootstrap_admin``.
 
     ``actor_identity_id`` is ``None`` exactly for the operator (bootstrap).
+
+    ``role`` is the grant THIS TRANSACTION WROTE, and ``retained_roles`` the
+    live grants the identity already held when it ran.  Before R9 the second
+    was always empty and the distinction did not exist: only a
+    never-activated ``pending`` row could be activated, and such a row holds
+    no grants.  A dormancy re-pend puts an identity that HAS been active back
+    in the pending queue with its grants intact, so an activation can now
+    write no grant at all and still leave the person holding deployment
+    ``admin``.  Recording only ``role`` there would put "activated, no role
+    granted" in the trail beside a database that says otherwise; the pair
+    says both halves, and neither is inferred from the other.
     """
 
     record: IdentityRecord
     actor_identity_id: str | None
     role: RoleGrant | None
+    retained_roles: tuple[RoleGrant, ...]
     quota_written: bool
     note: str
     activated_at: datetime
@@ -396,6 +414,40 @@ class IdentityRebound:
     previous_email: str
     current_email: str
     rebound_at: datetime
+
+
+@final
+@dataclass(frozen=True, slots=True)
+class IdentityDormant:
+    """R9 found this identity dormant past the container's window, and re-pended it.
+
+    The recycled-mailbox case R3 cannot see: the subject still resolves to
+    the same verified email, so nothing about the claims has changed -- what
+    has changed is that nobody has used the identity for longer than the
+    container is willing to keep a live admission open.  It drops to
+    ``pending``, so an administrator must re-admit it before it authenticates
+    anything again.
+
+    Constructed ONLY when the identity was actually re-pended.  D34's
+    exemption -- the last active human admin, where a re-pend would walk the
+    container to zero active administrators by doing nothing, and the
+    first-login-only bootstrap seed cannot re-fire -- leaves the row
+    ``active``, and an ``identity_disabled`` event for it would assert a
+    state change that did not happen.  That case is reported on
+    ``EnsureIdentityOutcome.dormancy_exempted_since`` and audited by the
+    caller, which is the same split R3 makes with ``rebound_refused``.
+
+    ``last_login_at`` is the login this dormancy was measured FROM, read
+    before the current login overwrote it.  It is the whole forensic content
+    of the event: ``identities`` is current state and the column is stamped
+    by this very transaction, so the moment the identity actually fell
+    silent survives nowhere else.
+    """
+
+    record: IdentityRecord
+    last_login_at: datetime
+    dormancy_days: int
+    re_pended_at: datetime
 
 
 @final
@@ -601,6 +653,19 @@ def _require_limit(limit: object, offset: object) -> None:
         raise ValueError("offset must be a non-negative integer")
 
 
+def _require_positive_int(value: object, field_name: str) -> None:
+    """A window, in days, that a caller passed in from settings.
+
+    ``type(value) is not int`` rather than ``isinstance``: ``bool`` is a
+    subclass of ``int``, and ``True`` would otherwise be admitted here as a
+    one-day dormancy window that re-pends the whole container inside a day.
+    Zero and negatives are refused for the same reason ``WebSettings``
+    declares ``gt=0`` -- a window of zero makes every login its own dormancy.
+    """
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer")
+
+
 def _require_provider(value: object) -> None:
     if type(value) is not str or value not in _PROVIDER_VALUES:
         raise ValueError("provider must be a known identity provider")
@@ -711,10 +776,33 @@ _ADMIN_HOLDER_ROWS: Final = (
 # drops FOR UPDATE; there ``engine.begin()`` is BEGIN IMMEDIATE, so the whole
 # read-count-then-write already runs under the single writer lock.
 _ADMIN_HOLDER_ROWS_FOR_UPDATE: Final = _ADMIN_HOLDER_ROWS.with_for_update()
+# The lazy purge's candidates: pending rows that have NEVER been activated.
+#
+# ``activated_at IS NULL`` is not belt-and-braces, it is the predicate the
+# purge has always meant -- "never-activated ``pending`` rows hold no PII and
+# no children" -- and R9 is what made stating it necessary.  A dormancy
+# re-pend puts a row that HAS been active back into ``pending``, with an
+# ``activated_at``, its role grants, its quota row and every session and blob
+# it owns, and its ``first_seen_at`` is necessarily older than the dormancy
+# window that re-pended it.  Without this term the next admin listing would
+# hand exactly that row to the delete, and the ownership foreign keys are
+# ``RESTRICT``: the lucky outcome is the purge failing, the unlucky one is a
+# person with no children losing their identity for having been away.
 _PENDING_ROWS: Final = (
     select(identities_table.c.identity_id, identities_table.c.first_seen_at)
-    .where(identities_table.c.access_state == "pending")
+    .where(identities_table.c.access_state == "pending", identities_table.c.activated_at.is_(None))
     .order_by(identities_table.c.first_seen_at, identities_table.c.identity_id)
+)
+# The identity's live allowance, if it has one.  ``activate_identity`` asks
+# because R9 made that route reachable for an identity that ALREADY holds a
+# quota row: before R9, only a never-activated ``pending`` row could be
+# activated and such a row has no allowance, so the insert could not collide.
+# A dormancy re-pend puts an identity that has been active -- and may carry
+# an administrator's per-identity override -- back in the pending queue, and
+# ``uq_quota_policies_active_per_identity`` would refuse the second row.
+_ACTIVE_QUOTA_POLICY_OF_IDENTITY: Final = select(quota_policies_table.c.policy_id).where(
+    quota_policies_table.c.identity_id == bindparam("identity_id"),
+    quota_policies_table.c.revoked_at.is_(None),
 )
 
 
@@ -824,6 +912,89 @@ def _rebound_pair(*, baseline: str | None, current: str | None) -> tuple[str, st
     return (baseline, current)
 
 
+def _dormant_since(last_login_at: Any, *, now: datetime, dormancy_days: int) -> datetime | None:
+    """The login R9 measures from when this identity is dormant, otherwise ``None``.
+
+    NULL ``last_login_at`` IS NOT INFINITE DORMANCY.  The column is nullable
+    precisely so a pre-provisioned or never-used row does not falsify the
+    window R9 measures (spec §identities, and ``pre_provision_identity``
+    stamps nothing there for the same reason): there is no login to be
+    dormant since, and substituting ``first_seen_at`` would invent the very
+    timestamp the nullable column refuses to invent.  Re-pending an
+    admitted-in-advance cohort on their FIRST login would also rebuild the
+    wall pre-provisioning exists to remove.  The exemption is a start rather
+    than a hole because this login stamps ``last_login_at``, so the identity
+    is measurable from its second login onward.
+
+    STRICTLY LONGER THAN the window, never equal to it: R9 refuses an
+    identity "dormant longer than the container's dormancy window", so a
+    login exactly ``dormancy_days`` after the last one is still admitted.
+
+    ``_ensure_utc`` is not optional here.  SQLite stores datetimes as text
+    and hands them back naive, while ``now`` is the database clock value and
+    is aware; comparing the two raw raises ``TypeError`` at login time.  The
+    parameter is typed ``Any`` for the same reason every other row value in
+    this module is: it comes off a database row, not from a type we own.
+    """
+    if last_login_at is None:
+        return None
+    since = _ensure_utc(last_login_at)
+    if now - since <= timedelta(days=dormancy_days):
+        return None
+    return since
+
+
+def _profile_refresh_values(claims: IdentityClaims, *, access_state: str) -> dict[str, str]:
+    """The profile columns a login refreshes: only those the claims CARRY.
+
+    A DISABLED ROW REFRESHES NOTHING, and that is a security property rather
+    than tidiness.  ``enable_identity`` rebases R3's baseline from
+    ``identities.email`` when it re-enables a ``rebound`` disable, on the
+    stated ground that the column holds the address the rebound write
+    recorded and that "a disabled row takes no further login writes".  Let a
+    later login attempt refresh ``email`` and that stops being true: whoever
+    now holds the recycled subject keeps overwriting the column, and the
+    administrator's re-enable adopts THEIR address as the trusted baseline.
+    The disable is the point at which the profile stops being maintained.
+    The rebound write itself is unaffected -- it happens while the row is
+    still ``active``, which is what makes the recorded address the right one.
+
+    ``identities`` is CURRENT STATE (spec §identities), and a row created by
+    ``_new_identity_values`` already takes ``display_name``, ``email`` and
+    ``organisation_id`` at first sight -- so a row BOUND rather than created
+    (a pre-provisioned one, which the administrator inserted with no profile
+    at all) would otherwise keep them NULL forever while a row created one
+    second earlier carries them.  That asymmetry is the defect this closes;
+    ``username`` was already refreshed on every login and these three now
+    match it.
+
+    AN ABSENT CLAIM NEVER NULLS A STORED VALUE.  ``organisation_id`` is the
+    VANguard ABN an administrator may have typed at pre-provision time, and
+    a profile that simply does not carry it must not be read as an
+    instruction to erase it.  An absent claim is no information, not a new
+    value.
+
+    ``subject_email_at_first_seen`` IS DELIBERATELY NOT HERE, and must never
+    be added.  It is R3's baseline, adopted exactly once while it is NULL by
+    the caller's own ADOPT branch; refreshing it on an ordinary login would
+    re-baseline every rebound against the address that tripped it and defeat
+    R3 permanently and silently.  ``raw_claims_json`` is absent for the other
+    standing reason: it is taken at ACTIVATION, not at first sight, so a
+    container does not accumulate the profile PII of everyone who merely
+    tried to log in.
+    """
+    if access_state == "disabled":
+        return {}
+    values: dict[str, str] = {}
+    if claims.display_name is not None:
+        values["display_name"] = claims.display_name
+    if claims.email is not None:
+        values["email"] = claims.email
+    if claims.organisation_id is not None:
+        values["organisation_id"] = claims.organisation_id
+    return values
+
+
 def _verified_actor(actor: IdentityAdminActor, actor_row: Any, actor_grants: Sequence[RoleGrant]) -> _VerifiedActor:
     """Refuse anything short of live admin authority, from the actor's row as re-read in the transaction."""
     if actor_row is None or actor_row.access_state != "active":
@@ -834,6 +1005,37 @@ def _verified_actor(actor: IdentityAdminActor, actor_row: Any, actor_grants: Seq
     if not _holds_deployment_admin(actor_grants):
         raise AdminAuthorityRequired()
     return _VerifiedActor(identity_id=actor.identity_id, kind=kind)
+
+
+def _unrevoked_grant_row(role_rows: Sequence[Any], *, role: str, scope: str | None) -> Any:
+    """The row that OCCUPIES the partial unique for ``(identity, role, scope)``, or ``None``.
+
+    R9 IS WHY EVERY INSERTER NOW ASKS, and this is the ``identity_roles`` half
+    of the collision ``_ACTIVE_QUOTA_POLICY_OF_IDENTITY`` answers for
+    ``quota_policies``.  Before R9 a route that grants a role could only run
+    on a never-activated ``pending`` row or a fresh one, neither of which
+    holds a grant, so inserting blind was safe.  A dormancy re-pend puts a row
+    that HAS been active -- with its grants -- back in the pending queue, and
+    a blind insert there raises ``IntegrityError``, which is NOT an
+    ``IdentityAuthorityRefusal``: it escapes the routes' translation as an
+    unhandled 500.
+
+    IT MATCHES THE INDEX'S OWN PREDICATE, NOT THIS MODULE'S NOTION OF ACTIVE,
+    and the difference is the whole reason it takes raw rows rather than
+    ``_active_grants`` output.  Both uniques are partial on ``revoked_at IS
+    NULL`` and neither mentions ``expires_at`` -- they cannot, because SQLite
+    stores timestamps as text and this module evaluates expiry in Python
+    against database time instead (see ``_ADMIN_HOLDER_ROWS``).  An EXPIRED
+    but unrevoked grant is therefore invisible to ``_active_grants`` and still
+    holds the index slot, so a guard written over the active grants alone
+    would step straight back into the collision it was added to prevent.
+
+    ``scope`` is compared rather than assumed: an unscoped grant is guarded by
+    ``uq_identity_roles_active_unscoped`` on ``(identity, role)`` and a scoped
+    one by ``uq_identity_roles_active_scoped`` on ``(identity, role, scope)``,
+    and comparing the column answers for both.
+    """
+    return next((row for row in role_rows if row.role == role and row.scope == scope and row.revoked_at is None), None)
 
 
 def _refuse_role_conflict(*, kind: str, role: str, held: Sequence[RoleGrant]) -> None:
@@ -1103,8 +1305,10 @@ class RepositoryIdentityAuthority:
         activate: bool,
         quota_tokens_per_day: int | None,
         quota_storage_bytes: int | None,
+        identity_dormancy_days: int,
         record_admission: RecordAdmission,
         record_rebound: Callable[[IdentityRebound], None],
+        record_dormant: Callable[[IdentityDormant], None],
     ) -> EnsureIdentityOutcome:
         """Resolve ``(provider, subject)`` to its identity row, creating it once.
 
@@ -1141,10 +1345,30 @@ class RepositoryIdentityAuthority:
         disable that did not happen.  Read ``rebound_refused`` on the outcome
         rather than the returned ``access_state``; the two come apart exactly
         in that carve-out.
+
+        IT IS ALSO R9's ENFORCEMENT POINT, for the same reason: a login is
+        the only moment at which dormancy is both measurable (the stored
+        ``last_login_at`` is still the PREVIOUS login, one statement before
+        this one overwrites it) and consequential.  There is no background
+        sweep, and R9 does not need one -- an identity nobody logs into
+        cannot use the access it is holding.  ``record_dormant`` fires inside
+        the transaction under the same rule as ``record_rebound`` and, like
+        it, ONLY when the identity was actually re-pended: D34's last-admin
+        exemption changes no state and is reported on
+        ``dormancy_exempted_since`` for the caller to audit, because there is
+        no state change for a failed audit to roll back.
+
+        ``identity_dormancy_days`` is passed IN rather than read here.  This
+        class holds an engine and nothing else -- no ``WebSettings``, no
+        clock, no recorder -- which is what lets one authority serve the
+        local and SSO wirings and what keeps a test from having to build a
+        settings object to exercise a lock order.  It is the same treatment
+        the quota defaults get.
         """
         claims = _require_claims(claims)
         if type(activate) is not bool:
             raise TypeError("activate must be a bool")
+        _require_positive_int(identity_dormancy_days, "identity_dormancy_days")
         try:
             try:
                 return self._ensure_identity_once(
@@ -1152,19 +1376,24 @@ class RepositoryIdentityAuthority:
                     activate=activate,
                     quota_tokens_per_day=quota_tokens_per_day,
                     quota_storage_bytes=quota_storage_bytes,
+                    identity_dormancy_days=identity_dormancy_days,
                     record_admission=record_admission,
                     record_rebound=record_rebound,
+                    record_dormant=record_dormant,
                     lock_admin_population=False,
                 )
             except _AdminLockRequired:
-                # R3 found a rebound on an identity holding deployment admin.
-                # Disabling it can lower R5's count, and that class of
-                # mutation must take the admin population BEFORE its own
-                # target row or two of them deadlock on each other's target
-                # (see _ADMIN_HOLDER_ROWS_FOR_UPDATE).  Attempt 1 already
-                # held the target, so its lock order was wrong and it rolled
-                # back having written nothing.  Retry with the population
-                # first.
+                # R3 found a rebound, or R9 found a dormancy, on an identity
+                # holding deployment admin.  BOTH carve-outs need R5's count
+                # and both consequences can lower it, so both raise this and
+                # both are answered the same way.
+                #
+                # That class of mutation must take the admin population
+                # BEFORE its own target row or two of them deadlock on each
+                # other's target (see _ADMIN_HOLDER_ROWS_FOR_UPDATE).
+                # Attempt 1 already held the target, so its lock order was
+                # wrong and it rolled back having written nothing.  Retry
+                # with the population first.
                 #
                 # EXACTLY ONCE, and the bound is structural rather than a
                 # counter: attempt 2 passes ``lock_admin_population=True``,
@@ -1176,8 +1405,10 @@ class RepositoryIdentityAuthority:
                     activate=activate,
                     quota_tokens_per_day=quota_tokens_per_day,
                     quota_storage_bytes=quota_storage_bytes,
+                    identity_dormancy_days=identity_dormancy_days,
                     record_admission=record_admission,
                     record_rebound=record_rebound,
+                    record_dormant=record_dormant,
                     lock_admin_population=True,
                 )
         except IntegrityError:
@@ -1197,7 +1428,11 @@ class RepositoryIdentityAuthority:
                 conn.execute(
                     update(identities_table)
                     .where(identities_table.c.identity_id == winner.identity_id)
-                    .values(last_login_at=now, username=claims.username)
+                    .values(
+                        last_login_at=now,
+                        username=claims.username,
+                        **_profile_refresh_values(claims, access_state=winner.access_state),
+                    )
                 )
             # ``activated_now`` is False and ``record_admission`` does NOT
             # fire: the winner wrote the activation pair, and a second one
@@ -1207,6 +1442,11 @@ class RepositoryIdentityAuthority:
             # re-evaluated here: this path exists because the row was created
             # by another writer moments ago, so its baseline was taken from
             # the very claims in hand and cannot already disagree with them.
+            #
+            # ``dormancy_exempted_since`` is None and R9 is not evaluated for
+            # the same reason again: the winner inserted this row in the
+            # moment before, so its ``last_login_at`` cannot be older than
+            # any window an operator can configure.
             return EnsureIdentityOutcome(
                 record=IdentityRecord(
                     identity_id=winner.identity_id,
@@ -1219,6 +1459,7 @@ class RepositoryIdentityAuthority:
                 activated_now=False,
                 quota_written=False,
                 rebound_refused=False,
+                dormancy_exempted_since=None,
             )
 
     def _ensure_identity_once(
@@ -1228,17 +1469,20 @@ class RepositoryIdentityAuthority:
         activate: bool,
         quota_tokens_per_day: int | None,
         quota_storage_bytes: int | None,
+        identity_dormancy_days: int,
         record_admission: RecordAdmission,
         record_rebound: Callable[[IdentityRebound], None],
+        record_dormant: Callable[[IdentityDormant], None],
         lock_admin_population: bool,
     ) -> EnsureIdentityOutcome:
         """One attempt.  Raises ``IntegrityError`` when another writer wins.
 
         ``lock_admin_population`` is attempt 2's flag, never a caller's
         choice: it takes R5's population lock BEFORE the target row, which is
-        the order R3's disable needs and the order every login would pay for
-        if this were unconditional.  Attempt 1 runs without it and raises
-        :class:`_AdminLockRequired` if it turns out to be needed.
+        the order R3's disable and R9's re-pend need, and the order every
+        login would pay for if this were unconditional.  Attempt 1 runs
+        without it and raises :class:`_AdminLockRequired` if it turns out to
+        be needed.
         """
         with self._engine.begin() as conn:
             now = _database_clock_value(conn.exec_driver_sql(self._clock_sql).scalar_one())
@@ -1285,6 +1529,9 @@ class RepositoryIdentityAuthority:
                     # the claims in hand, so it cannot already disagree with
                     # them. R3 has nothing to compare on a first sight.
                     rebound_refused=False,
+                    # And R9 has nothing to measure: the row's first
+                    # ``last_login_at`` is this moment.
+                    dormancy_exempted_since=None,
                 )
 
             bound = _record_from_row(existing)
@@ -1313,6 +1560,145 @@ class RepositoryIdentityAuthority:
             rebound = _rebound_pair(baseline=baseline, current=claims.email) if considered else None
 
             if rebound is None:
+                # ---- R9 / D34 (spec §Refusals): has nobody used this
+                # identity for longer than the container is willing to keep a
+                # live admission open?
+                #
+                # R3 IS EVALUATED FIRST AND OUTRANKS THIS, which is why R9
+                # lives inside the ``rebound is None`` branch rather than
+                # beside it.  Both can be true of one login -- a subject that
+                # was recycled while dormant is the likeliest way for that to
+                # happen -- and then R3 wins on three grounds.  Its evidence
+                # is the specific one an administrator must see (``rebound``
+                # names a recycled subject; ``dormant`` names only silence);
+                # its consequence is the stronger state (``disabled``, which
+                # ``enable_identity`` clears while rebasing the email
+                # baseline, versus ``pending``); and re-pending a row this
+                # transaction has just disabled would be the upgrade the spec
+                # forbids of a login ("an existing row is never downgraded
+                # and never upgraded by a login").  Running R9 first would
+                # also write an ``identity_disabled`` event asserting a
+                # re-pend that the very next statement superseded.
+                #
+                # ACTIVE ROWS ONLY.  A ``pending`` row is already unadmitted
+                # and re-pending it would restamp ``disabled_at`` and
+                # ``disable_reason`` for a transition that did not happen; a
+                # ``disabled`` row is already further out than R9 can put it,
+                # and moving it to ``pending`` would be that same forbidden
+                # upgrade.  Neither is a case R9 has anything to add to.
+                #
+                # R9 IS NOT EXCLUDED FOR LOCAL AUTH, unlike R3.  R3's
+                # exclusion rests on facts about the local subject -- it IS
+                # the username, freeing it retires the identity, and an email
+                # change would lock a local user out -- and not one of them
+                # says anything about how long an account has sat unused.  A
+                # dormant local account holds exactly the access a dormant
+                # IdP account does.
+                dormant_since = (
+                    _dormant_since(existing.last_login_at, now=now, dormancy_days=identity_dormancy_days)
+                    if bound.access_state == "active"
+                    else None
+                )
+                dormancy_exempted_since: datetime | None = None
+                if dormant_since is not None:
+                    # D34 gives R9 R5's last-admin carve-out, and for a
+                    # sharper reason than R3 has: R5 guards only the disable
+                    # ROUTE, so without this a single-admin container reaches
+                    # zero active administrators at day 91 by doing nothing,
+                    # and the bootstrap seed cannot re-fire because it is
+                    # first-login-only.
+                    #
+                    # THIS RIDES R3's TWO-ATTEMPT RETRY rather than counting
+                    # admins on its own.  An independent count would read the
+                    # admin population AFTER the target row is locked, which
+                    # inverts the order ``_ADMIN_HOLDER_ROWS_FOR_UPDATE``
+                    # documents and
+                    # ``tests/testcontainer/web/test_identity_last_admin_race_postgres.py``
+                    # pins.  Attempt 1 arrives with ``admin_holders`` None,
+                    # discovers here that it needs the count, and rolls back
+                    # having written nothing; ``ensure_identity`` retries once
+                    # with the population taken first.
+                    #
+                    # The escalation is gated on the target holding admin, in
+                    # that order, so an ordinary dormant login never pays for
+                    # the population lock -- which is the whole point of
+                    # attempt 1.  ``kind == "human"`` mirrors R3's carve-out
+                    # and ``disable_identity``: R5 counts HUMAN admins, so a
+                    # service identity is never protected.
+                    dormant_grants = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": bound.identity_id}).all(), now)
+                    if existing.kind == "human" and _holds_deployment_admin(dormant_grants):
+                        if admin_holders is None:
+                            raise _AdminLockRequired
+                        if _active_human_admin_count(admin_holders, now) <= 1:
+                            dormancy_exempted_since = dormant_since
+
+                if dormant_since is not None and dormancy_exempted_since is None:
+                    # The re-pend.  ``pending``, not ``disabled``: R9's remedy
+                    # is that an administrator re-admits the identity through
+                    # the activation route, which is where the decision "this
+                    # is still the same person" belongs.  The actor is
+                    # ``system`` -- no administrator decided this -- so
+                    # ``disabled_by_identity_id`` stays NULL, and the org-tree
+                    # revocation cascade does NOT run, for D32's reason: edge
+                    # revocation is unrecoverable and silence is not evidence
+                    # of anything about the org chart.
+                    #
+                    # ``last_login_at`` is still stamped with this login: the
+                    # person DID authenticate, and the next dormancy
+                    # measurement must run from now rather than from the
+                    # moment that tripped this one -- otherwise a re-admitted
+                    # identity is dormant again the instant it is activated.
+                    #
+                    # The R3 baseline is NOT adopted here even when it is
+                    # NULL.  This identity is being taken out of service, and
+                    # the login that re-admits it is the one whose email
+                    # becomes the baseline -- exactly as it would be for any
+                    # other pre-provisioned row.
+                    conn.execute(
+                        update(identities_table)
+                        .where(identities_table.c.identity_id == bound.identity_id)
+                        .values(
+                            last_login_at=now,
+                            username=claims.username,
+                            access_state="pending",
+                            disabled_at=now,
+                            disabled_by_identity_id=None,
+                            disable_reason=DORMANT_DISABLE_REASON,
+                            **_profile_refresh_values(claims, access_state=bound.access_state),
+                        )
+                    )
+                    pended_record = IdentityRecord(
+                        identity_id=bound.identity_id,
+                        provider=bound.provider,
+                        subject=bound.subject,
+                        username=claims.username,
+                        access_state="pending",
+                    )
+                    # Inside the transaction, like the admission pair and the
+                    # rebound disable: a re-pend this trail cannot hold does
+                    # not commit.
+                    record_dormant(
+                        IdentityDormant(
+                            record=pended_record,
+                            last_login_at=dormant_since,
+                            dormancy_days=identity_dormancy_days,
+                            re_pended_at=now,
+                        )
+                    )
+                    # The login itself is refused by the state gate, not by a
+                    # flag: ``admit`` refuses anything that is not ``active``
+                    # and the row is now ``pending``, so R9 needs no separate
+                    # ``refused`` term the way R3 does.  R3 needs one only
+                    # because its carve-out leaves the row ``active``.
+                    return EnsureIdentityOutcome(
+                        record=pended_record,
+                        created=False,
+                        activated_now=False,
+                        quota_written=False,
+                        rebound_refused=False,
+                        dormancy_exempted_since=None,
+                    )
+
                 if considered and baseline is None and claims.email is not None:
                     # ADOPT rather than trip.  A pre-provisioned row that
                     # nobody has logged into has no baseline, and leaving it
@@ -1323,13 +1709,22 @@ class RepositoryIdentityAuthority:
                     conn.execute(
                         update(identities_table)
                         .where(identities_table.c.identity_id == bound.identity_id)
-                        .values(last_login_at=now, username=claims.username, subject_email_at_first_seen=claims.email)
+                        .values(
+                            last_login_at=now,
+                            username=claims.username,
+                            subject_email_at_first_seen=claims.email,
+                            **_profile_refresh_values(claims, access_state=bound.access_state),
+                        )
                     )
                 else:
                     conn.execute(
                         update(identities_table)
                         .where(identities_table.c.identity_id == bound.identity_id)
-                        .values(last_login_at=now, username=claims.username)
+                        .values(
+                            last_login_at=now,
+                            username=claims.username,
+                            **_profile_refresh_values(claims, access_state=bound.access_state),
+                        )
                     )
                 return EnsureIdentityOutcome(
                     record=IdentityRecord(
@@ -1343,6 +1738,10 @@ class RepositoryIdentityAuthority:
                     activated_now=False,
                     quota_written=False,
                     rebound_refused=False,
+                    # Set only on D34's exemption, which changed nothing: the
+                    # caller writes the row that records the decision not to
+                    # re-pend, and the login proceeds.
+                    dormancy_exempted_since=dormancy_exempted_since,
                 )
 
             # R5's carve-out.  Disabling the LAST active human admin over a
@@ -1383,10 +1782,22 @@ class RepositoryIdentityAuthority:
                 # ``rebound_at`` is still stamped: the observation happened,
                 # and an admin reading this row must see it. No
                 # ``identity_disabled`` event -- see IdentityRebound.
+                #
+                # The profile refresh necessarily carries ``email`` on this
+                # path: a rebound cannot exist without a current address
+                # (``_rebound_pair`` returns None when the login carries
+                # none), so the helper is the same write the explicit
+                # ``email=claims.email`` used to be, plus the two other
+                # profile columns it was inconsistent with.
                 conn.execute(
                     update(identities_table)
                     .where(identities_table.c.identity_id == bound.identity_id)
-                    .values(last_login_at=now, username=claims.username, email=claims.email, rebound_at=now)
+                    .values(
+                        last_login_at=now,
+                        username=claims.username,
+                        rebound_at=now,
+                        **_profile_refresh_values(claims, access_state=bound.access_state),
+                    )
                 )
                 return EnsureIdentityOutcome(
                     record=IdentityRecord(
@@ -1400,6 +1811,9 @@ class RepositoryIdentityAuthority:
                     activated_now=False,
                     quota_written=False,
                     rebound_refused=True,
+                    # R9 was not evaluated: R3 outranks it and this login is
+                    # already refused, so there is no exemption to record.
+                    dormancy_exempted_since=None,
                 )
 
             # D32: state, not just a refused login.  Refusing the login alone
@@ -1416,12 +1830,18 @@ class RepositoryIdentityAuthority:
                 .values(
                     last_login_at=now,
                     username=claims.username,
-                    email=claims.email,
                     rebound_at=now,
                     access_state="disabled",
                     disabled_at=now,
                     disabled_by_identity_id=None,
                     disable_reason=REBOUND_DISABLE_REASON,
+                    # Carries ``email`` for the reason the carve-out above
+                    # states: a rebound implies a current address.  The state
+                    # passed is the one the row is coming FROM -- R3 only
+                    # reaches here for a row that is not yet disabled, which
+                    # is exactly why this write is the last one to record the
+                    # address ``enable_identity`` later rebases from.
+                    **_profile_refresh_values(claims, access_state=bound.access_state),
                 )
             )
             disabled_record = IdentityRecord(
@@ -1448,6 +1868,9 @@ class RepositoryIdentityAuthority:
                 activated_now=False,
                 quota_written=False,
                 rebound_refused=True,
+                # R9 was not evaluated: R3 outranks it, and this row is now
+                # further out of service than a re-pend could put it.
+                dormancy_exempted_since=None,
             )
 
     def retire_identity(
@@ -1562,6 +1985,7 @@ class RepositoryIdentityAuthority:
                     username=claims.username,
                     access_state="active",
                 )
+                role_rows: Sequence[Any] = ()
                 held: tuple[RoleGrant, ...] = ()
             else:
                 if existing.access_state == "disabled":
@@ -1575,32 +1999,76 @@ class RepositoryIdentityAuthority:
                     .values(access_state="active", activated_at=now, activated_by_identity_id=None)
                 )
                 bound = _record_from_row(existing, access_state="active")
-                held = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all(), now)
+                role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+                held = _active_grants(role_rows, now)
             _refuse_role_conflict(kind="human", role="admin", held=held)
-            grant = _new_role_grant(
-                identity_id=identity_id,
-                role="admin",
-                scope=None,
-                expires_at=None,
-                note=note,
-                granted_by_identity_id=identity_id,
-                now=now,
-            )
-            conn.execute(insert(identity_roles_table).values(**_role_values(grant)))
-            quota = _quota_values(
-                identity_id=identity_id,
-                now=now,
-                tokens_per_day=quota_tokens_per_day,
-                storage_bytes=quota_storage_bytes,
-                set_by_actor="operator",
-                set_by_identity_id=None,
-            )
+            # THE BOUND ROW MAY ALREADY HOLD THE GRANT, and this is the one
+            # command an operator runs when they are already locked out, so
+            # it must not be the thing that raises.  R9 re-pends any admin who
+            # is not the LAST one, leaving a ``pending`` row with a live
+            # deployment ``admin``; ``_ADMIN_HOLDER_ROWS`` does not count it,
+            # because it joins on ``access_state = 'active'``, so a container
+            # whose remaining admins lapse reaches zero active human admins
+            # with that grant still standing and this seed re-arms onto
+            # exactly that row.  A blind insert then collides on
+            # ``uq_identity_roles_active_unscoped``.
+            #
+            # AN EXPIRED ADMIN GRANT IS THE COMMONEST WAY HERE, and it
+            # predates R9: a container reaches zero active human admins most
+            # ordinarily because the one admin's grant simply ran out, and
+            # that dead row still holds the index slot the seed needs.  It is
+            # closed and replaced -- see ``activate_identity`` for the same
+            # branch and the same reasoning -- so the operator gets a fresh,
+            # unexpiring grant rather than a 500.
+            #
+            # ``grant`` stays None only when the row already holds a LIVE
+            # admin: nothing was granted, the caller writes no
+            # ``role_granted`` event, and ``retained_roles`` carries the grant
+            # that makes this identity the administrator anyway.
+            occupant = _unrevoked_grant_row(role_rows, role="admin", scope=None)
+            grant = None
+            if occupant is None or not _is_active(occupant.expires_at, occupant.revoked_at, now):
+                if occupant is not None:
+                    conn.execute(
+                        update(identity_roles_table).where(identity_roles_table.c.role_id == occupant.role_id).values(revoked_at=now)
+                    )
+                grant = _new_role_grant(
+                    identity_id=identity_id,
+                    role="admin",
+                    scope=None,
+                    expires_at=None,
+                    note=note,
+                    granted_by_identity_id=identity_id,
+                    now=now,
+                )
+                conn.execute(insert(identity_roles_table).values(**_role_values(grant)))
+            # AN EXISTING ALLOWANCE IS LEFT ALONE, the same branch and the
+            # same reason as in ``activate_identity``: the row this binds may
+            # have been active before -- an R9 re-pend is how a ``pending``
+            # row comes to carry a ``quota_policies`` row at all -- and
+            # ``uq_quota_policies_active_per_identity`` refuses a second live
+            # one.  Overwriting an administrator's per-identity override with
+            # the operator's container defaults would be the wrong answer
+            # even if the unique permitted it (D15).
+            quota = None
+            if conn.execute(_ACTIVE_QUOTA_POLICY_OF_IDENTITY, {"identity_id": identity_id}).first() is None:
+                quota = _quota_values(
+                    identity_id=identity_id,
+                    now=now,
+                    tokens_per_day=quota_tokens_per_day,
+                    storage_bytes=quota_storage_bytes,
+                    set_by_actor="operator",
+                    set_by_identity_id=None,
+                )
             if quota is not None:
                 conn.execute(quota_policies_table.insert().values(**quota))
             outcome = IdentityActivated(
                 record=bound,
                 actor_identity_id=None,
                 role=grant,
+                # ``()`` on the created branch by construction, and on the
+                # bound branch whatever the pending row was already carrying.
+                retained_roles=held,
                 quota_written=quota is not None,
                 note=note,
                 activated_at=now,
@@ -1706,6 +2174,10 @@ class RepositoryIdentityAuthority:
                 ),
                 actor_identity_id=verified.identity_id,
                 role=grant,
+                # Always empty: this method REFUSES a taken natural key, so
+                # the row it reports on was inserted by the statement above
+                # and cannot be carrying a grant from an earlier life.
+                retained_roles=(),
                 quota_written=quota is not None,
                 note=note,
                 activated_at=now,
@@ -1747,16 +2219,77 @@ class RepositoryIdentityAuthority:
             if row.access_state != "pending":
                 raise IdentityNotPending()
             kind = _parsed_kind(row.kind, identity_id=identity_id)
+            # THE HELD GRANTS ARE READ ON EVERY ACTIVATION, not only when a
+            # role is being granted.  R8 was the original reason to read them
+            # and it still only applies when there is a role to refuse, but
+            # since R9 the answer is also needed for ``role="none"``: a
+            # re-pended identity carries its grants into the pending queue,
+            # so an activation that grants nothing can still return a person
+            # to deployment ``admin``, and the outcome has to be able to say
+            # so.  For every never-activated pending row this reads no rows.
+            #
+            # The RAW rows are kept as well as the active ones: R8 and
+            # ``retained_roles`` are questions about live authority, while the
+            # partial unique is a question about unrevoked rows, and
+            # ``_unrevoked_grant_row`` explains why those are not the same set.
+            role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+            held = _active_grants(role_rows, now)
             if role != "none":
-                held = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all(), now)
                 _refuse_role_conflict(kind=kind, role=role, held=held)
+            # THE DISABLE COLUMNS ARE CLEARED HERE, not only in
+            # ``enable_identity``.  Since R9 landed, a ``pending`` row can
+            # carry ``disable_reason='dormant'`` and a ``disabled_at``: that
+            # is how the automatic re-pend explains itself to the admin
+            # reading the pending queue.  Leaving them would make the
+            # re-admitted, ACTIVE row keep saying it was dropped for
+            # dormancy, on every admin surface that renders the column, for
+            # the rest of its life.  ``enable_identity`` cannot do this job
+            # because it refuses anything but a ``disabled`` row, so the
+            # pending route is the only place a dormancy stamp can be
+            # retired.  For every other pending row the three are already
+            # NULL and this writes NULL over NULL.
             conn.execute(
                 update(identities_table)
                 .where(identities_table.c.identity_id == identity_id)
-                .values(access_state="active", activated_at=now, activated_by_identity_id=verified.identity_id)
+                .values(
+                    access_state="active",
+                    activated_at=now,
+                    activated_by_identity_id=verified.identity_id,
+                    disabled_at=None,
+                    disabled_by_identity_id=None,
+                    disable_reason=None,
+                )
             )
+            # A GRANT OF THE SAME ROLE THE IDENTITY STILL HOLDS IS LEFT ALONE.
+            # R9's remedy is that an administrator re-activates the identity,
+            # and the role they pick from the pending queue is most often the
+            # one the person already holds -- so the obvious re-admission is
+            # exactly the case a blind insert turns into an unhandled 500.
+            # Re-granting would also restamp ``granted_at`` and
+            # ``granted_by_identity_id`` on an authority the person never
+            # actually lost.  ``grant`` stays None when nothing was written,
+            # which keeps the audit pair from asserting a ``role_granted``
+            # this transaction did not make; ``retained_roles`` on the outcome
+            # is where the grant it left standing is reported instead.
+            #
+            # AN EXPIRED ONE IS CLOSED AND REPLACED, because it is dead to
+            # everything except the index: it confers nothing (``_is_active``
+            # drops it, so ``_active_human_admin_count`` and every
+            # authorization read have already stopped seeing it) while still
+            # occupying the partial unique.  Stamping ``revoked_at`` frees the
+            # slot and is bookkeeping rather than a decision -- the access it
+            # conferred ended at its own ``expires_at``, which the row still
+            # records -- and the fresh grant is the one the activation is
+            # actually making, so ``role`` names it truthfully.  Closing it
+            # cannot lower R5's count for the same reason: an expired grant
+            # was never in that count.
+            occupant = None if role == "none" else _unrevoked_grant_row(role_rows, role=role, scope=None)
             grant = None
-            if role != "none":
+            if role != "none" and (occupant is None or not _is_active(occupant.expires_at, occupant.revoked_at, now)):
+                if occupant is not None:
+                    conn.execute(
+                        update(identity_roles_table).where(identity_roles_table.c.role_id == occupant.role_id).values(revoked_at=now)
+                    )
                 grant = _new_role_grant(
                     identity_id=identity_id,
                     role=role,
@@ -1767,20 +2300,37 @@ class RepositoryIdentityAuthority:
                     now=now,
                 )
                 conn.execute(insert(identity_roles_table).values(**_role_values(grant)))
-            quota = _quota_values(
-                identity_id=identity_id,
-                now=now,
-                tokens_per_day=quota_tokens_per_day,
-                storage_bytes=quota_storage_bytes,
-                set_by_actor="identity",
-                set_by_identity_id=verified.identity_id,
-            )
+            # AN EXISTING ALLOWANCE IS LEFT ALONE, and this branch is new
+            # with R9.  Before it, only a never-activated ``pending`` row
+            # could reach here and such a row has no ``quota_policies`` row,
+            # so the insert always ran.  A dormancy re-pend puts an identity
+            # that HAS been active back in the pending queue, and re-admitting
+            # it must not write a second live policy row -- the partial unique
+            # refuses one -- nor overwrite an administrator's per-identity
+            # override with the container default (D15 makes the override the
+            # admin's to set, not activation's to reclaim).  ``quota_written``
+            # then reports False, which is what keeps the audit pair from
+            # asserting an allowance this transaction did not grant.
+            quota = None
+            if conn.execute(_ACTIVE_QUOTA_POLICY_OF_IDENTITY, {"identity_id": identity_id}).first() is None:
+                quota = _quota_values(
+                    identity_id=identity_id,
+                    now=now,
+                    tokens_per_day=quota_tokens_per_day,
+                    storage_bytes=quota_storage_bytes,
+                    set_by_actor="identity",
+                    set_by_identity_id=verified.identity_id,
+                )
             if quota is not None:
                 conn.execute(quota_policies_table.insert().values(**quota))
             outcome = IdentityActivated(
                 record=_record_from_row(row, access_state="active"),
                 actor_identity_id=verified.identity_id,
                 role=grant,
+                # What the identity was ALREADY holding when this ran: empty
+                # for every never-activated pending row, and the whole of the
+                # access an R9 re-admission restores without granting it.
+                retained_roles=held,
                 quota_written=quota is not None,
                 note=note,
                 activated_at=now,
@@ -1963,10 +2513,29 @@ class RepositoryIdentityAuthority:
             if expires_at is not None and _ensure_utc(expires_at) <= now:
                 raise ValueError("expires_at must be in the future")
             kind = _parsed_kind(row.kind, identity_id=identity_id)
-            held = _active_grants(conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all(), now)
+            role_rows = conn.execute(_ROLES_OF_IDENTITY, {"identity_id": identity_id}).all()
+            held = _active_grants(role_rows, now)
             _refuse_role_conflict(kind=kind, role=role, held=held)
-            if any(grant.role == role and grant.scope == scope for grant in held):
-                raise RoleAlreadyHeld()
+            # ALREADY-HELD IS A LIVE GRANT; AN EXPIRED ONE IS A DEAD ROW IN
+            # THE WAY.  This refusal used to be read off ``held``, which drops
+            # expired grants -- so re-granting a role whose previous grant had
+            # simply run out fell past the refusal and collided with the
+            # partial unique, which does not know about expiry
+            # (``_unrevoked_grant_row`` explains why it cannot).  That is an
+            # ``IntegrityError`` rather than a typed refusal, so it reached
+            # the route as an unhandled 500.  It predates R9 and is fixed here
+            # because it is the same mismatch, and because re-granting an
+            # expired role is the ordinary way an administrator renews one.
+            #
+            # Closing the dead row is bookkeeping, not a revocation decision:
+            # the access ended at its own ``expires_at``, which the row still
+            # records, and an expired grant is already outside every count and
+            # every authorization read.
+            occupant = _unrevoked_grant_row(role_rows, role=role, scope=scope)
+            if occupant is not None:
+                if _is_active(occupant.expires_at, occupant.revoked_at, now):
+                    raise RoleAlreadyHeld()
+                conn.execute(update(identity_roles_table).where(identity_roles_table.c.role_id == occupant.role_id).values(revoked_at=now))
             grant = _new_role_grant(
                 identity_id=identity_id,
                 role=role,
@@ -2189,11 +2758,14 @@ class RepositoryIdentityAuthority:
     ) -> PendingIdentitiesPurged:
         """The spec's lazy purge (rev2.8): never-activated ``pending`` rows past retention.
 
-        The ONLY delete on the identity tables.  A pending row holds no
-        profile PII and, by construction, no children: quota rows, role
-        grants and edges are written at activation.  The delete is guarded
-        by ``access_state = 'pending'`` again in the statement, so a row
-        activated between the read and the write survives.
+        The ONLY delete on the identity tables.  A NEVER-ACTIVATED pending
+        row holds no profile PII and, by construction, no children: quota
+        rows, role grants and edges are written at activation.  Both terms of
+        that predicate are repeated in the statement as well as in
+        ``_PENDING_ROWS``, so a row activated between the read and the write
+        survives -- and so does one an R9 dormancy re-pend put back in the
+        pending queue, which is pending WITH an ``activated_at`` and with all
+        the children the first sentence promises are absent.
         """
         actor = _require_actor(actor)
         if type(retention_days) is not int or retention_days < 1:
@@ -2211,6 +2783,7 @@ class RepositoryIdentityAuthority:
                     delete(identities_table).where(
                         identities_table.c.identity_id.in_(stale),
                         identities_table.c.access_state == "pending",
+                        identities_table.c.activated_at.is_(None),
                     )
                 )
             outcome = PendingIdentitiesPurged(

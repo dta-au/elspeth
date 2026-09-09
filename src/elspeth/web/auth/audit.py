@@ -133,6 +133,29 @@ class AuthAuditWriter(Protocol):
         current_email: str,
     ) -> None: ...
 
+    # Two more with no ``request``, both R9: the dormancy re-pend is the
+    # authority's own act like the rebound disable, and D34's exemption is
+    # the decision NOT to act, which only this trail records at all.
+    def record_identity_dormant(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None: ...
+
+    def record_identity_dormancy_exempted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None: ...
+
     def record_logout(
         self,
         request: Request,
@@ -159,6 +182,7 @@ class AuthAuditWriter(Protocol):
         note: str,
         role: IdentityRole | None,
         role_id: str | None,
+        retained_roles: tuple[tuple[IdentityRole, str | None], ...],
         tokens_per_day: int | None,
         storage_bytes: int | None,
         on_behalf_of: str | None,
@@ -247,6 +271,13 @@ class AuthAuditOperation(StrEnum):
     AUTH_FAILURE = "auth_failure"
     LOGIN_FAILURE = "login_failure"
     IDENTITY_RETIRED = "identity_retired"
+    # R9's two: the re-pend, and D34's decision not to re-pend. Separate
+    # members because this value only ever reaches a log line naming which
+    # write failed, and "identity_disabled" for both would make the two
+    # indistinguishable in exactly the diagnostic that needs to tell them
+    # apart.
+    IDENTITY_DORMANT = "identity_dormant"
+    IDENTITY_DORMANCY_EXEMPTED = "identity_dormancy_exempted"
     LOGOUT = "logout"
     IDENTITY_ACTIVATED = "identity_activated"
     IDENTITY_ENABLED = "identity_enabled"
@@ -737,6 +768,122 @@ class AuthAuditRecorder:
                 },
             )
 
+    def record_identity_dormant(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None:
+        """Write the ``identity_disabled`` row for an R9 dormancy re-pend.
+
+        A re-pend is not a disable of the ``disabled`` kind -- the row lands
+        in ``pending`` and an administrator re-admits it through the
+        activation route -- but ``identity_disabled`` is the closed
+        vocabulary's word for "the system took this identity out of service",
+        and ``metadata.cause`` is already what distinguishes a retirement
+        (``credential_deleted``) from a rebound (``rebound``). A fourteenth
+        event type would cost a Landscape epoch bump and a service stop for a
+        discriminator the metadata already carries, so ``state`` names the
+        state the row actually reached and no reader has to infer it from the
+        event type.
+
+        The actor is ``system``: no person decided this, and naming one would
+        put an administrator's identity on a row they never touched.
+
+        Not request-bound, for the reason the rebound row is not. This row is
+        the authority's state change; the refused login writes its own
+        ``auth_failure`` row carrying the request context and the
+        ``sso_access_pending`` category, and the two join on ``identity_id``.
+
+        BOTH NUMBERS ARE RECORDED. ``last_login_at`` is the login the window
+        was measured from -- ``identities`` is current state and this very
+        transaction overwrites that column, so the moment the identity fell
+        silent survives nowhere else -- and ``dormancy_days`` is the window
+        in force when it tripped, which an operator who later widens the
+        setting needs in order to read the row as anything but an accusation.
+
+        Runs inside the authority's transaction, so a re-pend this trail
+        cannot hold does not commit.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DORMANT) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_disabled",
+                outcome="success",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category=None,
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "cause": "dormant",
+                    "state": "pending",
+                    "last_login_at": last_login_at.isoformat(),
+                    "dormancy_days": dormancy_days,
+                },
+            )
+
+    def record_identity_dormancy_exempted(
+        self,
+        *,
+        provider: AuthProviderType,
+        identity_id: str,
+        username: str,
+        last_login_at: datetime,
+        dormancy_days: int,
+    ) -> None:
+        """Write the row recording D34's last-admin exemption from R9.
+
+        THE OUTCOME IS ``failure`` AND THAT IS THE POINT. The identity was
+        dormant past the window and was NOT re-pended, because re-pending the
+        last active human administrator walks the container to zero active
+        admins by doing nothing and the first-login-only bootstrap seed
+        cannot re-fire. The event type is the one the re-pend would have
+        written and the outcome column says it did not happen, so a reader
+        keying on ``(event_type, outcome)`` -- the pair
+        ``ix_auth_events_type_outcome`` exists for -- cannot read this as a
+        disable. That is the shape available rather than the shape preferred:
+        ``AuthAuditEventType`` is closed and its CHECK is hand-written, so a
+        dedicated event type costs a Landscape epoch bump.
+
+        ``failure_category`` follows the auth-audit repository's own rule
+        that a business-rule refusal keeps its own category rather than being
+        filed as an authorization denial.
+
+        THIS ROW IS THE ONLY EVIDENCE THE EXEMPTION HAPPENED. Nothing changes
+        on the identity -- that is what an exemption is -- so an
+        administrator asking why a container still holds a dormant sole admin
+        has no other trace to read. It is written by the caller AFTER
+        ``ensure_identity`` returns rather than inside its transaction,
+        because there is no state change for a failed audit to roll back.
+        """
+        with self._open_landscape(AuthAuditOperation.IDENTITY_DORMANCY_EXEMPTED) as db:
+            RecorderFactory(db).auth_audit.record_auth_event(
+                event_type="identity_disabled",
+                outcome="failure",
+                provider=provider,
+                identity_id=identity_id,
+                user_id=username,
+                username=username,
+                failure_category="dormancy_last_admin_exempt",
+                request_id=None,
+                client_host=None,
+                user_agent=None,
+                metadata={
+                    "actor": "system",
+                    "cause": "dormant",
+                    "exemption": "last_active_human_admin",
+                    "last_login_at": last_login_at.isoformat(),
+                    "dormancy_days": dormancy_days,
+                },
+            )
+
     def record_logout(
         self,
         request: Request,
@@ -773,6 +920,7 @@ class AuthAuditRecorder:
         note: str,
         role: IdentityRole | None,
         role_id: str | None,
+        retained_roles: tuple[tuple[IdentityRole, str | None], ...],
         tokens_per_day: int | None,
         storage_bytes: int | None,
         on_behalf_of: str | None,
@@ -784,6 +932,21 @@ class AuthAuditRecorder:
         identity was admitted, this is the role it was admitted with, and
         this is its allowance. Invoked INSIDE the authority's transaction,
         so an activation this trail cannot hold does not commit.
+
+        ``retained_roles`` NAMES THE ACCESS THE ACTIVATION DID NOT GRANT, and
+        it exists because R9 made "no ``role_granted`` row" stop meaning "no
+        role". A dormancy re-pend leaves an identity's grants standing, so an
+        administrator re-admitting it with ``role="none"`` restores a
+        deployment ``admin`` while this method writes only the
+        ``identity_activated`` row -- a trail an auditor would read as an
+        admission with no authority. The roles go in the metadata of that row
+        rather than into ``role_granted`` rows of their own: those assert a
+        grant, and each of these already has one from the day it was made.
+
+        EACH ONE CARRIES ITS SCOPE. A deployment-wide ``admin`` and an
+        ``admin`` scoped to a single compartment are different authorities --
+        only the first satisfies ``_holds_deployment_admin`` -- and a bare
+        list of role names cannot tell an auditor which one came back.
         """
         provenance = _admin_provenance(
             request, actor_identity_id=actor_identity_id, on_behalf_of=on_behalf_of, console_request_id=console_request_id
@@ -798,7 +961,18 @@ class AuthAuditRecorder:
                 user_id=username,
                 username=username,
                 failure_category=None,
-                metadata={**provenance.metadata, "cause": cause, "note": _bounded_text(note)},
+                metadata={
+                    **provenance.metadata,
+                    "cause": cause,
+                    "note": _bounded_text(note),
+                    # A list of objects, not a joined string: ``canonical_json``
+                    # renders it losslessly and a reader querying the trail
+                    # should not have to split text to learn whether an
+                    # unscoped ``admin`` is in it. Empty for every activation
+                    # of a never-activated pending row, which is every
+                    # activation there was before R9.
+                    "retained_roles": [{"role": role_held, "scope": scope} for role_held, scope in retained_roles],
+                },
                 **provenance.request_columns,
             )
             if role is not None and role_id is not None:
