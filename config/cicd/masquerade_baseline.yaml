@@ -228,6 +228,18 @@ entries:
   classification: reflection-owned-table
   justification: Applies names from the closed owned CounterEffect.increments table
     to the owned ExecutionCounters accumulator; no external name is admitted.
+- path: src/elspeth/engine/orchestrator/heartbeat.py
+  qualname: _is_lock_contention
+  kind: getattr
+  occurrences: 2
+  probe_shapes:
+  - 9662cdf731d49b485260de6ecb0fd43f6f3bc44361a935a7a1bb264f961184ce
+  - ff1af9089d867d68ad5aee6c6e4bfcb133749ac7a7118bc8b48c51716c78bc80
+  classification: external-parse
+  justification: Reads optional sqlstate and pgcode fields from foreign DBAPI
+    exceptions to support both psycopg drivers without requiring PostgreSQL
+    dependencies on SQLite installations. Only exact string SQLSTATE values
+    55P03 and 40P01 admit contention; cancellation and malformed values refuse.
 - path: src/elspeth/engine/orchestrator/outcomes.py
   qualname: reconcile_sink_write_diversions
   kind: getattr

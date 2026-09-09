@@ -122,7 +122,9 @@ def _bound_heartbeat_statement_waits(conn: Connection) -> None:
     degradation and let its owner join the thread during shutdown.
     """
     if conn.dialect.name == "postgresql":
-        conn.exec_driver_sql("SET LOCAL lock_timeout = '5000ms'")
+        # A lock timeout must precede the whole-statement limit, otherwise
+        # PostgreSQL reports generic cancellation instead of lock contention.
+        conn.exec_driver_sql("SET LOCAL lock_timeout = '4000ms'")
         conn.exec_driver_sql("SET LOCAL statement_timeout = '5000ms'")
 
 

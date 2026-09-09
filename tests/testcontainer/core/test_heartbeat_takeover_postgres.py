@@ -10,6 +10,8 @@ from typing import Any
 
 import pytest
 from sqlalchemy import event, select
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError
 from tests.fixtures.landscape import expire_leader_seat
 from tests.helpers.postgres_target import postgres_test_target
 from tests.helpers.run_coordination import register_run_leader
@@ -18,7 +20,7 @@ from tests.testcontainer.core.test_run_coordination_release_postgres import _see
 from elspeth.contracts.coordination import CoordinationSnapshot, CoordinationToken, WorkerMembershipLost, mint_worker_id
 from elspeth.core.checkpoint.recovery import NonResumableRunError
 from elspeth.core.landscape.database import LandscapeDB
-from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository
+from elspeth.core.landscape.run_coordination_repository import RunCoordinationRepository, _bound_heartbeat_statement_waits
 from elspeth.core.landscape.schema import run_coordination_events_table, run_coordination_table, run_workers_table
 
 pytestmark = pytest.mark.testcontainer
@@ -144,13 +146,15 @@ def test_heartbeat_and_takeover_serialize_without_either_deadlock_victim(postgre
 
 
 @pytest.mark.timeout(45)
-def test_postgresql_blocked_heartbeat_returns_and_stop_completes(postgres_url: str) -> None:
+@pytest.mark.parametrize("driver", ["psycopg", "psycopg2"])
+def test_postgresql_blocked_heartbeat_returns_and_stop_completes(postgres_url: str, driver: str) -> None:
     """A real held seat lock cannot trap the heartbeat or its owner in join()."""
     from elspeth.engine.orchestrator.heartbeat import RunHeartbeatThread
 
-    db = LandscapeDB.from_url(postgres_url)
+    driver_url = make_url(postgres_url).set(drivername=f"postgresql+{driver}").render_as_string(hide_password=False)
+    db = LandscapeDB.from_url(driver_url)
     repo = RunCoordinationRepository(db.engine)
-    run_id = "heartbeat-bounded-stop"
+    run_id = f"heartbeat-bounded-stop-{driver}"
     _seed_run(db, run_id=run_id, now=datetime.now(UTC))
     token = register_run_leader(repo, run_id=run_id, worker_id=mint_worker_id(run_id), window_seconds=80)
     beat_pid: list[int] = []
@@ -190,6 +194,7 @@ def test_postgresql_blocked_heartbeat_returns_and_stop_completes(postgres_url: s
             stopper.start()
             assert stopped.wait(8), "heartbeat stop remained blocked behind a PostgreSQL row lock"
             assert errors == []
+            heartbeat.check_and_raise()
             assert heartbeat._consecutive_busy == 1
             with db.engine.connect() as observer:
                 recorded = (
@@ -281,3 +286,24 @@ def test_takeover_wins_before_old_heartbeat_and_refuses_the_evicted_member(postg
         event.remove(db.engine, "before_cursor_execute", before_sql)
         event.remove(db.engine, "after_cursor_execute", after_sql)
         db.close()
+
+
+@pytest.mark.timeout(20)
+def test_heartbeat_statement_timeout_without_lock_contention_remains_fatal(postgres_url: str) -> None:
+    """The earlier lock budget must not turn arbitrary statement delays into BUSY."""
+    from psycopg.errors import QueryCanceled
+
+    from elspeth.engine.orchestrator.heartbeat import _is_lock_contention
+
+    with LandscapeDB.from_url(postgres_url) as db:
+        with pytest.raises(OperationalError) as raised, db.engine.begin() as conn:
+            _bound_heartbeat_statement_waits(conn)
+            assert (
+                conn.exec_driver_sql(
+                    "SELECT current_setting('lock_timeout')::interval < current_setting('statement_timeout')::interval"
+                ).scalar_one()
+                is True
+            )
+            conn.exec_driver_sql("SELECT pg_sleep(10)")
+        assert isinstance(raised.value.orig, QueryCanceled)
+        assert not _is_lock_contention(raised.value)

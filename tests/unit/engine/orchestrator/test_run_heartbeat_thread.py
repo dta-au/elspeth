@@ -988,3 +988,25 @@ def test_stop_before_start_is_safe() -> None:
 def test_stop_timeout_requires_finite_positive_budget(timeout: float) -> None:
     with pytest.raises(ValueError, match="finite and positive"):
         RunHeartbeatThread(_StubRepo(), member_token=_TOKEN, stop_timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("sqlstate", ["55P03", "40P01", "57014"])
+def test_postgresql_sqlstate_distinguishes_contention_from_statement_cancellation(sqlstate: str) -> None:
+    """Real psycopg exception classes carry stable SQLSTATE independent of text."""
+    from psycopg.errors import lookup
+
+    repo = _StubRepo()
+    failure = OperationalError("UPDATE run_workers", None, lookup(sqlstate)("driver diagnostic"))
+    repo.side_effect = failure
+    thread = _make_thread(repo, degraded_threshold=1)
+    thread._step_beat()
+    if sqlstate in {"55P03", "40P01"}:
+        assert thread._consecutive_busy == 1
+        assert len(repo.record_heartbeat_degraded_calls) == 1
+        thread.check_and_raise()
+    else:
+        assert thread._consecutive_busy == 0
+        assert repo.record_heartbeat_degraded_calls == []
+        with pytest.raises(OperationalError) as raised:
+            thread.check_and_raise()
+        assert raised.value is failure
