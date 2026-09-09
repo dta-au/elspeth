@@ -252,3 +252,80 @@ def test_call_judge_codex_transport_uses_codex_default(monkeypatch: pytest.Monke
     assert response.model_id == DEFAULT_CODEX_JUDGE_MODEL
     command = captured["command"]
     assert command[command.index("--model") : command.index("--model") + 2] == ["--model", DEFAULT_CODEX_JUDGE_MODEL]
+
+
+# The affordances the tool-mode prompt MUST carry. A fourth adversarial review
+# (2026-09-09) changed one token — `_codex_prompt(request, tool_mode=False)` —
+# and produced a byte-identical argv, a still-registered MCP server, a shell
+# still enabled by the sandbox, and a judge that was simply never told any of
+# it existed. That reproduces the exact starvation `543066e17` was written to
+# cure, and NO argv assertion can ever detect it: the judge's sight is decided
+# by the prompt, not by the command line. Pinned here positively.
+_TOOL_MODE_PROMPT_AFFORDANCES = (
+    "TOOL-AUGMENTED INVESTIGATION MODE",
+    "read_file/grep_files/glob_files",
+    "your own shell tool works read-only",
+    "prefer `grep -n`",
+    "CITE WHAT YOU READ",
+)
+
+
+def _captured_prompt(monkeypatch: pytest.MonkeyPatch, *, tool_scope: AgentToolScope | None) -> str:
+    captured: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured["input"] = kwargs["input"]
+        return subprocess.CompletedProcess(command, 0, stdout=_jsonl(), stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _call_codex_cli(_request(), DEFAULT_CODEX_JUDGE_MODEL, 1024, tool_scope=tool_scope)
+    prompt = captured["input"]
+    assert isinstance(prompt, str)
+    return prompt
+
+
+def test_codex_tool_mode_prompt_tells_the_judge_it_can_investigate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tool mode must hand the judge its affordances, not just enable them.
+
+    Enabling the shell and registering the reader is not enough: a judge that
+    is not told it has tools does not use them, and the failure mode is a
+    BLOCK-PENDING that reads exactly like a bad rationale.
+    """
+    source_root = tmp_path / "src"
+    source_root.mkdir()
+    scope = AgentToolScope(allowed_roots=(source_root.resolve(),), cwd=source_root.resolve(), max_turns=5)
+
+    prompt = _captured_prompt(monkeypatch, tool_scope=scope)
+
+    missing = [marker for marker in _TOOL_MODE_PROMPT_AFFORDANCES if marker not in prompt]
+    assert missing == [], f"the tool-mode prompt no longer tells the judge it can investigate: {missing}"
+
+
+def test_codex_blinded_mode_prompt_carries_no_investigation_affordances(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The contrast that keeps the tool-mode pin from being vacuous.
+
+    If these markers were unconditional the sibling test above would pass even
+    with tool mode switched off, which is precisely the mutant it exists to
+    catch.
+    """
+    prompt = _captured_prompt(monkeypatch, tool_scope=None)
+
+    present = [marker for marker in _TOOL_MODE_PROMPT_AFFORDANCES if marker in prompt]
+    assert present == [], f"blinded mode must not advertise tools it does not have: {present}"
+
+
+def test_judge_investigation_budget_is_a_loop_guard_not_a_ration() -> None:
+    """The read budget is load-bearing and was pinned by nothing.
+
+    `543066e17` raised these because 24 calls at 400 lines starved the judge
+    into three consecutive false BLOCKs on a correct rationale ("could not read
+    the named pinning tests within the available investigation budget"). Every
+    test that builds an `AgentToolScope` passes `max_turns` explicitly, so the
+    default is never otherwise exercised — a silent revert to 24/400 would
+    restore the starvation with the whole suite green.
+    """
+    from elspeth_lints.core.judge import _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS
+    from elspeth_lints.mcp.codex_judge_tools import _MAX_READ_LINES
+
+    assert _AGENT_TOOL_MODE_DEFAULT_MAX_TURNS >= 200, "a judge that runs out of calls mid-investigation emits a false BLOCK"
+    assert _MAX_READ_LINES >= 2000, "400-line reads cost 8+ calls on a single 3000-line test file"
