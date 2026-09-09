@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from typing import Annotated, cast
 from uuid import UUID, uuid4
 
 import elspeth.contracts.errors as contract_errors
@@ -20,7 +21,7 @@ from elspeth.contracts.freeze import deep_thaw
 from elspeth.web.composer.audit import BufferingRecorder
 from elspeth.web.composer.pipeline_planner import GuidedPlannerDecline, PipelinePlannerError, PlannerOriginatingMessage
 from elspeth.web.composer.pipeline_proposal import PlannerSurface, PresentBase, composition_content_hash
-from elspeth.web.composer.progress import client_cancelled_progress_event
+from elspeth.web.composer.progress import ComposerRequestLease, client_cancelled_progress_event
 from elspeth.web.composer.proposals import build_tool_proposal_summary
 from elspeth.web.composer.protocol import ComposerPluginCrashError, ComposerServiceError
 from elspeth.web.composer.redaction import redact_tool_call_arguments
@@ -46,13 +47,14 @@ from elspeth.web.sessions.schemas import CompositionProposalResponse, GuidedPlan
 
 from .._helpers import (
     APIRouter,
-    ComposerRateLimiter,
     Depends,
     HTTPException,
     Request,
     SessionServiceProtocol,
     UserIdentity,
+    WebRateLimiter,
     _cancel_on_client_disconnect,
+    _composer_progress_sink,
     _failure_log_request_id,
     _get_composer_progress_registry,
     _get_session_compose_lock_registry,
@@ -61,6 +63,7 @@ from .._helpers import (
     _request_plugin_policy_context,
     _safe_frame_strings,
     _state_from_record,
+    _track_compose_inflight,
     _verify_session_ownership,
     get_current_user,
     get_rate_limiter,
@@ -307,8 +310,9 @@ async def post_guided_plan(
     session_id: UUID,
     body: GuidedPlanRequest,
     request: Request,
+    _inflight_tally: Annotated[None, Depends(_track_compose_inflight)],
     user: UserIdentity = Depends(get_current_user),  # noqa: B008
-    rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+    rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
 ) -> CompositionProposalResponse | GuidedPlanDeclinedResponse:
     """Plan and atomically stage one full guided proposal.
 
@@ -398,6 +402,7 @@ async def post_guided_plan(
         raise AuditIntegrityError("guided-full operation was not reserved")
     if not isinstance(reserved, GuidedOperationLease):
         await _get_composer_progress_registry(request).publish_replay_if_unclaimed(
+            lease=cast(ComposerRequestLease, request.state.composer_request_lease),
             session_id=str(session_id),
             request_id=body.operation_id,
             user_id=user.user_id,
@@ -408,7 +413,9 @@ async def post_guided_plan(
         return reserved
 
     recorder = BufferingRecorder()
-    progress = _get_composer_progress_registry(request).bind_request(
+    progress = await _composer_progress_sink(
+        _get_composer_progress_registry(request),
+        request,
         session_id=str(session_id),
         request_id=body.operation_id,
         user_id=user.user_id,

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, Any, ClassVar, Final, Literal, Self, TypeAliasType, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from elspeth.contracts import OPERATION_TYPE_VALUES, NodeStateStatus, Operation, OperationType, TerminalOutcome
 from elspeth.web.sessions.protocol import (
@@ -648,26 +648,21 @@ class RunEvent(_StrictResponse):
     event_type/data types crashes immediately (offensive programming).
     """
 
-    _event_sequence: int | None = PrivateAttr(default=None)
+    event_sequence: int | None = Field(default=None, ge=1, exclude_if=lambda value: value is None)
 
     run_id: str
     timestamp: datetime = Field(strict=False)
     # NOTE: Fast pipelines may produce identical timestamps.
-    # Event ordering is guaranteed by the asyncio.Queue FIFO, not by timestamp.
+    # Durable sequence defines replay order; timestamps need not be unique.
     # Frontend must NOT sort by timestamp — use arrival order instead.
     event_type: RunEventType
     data: ProgressData | ErrorData | CompletedData | CancelledData | FailedData
 
-    @property
-    def event_sequence(self) -> int | None:
-        """Internal durable replay cursor; never part of websocket JSON/schema."""
-        return self._event_sequence
-
     def with_event_sequence(self, sequence: int) -> Self:
-        if sequence < 1:
+        if type(sequence) is not int or sequence < 1:
             raise ValueError(f"event sequence must be >= 1, got {sequence}")
         clone = self.model_copy()
-        clone._event_sequence = sequence
+        clone.event_sequence = sequence
         return clone
 
     @field_validator("timestamp", mode="before")

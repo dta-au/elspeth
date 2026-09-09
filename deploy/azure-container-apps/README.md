@@ -11,9 +11,25 @@ the operator procedures are the three runbooks
 [existing-service redeploy](../../docs/runbooks/azure-container-apps-existing-service-redeploy.md),
 [full disposable acceptance](../../docs/runbooks/azure-container-apps-deployment.md)).
 
-> **Status.** Prepared before the first live run. Until the sanitized receipt
-> at `docs/operator/evidence/azure-container-apps/0.8.0.json` exists, this
-> bundle is a program under acceptance, not a support claim.
+> **Status.** Implemented; desktop acceptance closed `elspeth-5ec3befc1a` on
+> 2026-09-10 under the operator's desktop-analysis ruling. No live cloud
+> acceptance is claimed. A future operator run may produce the sanitized receipt
+> at `docs/operator/evidence/azure-container-apps/0.8.0.json`; that receipt is
+> no longer a tracker closure or documentation-promotion condition.
+
+The supported operating configuration is `Single` revision mode, `sticky`
+session affinity and 2–4 replicas, with one web process per replica. External
+PostgreSQL provides single-use tickets, durable run-event replay on authorized
+peer reconnect, renewable Composer request leases with saved progress and
+current inflight accounting, and shared budgets for auth, writes and
+Composer/execution work. An interrupted provider request is not automatically
+resumed. Dead-owner recovery does not provide transparent run handoff.
+
+Verification is limited to local PostgreSQL mechanism and integration evidence;
+no cloud receipt or no-affinity deployment qualification is claimed. The legacy
+v2 P4b receipt remains conservative `cannot_pass` with `owner_affine` and does
+not measure these new runtime capabilities. Receipt evolution is deferred;
+Single/sticky remains the operating configuration.
 
 ## Storage contract (stated once)
 
@@ -53,8 +69,8 @@ JSON from environment outputs, verified image digests and Key Vault version
 IDs. `scripts/validate-workload-parameters.jq` rejects placeholders before
 what-if. Redeployment reuses the retained file to preserve secret versions and
 configuration. `scripts/run-job.sh` waits on the exact newly started execution.
-The acceptance driver uses the landed probe facade; live evidence remains an
-operator-run acceptance requirement.
+The acceptance driver uses the landed probe facade; claiming live evidence
+requires an actual operator-run acceptance.
 
 The final `single-revision` stage deploys `r<sha12>-single` with `Single`
 revision mode, `sticky` affinity and exactly two replicas. Fresh P1 and P4a

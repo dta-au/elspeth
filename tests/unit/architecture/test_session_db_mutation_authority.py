@@ -76,6 +76,8 @@ class _NameBinding:
 
 
 _TABLE_POLICIES: tuple[TablePolicy, ...] = (
+    TablePolicy("composer_inflight_requests", "session", "SessionComposerProgressAuthority"),
+    TablePolicy("composer_progress_snapshots", "session", "SessionComposerProgressAuthority"),
     # ── Identity substrate and workflow governance (epoch 52,
     # elspeth-07cd19ba73) ────────────────────────────────────────────────
     #
@@ -244,6 +246,67 @@ _PROTECTED_LOGICAL_TABLES = {
 }
 
 _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
+    # ACA shared UI state and quota transactions; admit exact methods only.
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.begin_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.heartbeat_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.end_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.bind_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.publish",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.replay",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.clear",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.issue",
+        "SessionWebsocketTicketAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.consume",
+        "SessionWebsocketTicketAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "RateLimitAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority._cleanup",
+        "RateLimitAuthority",
+    ),
     AuthoritySymbol(
         "src/elspeth/web/sessions/service.py",
         "_SessionComposerMutations.create_composition_proposal",
@@ -795,6 +858,67 @@ _NAMED_AUTHORITY_SYMBOLS: tuple[AuthoritySymbol, ...] = (
 # Entries here are exact (not prefixes) and may only contain the acquisition;
 # returned, yielded, or forwarded raw connections remain violations.
 _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
+    # ACA shared UI state and quota transactions; admit exact methods only.
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.begin_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.heartbeat_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.end_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.bind_request",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.publish",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.replay",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.clear",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "SessionComposerProgressAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.issue",
+        "SessionWebsocketTicketAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.consume",
+        "SessionWebsocketTicketAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "RateLimitAuthority",
+    ),
+    AuthoritySymbol(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority._cleanup",
+        "RateLimitAuthority",
+    ),
     AuthoritySymbol(
         "src/elspeth/web/sessions/service.py",
         "_SessionComposerMutations.create_composition_proposal",
@@ -1018,6 +1142,317 @@ _CONTAINED_CONNECTION_AUTHORITIES: tuple[AuthoritySymbol, ...] = (
 # This manifest grows only after routing a site through its table-specific
 # typed authority.
 _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
+    # ACA durable progress, single-use tickets, and shared quota inventory.
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.begin_request",
+        "composer_inflight_requests",
+        "insert",
+        "4ad85d47154e036e",
+        1,
+        "SessionComposerProgressAuthority",
+        line=137,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "composer_inflight_requests",
+        "delete",
+        "cff974e39ece68c3",
+        1,
+        "SessionComposerProgressAuthority",
+        line=207,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "composer_progress_snapshots",
+        "delete",
+        "cff974e39ece68c3",
+        1,
+        "SessionComposerProgressAuthority",
+        line=236,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.heartbeat_request",
+        "composer_inflight_requests",
+        "update",
+        "e987be95118c2794",
+        1,
+        "SessionComposerProgressAuthority",
+        line=254,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.end_request",
+        "composer_inflight_requests",
+        "delete",
+        "32511df076237e41",
+        1,
+        "SessionComposerProgressAuthority",
+        line=273,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.bind_request",
+        "composer_progress_snapshots",
+        "delete",
+        "745594628ce42b72",
+        1,
+        "SessionComposerProgressAuthority",
+        line=301,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.bind_request",
+        "composer_progress_snapshots",
+        "insert",
+        "745594628ce42b72",
+        1,
+        "SessionComposerProgressAuthority",
+        line=304,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.publish",
+        "composer_progress_snapshots",
+        "update",
+        "a5318a055ad00abc",
+        1,
+        "SessionComposerProgressAuthority",
+        line=337,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.replay",
+        "composer_progress_snapshots",
+        "delete",
+        "f960e613f1930864",
+        1,
+        "SessionComposerProgressAuthority",
+        line=380,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.replay",
+        "composer_progress_snapshots",
+        "insert",
+        "f960e613f1930864",
+        1,
+        "SessionComposerProgressAuthority",
+        line=382,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.clear",
+        "composer_progress_snapshots",
+        "delete",
+        "59b6538fa544a381",
+        1,
+        "SessionComposerProgressAuthority",
+        line=462,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.begin_request",
+        "<sessions-write-connection>",
+        "write_connection",
+        "0970c41df2c893f4",
+        1,
+        "SessionComposerProgressAuthority",
+        line=130,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "<sessions-write-connection>",
+        "write_connection",
+        "1a7fde8586e34193",
+        1,
+        "SessionComposerProgressAuthority",
+        line=175,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.heartbeat_request",
+        "<sessions-write-connection>",
+        "write_connection",
+        "28000fbb556443a1",
+        1,
+        "SessionComposerProgressAuthority",
+        line=247,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.end_request",
+        "<sessions-write-connection>",
+        "write_connection",
+        "49b50c96c1b65cdd",
+        1,
+        "SessionComposerProgressAuthority",
+        line=270,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.bind_request",
+        "<sessions-write-connection>",
+        "write_connection",
+        "247a9b64e0be2e7c",
+        1,
+        "SessionComposerProgressAuthority",
+        line=283,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.publish",
+        "<sessions-write-connection>",
+        "write_connection",
+        "9e0d21fed1fa215d",
+        1,
+        "SessionComposerProgressAuthority",
+        line=318,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.replay",
+        "<sessions-write-connection>",
+        "write_connection",
+        "db9a62751aba5a78",
+        1,
+        "SessionComposerProgressAuthority",
+        line=352,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.clear",
+        "<sessions-write-connection>",
+        "write_connection",
+        "770cf5c272f1e629",
+        1,
+        "SessionComposerProgressAuthority",
+        line=449,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.cleanup_expired",
+        "<sessions-write-connection>",
+        "write_connection",
+        "b490446f42f62c40",
+        1,
+        "SessionComposerProgressAuthority",
+        line=157,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority._cleanup",
+        "rate_limit_buckets",
+        "delete",
+        "42def2e7bc101d58",
+        1,
+        "RateLimitAuthority",
+        line=72,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "rate_limit_buckets",
+        "upsert",
+        "d8227c1fcb690216",
+        1,
+        "RateLimitAuthority",
+        line=88,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "rate_limit_events",
+        "delete",
+        "d8227c1fcb690216",
+        1,
+        "RateLimitAuthority",
+        line=108,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "rate_limit_events",
+        "insert",
+        "d8227c1fcb690216",
+        1,
+        "RateLimitAuthority",
+        line=123,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "rate_limit_buckets",
+        "update",
+        "d8227c1fcb690216",
+        1,
+        "RateLimitAuthority",
+        line=126,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority._cleanup",
+        "<sessions-write-connection>",
+        "write_connection",
+        "1d8ca636fac4a167",
+        1,
+        "RateLimitAuthority",
+        line=57,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "RepositoryRateLimitAuthority.admit",
+        "<sessions-write-connection>",
+        "write_connection",
+        "242a081fdde02292",
+        1,
+        "RateLimitAuthority",
+        line=85,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.issue",
+        "websocket_tickets",
+        "insert",
+        "11c7fb8c2c2dc4fb",
+        1,
+        "SessionWebsocketTicketAuthority",
+        line=66,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.consume",
+        "websocket_tickets",
+        "update",
+        "31f1a490d7ce950a",
+        1,
+        "SessionWebsocketTicketAuthority",
+        line=102,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.issue",
+        "<sessions-write-connection>",
+        "write_connection",
+        "d8e3f5f9f04778ef",
+        1,
+        "SessionWebsocketTicketAuthority",
+        line=43,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "RepositorySessionWebsocketTicketAuthority.consume",
+        "<sessions-write-connection>",
+        "write_connection",
+        "2800de4920eabca2",
+        1,
+        "SessionWebsocketTicketAuthority",
+        line=82,
+    ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
         "BlobServiceImpl._cleanup_blobs_for_fork_sync",
@@ -3177,7 +3612,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "730473cf9d5628ab",
         1,
         "SessionSchemaAuthority",
-        line=268,
+        line=270,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -3187,7 +3622,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         1,
         "SessionSchemaAuthority",
-        line=286,
+        line=288,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -3197,7 +3632,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "ae6f27adb45e82ea",
         2,
         "SessionSchemaAuthority",
-        line=287,
+        line=289,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -3207,7 +3642,7 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
         "dc1da0e98009a36e",
         1,
         "SessionSchemaAuthority",
-        line=290,
+        line=292,
     ),
     # src/elspeth/web/sessions/dead_site_supersession.py :: SessionInterpretationAuthority
     WriterIdentity(
@@ -3238,6 +3673,37 @@ _REVIEWED_WRITERS: tuple[WriterIdentity, ...] = (
 # separate from the writer manifest: any fingerprint, multiplicity, or symbol
 # drift reopens review, and any DML added beside them is independently caught.
 _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
+    # ACA durable progress, single-use tickets, and shared quota inventory.
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.get_latest",
+        "<sessions-write-connection>",
+        "write_connection",
+        "acf458976b692a73",
+        1,
+        None,
+        line=396,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "SessionComposerProgressAuthority.list_active",
+        "<sessions-write-connection>",
+        "write_connection",
+        "0e1f5f4e34408b2d",
+        1,
+        None,
+        line=416,
+    ),
+    WriterIdentity(
+        "src/elspeth/web/execution/run_progress_reader.py",
+        "RepositoryRunProgressReader.read_after",
+        "<sessions-write-connection>",
+        "write_connection",
+        "f035cfe99ca1d247",
+        1,
+        None,
+        line=30,
+    ),
     WriterIdentity(
         "src/elspeth/web/blobs/service.py",
         "publish_inline_custody_publication",
@@ -3659,7 +4125,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "d7ac5811a7ee7916",
         1,
         "SessionSchemaAuthority",
-        line=303,
+        line=305,
     ),
     WriterIdentity(
         "src/elspeth/web/sessions/schema.py",
@@ -3669,7 +4135,7 @@ _REVIEWED_READ_CONNECTIONS: tuple[WriterIdentity, ...] = (
         "23a842a553f2f5b5",
         1,
         "SessionSchemaAuthority",
-        line=416,
+        line=418,
     ),
     # src/elspeth/web/sessions/service.py (read-only blocks, family R)
     WriterIdentity(
@@ -7365,6 +7831,20 @@ class _ProductionWriterCollector(ast.NodeVisitor):
                 if expression.args and isinstance(expression.args[0], ast.Constant) and isinstance(expression.args[0].value, str):
                     return _raw_sql_is_obviously_read_only(expression.args[0].value)
                 return False
+            if isinstance(func, ast.Attribute) and func.attr in {
+                "union",
+                "union_all",
+                "intersect",
+                "intersect_all",
+                "except_",
+                "except_all",
+            }:
+                return (
+                    bool(expression.args)
+                    and not expression.keywords
+                    and self._is_obviously_read_only_statement(func.value, use=use, visited=visited)
+                    and all(self._is_obviously_read_only_statement(arg, use=use, visited=visited) for arg in expression.args)
+                )
             if isinstance(func, ast.Attribute) and func.attr in _TRANSPARENT_SQLALCHEMY_STATEMENT_METHODS:
                 return self._is_obviously_read_only_statement(func.value, use=use, visited=visited)
             return self._private_helper_returns_only_read_only_statements(expression, visited=visited)
@@ -7527,14 +8007,15 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         return values.pop() if len(values) == 1 else None
 
     def _self_attribute_module_constant_texts(self, attribute: ast.Attribute, *, use: ast.AST) -> list[str] | None:
-        """The string constants ``self.<attr>`` can hold, when that is provable from this module alone.
+        """The string constants ``self.<attr>`` can hold in a literal module dictionary.
 
         Admitted shape, and nothing wider: ``use`` sits in an instance method;
         the enclosing class assigns the attribute EXACTLY once anywhere in its
         body, as ``self.<attr> = NAME[...]``; ``NAME`` is bound exactly once at
         module level to a dict display whose every value is a string literal.
         The dialect-keyed clock SQL of the Sessions authorities is this shape.
-        Anything else -- an import, a second assignment, a ``.get``, a computed
+        One plain import from an inspectable ``elspeth`` module is also resolved.
+        Anything else -- an unresolved import, a second assignment, a ``.get``, a computed
         value, a non-literal entry -- returns ``None`` and the statement stays
         unresolved.  This is the only way an attribute-held statement becomes
         visible to the manifest; before it, a DELETE behind ``self._clock_sql``
@@ -7580,11 +8061,79 @@ class _ProductionWriterCollector(ast.NodeVisitor):
         bound = assignments[0]
         if not (isinstance(bound, ast.Subscript) and isinstance(bound.value, ast.Name)):
             return None
+        constant_tree = self.tree
+        constant_name = bound.value.id
+        reaching, complete, scope = self._visible_reaching_bindings(bound, constant_name)
+        imported = [binding for binding in reaching if binding.imported is not None]
+        if imported:
+            if not complete or not isinstance(scope, ast.Module) or len(reaching) != 1:
+                return None
+            qualified = imported[0].imported
+            if qualified is None or not qualified.startswith("elspeth."):
+                return None
+            module, _, constant_name = qualified.rpartition(".")
+            # Module aliases and second aliases of this mutable dictionary
+            # defeat a direct-name use census. Keep those forms opaque.
+            for node in ast.walk(self.tree):
+                if isinstance(node, ast.Import) and any(
+                    alias.name == module or module.startswith(alias.name + ".") for alias in node.names
+                ):
+                    return None
+                if isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        return None
+                    for alias in node.names:
+                        imported_name = f"{node.module}.{alias.name}"
+                        if imported_name == module or module.startswith(imported_name + "."):
+                            return None
+                        if imported_name == qualified and (alias.asname or alias.name) != bound.value.id:
+                            return None
+            peer = self._peer_collector(f"src/{module.replace('.', '/')}.py")
+            if peer is None:
+                return None
+            constant_tree = peer.tree
+            for node in ast.walk(constant_tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+                    (alias.asname or (alias.name.split(".")[0] if isinstance(node, ast.Import) else alias.name)) == constant_name
+                    or alias.name == "*"
+                    for alias in node.names
+                ):
+                    return None
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == constant_name:
+                    return None
+                if isinstance(node, (ast.MatchAs, ast.MatchStar, ast.ExceptHandler)) and node.name == constant_name:
+                    return None
+                if isinstance(node, ast.MatchMapping) and node.rest == constant_name:
+                    return None
+            # The imported object must remain a single literal binding in its
+            # defining module; mutation/rebinding reopens opaque SQL review.
+            uses = [node for node in ast.walk(constant_tree) if isinstance(node, ast.Name) and node.id == constant_name]
+            if sum(isinstance(node.ctx, ast.Store) for node in uses) != 1:
+                return None
+            for name_use in uses:
+                parent = _parent_node(name_use)
+                if isinstance(name_use.ctx, ast.Store):
+                    if not (
+                        (isinstance(parent, ast.Assign) and len(parent.targets) == 1 and parent.targets[0] is name_use)
+                        or (isinstance(parent, ast.AnnAssign) and parent.target is name_use)
+                    ):
+                        return None
+                    continue
+                if not (isinstance(parent, ast.Compare) or (isinstance(parent, ast.Subscript) and isinstance(parent.ctx, ast.Load))):
+                    return None
+            for name_use in ast.walk(self.tree):
+                if not isinstance(name_use, ast.Name) or name_use.id != bound.value.id:
+                    continue
+                parent = _parent_node(name_use)
+                if isinstance(name_use.ctx, (ast.Store, ast.Del)):
+                    return None
+                if not (isinstance(parent, ast.Compare) or (isinstance(parent, ast.Subscript) and isinstance(parent.ctx, ast.Load))):
+                    return None
         module_bindings = [
             node.value
-            for node in self.tree.body
-            if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == bound.value.id for t in node.targets))
-            or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == bound.value.id)
+            for node in constant_tree.body
+            if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == constant_name for t in node.targets))
+            or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.target.id == constant_name)
         ]
         if len(module_bindings) != 1 or not isinstance(module_bindings[0], ast.Dict):
             return None
@@ -9783,6 +10332,35 @@ def test_user_preference_authority_is_exact_contained_and_complete() -> None:
     assert not [site for site in live if site.symbol.startswith("RepositoryUserPreferenceAuthority")]
 
 
+def test_aca_shared_surfaces_are_exact_contained_and_fail_closed() -> None:
+    root = _repo_root()
+    paths = {
+        "src/elspeth/web/coordination/websocket_ticket_authority.py",
+        "src/elspeth/web/coordination/composer_progress_authority.py",
+        "src/elspeth/web/coordination/rate_limit_authority.py",
+        "src/elspeth/web/execution/run_progress_reader.py",
+    }
+    live = scan_production_writers([root / path for path in sorted(paths)], anchor=root)
+    reviewed = [site for site in (*_REVIEWED_WRITERS, *_REVIEWED_READ_CONNECTIONS) if site.path in paths]
+    assert inventory_drift(live, reviewed) == ([], [])
+    assert not [site for site in live if site.connection_escape or site.table == "<unresolved-session-write>"]
+    mutations = [site for site in live if site.operation != "write_connection"]
+    assert authority_policy_violations(mutations, _TABLE_POLICIES) == ([], [])
+    assert {site.table for site in mutations} == {
+        "websocket_tickets",
+        "composer_inflight_requests",
+        "composer_progress_snapshots",
+        "rate_limit_buckets",
+        "rate_limit_events",
+    }
+    for binding in _NAMED_AUTHORITY_SYMBOLS:
+        if binding.path in paths:
+            assert _authority_for(binding.path, binding.symbol_prefix + "_replacement") is None
+            assert _authority_for(binding.path, binding.symbol_prefix.rpartition(".")[0] + ".future_method") is None
+    read_connections = [site for site in _REVIEWED_READ_CONNECTIONS if site.path in paths]
+    assert reviewed_read_connection_policy_violations(read_connections) == []
+
+
 def test_named_authority_registry_is_explicit_extensible_and_exact() -> None:
     path = "src/elspeth/web/coordination/repository.py"
     session_service_path = "src/elspeth/web/sessions/service.py"
@@ -11733,6 +12311,67 @@ def test_explicit_lock_table_is_a_lock_acquisition_and_every_loosened_form_is_un
     assert Counter((site.symbol, site.table, site.operation) for site in sites if site.operation == "raw_delete_from") == Counter(
         {("second_statement", "identity_roles", "raw_delete_from"): 1}
     )
+
+
+@pytest.mark.parametrize(
+    ("definition", "consumer_change", "opaque"),
+    [
+        ('CLOCK = {"pg": "SELECT clock_timestamp()"}', "", False),
+        ('CLOCK = {"pg": "DELETE FROM identities"}', "", True),
+        ('CLOCK = {"pg": unknown}', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nCLOCK = {"pg": "SELECT 2"}', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nCLOCK["pg"] = unknown', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nalias = CLOCK', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nchange(CLOCK)', "", True),
+        ('CLOCK = alias = {"pg": "SELECT 1"}\nalias["pg"] = "DELETE FROM identities"', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nfrom elsewhere import CLOCK', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nfrom elsewhere import alternate as CLOCK', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nfrom elsewhere import *', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nmatch unknown:\n    case CLOCK: pass', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nmatch unknown:\n    case [*CLOCK]: pass', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\nmatch unknown:\n    case {**CLOCK}: pass', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}\ntry: pass\nexcept Exception as CLOCK: pass', "", True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'CLOCK.update({"pg": unknown})', True),
+        ('CLOCK = {"pg": "SELECT 1"}', "alias = CLOCK", True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'import elspeth.clock_values as clock\nclock.CLOCK["pg"] = unknown', True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'from elspeth import clock_values as clock\nclock.CLOCK["pg"] = unknown', True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'from elspeth.clock_values import CLOCK as alias\nalias["pg"] = unknown', True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'from . import clock_values as clock\nclock.CLOCK["pg"] = unknown', True),
+        ('CLOCK = {"pg": "SELECT 1"}', 'from .clock_values import CLOCK as alias\nalias["pg"] = unknown', True),
+    ],
+)
+def test_imported_literal_clock_dictionary_is_inspected_without_hiding_writes(
+    tmp_path: Path, definition: str, consumer_change: str, opaque: bool
+) -> None:
+    module = tmp_path / "src/elspeth/clock_values.py"
+    module.parent.mkdir(parents=True)
+    module.write_text(definition + "\n")
+    source = tmp_path / "consumer.py"
+    source.write_text(
+        "from elspeth.clock_values import CLOCK\n" + consumer_change + "\nclass Authority:\n"
+        "    def __init__(self, dialect):\n"
+        "        self._clock_sql = CLOCK[dialect]\n"
+        "    def read(self, conn):\n"
+        "        conn.exec_driver_sql(self._clock_sql)\n"
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    assert bool([site for site in sites if site.operation == "unknown_exec_driver_sql"]) is opaque
+
+
+@pytest.mark.parametrize("second", ["select(identities_table)", "delete(identities_table)", "unknown"])
+def test_read_only_union_requires_every_branch_to_be_read_only(tmp_path: Path, second: str) -> None:
+    source = tmp_path / "union_query.py"
+    source.write_text(
+        "from sqlalchemy import select, delete\n"
+        "from elspeth.web.sessions.models import identities_table\n"
+        "def inspect_rows(conn):\n"
+        f"    conn.execute(select(identities_table).union({second}).limit(100))\n"
+    )
+    sites = scan_production_writers([source], anchor=tmp_path)
+    if second.startswith("select"):
+        assert sites == []
+    else:
+        assert any(site.table == "<unresolved-session-write>" for site in sites)
 
 
 def test_self_attribute_bound_once_from_a_module_dict_of_literals_is_classified_by_its_texts(tmp_path: Path) -> None:

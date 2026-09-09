@@ -271,7 +271,15 @@ def test_runbooks_cite_the_measured_facts_and_the_bundle_and_declare_their_statu
         assert "deploy/azure-container-apps" in text, runbook.name
         assert RECEIPT_PATH in text, runbook.name
         assert "**Status.**" in text, runbook.name
-        assert "not a support claim" in " ".join(text.split()), runbook.name
+        normalized = " ".join(text.replace("> ", "").split())
+        assert "desktop acceptance" in normalized, runbook.name
+        assert "closed on 2026-09-10" in normalized, runbook.name
+        assert "No live cloud acceptance is claimed" in normalized, runbook.name
+        assert "durable run-event replay" in normalized, runbook.name
+        assert "shared budgets" in normalized, runbook.name
+        assert "interrupted provider request is not automatically resumed" in normalized, runbook.name
+        assert "reconnect" in normalized, runbook.name
+        assert "not a support claim" not in normalized, runbook.name
         assert "**LIVE" in text, runbook.name
 
 
@@ -652,11 +660,24 @@ def test_secret_rotation_cites_the_key_derivation_authority() -> None:
 
 def test_receipt_vocabulary_is_closed_and_named() -> None:
     text = _text(ACCEPTANCE_RUNBOOK)
-    receipt = " ".join(text[text.index("## Receipt and docs flip") :].split())
+    receipt = " ".join(text[text.index("## Receipt from an operator-run acceptance") :].split())
     for kind in CHECK_KINDS:
         assert f"`{kind}`" in receipt, kind
-    assert "in **one commit**" in receipt
-    assert "the bar is a second clean run end to end" in receipt
+    assert "only after the live procedure completes" in receipt
+    assert "not prerequisites to closing `elspeth-5ec3befc1a`" in receipt
+    assert "Never create a receipt from desktop analysis" in receipt
+    assert "legacy v2 P4b" in text
+    assert "does not measure the new runtime capabilities" in " ".join(text.split())
+
+
+def test_package_documents_v3_deferral_without_erasing_future_triggers() -> None:
+    path = REPO_ROOT / "src/elspeth/web/_azure_container_apps_acceptance/README.md"
+    text = " ".join(_text(path).split())
+    assert "0.8.1 disposition (2026-09-10): explicitly defer v3 implementation" in text
+    assert "changes neither the receipt envelope nor the provider set" in text
+    assert "third acceptance provider" in text
+    assert "compatibility-record field set" in text
+    assert "both provider regression suites" in text
 
 
 def test_testcontainer_run_is_recorded_with_the_ci_selection_and_gated() -> None:
@@ -697,6 +718,10 @@ def test_skill_mirrors_the_ecs_layout_and_worktree_guidance() -> None:
     assert SKILL_SYMLINK.resolve() == SKILL_DIR.resolve()
 
     skill = _text(SKILL_DIR / "SKILL.md")
+    status = " ".join(skill.replace("> ", "").split())
+    assert "desktop acceptance" in status
+    assert "No live cloud acceptance is claimed" in status
+    assert "PostgreSQL progress and shared budgets" in status
     frontmatter = yaml.safe_load(skill.split("---\n")[1])
     assert frontmatter["name"] == "operating-azure-container-apps"
     assert "Do not use for AWS ECS" in " ".join(frontmatter["description"].split())

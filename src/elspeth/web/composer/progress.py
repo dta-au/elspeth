@@ -19,8 +19,10 @@ references tool names from ``elspeth.web.composer.tools``.
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Literal
+from uuid import uuid4
 
 from elspeth.contracts.composer_progress import (
     NON_TERMINAL_PROGRESS_PHASES,
@@ -41,6 +43,15 @@ __all__ = [
     "tool_completed_progress_event",
     "tool_started_progress_event",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class ComposerRequestLease:
+    """Server-owned identity of exactly one HTTP request lifecycle."""
+
+    request_token: str
+    session_id: str
+    user_id: str
 
 
 class ComposerProgressSnapshot(ComposerProgressEvent):
@@ -81,7 +92,41 @@ class ComposerProgressRegistry:
         self._inflight: dict[str, int] = {}
         self._request_generations: dict[str, int] = {}
         self._next_request_generation = 0
+        self._leases: dict[str, ComposerRequestLease] = {}
         self._lock = threading.Lock()
+
+    async def start_request(self, session_id: str, user_id: str) -> ComposerRequestLease:
+        lease = ComposerRequestLease(str(uuid4()), session_id, user_id)
+        with self._lock:
+            self._leases[lease.request_token] = lease
+            self._user_index[session_id] = user_id
+        self.begin_request(session_id)
+        return lease
+
+    async def renew_request(self, lease: ComposerRequestLease) -> None:
+        with self._lock:
+            if self._leases[lease.request_token] != lease:
+                raise RuntimeError("Composer request lease mismatch")
+
+    async def finish_request(self, lease: ComposerRequestLease) -> None:
+        with self._lock:
+            if self._leases[lease.request_token] != lease:
+                raise RuntimeError("Composer request lease mismatch")
+            del self._leases[lease.request_token]
+        self.end_request(lease.session_id)
+
+    async def claim_request(
+        self,
+        *,
+        session_id: str,
+        request_id: str | None,
+        user_id: str,
+        lease: ComposerRequestLease,
+    ) -> ComposerProgressSink:
+        if lease.session_id != session_id or lease.user_id != user_id:
+            raise RuntimeError("Composer request lease ownership mismatch")
+        await self.renew_request(lease)
+        return self.bind_request(session_id=session_id, request_id=request_id, user_id=user_id)
 
     def begin_request(self, session_id: str) -> None:
         """Count one compose request as in flight for ``session_id``.
@@ -130,6 +175,7 @@ class ComposerProgressRegistry:
     async def publish_replay_if_unclaimed(
         self,
         *,
+        lease: ComposerRequestLease | None = None,
         session_id: str,
         request_id: str,
         user_id: str,
@@ -212,7 +258,7 @@ class ComposerProgressRegistry:
         self._user_index[session_id] = user_id
         return snapshot
 
-    async def get_latest(self, session_id: str) -> ComposerProgressSnapshot:
+    async def get_latest(self, session_id: str, user_id: str | None = None) -> ComposerProgressSnapshot:
         """Return latest progress or a neutral idle snapshot.
 
         The snapshot is enriched with the CURRENT in-flight request count —
@@ -237,12 +283,11 @@ class ComposerProgressRegistry:
         return snapshot.model_copy(update={"inflight_requests": inflight})
 
     async def list_active(self, *, user_id: str) -> tuple[ComposerProgressSnapshot, ...]:
-        """Return non-terminal snapshots for one user's sessions.
+        """Return working snapshots and queued requests for one user's sessions.
 
-        "Non-terminal" means the composer is still working (starting,
-        calling_model, using_tools, validating, saving). Snapshots whose
-        phase is idle/complete/failed/cancelled are excluded — those
-        sessions are no longer in flight.
+        A live request remains active before its first publication and while
+        the prior snapshot is terminal. Non-terminal legacy publications also
+        remain visible for the process-local adapter.
 
         Filtered by ``user_id`` against the internal user index so a
         caller cannot enumerate other users' sessions even if they hold
@@ -259,12 +304,14 @@ class ComposerProgressRegistry:
         with self._lock:
             owned = (
                 self._with_live_inflight(sid, snap)
-                for sid, snap in self._snapshots.items()
-                if self._user_index[sid] == user_id and snap.phase in NON_TERMINAL_PROGRESS_PHASES
+                for sid in self._snapshots.keys() | self._inflight.keys()
+                if sid in self._user_index and self._user_index[sid] == user_id
+                for snap in [self._snapshots[sid] if sid in self._snapshots else _idle_snapshot(sid)]
+                if snap.phase in NON_TERMINAL_PROGRESS_PHASES or sid in self._inflight
             )
             return tuple(sorted(owned, key=lambda snap: snap.updated_at))
 
-    async def clear(self, session_id: str) -> None:
+    async def clear(self, session_id: str, user_id: str | None = None) -> None:
         """Remove a session snapshot and its user-index entry.
 
         Idempotent — clear() is called from session archival regardless of

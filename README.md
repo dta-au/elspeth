@@ -164,9 +164,11 @@ Composer authoring, trust boundaries, and committed blob cleanup.
   Docker Compose/PostgreSQL and native Linux systemd bundles, retains the AWS
   ECS acceptance controller, and packages the Web Composer in a pinned,
   non-root container image. The Azure Container Apps Bicep bundle ships in
-  `deploy/azure-container-apps/` with its receipts, replica-count probes and
-  runbooks; its replica > 1 live acceptance is an operator-run step on dev
-  hardware, and the support claim waits for that receipt.
+  `deploy/azure-container-apps/` with receipt validators, replica-count probes
+  and runbooks. Its Single/sticky configuration received desktop acceptance
+  on 2026-09-10; live cloud acceptance is not claimed. PostgreSQL supplies
+  durable progress, single-use tickets and shared budgets, with the verified
+  scope and limits in [Deployment Platforms](docs/reference/deployment-platforms.md).
 - **Committed blob deletion is recoverable.** Durable cleanup state remains
   until both the staged unlink and parent-directory fsync succeed, so restart
   recovery does not retain unaccounted files.
@@ -598,10 +600,14 @@ Current 0.8.0 behaviour:
 - A run can be driven by a single process or by a leader plus claim-only
   followers across multiple processes on one host (`elspeth join`), backed by
   one write-ahead logging (WAL) SQLite audit database.
-- Maintained web deployment profiles run one process or replica. Cross-instance
-  web coordination remains deferred; production Compose, AWS ECS, Azure VM, and
-  Kubernetes BYO deployments use external PostgreSQL where the deployment
-  contract requires it.
+- Maintained web deployment profiles run one process per replica. ACA uses
+  Single/sticky routing with PostgreSQL membership and session fencing;
+  durable run-event replay, renewable Composer inflight accounting and shared
+  budgets work across replicas. Interrupted provider requests are not
+  automatically resumed, and dead-owner recovery does not imply transparent
+  run handoff. Other maintained targets retain one replica and
+  stop-before-start replacement. Production deployments use external PostgreSQL
+  where the deployment contract requires it.
 - Each web process serves all blocking work from one shared 16-thread worker
   pool with bounded, fail-fast admission; the pool is not yet partitioned by
   purpose (see [Web worker pool capacity](#web-worker-pool-capacity)).

@@ -801,6 +801,7 @@ export interface Run {
  * - "failed" -- terminal. Pipeline aborted due to an unrecoverable error.
  */
 export interface RunEvent {
+  event_sequence?: number;
   run_id: string;
   timestamp: string;
   event_type: "progress" | "error" | "completed" | "cancelled" | "failed";

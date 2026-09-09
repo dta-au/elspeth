@@ -3141,9 +3141,12 @@ class TestValidationErrorRedaction:
     def test_sessions_message_route_redacts_input(self, tmp_path) -> None:
         """POST to a session message route with invalid body must not echo content."""
         client = self._authed_client(tmp_path)
+        created = client.post("/api/sessions", json={"title": "Validation redaction"})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
         # Send a message with state_id as a non-UUID string — triggers 422
         resp = client.post(
-            "/api/sessions/00000000-0000-0000-0000-000000000000/messages",
+            f"/api/sessions/{session_id}/messages",
             json={"content": "leaked-password-value", "state_id": "not-a-uuid"},
         )
         assert resp.status_code == 422

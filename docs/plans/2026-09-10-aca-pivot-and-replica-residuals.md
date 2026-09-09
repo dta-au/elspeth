@@ -100,7 +100,7 @@ verdict. Preserve them while extending the runtime.
 
 **Done when:** the named pages agree about desktop acceptance and runtime
 limitations, and their contract tests pass. No cloud deployment is required.
-This follow-up is outside the current `docs/plans` edit scope.
+The subsequent instruction to execute this plan authorizes this follow-up.
 
 ## B. Durable run admission, handoff and cancellation
 
@@ -203,10 +203,10 @@ and auth, write and Composer routes select the shared adapter consistently.
 
 The v3 trigger in `_azure_container_apps_acceptance/README.md` includes
 **0.8.1 planning**, and this checkout is already on that release branch.
-Record an explicit disposition now: this ACA reconciliation **proposes deferring
-v3 implementation** because it changes neither the receipt envelope nor the
-provider set. This proposal does not erase the trigger or constitute operator
-ratification. Revisit it before a third provider or envelope/compatibility-field
+The instruction to execute this plan adopts its explicit disposition:
+**defer v3 implementation** because this work changes neither the receipt
+envelope nor the provider set. This does not erase the trigger. Revisit it
+before a third provider or envelope/compatibility-field
 change; implement the shared contract once, with both provider regression suites.
 
 For that work inspect `src/elspeth/web/_acceptance_common/`,

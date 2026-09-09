@@ -81,6 +81,7 @@ from elspeth.web.composer.tutorial_abandon_routes import create_tutorial_abandon
 from elspeth.web.composer.tutorial_run_routes import create_tutorial_run_router
 from elspeth.web.config import WebSettings, _allow_insecure_test_keys, settings_from_env
 from elspeth.web.coordination.audit_access_log_authority import RepositoryAuditAccessLogAuthority
+from elspeth.web.coordination.composer_progress_authority import DatabaseComposerProgressRegistry, SessionComposerProgressAuthority
 from elspeth.web.coordination.identity_authority import (
     IdentityRebound,
     IdentityRetired,
@@ -96,13 +97,16 @@ from elspeth.web.coordination.membership_lifecycle import (
     SingleProcessWebInstanceMembership,
     WebInstanceMembership,
 )
+from elspeth.web.coordination.rate_limit_authority import RepositoryRateLimitAuthority
 from elspeth.web.coordination.repository import PostgresSessionOperationRepository
 from elspeth.web.coordination.sqlite_authority import SQLiteLocalSessionOperationAuthority
+from elspeth.web.coordination.websocket_ticket_authority import RepositorySessionWebsocketTicketAuthority
 from elspeth.web.dependencies import create_catalog_service
 from elspeth.web.deployment_contract import resolve_deployment_state_mode
 from elspeth.web.deployment_profiles import deployment_startup_profile, read_platform_identity, resolve_instance_id
 from elspeth.web.execution.progress import ProgressBroadcaster
 from elspeth.web.execution.routes import create_execution_router
+from elspeth.web.execution.run_progress_reader import RepositoryRunProgressReader
 from elspeth.web.execution.runtime_preflight import RuntimePreflightCoordinator
 from elspeth.web.execution.service import ExecutionServiceImpl
 from elspeth.web.execution.validation import validate_pipeline
@@ -115,7 +119,7 @@ from elspeth.web.key_derivation import (
 )
 from elspeth.web.landscape_access import open_landscape_db
 from elspeth.web.middleware.instance_identity import InstanceIdentityMiddleware
-from elspeth.web.middleware.rate_limit import ComposerRateLimiter
+from elspeth.web.middleware.rate_limit import ComposerRateLimiter, SharedRateLimiter
 from elspeth.web.middleware.request_id import RequestIdMiddleware
 from elspeth.web.operator_telemetry import bootstrap_operator_telemetry
 from elspeth.web.preferences.routes import create_preferences_router
@@ -1656,32 +1660,37 @@ def _create_app(
         operator_profile_registry=app.state.operator_profile_registry,
     )
     app.state.composer_availability = app.state.composer_service.get_availability()
-    app.state.composer_progress_registry = ComposerProgressRegistry()
-    app.state.websocket_ticket_store = WebSocketTicketStore()
-
-    # --- Rate limiter (per-process in-memory) ---
-    # ComposerRateLimiter is safe to construct in sync context because
-    # _locks_lock is lazily created on first async use (Python 3.12+
-    # requires asyncio.Lock() inside a running event loop).
-    app.state.rate_limiter = ComposerRateLimiter(
-        limit=settings.composer_rate_limit_per_minute,
-    )
-
-    # --- Write rate limiter (per-process in-memory) ---
-    # Cheap authenticated DB writes get their own bucket so tutorial
-    # preference bursts never compete with the LLM-call budget above.
-    app.state.write_rate_limiter = ComposerRateLimiter(
-        limit=settings.write_rate_limit_per_minute,
-    )
-
-    # --- Auth rate limiter (per-IP, unauthenticated endpoints) ---
-    app.state.auth_rate_limiter = ComposerRateLimiter(
-        limit=settings.auth_rate_limit_per_minute,
-    )
+    # PostgreSQL owns cross-process UI state and quotas. Construction never
+    # falls back to a process-local store when the database refuses a call.
+    if session_engine.dialect.name == "postgresql":
+        app.state.composer_progress_registry = DatabaseComposerProgressRegistry(
+            SessionComposerProgressAuthority(session_engine, owner_instance_id=instance_id)
+        )
+        app.state.websocket_ticket_store = RepositorySessionWebsocketTicketAuthority(session_engine)
+        app.state.run_progress_reader = RepositoryRunProgressReader(session_engine)
+        rate_limit_authority = RepositoryRateLimitAuthority(
+            session_engine,
+            signing_key=settings.shareable_link_signing_key.get_secret_value(),
+        )
+        app.state.rate_limiter = SharedRateLimiter(
+            settings.composer_rate_limit_per_minute, authority=rate_limit_authority, scope="composer"
+        )
+        app.state.write_rate_limiter = SharedRateLimiter(
+            settings.write_rate_limit_per_minute, authority=rate_limit_authority, scope="write"
+        )
+        app.state.auth_rate_limiter = SharedRateLimiter(settings.auth_rate_limit_per_minute, authority=rate_limit_authority, scope="auth")
+    else:
+        app.state.composer_progress_registry = ComposerProgressRegistry()
+        app.state.websocket_ticket_store = WebSocketTicketStore()
+        app.state.run_progress_reader = None
+        app.state.rate_limiter = ComposerRateLimiter(settings.composer_rate_limit_per_minute)
+        app.state.write_rate_limiter = ComposerRateLimiter(settings.write_rate_limit_per_minute)
+        app.state.auth_rate_limiter = ComposerRateLimiter(settings.auth_rate_limit_per_minute)
 
     # --- Multi-worker enforcement (W10 -> R6) ---
-    # ProgressBroadcaster and the rate limiter are process-local, so
-    # multi-worker mode is unsupported.  Check multiple signals because
+    # One worker per container remains the deployment contract. Replicas
+    # coordinate through PostgreSQL; SQLite retains local UI state. Check
+    # multiple signals because
     # different deployment tools advertise workers in different ways.
     multi_worker_reason: str | None = None
 
@@ -1709,9 +1718,7 @@ def _create_app(
     if multi_worker_reason is not None:
         raise RuntimeError(
             f"Multi-worker mode detected ({multi_worker_reason}) but is not supported. "
-            "ProgressBroadcaster holds subscriber queues in process memory — "
-            "WebSocket progress streaming requires a single worker. "
-            "For multi-worker deployment, replace ProgressBroadcaster with Redis Streams."
+            "Run one web worker per container and use separate PostgreSQL-backed replicas for scaling."
         )
 
     # --- Register routers ---

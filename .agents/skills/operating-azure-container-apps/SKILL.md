@@ -26,10 +26,13 @@ procedures are `docs/runbooks/azure-container-apps-cold-install.md`,
 `docs/runbooks/azure-container-apps-existing-service-redeploy.md` and
 `docs/runbooks/azure-container-apps-deployment.md`.
 
-> **Status.** Skeleton prepared by Phase 6b before the first live run. Until
-> the sanitized receipt at
-> `docs/operator/evidence/azure-container-apps/0.8.0.json` exists, this skill
-> describes a program under acceptance, not a supported platform.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10. The supported configuration retains
+> Single/sticky routing, with PostgreSQL progress and shared budgets verified
+> through local mechanism/integration evidence. No live cloud
+> acceptance is claimed. A future receipt at
+> `docs/operator/evidence/azure-container-apps/0.8.0.json` must come from actual
+> operator execution; it is no longer a closure or documentation-promotion gate.
 
 ## Scope first
 

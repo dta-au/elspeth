@@ -4275,8 +4275,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -4748,8 +4749,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,
@@ -5396,8 +5398,9 @@ async def post_guided_respond(
                             # path had no sink, so the indicator showed elapsed
                             # time with no phase text). Mirrors guided_plan.py's
                             # progress wiring.
-                            planner_progress = _composer_progress_sink(
+                            planner_progress = await _composer_progress_sink(
                                 progress_registry,
+                                request=request,
                                 session_id=str(session_id),
                                 request_id=body.operation_id,
                                 user_id=user.user_id,

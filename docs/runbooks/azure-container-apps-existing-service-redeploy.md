@@ -11,10 +11,24 @@ the release-specific replica > 1 acceptance program use
 Every platform literal below is measured in the
 [platform facts](../plans/2026-09-05-phase6b-azure-container-apps-platform-facts.md).
 
-> **Status.** Skeleton prepared by Phase 6b before the first live run; steps
-> marked **LIVE** are completed from the 6b-7 acceptance. Until the sanitized
-> receipt at `docs/operator/evidence/azure-container-apps/0.8.0.json` exists,
-> this is not a support claim.
+> **Status.** The implemented ACA slice received desktop acceptance:
+> `elspeth-5ec3befc1a` closed on 2026-09-10 by operator ruling. No live cloud
+> acceptance is claimed. This is an executable operator procedure; steps marked
+> **LIVE** require measurements during execution. A future acceptance receipt at
+> `docs/operator/evidence/azure-container-apps/0.8.0.json` is no longer a tracker
+> closure or documentation-promotion condition.
+
+The supported configuration retains `Single` revision mode, `sticky` session
+affinity and 2–4 replicas with one web process per replica. External PostgreSQL
+provides single-use tickets and durable run-event replay on authorized peer
+reconnect, renewable Composer request leases with saved progress and current
+inflight accounting, and shared budgets for auth, writes and Composer/execution
+work. An interrupted provider request is not automatically resumed. Dead-owner
+recovery does not imply transparent run handoff. Verification is limited to
+local PostgreSQL mechanism and integration evidence, with no cloud receipt or
+no-affinity deployment qualification. The legacy v2 P4b receipt remains
+conservative `cannot_pass`; it does not measure the new runtime capabilities.
+Receipt evolution is deferred.
 
 ## Safety contract
 

@@ -31,7 +31,7 @@ from elspeth.web.auth.models import UserIdentity
 from elspeth.web.coordination.contracts import SessionOperationKind
 from elspeth.web.coordination.lifecycle import SessionOperationLease
 from elspeth.web.middleware.rate_limit import (
-    ComposerRateLimiter,
+    WebRateLimiter,
     get_rate_limiter,
     get_write_rate_limiter,
 )
@@ -67,7 +67,7 @@ def create_shareable_reviews_router() -> APIRouter:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         # Write bucket: cheap DB write / token mint, not an LLM call.
-        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Mint a signed share artifact for the current composition state.
 
@@ -127,7 +127,7 @@ def create_shareable_reviews_router() -> APIRouter:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         # Write bucket: cheap DB write / token mint, not an LLM call.
-        rate_limiter: ComposerRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_write_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Re-mint a fresh token for the current (session, state).
 
@@ -156,7 +156,7 @@ def create_shareable_reviews_router() -> APIRouter:
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
         # Strict bucket: abuse-sensitive token probe stays strict.
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
     ) -> JSONResponse:
         """Read-only inspect view of a shared composition.
 

@@ -21,7 +21,6 @@ from ._helpers import (
     ComposerConvergenceError,
     ComposerPluginCrashError,
     ComposerProgressEvent,
-    ComposerRateLimiter,
     ComposerRuntimePreflightError,
     ComposerService,
     ComposerServiceError,
@@ -39,6 +38,7 @@ from ._helpers import (
     SendMessageRequest,
     SessionServiceProtocol,
     UserIdentity,
+    WebRateLimiter,
     _BadRequestLLMError,
     _cancel_on_client_disconnect,
     _composer_chat_history,
@@ -110,7 +110,7 @@ def register_message_routes(router: APIRouter) -> None:
         body: SendMessageRequest,
         request: Request,
         user: UserIdentity = Depends(get_current_user),  # noqa: B008
-        rate_limiter: ComposerRateLimiter = Depends(get_rate_limiter),  # noqa: B008
+        rate_limiter: WebRateLimiter = Depends(get_rate_limiter),  # noqa: B008
         # In-flight compose tally for the SPA's post-abort settlement signal
         # (elspeth-06a23adfcc); decrements only after the route fully unwinds.
         _inflight_tally: None = Depends(_track_compose_inflight),
@@ -230,8 +230,9 @@ def register_message_routes(router: APIRouter) -> None:
                 session_operation_context=compose_operation_lease.context,
             )
             progress_registry = _get_composer_progress_registry(request)
-            progress_sink = _composer_progress_sink(
+            progress_sink = await _composer_progress_sink(
                 progress_registry,
+                request=request,
                 session_id=str(session.id),
                 request_id=str(user_msg.id),
                 user_id=str(user.user_id),
