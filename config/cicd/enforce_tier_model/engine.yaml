@@ -11,7 +11,7 @@ allow_hits:
     (which binds to the exact code and location the judge inspected) could not
     be carried. The rationale above was re-verified against the current code
     at this site.
-  expires: '2026-08-31'
+  expires: '2026-10-06'
 - key: engine/error_boundary.py:R5:reraise_if_engine_crash_through:fp=ebeeba143fd8094a
   owner: john
   reason: |-

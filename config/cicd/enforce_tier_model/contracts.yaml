@@ -6,7 +6,7 @@ allow_hits:
     _register_with_module_prefix line 146 (`if not (isinstance(cls, type) and issubclass(cls, BaseException))`) is an offensive invariant check at the @tier_1_error decorator API boundary. The decorated object is supplied by framework code at import time (Tier-1, our own code registering our own exceptions), not external Tier-3 data; the check validates that the decorator target is a BaseException subclass and raises TypeError on violation (line 147). This is the 'detect an invalid state and throw a meaningful error' branch of the Decision Test — a non-class or non-exception target is a framework bug that must crash before the registry freezes. No coercion, no suppression.
   safety: |-
     Suppression gated by cicd-judge; see judge_rationale below.
-  expires: '2026-08-31'
+  expires: '2026-10-06'
   judge_verdict: ACCEPTED
   judge_recorded_at: '2026-06-02T02:37:02.817384+00:00'
   judge_model: 'claude-opus-4-7[1m]'
