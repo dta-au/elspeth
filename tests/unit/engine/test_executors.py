@@ -5698,12 +5698,15 @@ class TestGateExecutorExecutionErrorFieldRename:
 
 
 class TestReRaiseGuardPattern:
-    """Structural test: every except (FrameworkBugError, AuditIntegrityError) is a bare re-raise.
+    """Structural test: no except (FrameworkBugError, AuditIntegrityError) swallows or substitutes.
 
     The re-raise pattern is a safety-critical invariant across the codebase:
     system-level exceptions must NEVER be caught and wrapped, logged-and-swallowed,
-    or transformed into a different exception.  The only valid body for these
-    handlers is a bare ``raise`` statement.
+    or transformed into a different exception. Nearly every handler says that as a
+    lone bare ``raise``, but a body that records the terminal outcome first and
+    then re-raises the SAME exception is equally valid and is what
+    ``post_guided_plan`` does — so the gate measures the invariant (never return,
+    always end in a raise, never substitute) rather than the statement count.
 
     This test uses AST parsing to verify the pattern is applied consistently
     across all source files, catching drift when someone refactors a try/except
@@ -5722,10 +5725,35 @@ class TestReRaiseGuardPattern:
     _HANDLER_ALLOWLIST = frozenset({"cli.py", "sink.py", "heartbeat.py"})
 
     def test_all_reraise_guards_have_bare_raise(self) -> None:
-        """Every except (FrameworkBugError, AuditIntegrityError) must contain only 'raise'.
+        """A TIER_1_ERRORS handler may never swallow or substitute the failure.
 
-        Exception: cli.py is the outermost boundary and intentionally formats
-        these errors for operator display with distinct exit codes.
+        ADR-008: a registered Tier-1 error bubbles typed and aborts. Most
+        handlers say that as a lone bare ``raise``, and this gate used to
+        require exactly that shape. Recording the terminal outcome first is
+        also legitimate, and adjudicated: ``post_guided_plan`` has no
+        enclosing lease guard to settle for it (unlike ``post_guided_start``,
+        which delegates to ``lease_guard.finish_active_exception``), so its
+        arm settles the operation row with its audit evidence, publishes the
+        terminal progress event, and only then re-raises.
+
+        What the shape is measured for is the invariant, not the statement
+        count. No handler may:
+
+        * ``return`` out of the handler, or end on any statement other than a
+          ``raise`` — either way a path leaves the handler without the Tier-1
+          failure and the caller reads a success or a lesser fault; or
+        * ``raise`` some *other* exception, substituting for the integrity
+          failure the caller must see.
+
+        ``raise <caught name> from <secondary>`` is fine: the Tier-1 exception
+        is still what escapes, with the secondary chained beneath it. A
+        handler that binds no name (``except TIER_1_ERRORS:``) can therefore
+        only re-raise bare. Nested ``def``/``lambda`` bodies are not this
+        handler's control flow and are not inspected.
+
+        Exception: the ``_HANDLER_ALLOWLIST`` files above are outermost
+        boundaries that deliberately latch or format these errors rather than
+        re-raising them in place.
         """
         import ast
         from pathlib import Path
@@ -5744,26 +5772,60 @@ class TestReRaiseGuardPattern:
                 if not isinstance(node, ast.ExceptHandler):
                     continue
 
-                # Match: except (FrameworkBugError, AuditIntegrityError)
+                # Match: except TIER_1_ERRORS / except contract_errors.TIER_1_ERRORS
                 if not _is_framework_audit_handler(node):
                     continue
 
-                # Body must be exactly: [Raise()] or [Expr(comment), Raise()]
-                # (allowing a comment-like string expression before the raise)
-                stmts = [s for s in node.body if not isinstance(s, ast.Expr)]
-                if len(stmts) != 1 or not isinstance(stmts[0], ast.Raise):
+                where = f"{py_file.relative_to('src')}:{node.lineno}"
+                owned = _handler_owned_nodes(node)
+
+                for stmt in owned:
+                    if isinstance(stmt, ast.Return):
+                        violations.append(
+                            f"{where}: except TIER_1_ERRORS handler returns at line {stmt.lineno} "
+                            f"instead of re-raising — the Tier-1 failure is swallowed"
+                        )
+
+                # A handler whose last statement is not a raise has a path that
+                # falls out of it, which swallows the failure just as quietly.
+                last = node.body[-1]
+                if not isinstance(last, ast.Raise):
                     violations.append(
-                        f"{py_file.relative_to('src')}:{node.lineno}: "
-                        f"except (FrameworkBugError, AuditIntegrityError) handler "
-                        f"has non-trivial body (expected bare 'raise')"
+                        f"{where}: except TIER_1_ERRORS handler ends on {type(last).__name__} "
+                        f"at line {last.lineno} rather than a re-raise — a path falls out of "
+                        f"the handler carrying no Tier-1 failure"
                     )
-                elif stmts[0].exc is not None:
-                    # Bare raise has exc=None; raise SomeError(...) has exc set
+
+                for stmt in owned:
+                    if not isinstance(stmt, ast.Raise) or stmt.exc is None:
+                        continue  # a bare ``raise`` re-raises the caught exception
+                    if node.name is not None and isinstance(stmt.exc, ast.Name) and stmt.exc.id == node.name:
+                        continue  # ``raise <caught name> [from ...]`` keeps the Tier-1 primary
                     violations.append(
-                        f"{py_file.relative_to('src')}:{node.lineno}: "
-                        f"except (FrameworkBugError, AuditIntegrityError) handler "
-                        f"raises a new exception instead of bare re-raise"
+                        f"{where}: except TIER_1_ERRORS handler raises a substituted exception "
+                        f"at line {stmt.lineno} instead of the caught Tier-1 failure"
                     )
+
+                # ``raise <caught name>`` is a re-raise only while that name still
+                # binds the caught exception. Rebinding it — by assignment, or by
+                # an inner handler that catches ``as`` the same name — lets any
+                # exception leave through the spelling the check above trusts, so
+                # the rebinding is refused outright rather than tracked.
+                if node.name is not None:
+                    for stmt in owned:
+                        if isinstance(stmt, ast.Name):
+                            rebinds = isinstance(stmt.ctx, ast.Store) and stmt.id == node.name
+                        elif isinstance(stmt, ast.ExceptHandler):
+                            rebinds = stmt.name == node.name
+                        else:
+                            continue
+                        if not rebinds:
+                            continue
+                        violations.append(
+                            f"{where}: except TIER_1_ERRORS handler rebinds its caught name "
+                            f"'{node.name}' at line {stmt.lineno} — a later `raise {node.name}` "
+                            f"would no longer re-raise the Tier-1 failure"
+                        )
 
         assert not violations, f"Re-raise guard violations found ({len(violations)}):\n" + "\n".join(f"  - {v}" for v in violations)
 
@@ -6197,6 +6259,35 @@ def _is_framework_audit_handler(handler: object) -> bool:
     if isinstance(handler.type, ast.Name):
         return handler.type.id == "TIER_1_ERRORS"
     return isinstance(handler.type, ast.Attribute) and handler.type.attr == "TIER_1_ERRORS"
+
+
+def _handler_owned_nodes(handler: object) -> list[object]:
+    """Every node on an except handler's OWN path out, closures excluded.
+
+    A ``return`` or ``raise`` inside a ``def``/``lambda`` the handler happens
+    to declare belongs to that callable, not to the handler's control flow,
+    so descending into one would report a violation the handler never commits.
+    """
+    import ast
+
+    if not isinstance(handler, ast.ExceptHandler):
+        return []
+
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    owned: list[object] = []
+    # The seed is filtered too: a ``def`` declared directly in the handler body
+    # is as much someone else's control flow as one nested deeper, and skipping
+    # it only on the recursive step would attribute a closure's ``return`` to
+    # the handler that merely declares it.
+    stack: list[ast.AST] = [stmt for stmt in handler.body if not isinstance(stmt, nested)]
+    while stack:
+        node = stack.pop()
+        owned.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nested):
+                continue
+            stack.append(child)
+    return owned
 
 
 # =============================================================================

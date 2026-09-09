@@ -74,7 +74,10 @@ def test_current_public_release_surfaces_match_package_version() -> None:
     assert _match_version("docs/README.md", rf"^\*\*Framework status:\*\* `(?P<version>{SEMVER})`$") == current_version
     assert _match_version("CHANGELOG.md", rf"^## (?P<version>{SEMVER})\s+-\s+.+$") == current_version
     assert _match_version("README.md", rf"^!\[Status: (?P<version>{SEMVER})\]\([^)]+\)$") == current_version
-    assert _match_version("README.md", rf"^## What Changed In (?P<version>{SEMVER})$") == current_version
+    # Sentence case, not Title Case: the README's heading style. Pinned exactly
+    # rather than case-insensitively — tolerating both spellings would let the
+    # heading drift back.
+    assert _match_version("README.md", rf"^## What changed in (?P<version>{SEMVER})$") == current_version
 
 
 def test_release_markdown_links_resolve() -> None:
