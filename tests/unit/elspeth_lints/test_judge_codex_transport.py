@@ -27,47 +27,63 @@ from elspeth_lints.core.judge import (
 )
 
 # The COMPLETE set of Codex feature settings the judge transport is allowed to
-# send. Asserted exactly, as a positive whitelist, because "the judge's shell is
-# enabled" cannot be expressed as a negative.
+# send, in order. The judge's shell being ON is a security property of
+# `543066e17`, so it is pinned by asserting the WHOLE config list, unfiltered.
 #
-# Two adversarial reviews (2026-09-09) each defeated a negative assertion:
+# Three adversarial reviews (2026-09-09) each defeated a weaker form, every
+# bypass measured against the real CLI with `codex features list` reporting
+# shell_tool false while the test stayed green:
 #   1. `"features.shell_tool=false" not in command` — exact list membership,
-#      defeated by requoting to `features.shell_tool="false"`, the style the
-#      sibling `web_search="disabled"` flag already uses.
-#   2. a regex over each argv element — defeated STRUCTURALLY by Codex's own
-#      documented `--disable shell_tool`, where the feature name is a SEPARATE
-#      argv element, so no `features.X=false` pattern can ever match it. The
-#      same review also got through with the attached forms
-#      `-cfeatures.shell_tool=false` and `--config=features.shell_tool=false`.
-# Both bypasses were measured against the real CLI: `codex features list`
-# reported shell_tool false while the test stayed green.
+#      beaten by requoting to `features.shell_tool="false"`.
+#   2. a regex per argv element — beaten structurally by Codex's documented
+#      `--disable shell_tool` (the feature name is a SEPARATE argv element),
+#      and by the attached `-cfeatures.X=false` / `--config=features.X=false`.
+#   3. a set-equality over elements containing `"features."` — beaten by the
+#      TOML inline table `features={shell_tool=false,shell_snapshot=false}`,
+#      which never types the dot and so was never even examined.
 #
-# An exact whitelist closes all three: any added setting, in any spelling,
-# changes this set. `--disable` is refused outright since it is the documented
-# equivalent of `-c features.<name>=false`.
-_EXPECTED_FEATURE_SETTINGS = frozenset(
-    {
-        "features.apps=false",
-        "features.goals=false",
-        "features.hooks=false",
-        "features.memories=false",
-        "features.multi_agent=false",
-        "features.personality=false",
-        "features.remote_plugin=false",
-    }
+# The third review named the shared root cause: *a positive assertion over a
+# negatively-filtered subset is still a negative assertion.* Any filter can be
+# stepped around by a spelling the filter does not recognise. So there is no
+# filter here — every `-c` value must appear in this list, and the only values
+# exempt are the judge's own MCP registrations, which are checked separately.
+_EXPECTED_BASE_CONFIG: tuple[str, ...] = (
+    'approval_policy="never"',
+    'web_search="disabled"',
+    f'model_reasoning_effort="{CODEX_JUDGE_REASONING_EFFORT}"',
+    "features.apps=false",
+    "features.hooks=false",
+    "features.goals=false",
+    "features.memories=false",
+    "features.multi_agent=false",
+    "features.remote_plugin=false",
+    "features.personality=false",
 )
+_MCP_CONFIG_PREFIX = "mcp_servers.elspeth_judge_tools."
 
 
 def _assert_judge_shell_is_enabled(command: list[str]) -> None:
-    """Fail if any argv element could turn a Codex shell capability off."""
-    assert "--disable" not in command, "Codex's --disable is the documented equivalent of features.<name>=false"
-    assert not [part for part in command if part.startswith("--disable")], "no attached --disable=<feature> form either"
-    # Substring, not prefix: catches the attached `-cfeatures.X=false` and
-    # `--config=features.X=false` spellings as well as a bare `-c` value.
-    feature_settings = {part for part in command if "features." in part}
-    assert feature_settings == set(_EXPECTED_FEATURE_SETTINGS), (
-        f"unexpected Codex feature settings: {sorted(feature_settings ^ set(_EXPECTED_FEATURE_SETTINGS))}"
+    """Fail if the argv could turn a Codex shell capability off, in ANY spelling.
+
+    Deliberately unfiltered: the settings are compared as a whole list, so a
+    novel override form fails by being unrecognised rather than by matching a
+    pattern someone thought to write down.
+    """
+    # Every other way to set a config value is refused outright, so the
+    # list comparison below cannot be sidestepped by an attached form.
+    for part in command:
+        assert not part.startswith("--disable"), f"--disable is Codex's documented equivalent of features.<name>=false: {part!r}"
+        assert not part.startswith("--config"), f"config must be passed as a bare -c pair, not attached: {part!r}"
+        assert part == "-c" or not part.startswith("-c"), f"attached -c value bypasses the config pin: {part!r}"
+    config_values = [command[index + 1] for index, part in enumerate(command) if part == "-c"]
+    mcp_values = [value for value in config_values if value.startswith(_MCP_CONFIG_PREFIX)]
+    base_values = [value for value in config_values if not value.startswith(_MCP_CONFIG_PREFIX)]
+    assert tuple(base_values) == _EXPECTED_BASE_CONFIG, (
+        f"the judge's Codex config changed; every -c value must be pinned here. unexpected: {sorted(set(base_values) - set(_EXPECTED_BASE_CONFIG))}"
     )
+    # Tool mode adds MCP registrations; blinded mode adds none. Neither may
+    # smuggle a feature setting in under the MCP prefix.
+    assert all("features" not in value for value in mcp_values), f"an MCP setting must not carry a feature override: {mcp_values}"
 
 
 def _request() -> JudgeRequest:
